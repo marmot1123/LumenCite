@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>LumenCite — Detail</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;450;500;550;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Serif:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;600&display=swap" rel="stylesheet" />
+
+<template id="__bundler_thumbnail">
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <rect width="200" height="200" fill="#f3eedb"/>
+  <rect x="56" y="40" width="88" height="120" fill="white" stroke="#9a6a18" stroke-width="3"/>
+  <line x1="68" y1="60" x2="132" y2="60" stroke="#9a6a18" stroke-width="3"/>
+  <line x1="68" y1="74" x2="120" y2="74" stroke="#9a6a18" stroke-width="2" opacity="0.6"/>
+  <line x1="68" y1="84" x2="124" y2="84" stroke="#9a6a18" stroke-width="2" opacity="0.6"/>
+  <line x1="68" y1="94" x2="116" y2="94" stroke="#9a6a18" stroke-width="2" opacity="0.6"/>
+  <line x1="68" y1="110" x2="120" y2="110" stroke="#9a6a18" stroke-width="2" opacity="0.6"/>
+  <line x1="68" y1="120" x2="124" y2="120" stroke="#9a6a18" stroke-width="2" opacity="0.6"/>
+  <line x1="68" y1="130" x2="118" y2="130" stroke="#9a6a18" stroke-width="2" opacity="0.6"/>
+</svg>
+</template>
+
+<style>
+  :root {
+    --bg: oklch(0.985 0.003 80);
+    --surface: #ffffff;
+    --surface-2: oklch(0.975 0.004 80);
+    --sidebar: oklch(0.972 0.004 80);
+    --border: oklch(0.92 0.005 80);
+    --border-subtle: oklch(0.95 0.004 80);
+    --border-strong: oklch(0.86 0.006 80);
+    --text: oklch(0.22 0.01 70);
+    --text-mute: oklch(0.5 0.008 70);
+    --text-faint: oklch(0.65 0.005 70);
+    --row-hover: oklch(0.965 0.005 80);
+    --row-selected: oklch(0.955 0.02 70);
+    --hover: oklch(0.95 0.005 80);
+    --accent-strong: oklch(0.62 0.14 65);
+    --accent-soft: oklch(0.95 0.04 70);
+    --highlight-yellow: oklch(0.93 0.13 95 / 0.55);
+    --highlight-green: oklch(0.92 0.13 145 / 0.5);
+    --highlight-blue: oklch(0.92 0.10 240 / 0.5);
+    --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body, #root { margin: 0; padding: 0; height: 100%; }
+  body {
+    font-family: "IBM Plex Sans", "Noto Sans JP", -apple-system, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+    background: oklch(0.93 0.005 80); color: var(--text); overflow: hidden;
+  }
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: oklch(0.7 0.005 80 / 0.3); border-radius: 999px;
+    border: 2px solid transparent; background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover { background: oklch(0.55 0.005 80 / 0.5); border: 2px solid transparent; background-clip: padding-box; }
+
+  input::placeholder { color: var(--text-faint); }
+  button { font-family: inherit; }
+
+  .stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(ellipse at 30% 20%, oklch(0.96 0.02 70) 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 90%, oklch(0.94 0.03 50) 0%, transparent 55%),
+      oklch(0.92 0.005 80);
+    overflow: hidden;
+  }
+  .scale-wrap {
+    width: 1400px; height: 900px;
+    transform-origin: center center; flex-shrink: 0;
+  }
+  .mac-window {
+    width: 100%; height: 100%;
+    border-radius: 12px; overflow: hidden; background: var(--surface);
+    box-shadow:
+      0 0 0 1px oklch(0 0 0 / 0.08),
+      0 1px 0 oklch(1 0 0 / 0.6) inset,
+      0 30px 60px oklch(0 0 0 / 0.18),
+      0 8px 20px oklch(0 0 0 / 0.10);
+    display: flex; flex-direction: column;
+  }
+  .mac-titlebar {
+    height: 30px; flex-shrink: 0;
+    background: linear-gradient(to bottom, oklch(0.97 0.004 80), oklch(0.94 0.005 80));
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 12px; position: relative;
+  }
+  .traffic { display: flex; gap: 8px; align-items: center; }
+  .traffic .dot { width: 12px; height: 12px; border-radius: 50%; border: 0.5px solid oklch(0 0 0 / 0.1); }
+  .traffic .red    { background: #ff5f57; }
+  .traffic .yellow { background: #febc2e; }
+  .traffic .green  { background: #28c940; }
+  .mac-tab {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: var(--text-mute); font-weight: 500;
+    display: flex; align-items: center; gap: 5px;
+  }
+
+  /* Fake PDF page */
+  .pdf-page {
+    width: 612px; min-height: 792px; /* US Letter */
+    background: white; margin: 24px auto;
+    box-shadow: 0 0 0 1px oklch(0 0 0 / 0.08), 0 8px 24px oklch(0 0 0 / 0.12);
+    padding: 56px 64px; font-family: "IBM Plex Serif", Georgia, serif;
+    color: #1a1a1a; position: relative;
+  }
+  .pdf-page h1 {
+    font-size: 17px; font-weight: 700; line-height: 1.25;
+    text-align: center; margin: 0 0 18px; letter-spacing: -0.01em;
+  }
+  .pdf-page .authors {
+    font-size: 11px; text-align: center; margin-bottom: 6px; color: #333;
+  }
+  .pdf-page .affil {
+    font-size: 9.5px; text-align: center; color: #555; font-style: italic;
+    margin-bottom: 22px;
+  }
+  .pdf-page h2 {
+    font-size: 12px; font-weight: 700; margin: 18px 0 6px;
+    text-transform: none; letter-spacing: 0.01em;
+  }
+  .pdf-page p {
+    font-size: 9.5px; line-height: 1.45; margin: 0 0 8px;
+    text-align: justify; hyphens: auto;
+  }
+  .pdf-page .columns {
+    column-count: 2; column-gap: 22px; margin-top: 8px;
+  }
+  .pdf-page .figure {
+    width: 100%; height: 110px;
+    background: repeating-linear-gradient(45deg,
+      oklch(0.95 0.005 80) 0 6px, oklch(0.92 0.005 80) 6px 12px);
+    border: 0.5px solid #ccc;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 9px; color: #888;
+    margin: 8px 0; break-inside: avoid;
+  }
+  .pdf-page .caption {
+    font-size: 8.5px; text-align: center; color: #333; margin-bottom: 8px;
+    break-inside: avoid;
+  }
+  .pdf-page .equation {
+    text-align: center; font-style: italic; font-size: 11px;
+    margin: 8px 0; color: #1a1a1a;
+  }
+  .pdf-page .pageno {
+    position: absolute; bottom: 24px; left: 0; right: 0;
+    text-align: center; font-size: 9px; color: #888;
+  }
+  .hl-y { background: var(--highlight-yellow); padding: 0 1px; }
+  .hl-g { background: var(--highlight-green); padding: 0 1px; }
+  .hl-b { background: var(--highlight-blue); padding: 0 1px; }
+</style>
+</head>
+<body>
+<div id="stage" class="stage">
+  <div class="scale-wrap" id="scaleWrap">
+    <div class="mac-window">
+      <div class="mac-titlebar">
+        <div class="traffic"><span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span></div>
+        <div class="mac-tab"><span>LumenCite — Attention Is All You Need.pdf</span></div>
+      </div>
+      <div style="flex:1; min-height:0;"><div id="root"></div></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="detail-app.jsx"></script>
+
+<script>
+  const wrap = document.getElementById('scaleWrap');
+  function fit() {
+    const sx = window.innerWidth / 1400;
+    const sy = window.innerHeight / 900;
+    wrap.style.transform = 'scale(' + Math.min(sx, sy, 1) + ')';
+  }
+  fit(); window.addEventListener('resize', fit);
+</script>
+</body>
+</html>

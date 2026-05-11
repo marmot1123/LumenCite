@@ -1,0 +1,42 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;450;500;550;600;700&family=IBM+Plex+Serif:wght@600&family=Noto+Sans+JP:wght@400;500;600&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', 'Noto Sans JP', system-ui, sans-serif;
+}
+
+:root {
+  --bg:            oklch(0.985 0.003 80);
+  --surface:       #ffffff;
+  --surface-2:     oklch(0.975 0.004 80);
+  --sidebar:       oklch(0.972 0.004 80);
+  --border:        oklch(0.92  0.005 80);
+  --border-subtle: oklch(0.95  0.004 80);
+  --border-strong: oklch(0.86  0.006 80);
+  --text:          oklch(0.22  0.01  70);
+  --text-mute:     oklch(0.5   0.008 70);
+  --text-faint:    oklch(0.65  0.005 70);
+  --row-hover:     oklch(0.965 0.005 80);
+  --row-selected:  oklch(0.955 0.02  70);
+  --hover:         oklch(0.95  0.005 80);
+  --accent-strong: oklch(0.62 0.14 65);
+  --accent-soft:   oklch(0.95 0.04 70);
+  --accent-ring:   oklch(0.7 0.13 65 / 0.25);
+  --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+button { font-family: inherit; }
+input, textarea { font-family: inherit; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}

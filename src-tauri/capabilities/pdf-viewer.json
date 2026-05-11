@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pdf-viewer",
+  "description": "Capability for the PDF viewer window",
+  "windows": ["pdf-viewer-*"],
+  "permissions": ["core:default"]
+}

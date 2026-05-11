@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>LumenCite — Library</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;450;500;550;600;700&family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+JP:wght@400;500;600&display=swap" rel="stylesheet" />
+
+<template id="__bundler_thumbnail">
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f3eedb"/><stop offset="100%" stop-color="#e8d8a8"/>
+    </linearGradient>
+  </defs>
+  <rect width="200" height="200" fill="url(#g)"/>
+  <g transform="translate(60,60)">
+    <path d="M14 10v40a26 26 0 0 0 52 0V10" stroke="#9a6a18" stroke-width="6" stroke-linecap="round" fill="none"/>
+    <circle cx="40" cy="62" r="7" fill="#9a6a18"/>
+  </g>
+</svg>
+</template>
+
+<style>
+  :root {
+    --bg: oklch(0.985 0.003 80);
+    --surface: #ffffff;
+    --surface-2: oklch(0.975 0.004 80);
+    --sidebar: oklch(0.972 0.004 80);
+    --border: oklch(0.92 0.005 80);
+    --border-subtle: oklch(0.95 0.004 80);
+    --border-strong: oklch(0.86 0.006 80);
+    --text: oklch(0.22 0.01 70);
+    --text-mute: oklch(0.5 0.008 70);
+    --text-faint: oklch(0.65 0.005 70);
+    --row-hover: oklch(0.965 0.005 80);
+    --row-selected: oklch(0.955 0.02 70);
+    --hover: oklch(0.95 0.005 80);
+    --accent-strong: oklch(0.62 0.14 65);
+    --accent-soft: oklch(0.95 0.04 70);
+    --accent-ring: oklch(0.7 0.13 65 / 0.25);
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body, #root { margin: 0; padding: 0; height: 100%; }
+  body {
+    font-family: "IBM Plex Sans", "Noto Sans JP", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: oklch(0.93 0.005 80);
+    color: var(--text);
+    overflow: hidden;
+  }
+
+  /* Tighten scrollbars to match desktop chrome */
+  .entries-scroll::-webkit-scrollbar,
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: oklch(0.7 0.005 80 / 0.3); border-radius: 999px;
+    border: 2px solid transparent; background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover { background: oklch(0.55 0.005 80 / 0.5); border: 2px solid transparent; background-clip: padding-box; }
+
+  input::placeholder { color: var(--text-faint); }
+  button { font-family: inherit; }
+
+  /* Mac window stage — fixed canvas, scaled to fit viewport */
+  .stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(ellipse at 30% 20%, oklch(0.96 0.02 70) 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 90%, oklch(0.94 0.03 50) 0%, transparent 55%),
+      oklch(0.92 0.005 80);
+    overflow: hidden;
+  }
+  .stage.dark {
+    background:
+      radial-gradient(ellipse at 30% 20%, oklch(0.32 0.025 70) 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 90%, oklch(0.28 0.03 50) 0%, transparent 55%),
+      oklch(0.22 0.004 80);
+  }
+  .scale-wrap {
+    width: 1400px; height: 900px;
+    transform-origin: center center;
+    flex-shrink: 0;
+  }
+
+  .mac-window {
+    width: 100%; height: 100%;
+    border-radius: 12px; overflow: hidden;
+    background: var(--surface);
+    box-shadow:
+      0 0 0 1px oklch(0 0 0 / 0.08),
+      0 1px 0 oklch(1 0 0 / 0.6) inset,
+      0 30px 60px oklch(0 0 0 / 0.18),
+      0 8px 20px oklch(0 0 0 / 0.10);
+    display: flex; flex-direction: column;
+  }
+  .mac-titlebar {
+    height: 30px; flex-shrink: 0;
+    background: linear-gradient(to bottom, oklch(0.97 0.004 80), oklch(0.94 0.005 80));
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 12px;
+    position: relative;
+  }
+  .stage.dark .mac-titlebar {
+    background: linear-gradient(to bottom, oklch(0.26 0.005 80), oklch(0.22 0.005 80));
+    border-bottom-color: oklch(0.30 0.005 80);
+  }
+  .traffic { display: flex; gap: 8px; align-items: center; }
+  .traffic .dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    border: 0.5px solid oklch(0 0 0 / 0.1);
+  }
+  .traffic .red    { background: #ff5f57; }
+  .traffic .yellow { background: #febc2e; }
+  .traffic .green  { background: #28c940; }
+  .mac-tab {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: var(--text-mute); font-weight: 500;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .mac-tab .file {
+    width: 11px; height: 11px; border-radius: 2px;
+    background: linear-gradient(140deg, oklch(0.78 0.16 75), oklch(0.62 0.16 50));
+  }
+  .mac-body { flex: 1; min-height: 0; }
+</style>
+</head>
+<body>
+  <div id="stage" class="stage">
+    <div class="scale-wrap" id="scaleWrap">
+    <div class="mac-window">
+      <div class="mac-titlebar">
+        <div class="traffic">
+          <span class="dot red"></span>
+          <span class="dot yellow"></span>
+          <span class="dot green"></span>
+        </div>
+        <div class="mac-tab">
+          <span class="file"></span>
+          <span>LumenCite — references.lumen</span>
+        </div>
+      </div>
+      <div class="mac-body">
+        <div id="root"></div>
+      </div>
+    </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="starters/tweaks-panel.jsx"></script>
+  <script type="text/babel" src="data.jsx"></script>
+  <script type="text/babel" src="app.jsx"></script>
+  <script type="text/babel" src="sidebar.jsx"></script>
+  <script type="text/babel" src="table.jsx"></script>
+  <script type="text/babel" src="detail.jsx"></script>
+  <script type="text/babel" src="main.jsx"></script>
+
+  <script>
+    // Sync stage bg with theme tweak
+    const obs = new MutationObserver(() => {
+      const bg = document.documentElement.style.getPropertyValue('--bg');
+      const dark = bg.includes('0.27') || bg.includes('0.18');
+      document.getElementById('stage').classList.toggle('dark', dark);
+    });
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
+
+    // Scale-to-fit the fixed 1400×900 desktop canvas into any viewport
+    const wrap = document.getElementById('scaleWrap');
+    function fit() {
+      const sx = window.innerWidth / 1400;
+      const sy = window.innerHeight / 900;
+      const s = Math.min(sx, sy, 1);
+      wrap.style.transform = 'scale(' + s + ')';
+    }
+    fit();
+    window.addEventListener('resize', fit);
+  </script>
+</body>
+</html>

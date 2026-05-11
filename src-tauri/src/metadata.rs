@@ -1,0 +1,436 @@
+use std::collections::HashMap;
+
+use crate::models::EntryInput;
+
+// ── DOI（CrossRef API）────────────────────────────────────────────────────────
+
+pub async fn fetch_by_doi(doi: &str) -> Result<EntryInput, String> {
+    let doi = doi
+        .trim()
+        .trim_start_matches("https://doi.org/")
+        .trim_start_matches("http://doi.org/")
+        .trim_start_matches("doi:");
+
+    let url = format!("https://api.crossref.org/works/{}", doi);
+    let client = reqwest::Client::builder()
+        .user_agent("LumenCite/0.1 (mailto:support@lumencite.app)")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("ネットワークエラー: {}", e))?
+        .error_for_status()
+        .map_err(|_| "DOI が見つかりませんでした".to_string())?
+        .json()
+        .await
+        .map_err(|e| format!("レスポンス解析エラー: {}", e))?;
+
+    Ok(crossref_to_input(&resp["message"], doi))
+}
+
+fn crossref_to_input(msg: &serde_json::Value, doi: &str) -> EntryInput {
+    let title = msg["title"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("(タイトルなし)")
+        .to_string();
+
+    let author_names: Vec<String> = msg["author"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|a| {
+            let given = a["given"].as_str().unwrap_or("");
+            let family = a["family"].as_str().unwrap_or("");
+            if family.is_empty() {
+                a["name"].as_str().map(|s| s.to_string())
+            } else if given.is_empty() {
+                Some(family.to_string())
+            } else {
+                Some(format!("{} {}", given, family))
+            }
+        })
+        .collect();
+
+    let year = msg["published"]["date-parts"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|d| d.as_array())
+        .and_then(|d| d.first())
+        .and_then(|y| y.as_i64())
+        .or_else(|| {
+            msg["published-print"]["date-parts"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|d| d.as_array())
+                .and_then(|d| d.first())
+                .and_then(|y| y.as_i64())
+        });
+
+    let abstract_ = msg["abstract"].as_str().map(strip_html_tags);
+
+    let entry_type = match msg["type"].as_str().unwrap_or("") {
+        "journal-article" | "article" => "article",
+        "book" | "monograph" | "reference-book" | "edited-book" => "book",
+        "proceedings-article" => "inproceedings",
+        "dissertation" => "thesis",
+        _ => "misc",
+    }
+    .to_string();
+
+    let url_val = msg["URL"].as_str().map(|s| s.to_string());
+
+    let mut extra_fields: HashMap<String, String> = HashMap::new();
+
+    // container-title は article なら journal、inproceedings なら booktitle
+    let container = msg["container-title"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(c) = container {
+        let key = if entry_type == "inproceedings" { "booktitle" } else { "journal" };
+        extra_fields.insert(key.to_string(), c);
+    }
+
+    if let Some(v) = msg["volume"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        extra_fields.insert("volume".to_string(), v.to_string());
+    }
+    if let Some(v) = msg["issue"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        extra_fields.insert("issue".to_string(), v.to_string());
+    }
+    if let Some(v) = msg["page"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        extra_fields.insert("pages".to_string(), v.to_string());
+    }
+    if let Some(v) = msg["publisher"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        extra_fields.insert("publisher".to_string(), v.to_string());
+    }
+    if let Some(v) = msg["publisher-location"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        extra_fields.insert("address".to_string(), v.to_string());
+    }
+
+    EntryInput {
+        title,
+        year,
+        entry_type,
+        doi: Some(doi.to_string()),
+        url: url_val,
+        author_names,
+        abstract_,
+        extra_fields,
+        ..Default::default()
+    }
+}
+
+// ── arXiv API ─────────────────────────────────────────────────────────────────
+
+pub async fn fetch_by_arxiv(arxiv_id: &str) -> Result<EntryInput, String> {
+    let id = normalize_arxiv_id(arxiv_id);
+    let url = format!("https://export.arxiv.org/api/query?id_list={}", id);
+
+    let text = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("ネットワークエラー: {}", e))?
+        .text()
+        .await
+        .map_err(|e| format!("レスポンス解析エラー: {}", e))?;
+
+    // Find the <entry> element (skip feed-level tags)
+    let entry = {
+        let start = text.find("<entry>").ok_or("arXiv: エントリが見つかりません（IDを確認してください）")?;
+        let end = text[start..].find("</entry>").ok_or("arXiv: レスポンス解析エラー")?;
+        &text[start..start + end + "</entry>".len()]
+    };
+
+    let title = extract_first_xml_text(entry, "title")
+        .map(|t| t.trim().replace('\n', " "))
+        .unwrap_or_else(|| "(タイトルなし)".to_string());
+
+    let author_names = extract_all_xml_text(entry, "name");
+
+    let year = extract_first_xml_text(entry, "published")
+        .and_then(|s| s.get(..4).map(|y| y.to_string()))
+        .and_then(|y| y.parse::<i64>().ok());
+
+    let abstract_ = extract_first_xml_text(entry, "summary")
+        .map(|s| s.trim().replace('\n', " "));
+
+    Ok(EntryInput {
+        title,
+        year,
+        entry_type: "article".to_string(),
+        arxiv_id: Some(id),
+        author_names,
+        abstract_,
+        ..Default::default()
+    })
+}
+
+// ── ISBN（OpenLibrary API）────────────────────────────────────────────────────
+
+pub async fn fetch_by_isbn(isbn: &str) -> Result<EntryInput, String> {
+    let isbn = isbn.trim().replace(['-', ' '], "");
+    let url = format!(
+        "https://openlibrary.org/api/books?bibkeys=ISBN:{}&format=json&jscmd=data",
+        isbn
+    );
+
+    let resp: serde_json::Value = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("ネットワークエラー: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("レスポンス解析エラー: {}", e))?;
+
+    let key = format!("ISBN:{}", isbn);
+    let book = resp
+        .get(&key)
+        .ok_or_else(|| "ISBN が見つかりませんでした".to_string())?;
+
+    Ok(openlibrary_to_input(book, &isbn))
+}
+
+fn openlibrary_to_input(book: &serde_json::Value, isbn: &str) -> EntryInput {
+    let title = book["title"]
+        .as_str()
+        .unwrap_or("(タイトルなし)")
+        .to_string();
+
+    let author_names: Vec<String> = book["authors"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|a| a["name"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    let year = book["publish_date"].as_str().and_then(|s| {
+        s.split_whitespace()
+            .find_map(|w| w.parse::<i64>().ok().filter(|&y| y > 1000 && y < 2200))
+    });
+
+    let mut extra_fields: HashMap<String, String> = HashMap::new();
+
+    let publisher = book["publishers"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|p| p["name"].as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(p) = publisher {
+        extra_fields.insert("publisher".to_string(), p);
+    }
+
+    let pages = book["number_of_pages"]
+        .as_i64()
+        .map(|n| n.to_string())
+        .or_else(|| {
+            book["pagination"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        });
+    if let Some(p) = pages {
+        extra_fields.insert("pages".to_string(), p);
+    }
+
+    let address = book["publish_places"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|p| p["name"].as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(a) = address {
+        extra_fields.insert("address".to_string(), a);
+    }
+
+    EntryInput {
+        title,
+        year,
+        entry_type: "book".to_string(),
+        isbn: Some(isbn.to_string()),
+        author_names,
+        extra_fields,
+        ..Default::default()
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+fn normalize_arxiv_id(id: &str) -> String {
+    let id = id.trim();
+    if let Some(pos) = id.rfind('/') {
+        let rest = &id[pos + 1..];
+        // strip version suffix like v5
+        return rest
+            .find('v')
+            .map_or(rest, |v| &rest[..v])
+            .to_string();
+    }
+    if let Some(s) = id.strip_prefix("arXiv:").or_else(|| id.strip_prefix("arxiv:")) {
+        return s.to_string();
+    }
+    id.to_string()
+}
+
+fn extract_first_xml_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)?;
+    Some(xml[start..start + end].to_string())
+}
+
+fn extract_all_xml_text(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let mut results = Vec::new();
+    let mut pos = 0;
+    while let Some(s) = xml[pos..].find(&open) {
+        let cs = pos + s + open.len();
+        if let Some(e) = xml[cs..].find(&close) {
+            results.push(xml[cs..cs + e].trim().to_string());
+            pos = cs + e + close.len();
+        } else {
+            break;
+        }
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── crossref_to_input ────────────────────────────────────────────────────
+
+    #[test]
+    fn crossref_extracts_journal_and_pages_for_article() {
+        let msg = json!({
+            "type": "journal-article",
+            "title": ["Example Title"],
+            "container-title": ["Nature"],
+            "volume": "612",
+            "issue": "7940",
+            "page": "150-160",
+            "publisher": "Springer Nature",
+        });
+
+        let input = crossref_to_input(&msg, "10.1234/test");
+
+        assert_eq!(input.entry_type, "article");
+        assert_eq!(input.extra_fields.get("journal").map(String::as_str), Some("Nature"));
+        assert_eq!(input.extra_fields.get("volume").map(String::as_str), Some("612"));
+        assert_eq!(input.extra_fields.get("issue").map(String::as_str), Some("7940"));
+        assert_eq!(input.extra_fields.get("pages").map(String::as_str), Some("150-160"));
+        assert_eq!(input.extra_fields.get("publisher").map(String::as_str), Some("Springer Nature"));
+    }
+
+    #[test]
+    fn crossref_uses_booktitle_for_inproceedings() {
+        let msg = json!({
+            "type": "proceedings-article",
+            "title": ["Conference Paper"],
+            "container-title": ["Proceedings of CVPR 2024"],
+            "page": "1234-1245",
+        });
+
+        let input = crossref_to_input(&msg, "10.1234/conf");
+
+        assert_eq!(input.entry_type, "inproceedings");
+        assert_eq!(input.extra_fields.get("booktitle").map(String::as_str), Some("Proceedings of CVPR 2024"));
+        assert!(!input.extra_fields.contains_key("journal"));
+        assert_eq!(input.extra_fields.get("pages").map(String::as_str), Some("1234-1245"));
+    }
+
+    #[test]
+    fn crossref_omits_missing_fields() {
+        let msg = json!({
+            "type": "journal-article",
+            "title": ["Bare Bones"],
+        });
+
+        let input = crossref_to_input(&msg, "10.0/x");
+
+        assert!(input.extra_fields.is_empty());
+        assert_eq!(input.title, "Bare Bones");
+    }
+
+    #[test]
+    fn crossref_skips_empty_strings() {
+        let msg = json!({
+            "type": "journal-article",
+            "title": ["X"],
+            "volume": "",
+            "page": "   ",
+            "container-title": [""],
+        });
+
+        let input = crossref_to_input(&msg, "10.0/x");
+
+        assert!(!input.extra_fields.contains_key("volume"));
+        assert!(!input.extra_fields.contains_key("pages"));
+        assert!(!input.extra_fields.contains_key("journal"));
+    }
+
+    // ── openlibrary_to_input ─────────────────────────────────────────────────
+
+    #[test]
+    fn openlibrary_extracts_publisher_and_pages() {
+        let book = json!({
+            "title": "CLRS",
+            "authors": [{ "name": "Thomas H. Cormen" }],
+            "publish_date": "2009",
+            "publishers": [{ "name": "MIT Press" }],
+            "number_of_pages": 1312,
+            "publish_places": [{ "name": "Cambridge, MA" }],
+        });
+
+        let input = openlibrary_to_input(&book, "9780262033848");
+
+        assert_eq!(input.title, "CLRS");
+        assert_eq!(input.entry_type, "book");
+        assert_eq!(input.extra_fields.get("publisher").map(String::as_str), Some("MIT Press"));
+        assert_eq!(input.extra_fields.get("pages").map(String::as_str), Some("1312"));
+        assert_eq!(input.extra_fields.get("address").map(String::as_str), Some("Cambridge, MA"));
+    }
+
+    #[test]
+    fn openlibrary_falls_back_to_pagination_string() {
+        let book = json!({
+            "title": "Foo",
+            "pagination": "xii, 480 p.",
+        });
+
+        let input = openlibrary_to_input(&book, "0000000000");
+
+        assert_eq!(input.extra_fields.get("pages").map(String::as_str), Some("xii, 480 p."));
+    }
+
+    #[test]
+    fn openlibrary_omits_missing_extras() {
+        let book = json!({ "title": "Minimal" });
+        let input = openlibrary_to_input(&book, "0000000000");
+        assert!(input.extra_fields.is_empty());
+    }
+}
