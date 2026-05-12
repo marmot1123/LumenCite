@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { Icon } from "./icons";
 import { tagColorForName } from "./TagPill";
+import LumenciteLogo from "../../design/logo-exports/lumencite.svg?url";
 import type { Collection, SidebarCounts, Tag } from "../types";
 
 interface SidebarProps {
@@ -355,18 +356,13 @@ export function Sidebar({
         display: "flex", alignItems: "center", gap: 10,
         WebkitAppRegion: "drag",
       } as React.CSSProperties}>
-        <div style={{
-          width: 22, height: 22, borderRadius: 6,
-          background: "linear-gradient(140deg, oklch(0.78 0.16 75), oklch(0.62 0.16 50))",
-          display: "flex", alignItems: "center", justifyContent: "center",
-          flexShrink: 0,
-          boxShadow: "0 1px 2px rgba(120,80,20,0.25), inset 0 0.5px 0 rgba(255,255,255,0.5)",
-        }}>
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-            <path d="M3 2v6a3 3 0 0 0 6 0V2" stroke="white" strokeWidth="1.4" strokeLinecap="round"/>
-            <circle cx="6" cy="9.5" r="1" fill="white"/>
-          </svg>
-        </div>
+        <img
+          src={LumenciteLogo}
+          alt="LumenCite"
+          width={22}
+          height={22}
+          style={{ flexShrink: 0, display: "block" }}
+        />
         <div style={{ flex: 1 }}>
           <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", letterSpacing: "-0.01em" }}>
             LumenCite
