@@ -500,7 +500,8 @@
       "llm": "LLM",
       "bibtex": "BibTeX sync",
       "updates": "Updates",
-      "data": "Data"
+      "data": "Data",
+      "about": "About"
     },
     "appearance": {
       "language": "Language",
@@ -584,6 +585,19 @@
       "exportDone": "Wrote to {{path}}",
       "exportCancelled": "Cancelled",
       "exportError": "Export failed: {{error}}"
+    },
+    "about": {
+      "appTitle": "LumenCite",
+      "tagline": "A desktop reference manager for researchers",
+      "version": "Version {{version}}",
+      "license": "License: MIT",
+      "openRepo": "Open GitHub repository",
+      "openLicense": "View full license",
+      "supportTitle": "Support the project",
+      "supportBody": "LumenCite is an open-source personal project. If you find it useful, please consider supporting development with a donation.",
+      "openSponsors": "Sponsor on GitHub",
+      "thanksTitle": "Built on shoulders of giants",
+      "thanksBody": "Powered by Tauri, React, pdf.js, KaTeX, and many other open-source libraries."
     }
   }
 }

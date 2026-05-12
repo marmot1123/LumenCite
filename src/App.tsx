@@ -132,6 +132,7 @@ export default function App() {
   const [screen, setScreen] = useState<"library" | "detail">("library");
   const [showSummary, setShowSummary] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<"appearance" | "llm" | "bibtex" | "updates" | "data" | "about" | undefined>(undefined);
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
 
@@ -168,12 +169,20 @@ export default function App() {
     return () => { unlistenPromise.then(u => u()); };
   }, []);
 
-  // メニューバー「Settings…」(⌘+, / Ctrl+,) から発火される open-settings イベントを購読
+  // メニューバー「Settings…」(⌘+, / Ctrl+,) と「About …」から発火されるイベントを購読
   useEffect(() => {
-    const unlistenPromise = listen("open-settings", () => {
+    const unlistenSettings = listen("open-settings", () => {
+      setSettingsInitialTab(undefined);
       setShowSettings(true);
     });
-    return () => { unlistenPromise.then(u => u()); };
+    const unlistenAbout = listen("open-about", () => {
+      setSettingsInitialTab("about");
+      setShowSettings(true);
+    });
+    return () => {
+      unlistenSettings.then(u => u());
+      unlistenAbout.then(u => u());
+    };
   }, []);
 
   useEffect(() => {
@@ -924,8 +933,9 @@ export default function App() {
 
       {showSettings && (
         <SettingsModal
-          onClose={() => setShowSettings(false)}
+          onClose={() => { setShowSettings(false); setSettingsInitialTab(undefined); }}
           onOpenBibtexSync={() => { setShowSettings(false); setShowBibtexSync(true); }}
+          initialTab={settingsInitialTab}
         />
       )}
 

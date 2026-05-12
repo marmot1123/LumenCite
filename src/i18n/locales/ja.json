@@ -500,7 +500,8 @@
       "llm": "LLM",
       "bibtex": "BibTeX 同期",
       "updates": "アップデート",
-      "data": "データ"
+      "data": "データ",
+      "about": "情報"
     },
     "appearance": {
       "language": "言語",
@@ -584,6 +585,19 @@
       "exportDone": "{{path}} に書き出しました",
       "exportCancelled": "キャンセルしました",
       "exportError": "エクスポートに失敗しました: {{error}}"
+    },
+    "about": {
+      "appTitle": "LumenCite",
+      "tagline": "研究者のためのデスクトップ文献管理アプリ",
+      "version": "バージョン {{version}}",
+      "license": "ライセンス: MIT",
+      "openRepo": "GitHub リポジトリを開く",
+      "openLicense": "ライセンス全文を見る",
+      "supportTitle": "プロジェクトを応援する",
+      "supportBody": "LumenCite はオープンソースの個人プロジェクトです。開発を継続できるよう、よろしければ寄付でご支援ください。",
+      "openSponsors": "GitHub Sponsors で支援する",
+      "thanksTitle": "依存関係への感謝",
+      "thanksBody": "Tauri / React / pdf.js / KaTeX をはじめとした多数の OSS ライブラリの上に成り立っています。"
     }
   }
 }

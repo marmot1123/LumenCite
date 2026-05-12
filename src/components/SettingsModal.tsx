@@ -1,17 +1,25 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTheme } from "../hooks/useTheme";
 import { useLanguage } from "../hooks/useLanguage";
 import { Icon } from "./icons";
 import { checkForUpdate, applyUpdate, type UpdateAvailable } from "../lib/updater";
+import LumenciteLogo from "../../design/logo-exports/lumencite.svg?url";
 import type { AccentName, Density, LlmProvider, LlmSettings, SummarySource, ThemeMode } from "../types";
 
-type TabId = "appearance" | "llm" | "bibtex" | "updates" | "data";
+type TabId = "appearance" | "llm" | "bibtex" | "updates" | "data" | "about";
+
+const REPO_URL = "https://github.com/marmot1123/lumencite";
+const SPONSORS_URL = "https://github.com/sponsors/marmot1123";
+const LICENSE_URL = "https://github.com/marmot1123/lumencite/blob/main/LICENSE";
 
 interface SettingsModalProps {
   onClose: () => void;
   onOpenBibtexSync: () => void;
+  /** モーダル起動時に開くタブ（既定: appearance） */
+  initialTab?: TabId;
 }
 
 const APP_VERSION = "0.1.0";
@@ -22,6 +30,7 @@ const TABS: { id: TabId; iconName: Parameters<typeof Icon>[0]["name"] }[] = [
   { id: "bibtex",     iconName: "sync" },
   { id: "updates",    iconName: "download" },
   { id: "data",       iconName: "library" },
+  { id: "about",      iconName: "star" },
 ];
 
 const ACCENT_SWATCHES: { id: AccentName; color: string; labelKey: "settings.appearance.accentAmber" | "settings.appearance.accentIndigo" | "settings.appearance.accentTeal" | "settings.appearance.accentRose" }[] = [
@@ -678,9 +687,56 @@ function DataTab() {
   );
 }
 
-export function SettingsModal({ onClose, onOpenBibtexSync }: SettingsModalProps) {
+function AboutTab() {
   const { t } = useTranslation();
-  const [active, setActive] = useState<TabId>("appearance");
+  const open = (url: string) => { void openUrl(url); };
+  return (
+    <>
+      <div style={{
+        display: "flex", alignItems: "center", gap: 12, marginBottom: 18,
+      }}>
+        <img src={LumenciteLogo} alt="LumenCite" width={48} height={48} style={{ display: "block" }} />
+        <div>
+          <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text)", letterSpacing: "-0.01em" }}>
+            {t("settings.about.appTitle")}
+          </div>
+          <div style={{ fontSize: 12, color: "var(--text-mute)", marginTop: 2 }}>
+            {t("settings.about.tagline")}
+          </div>
+        </div>
+      </div>
+
+      <Section title={t("settings.about.appTitle")}>
+        <div style={{ fontSize: 12.5, color: "var(--text)", marginBottom: 4 }}>
+          {t("settings.about.version", { version: APP_VERSION })}
+        </div>
+        <div style={{ fontSize: 12.5, color: "var(--text)", marginBottom: 10 }}>
+          {t("settings.about.license")}
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <SecondaryBtn onClick={() => open(REPO_URL)}>{t("settings.about.openRepo")}</SecondaryBtn>
+          <SecondaryBtn onClick={() => open(LICENSE_URL)}>{t("settings.about.openLicense")}</SecondaryBtn>
+        </div>
+      </Section>
+
+      <Section title={t("settings.about.supportTitle")} description={t("settings.about.supportBody")}>
+        <PrimaryBtn onClick={() => open(SPONSORS_URL)}>
+          {t("settings.about.openSponsors")}
+        </PrimaryBtn>
+      </Section>
+
+      <Section title={t("settings.about.thanksTitle")}>
+        <div style={{ fontSize: 12, color: "var(--text-mute)", lineHeight: 1.6 }}>
+          {t("settings.about.thanksBody")}
+        </div>
+      </Section>
+    </>
+  );
+}
+
+export function SettingsModal({ onClose, onOpenBibtexSync, initialTab }: SettingsModalProps) {
+  const { t } = useTranslation();
+  const [active, setActive] = useState<TabId>(initialTab ?? "appearance");
 
   return (
     <div
@@ -766,6 +822,7 @@ export function SettingsModal({ onClose, onOpenBibtexSync }: SettingsModalProps)
             {active === "bibtex" && <BibtexTab onOpenBibtexSync={onOpenBibtexSync} />}
             {active === "updates" && <UpdatesTab />}
             {active === "data" && <DataTab />}
+            {active === "about" && <AboutTab />}
           </div>
         </div>
 

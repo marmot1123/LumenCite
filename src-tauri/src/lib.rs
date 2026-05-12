@@ -1059,6 +1059,15 @@ fn install_app_menu(app: &AppHandle) -> tauri::Result<()> {
         true,
         Some("CmdOrCtrl+,"),
     )?;
+    // OS 標準の About ダイアログは使わず、アプリ内の About タブを開くカスタム項目にする。
+    let about_item = MenuItem::with_id(
+        app,
+        "open-about",
+        format!("About {}", pkg.name),
+        true,
+        None::<&str>,
+    )?;
+    let _ = &about; // about metadata は OS 標準ダイアログ用だったので未使用化
 
     #[cfg(target_os = "macos")]
     let app_submenu = Submenu::with_items(
@@ -1066,7 +1075,7 @@ fn install_app_menu(app: &AppHandle) -> tauri::Result<()> {
         &pkg.name,
         true,
         &[
-            &PredefinedMenuItem::about(app, None, Some(about.clone()))?,
+            &about_item,
             &PredefinedMenuItem::separator(app)?,
             &settings_item,
             &PredefinedMenuItem::separator(app)?,
@@ -1128,11 +1137,12 @@ fn install_app_menu(app: &AppHandle) -> tauri::Result<()> {
         ],
     )?;
 
+    // macOS では Help にも About を入れない（アプリメニューの About に集約）。
+    // Windows/Linux では Help メニューに About を入れる（macOS のアプリメニューが無いため）。
     #[cfg(target_os = "macos")]
     let help_items: Vec<&dyn tauri::menu::IsMenuItem<_>> = vec![];
     #[cfg(not(target_os = "macos"))]
-    let help_items: Vec<&dyn tauri::menu::IsMenuItem<_>> =
-        vec![&PredefinedMenuItem::about(app, None, Some(about.clone()))?];
+    let help_items: Vec<&dyn tauri::menu::IsMenuItem<_>> = vec![&about_item];
     let help_submenu = Submenu::with_items(app, "Help", true, &help_items)?;
 
     #[cfg(target_os = "macos")]
@@ -1148,8 +1158,10 @@ fn install_app_menu(app: &AppHandle) -> tauri::Result<()> {
 
     app.set_menu(menu)?;
     app.on_menu_event(|app_handle, event| {
-        if event.id() == "open-settings" {
-            let _ = app_handle.emit("open-settings", ());
+        match event.id().as_ref() {
+            "open-settings" => { let _ = app_handle.emit("open-settings", ()); }
+            "open-about"    => { let _ = app_handle.emit("open-about", ()); }
+            _ => {}
         }
     });
     Ok(())

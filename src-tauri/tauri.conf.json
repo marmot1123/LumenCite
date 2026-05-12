@@ -34,6 +34,8 @@
       "icons/icon.ico"
     ],
     "category": "Productivity",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
     "shortDescription": "Reference and bibliography management for researchers",
     "longDescription": "LumenCite is a desktop reference manager for researchers, integrating PDF reading, BibTeX sync for LaTeX workflows, and LLM-assisted summarization.",
     "macOS": {
