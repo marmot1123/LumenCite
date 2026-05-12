@@ -5,9 +5,12 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:webview:allow-print",
     "opener:default",
     "clipboard-manager:allow-write-text",
     "dialog:allow-save",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

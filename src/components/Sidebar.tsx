@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { Icon } from "./icons";
 import { tagColorForName } from "./TagPill";
 import type { Collection, SidebarCounts, Tag } from "../types";
@@ -21,6 +22,11 @@ interface SidebarProps {
   bibtexLastSynced: string | null;
   bibtexLastError: string | null;
   onOpenBibtexSync: () => void;
+  onOpenSettings: () => void;
+  /** ゴミ箱・お気に入り等の特殊ビューへのドロップ */
+  onDropToView: (view: "starred" | "trash", draggingId: number) => void;
+  /** タグへのドロップ（既存タグに付与） */
+  onDropToTag: (tagId: number, draggingId: number) => void;
 }
 
 const iconBtn: React.CSSProperties = {
@@ -121,7 +127,7 @@ function NavRow({ icon, label, count, active, onClick, indent = 0, expandable, e
 
 function InlineInput({
   initialValue = "",
-  placeholder = "コレクション名…",
+  placeholder,
   indent = 0,
   onSubmit,
   onCancel,
@@ -192,6 +198,7 @@ function CollectionRow({
   draggingId: number | null;
   collectionCounts: Record<string, number>;
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const [isDragHovering, setIsDragHovering] = useState(false);
   const isAddingChild = addingChildOf === col.id;
@@ -201,7 +208,6 @@ function CollectionRow({
     if (isAddingChild) setExpanded(true);
   }, [isAddingChild]);
 
-  // Clear hover when drag ends
   useEffect(() => {
     if (draggingId === null) setIsDragHovering(false);
   }, [draggingId]);
@@ -218,6 +224,7 @@ function CollectionRow({
     return (
       <InlineInput
         initialValue={col.name}
+        placeholder={t("sidebar.collectionPlaceholder")}
         indent={depth}
         onSubmit={(name) => onRenameSubmit(col.id, name)}
         onCancel={onRenameCancel}
@@ -248,6 +255,7 @@ function CollectionRow({
           ))}
           {isAddingChild && (
             <InlineInput
+              placeholder={t("sidebar.collectionPlaceholder")}
               indent={depth + 1}
               onSubmit={(name) => onAddChildSubmit(name, col.id)}
               onCancel={onAddChildCancel}
@@ -264,8 +272,44 @@ export function Sidebar({
   onCreateCollection, onRenameCollection, onDeleteCollection,
   onCreateTag, onDeleteTag, onExportCollection, onDropEntry, draggingId,
   bibtexSyncPath, bibtexLastSynced, bibtexLastError, onOpenBibtexSync,
+  onOpenSettings, onDropToView, onDropToTag,
 }: SidebarProps) {
+  const { t } = useTranslation();
   const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [hoverView, setHoverView] = useState<"starred" | "trash" | null>(null);
+  const [hoverTagId, setHoverTagId] = useState<number | null>(null);
+
+  // ドラッグが終わったら hover 状態をクリア
+  useEffect(() => {
+    if (draggingId === null) {
+      setHoverView(null);
+      setHoverTagId(null);
+    }
+  }, [draggingId]);
+
+  const navDropProps = (view: "starred" | "trash") => ({
+    dropTarget: hoverView === view && draggingId !== null,
+    onMouseEnter: () => { if (draggingId !== null) setHoverView(view); },
+    onMouseLeave: () => { if (hoverView === view) setHoverView(null); },
+    onMouseUp: () => {
+      if (hoverView === view && draggingId !== null) {
+        onDropToView(view, draggingId);
+        setHoverView(null);
+      }
+    },
+  });
+
+  const tagDropProps = (tagId: number) => ({
+    dropTarget: hoverTagId === tagId && draggingId !== null,
+    onMouseEnter: () => { if (draggingId !== null) setHoverTagId(tagId); },
+    onMouseLeave: () => { if (hoverTagId === tagId) setHoverTagId(null); },
+    onMouseUp: () => {
+      if (hoverTagId === tagId && draggingId !== null) {
+        onDropToTag(tagId, draggingId);
+        setHoverTagId(null);
+      }
+    },
+  });
   const [addingChildOf, setAddingChildOf] = useState<number | null>(null);
   const [addingRoot, setAddingRoot] = useState(false);
   const [addingTag, setAddingTag] = useState(false);
@@ -327,11 +371,11 @@ export function Sidebar({
           <div style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", letterSpacing: "-0.01em" }}>
             LumenCite
           </div>
-          <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 1 }}>研究ライブラリ</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 1 }}>{t("sidebar.brandSubtitle")}</div>
         </div>
         <button
           onClick={onOpenBibtexSync}
-          title="BibTeX 自動同期"
+          title={t("sidebar.bibtexSyncTooltip")}
           style={{ ...iconBtn, WebkitAppRegion: "no-drag" } as React.CSSProperties}
         >
           <Icon name="sync" size={13} color="var(--text-mute)" />
@@ -339,22 +383,24 @@ export function Sidebar({
       </div>
 
       <div style={{ flex: 1, overflow: "auto", padding: "4px 0 16px" }}>
-        <SidebarSection title="ライブラリ">
-          <NavRow icon="library" label="すべての文献" count={counts.total}
+        <SidebarSection title={t("sidebar.library")}>
+          <NavRow icon="library" label={t("sidebar.allEntries")} count={counts.total}
             active={selectedView === "all"} onClick={() => onSelectView("all")} />
-          <NavRow icon="clock" label="最近追加" count={Math.min(counts.total, 8)}
+          <NavRow icon="clock" label={t("sidebar.recent")} count={Math.min(counts.total, 8)}
             active={selectedView === "recent"} onClick={() => onSelectView("recent")} />
           <NavRow
             icon={<Icon name="starFill" size={12} color="oklch(0.7 0.13 70)" />}
-            label="お気に入り" count={counts.starred}
-            active={selectedView === "starred"} onClick={() => onSelectView("starred")} />
-          <NavRow icon="inbox" label="未整理" count={counts.unfiled}
+            label={t("sidebar.starred")} count={counts.starred}
+            active={selectedView === "starred"} onClick={() => onSelectView("starred")}
+            {...navDropProps("starred")} />
+          <NavRow icon="inbox" label={t("sidebar.unfiled")} count={counts.unfiled}
             active={selectedView === "unfiled"} onClick={() => onSelectView("unfiled")} />
-          <NavRow icon="trash" label="ゴミ箱" count={counts.trash}
-            active={selectedView === "trash"} onClick={() => onSelectView("trash")} />
+          <NavRow icon="trash" label={t("sidebar.trash")} count={counts.trash}
+            active={selectedView === "trash"} onClick={() => onSelectView("trash")}
+            {...navDropProps("trash")} />
         </SidebarSection>
 
-        <SidebarSection title="コレクション" action={
+        <SidebarSection title={t("sidebar.collections")} action={
           <button
             style={{ ...iconBtn, width: 18, height: 18 }}
             onMouseDown={e => e.stopPropagation()}
@@ -380,13 +426,14 @@ export function Sidebar({
           ))}
           {addingRoot && (
             <InlineInput
+              placeholder={t("sidebar.collectionPlaceholder")}
               onSubmit={(name) => { onCreateCollection(name); setAddingRoot(false); }}
               onCancel={() => setAddingRoot(false)}
             />
           )}
         </SidebarSection>
 
-        <SidebarSection title="タグ" action={
+        <SidebarSection title={t("sidebar.tags")} action={
           <button
             style={{ ...iconBtn, width: 18, height: 18 }}
             onMouseDown={e => e.stopPropagation()}
@@ -395,20 +442,21 @@ export function Sidebar({
             <Icon name="plus" size={11} color="var(--text-mute)" />
           </button>
         }>
-          {tags.map(t => (
+          {tags.map(tag => (
             <NavRow
-              key={t.id}
-              icon={<TagDot name={t.name} />}
-              label={t.name}
-              count={counts.tags[String(t.id)] ?? 0}
-              active={selectedView === `tag:${t.id}`}
-              onClick={() => onSelectView(`tag:${t.id}`)}
-              onContextMenu={(e) => handleTagContextMenu(e, t)}
+              key={tag.id}
+              icon={<TagDot name={tag.name} />}
+              label={tag.name}
+              count={counts.tags[String(tag.id)] ?? 0}
+              active={selectedView === `tag:${tag.id}`}
+              onClick={() => onSelectView(`tag:${tag.id}`)}
+              onContextMenu={(e) => handleTagContextMenu(e, tag)}
+              {...tagDropProps(tag.id)}
             />
           ))}
           {addingTag && (
             <InlineInput
-              placeholder="タグ名…"
+              placeholder={t("sidebar.tagPlaceholder")}
               onSubmit={(name) => { onCreateTag(name); setAddingTag(false); }}
               onCancel={() => setAddingTag(false)}
             />
@@ -416,13 +464,34 @@ export function Sidebar({
         </SidebarSection>
       </div>
 
-      {/* sync status */}
-      <SyncStatus
-        path={bibtexSyncPath}
-        lastSynced={bibtexLastSynced}
-        error={bibtexLastError}
-        onClick={onOpenBibtexSync}
-      />
+      {/* footer: bibtex sync status + settings */}
+      <div style={{
+        borderTop: "1px solid var(--border)",
+        display: "flex", alignItems: "stretch",
+      }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <SyncStatus
+            path={bibtexSyncPath}
+            lastSynced={bibtexLastSynced}
+            error={bibtexLastError}
+            onClick={onOpenBibtexSync}
+          />
+        </div>
+        <button
+          onClick={onOpenSettings}
+          aria-label="Settings"
+          title="Settings"
+          style={{
+            width: 38, padding: 0, border: "none",
+            borderLeft: "1px solid var(--border)",
+            background: "transparent", cursor: "pointer",
+            display: "inline-flex", alignItems: "center", justifyContent: "center",
+            color: "var(--text-mute)",
+          }}
+        >
+          <Icon name="settings" size={14} color="var(--text-mute)" />
+        </button>
+      </div>
 
       {/* Context menu */}
       {contextMenu && (
@@ -440,22 +509,22 @@ export function Sidebar({
           }}
           onClick={e => e.stopPropagation()}
         >
-          <ContextMenuItem label="名前を変更" onClick={() => {
+          <ContextMenuItem label={t("sidebar.rename")} onClick={() => {
             setRenamingId(contextMenu.col.id);
             setAddingRoot(false);
             setContextMenu(null);
           }} />
-          <ContextMenuItem label="サブコレクションを追加" onClick={() => {
+          <ContextMenuItem label={t("sidebar.addSubcollection")} onClick={() => {
             setAddingChildOf(contextMenu.col.id);
             setAddingRoot(false);
             setContextMenu(null);
           }} />
-          <ContextMenuItem label="BibTeX を書き出し" onClick={() => {
+          <ContextMenuItem label={t("sidebar.exportBibtex")} onClick={() => {
             onExportCollection(contextMenu.col.id, contextMenu.col.name);
             setContextMenu(null);
           }} />
           <div style={{ height: 1, background: "var(--border)", margin: "3px 0" }} />
-          <ContextMenuItem label="削除" danger onClick={() => {
+          <ContextMenuItem label={t("sidebar.delete")} danger onClick={() => {
             onDeleteCollection(contextMenu.col.id);
             setContextMenu(null);
           }} />
@@ -477,7 +546,7 @@ export function Sidebar({
           }}
           onClick={e => e.stopPropagation()}
         >
-          <ContextMenuItem label="削除" danger onClick={() => {
+          <ContextMenuItem label={t("sidebar.delete")} danger onClick={() => {
             onDeleteTag(tagContextMenu.tag.id);
             setTagContextMenu(null);
           }} />
@@ -493,20 +562,20 @@ function SyncStatus({ path, lastSynced, error, onClick }: {
   error: string | null;
   onClick: () => void;
 }) {
-  // path 未設定: グレー＋「未設定」 / error あり: 赤 / 通常: 緑＋ファイル名
+  const { t } = useTranslation();
   const fileName = path ? path.split("/").pop() ?? path : null;
   const dotColor = !path
     ? "oklch(0.7 0 0)"
     : error
-    ? "oklch(0.55 0.18 15)"
+    ? "var(--danger-strong)"
     : "oklch(0.68 0.13 150)";
   const label = !path
-    ? "BibTeX 同期: 未設定"
+    ? t("sidebar.bibtexSync.notSet")
     : error
-    ? "同期エラー"
+    ? t("sidebar.bibtexSync.error")
     : fileName
-    ? `${fileName} と同期`
-    : "同期中";
+    ? t("sidebar.bibtexSync.syncedWith", { file: fileName })
+    : t("sidebar.bibtexSync.syncing");
   const human = lastSynced && !error
     ? new Date(parseInt(lastSynced, 10) * 1000).toLocaleTimeString()
     : null;
@@ -514,9 +583,9 @@ function SyncStatus({ path, lastSynced, error, onClick }: {
   return (
     <div
       onClick={onClick}
-      title={path ?? "クリックして設定"}
+      title={path ?? t("sidebar.bibtexSync.clickToConfigure")}
       style={{
-        padding: "10px 18px 12px", borderTop: "1px solid var(--border)",
+        padding: "10px 18px 12px",
         fontSize: 11, color: "var(--text-faint)",
         display: "flex", alignItems: "center", gap: 7, cursor: "pointer",
       }}
@@ -554,7 +623,7 @@ function ContextMenuItem({ label, onClick, danger = false }: {
         fontSize: 12.5, cursor: "pointer",
         color: danger ? "oklch(0.52 0.18 15)" : "var(--text)",
         background: hover
-          ? (danger ? "oklch(0.96 0.03 15)" : "var(--hover)")
+          ? (danger ? "var(--danger-bg)" : "var(--hover)")
           : "transparent",
       }}
     >{label}</button>

@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import i18n from "./i18n";
 import { PdfViewer } from "./components/PdfViewer";
 import "./index.css";
 
@@ -15,7 +16,7 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <PdfViewer attachmentId={id} initialPage={initialPage} />
     ) : (
       <div style={{ padding: 24, fontFamily: "system-ui", color: "#888" }}>
-        添付IDが指定されていません
+        {i18n.t("pdfViewer.noAttachmentId")}
       </div>
     )}
   </React.StrictMode>,

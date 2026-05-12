@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import * as pdfjsLib from "pdfjs-dist";
@@ -22,6 +23,7 @@ const SCALE_STEPS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 const DEFAULT_SCALE = 1.25;
 
 export function PdfViewer({ attachmentId, initialPage }: Props) {
+  const { t } = useTranslation();
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
   const [pages, setPages] = useState<PageInfo[]>([]);
   const [scale, setScale] = useState<number>(DEFAULT_SCALE);
@@ -192,7 +194,7 @@ export function PdfViewer({ attachmentId, initialPage }: Props) {
           {Math.round(scale * 100)}%
         </span>
         <ToolbarButton onClick={zoomIn} disabled={scale >= SCALE_STEPS[SCALE_STEPS.length - 1]}>+</ToolbarButton>
-        <ToolbarButton onClick={() => setScale(DEFAULT_SCALE)}>リセット</ToolbarButton>
+        <ToolbarButton onClick={() => setScale(DEFAULT_SCALE)}>{t("pdfViewer.reset")}</ToolbarButton>
       </div>
 
       {/* viewport */}
@@ -205,10 +207,10 @@ export function PdfViewer({ attachmentId, initialPage }: Props) {
           background: "#2b2b2b",
         }}
       >
-        {loading && <div style={{ color: "#999", marginTop: 80 }}>読み込み中…</div>}
+        {loading && <div style={{ color: "#999", marginTop: 80 }}>{t("pdfViewer.loading")}</div>}
         {error && (
           <div style={{ color: "#f87171", marginTop: 80, maxWidth: 600, textAlign: "center" }}>
-            <div style={{ marginBottom: 6, fontWeight: 600 }}>PDFを開けませんでした</div>
+            <div style={{ marginBottom: 6, fontWeight: 600 }}>{t("pdfViewer.error")}</div>
             <div style={{ fontSize: 11.5, color: "#fca5a5" }}>{error}</div>
           </div>
         )}

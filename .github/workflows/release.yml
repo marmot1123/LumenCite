@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-14
+            args: "--target aarch64-apple-darwin"
+            label: macos-arm64
+          - platform: macos-13
+            args: "--target x86_64-apple-darwin"
+            label: macos-x64
+          - platform: ubuntu-22.04
+            args: ""
+            label: linux-x64
+          - platform: windows-latest
+            args: ""
+            label: windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || matrix.platform == 'macos-13' && 'x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust target
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── macOS 署名用 keychain セットアップ ──────────────────────
+      - name: Import macOS signing certificate
+        if: startsWith(matrix.platform, 'macos')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm certificate.p12
+
+      # ── Windows 署名用証明書を一時ファイル化 ─────────────────────
+      - name: Prepare Windows code signing certificate
+        if: matrix.platform == 'windows-latest'
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+        shell: pwsh
+        run: |
+          if ($env:WINDOWS_CERTIFICATE) {
+            [System.IO.File]::WriteAllBytes("$env:GITHUB_WORKSPACE\cert.pfx", [System.Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            echo "WINDOWS_CERTIFICATE_PATH=$env:GITHUB_WORKSPACE\cert.pfx" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Build & sign with tauri-action
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS 署名 / notarization
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows 署名
+          TAURI_WINDOWS_CERTIFICATE: ${{ env.WINDOWS_CERTIFICATE_PATH }}
+          TAURI_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # Tauri updater 署名鍵
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "LumenCite ${{ github.ref_name }}"
+          releaseBody: |
+            See `CHANGELOG.md` for details.
+
+            Downloads:
+            - **macOS (Apple Silicon)**: `.dmg` ending with `aarch64.dmg`
+            - **macOS (Intel)**: `.dmg` ending with `x64.dmg`
+            - **Windows**: `.msi` installer
+            - **Linux**: `.AppImage`, `.deb`, `.rpm`
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+      - name: Cleanup macOS keychain
+        if: startsWith(matrix.platform, 'macos') && always()
+        run: |
+          security delete-keychain build.keychain || true

@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 
 interface BibtexSyncSheetProps {
@@ -17,6 +18,7 @@ function formatEpochSecs(s: string | null): string | null {
 }
 
 export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, onPathChanged }: BibtexSyncSheetProps) {
+  const { t } = useTranslation();
   const [path, setPath] = useState<string | null>(initialPath);
   const [busy, setBusy] = useState(false);
 
@@ -78,17 +80,16 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
         }}
       >
         <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text)", marginBottom: 4 }}>
-          BibTeX 自動同期
+          {t("bibtexSyncSheet.title")}
         </div>
         <div style={{ fontSize: 12, color: "var(--text-mute)", lineHeight: 1.55, marginBottom: 16 }}>
-          ライブラリ（ゴミ箱を除く）を指定した <code style={{ fontFamily: "var(--mono)" }}>.bib</code> に自動エクスポートします。
-          エントリの追加・編集・削除のたびに少し遅れて書き出されます（VSCode LaTeX Workshop からの参照を想定）。
+          {t("bibtexSyncSheet.description")}
         </div>
 
         <div style={{
           fontSize: 10.5, fontWeight: 600, color: "var(--text-faint)",
           textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 5,
-        }}>同期先</div>
+        }}>{t("bibtexSyncSheet.destLabel")}</div>
         <div style={{
           padding: "8px 10px", borderRadius: 6,
           border: "1px solid var(--border)",
@@ -97,7 +98,7 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
           fontFamily: "var(--mono)",
           wordBreak: "break-all", marginBottom: 12, minHeight: 18,
         }}>
-          {path ?? "未設定"}
+          {path ?? t("bibtexSyncSheet.notSet")}
         </div>
 
         <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
@@ -110,7 +111,7 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
               background: "var(--accent-strong)", color: "white",
               fontSize: 12, fontWeight: 500, cursor: busy ? "default" : "pointer",
             }}
-          >ファイルを選択…</button>
+          >{t("bibtexSyncSheet.pickFile")}</button>
           <button
             onClick={syncNow}
             disabled={busy || !path}
@@ -120,7 +121,7 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
               background: "var(--surface)", color: !path ? "var(--text-faint)" : "var(--text)",
               fontSize: 12, cursor: (busy || !path) ? "default" : "pointer",
             }}
-          >今すぐ同期</button>
+          >{t("bibtexSyncSheet.syncNow")}</button>
           {path && (
             <button
               onClick={clear}
@@ -132,7 +133,7 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
                 fontSize: 12, cursor: busy ? "default" : "pointer",
                 marginLeft: "auto",
               }}
-            >同期を解除</button>
+            >{t("bibtexSyncSheet.clearSync")}</button>
           )}
         </div>
 
@@ -142,13 +143,13 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
           marginBottom: 12,
         }}>
           {lastError ? (
-            <span style={{ color: "oklch(0.55 0.18 15)" }}>同期エラー: {lastError}</span>
+            <span style={{ color: "var(--danger-strong)" }}>{t("bibtexSyncSheet.syncError", { error: lastError })}</span>
           ) : lastSyncedHuman ? (
-            <span>最終同期: {lastSyncedHuman}</span>
+            <span>{t("bibtexSyncSheet.lastSynced", { time: lastSyncedHuman })}</span>
           ) : path ? (
-            <span style={{ color: "var(--text-faint)" }}>まだ同期されていません</span>
+            <span style={{ color: "var(--text-faint)" }}>{t("bibtexSyncSheet.neverSynced")}</span>
           ) : (
-            <span style={{ color: "var(--text-faint)" }}>同期は無効です</span>
+            <span style={{ color: "var(--text-faint)" }}>{t("bibtexSyncSheet.disabled")}</span>
           )}
         </div>
 
@@ -161,7 +162,7 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
               background: "var(--surface)", color: "var(--text)",
               fontSize: 12, cursor: "pointer",
             }}
-          >閉じる</button>
+          >{t("common.close")}</button>
         </div>
       </div>
     </div>

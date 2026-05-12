@@ -26,6 +26,16 @@ html, body, #root {
   --accent-strong: oklch(0.62 0.14 65);
   --accent-soft:   oklch(0.95 0.04 70);
   --accent-ring:   oklch(0.7 0.13 65 / 0.25);
+  /* 状態色（useTheme.ts で light/dark 切替時に上書きされる初期値） */
+  --danger-bg:     oklch(0.96 0.03 15);
+  --danger-border: oklch(0.88 0.06 15);
+  --danger-text:   oklch(0.45 0.13 15);
+  --danger-strong: oklch(0.55 0.18 15);
+  --warn-bg:       oklch(0.96 0.06 70);
+  --warn-border:   oklch(0.85 0.13 70);
+  --warn-text:     oklch(0.35 0.10 70);
+  --warn-strong:   oklch(0.55 0.15 70);
+  --success-text:  oklch(0.55 0.12 145);
   --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
@@ -39,4 +49,224 @@ input, textarea { font-family: inherit; }
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.35; }
+}
+
+/* 印刷用: window.print() で .lc-print-root の中身だけが出るようにする。
+   WebKit (WKWebView) は <img> 単体への page-break を無視するため、
+   各画像を <div> でラップしてその div に break を指定する。 */
+.lc-print-root { display: none; }
+@media print {
+  @page { size: auto; margin: 10mm; }
+  html, body {
+    height: auto !important;
+    overflow: visible !important;
+    background: white !important;
+  }
+  body > *:not(.lc-print-root) { display: none !important; }
+  .lc-print-root { display: block !important; }
+  .lc-print-page {
+    page-break-after: always;
+    break-after: page;
+    page-break-inside: avoid;
+    break-inside: avoid;
+    text-align: center;
+    margin: 0;
+    padding: 0;
+  }
+  .lc-print-page:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+  .lc-print-page img {
+    display: block;
+    margin: 0 auto;
+    max-width: 100%;
+    max-height: 100vh;
+    height: auto;
+    width: auto;
+    object-fit: contain;
+  }
+}
+
+/* Markdown / KaTeX レンダリングのスタイル微調整 */
+.lc-markdown p { margin: 0 0 0.55em; line-height: 1.55; }
+.lc-markdown p:last-child { margin-bottom: 0; }
+.lc-markdown h1, .lc-markdown h2, .lc-markdown h3, .lc-markdown h4 {
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  margin: 0.8em 0 0.4em;
+  line-height: 1.3;
+}
+.lc-markdown h1 { font-size: 15px; }
+.lc-markdown h2 { font-size: 13.5px; }
+.lc-markdown h3 { font-size: 12.5px; }
+.lc-markdown h4 { font-size: 12px; color: var(--text-mute); }
+.lc-markdown ul, .lc-markdown ol { padding-left: 1.4em; margin: 0.4em 0 0.6em; }
+.lc-markdown li { margin: 0.15em 0; }
+.lc-markdown code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.lc-markdown pre {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow: auto;
+  margin: 0.5em 0;
+}
+.lc-markdown pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+.lc-markdown a { color: var(--accent-strong); text-decoration: none; }
+.lc-markdown a:hover { text-decoration: underline; }
+.lc-markdown blockquote {
+  margin: 0.5em 0;
+  padding: 2px 10px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--text-mute);
+}
+.lc-markdown hr { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
+.lc-markdown .katex { font-size: 1em; }
+.lc-markdown .katex-display { margin: 0.5em 0; overflow-x: auto; overflow-y: hidden; }
+
+/* コマンドパレット (cmdk) */
+.lc-cmdk-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.30);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 12vh;
+  z-index: 1100;
+}
+.lc-cmdk {
+  width: 600px; max-width: 92vw;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  max-height: 70vh;
+}
+.lc-cmdk [cmdk-input] {
+  width: 100%; box-sizing: border-box;
+  padding: 14px 16px;
+  border: none; border-bottom: 1px solid var(--border);
+  background: transparent; color: var(--text);
+  font-size: 13.5px; outline: none;
+  font-family: inherit;
+}
+.lc-cmdk [cmdk-input]::placeholder { color: var(--text-faint); }
+.lc-cmdk [cmdk-list] {
+  flex: 1; overflow: auto;
+  padding: 6px;
+  max-height: 56vh;
+}
+.lc-cmdk [cmdk-group-heading] {
+  font-size: 10.5px; font-weight: 600;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 8px 10px 4px;
+}
+.lc-cmdk [cmdk-item] {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  font-size: 12.5px; color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.lc-cmdk [cmdk-item][data-selected="true"] {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.lc-cmdk [cmdk-empty] {
+  padding: 18px 12px;
+  font-size: 12px; color: var(--text-faint);
+  text-align: center;
+}
+.lc-cmdk-item-sub {
+  font-size: 11px; color: var(--text-faint);
+  margin-left: auto;
+  font-family: var(--mono);
+}
+.lc-cmdk-kbd {
+  display: inline-flex; align-items: center;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--surface-2);
+  font-family: var(--mono); font-size: 10.5px;
+  color: var(--text-mute);
+}
+
+/* PDF ビューワーのテキストレイヤー — pdfjs-dist 公式の TextLayer クラス前提。
+   container には .textLayer を付与し、--total-scale-factor を CSS 変数で渡す。 */
+.textLayer {
+  position: absolute;
+  text-align: initial;
+  inset: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  -webkit-text-size-adjust: none;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}
+
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.textLayer .markedContent { display: contents; }
+
+.textLayer span[role="img"] {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+.textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.textLayer.selecting .endOfContent { top: 0; }
+
+.textLayer ::selection {
+  background: oklch(0.62 0.14 65 / 0.4);
 }

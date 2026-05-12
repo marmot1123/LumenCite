@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { Icon } from "./icons";
 import { ExtraFieldInputs } from "./ExtraFieldInputs";
@@ -8,19 +9,13 @@ interface AddSheetProps {
   onClose: () => void;
   onCreated: (entry: EntryDetail) => void;
   onImported: () => void;
+  onSelectExisting?: (id: number) => void;
 }
 
 type AddTab = "doi" | "arxiv" | "isbn" | "bibtex" | "manual";
 type Phase = "input" | "loading" | "preview" | "error" | "saving";
 
-const ENTRY_TYPES: { value: EntryType; label: string }[] = [
-  { value: "article",        label: "論文（article）" },
-  { value: "book",           label: "書籍（book）" },
-  { value: "inproceedings",  label: "会議録（inproceedings）" },
-  { value: "thesis",         label: "学位論文（thesis）" },
-  { value: "webpage",        label: "Webページ（webpage）" },
-  { value: "misc",           label: "その他（misc）" },
-];
+const ENTRY_TYPES: EntryType[] = ["article", "book", "inproceedings", "thesis", "webpage", "misc"];
 
 const FETCH_COMMANDS: Record<string, string> = {
   doi:   "fetch_metadata_by_doi",
@@ -44,26 +39,41 @@ const PLACEHOLDERS: Record<AddTab, string> = {
 
 // ── 識別子タブ（DOI / arXiv / ISBN）──────────────────────────────────────────
 
-function IdentifierTab({ tabId, onCreated, onClose }: {
+function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
   tabId: "doi" | "arxiv" | "isbn";
   onCreated: (entry: EntryDetail) => void;
   onClose: () => void;
+  onSelectExisting?: (id: number) => void;
 }) {
+  const { t } = useTranslation();
   const [value, setValue] = useState("");
   const [phase, setPhase] = useState<Phase>("input");
   const [preview, setPreview] = useState<EntryInput | null>(null);
   const [error, setError] = useState("");
+  const [duplicateId, setDuplicateId] = useState<number | null>(null);
 
   const handleFetch = async () => {
     if (!value.trim()) return;
     setPhase("loading");
     setError("");
+    setDuplicateId(null);
     try {
       const data = await invoke<EntryInput>(FETCH_COMMANDS[tabId], {
         [FETCH_ARGS[tabId]]: value.trim(),
       });
       setPreview(data);
       setPhase("preview");
+      // 取得後すぐに既存ライブラリ内の重複を確認。失敗しても警告は出さない。
+      try {
+        const hit = await invoke<number | null>("find_duplicate_entry", {
+          doi:     data.doi     ?? null,
+          arxivId: data.arxiv_id ?? null,
+          isbn:    data.isbn    ?? null,
+        });
+        setDuplicateId(hit ?? null);
+      } catch {
+        setDuplicateId(null);
+      }
     } catch (e) {
       setError(String(e));
       setPhase("error");
@@ -110,23 +120,47 @@ function IdentifierTab({ tabId, onCreated, onClose }: {
             opacity: !value.trim() || phase === "loading" ? 0.6 : 1,
           }}
         >
-          {phase === "loading" ? "取得中…" : "取得"}
+          {phase === "loading" ? t("addSheet.identifier.fetching") : t("addSheet.identifier.fetch")}
         </button>
       </div>
 
       <div style={{ marginTop: 10, fontSize: 11, color: "var(--text-faint)", display: "flex", alignItems: "center", gap: 6 }}>
         <Icon name="info" size={11} color="var(--text-faint)" />
-        {tabId === "doi"   && "CrossRef から取得します"}
-        {tabId === "arxiv" && "arXiv API から取得します"}
-        {tabId === "isbn"  && "Open Library から取得します"}
+        {tabId === "doi"   && t("addSheet.identifier.fetchFromDoi")}
+        {tabId === "arxiv" && t("addSheet.identifier.fetchFromArxiv")}
+        {tabId === "isbn"  && t("addSheet.identifier.fetchFromIsbn")}
       </div>
 
       {phase === "error" && (
         <div style={{
           marginTop: 12, padding: "8px 12px", borderRadius: 6,
-          background: "oklch(0.95 0.04 15)", color: "oklch(0.45 0.13 15)",
+          background: "var(--danger-bg)", color: "var(--danger-text)",
           fontSize: 12,
         }}>{error}</div>
+      )}
+
+      {phase === "preview" && preview && duplicateId != null && (
+        <div style={{
+          marginTop: 12, padding: "9px 12px", borderRadius: 7,
+          background: "var(--warn-bg)",
+          border: "1px solid var(--warn-border)",
+          display: "flex", alignItems: "center", gap: 10,
+        }}>
+          <Icon name="info" size={12} color="var(--warn-text)" />
+          <span style={{ flex: 1, fontSize: 11.5, color: "var(--warn-text)", lineHeight: 1.5 }}>
+            {t("addSheet.identifier.duplicateWarn")}
+          </span>
+          {onSelectExisting && (
+            <button
+              onClick={() => { onSelectExisting(duplicateId); onClose(); }}
+              style={{
+                padding: "3px 9px", borderRadius: 4, border: "none",
+                background: "var(--warn-strong)", color: "white",
+                fontSize: 11, fontWeight: 600, cursor: "pointer",
+              }}
+            >{t("addSheet.identifier.showExisting")}</button>
+          )}
+        </div>
       )}
 
       {phase === "preview" && preview && (
@@ -140,7 +174,7 @@ function IdentifierTab({ tabId, onCreated, onClose }: {
           {preview.author_names && preview.author_names.length > 0 && (
             <div style={{ marginTop: 4, fontSize: 12, color: "var(--text-mute)" }}>
               {preview.author_names.slice(0, 3).join(", ")}
-              {preview.author_names.length > 3 ? ` 他${preview.author_names.length - 3}名` : ""}
+              {preview.author_names.length > 3 ? t("addSheet.identifier.authorMore", { count: preview.author_names.length - 3 }) : ""}
             </div>
           )}
           <div style={{ marginTop: 4, fontSize: 11.5, color: "var(--text-faint)", display: "flex", gap: 10 }}>
@@ -161,18 +195,21 @@ function IdentifierTab({ tabId, onCreated, onClose }: {
           border: "1px solid var(--border-strong)",
           background: "var(--surface)", color: "var(--text)",
           fontSize: 12, cursor: "pointer",
-        }}>キャンセル</button>
+        }}>{t("common.cancel")}</button>
         <button
           onClick={handleAdd}
           disabled={phase !== "preview" || !preview}
           style={{
             padding: "5px 14px", borderRadius: 5, border: "none",
-            background: "var(--accent-strong)", color: "white",
+            background: duplicateId != null ? "var(--warn-strong)" : "var(--accent-strong)",
+            color: "white",
             fontSize: 12, fontWeight: 500, cursor: "pointer",
             opacity: phase !== "preview" ? 0.4 : 1,
           }}
         >
-          {phase === "saving" ? "追加中…" : "ライブラリに追加"}
+          {phase === "saving"
+            ? t("addSheet.addingToLibrary")
+            : duplicateId != null ? t("addSheet.identifier.createAnyway") : t("addSheet.addToLibrary")}
         </button>
       </div>
     </div>
@@ -185,6 +222,7 @@ function ManualTab({ onCreated, onClose }: {
   onCreated: (entry: EntryDetail) => void;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   const [form, setForm] = useState<EntryInput>({
     title: "",
     entry_type: "article",
@@ -262,27 +300,30 @@ function ManualTab({ onCreated, onClose }: {
     <div style={{ padding: "14px 18px 0", maxHeight: 460, overflowY: "auto" }}>
       {/* entry_type */}
       <div style={{ marginBottom: 12 }}>
-        <label style={labelStyle}>種別</label>
+        <label style={labelStyle}>{t("addSheet.field.type")}</label>
         <select value={form.entry_type} onChange={e => set("entry_type", e.target.value as EntryType)}
           style={{ ...fieldStyle, cursor: "pointer" }}>
-          {ENTRY_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+          {ENTRY_TYPES.map(type => (
+            <option key={type} value={type}>{t(`entryTypeLabel.${type}` as const)}</option>
+          ))}
         </select>
       </div>
 
       {/* title */}
       <div style={{ marginBottom: 12 }}>
-        <label style={labelStyle}>タイトル *</label>
+        <label style={labelStyle}>{t("addSheet.field.titleRequired")}</label>
         <input value={form.title} onChange={e => set("title", e.target.value)}
-          placeholder="論文・書籍のタイトル" style={fieldStyle} />
+          placeholder={t("addSheet.field.titlePlaceholder")} style={fieldStyle} />
       </div>
 
       {/* authors */}
       <div style={{ marginBottom: 12 }}>
-        <label style={labelStyle}>著者</label>
+        <label style={labelStyle}>{t("addSheet.field.authors")}</label>
         {(form.author_names ?? [""]).map((name, i) => (
           <div key={i} style={{ display: "flex", gap: 6, marginBottom: 5 }}>
             <input value={name} onChange={e => setAuthor(i, e.target.value)}
-              placeholder={`著者 ${i + 1}`} style={{ ...fieldStyle, flex: 1 }} />
+              placeholder={t("addSheet.field.authorPlaceholder", { index: i + 1 })}
+              style={{ ...fieldStyle, flex: 1 }} />
             {(form.author_names ?? []).length > 1 && (
               <button onClick={() => removeAuthor(i)} style={{
                 padding: "0 8px", border: "1px solid var(--border-strong)",
@@ -295,12 +336,12 @@ function ManualTab({ onCreated, onClose }: {
         <button onClick={addAuthor} style={{
           fontSize: 11.5, color: "var(--accent-strong)", border: "none",
           background: "transparent", cursor: "pointer", padding: "2px 0",
-        }}>+ 著者を追加</button>
+        }}>{t("addSheet.field.addAuthor")}</button>
       </div>
 
       {/* year */}
       <div style={{ marginBottom: 12 }}>
-        <label style={labelStyle}>出版年</label>
+        <label style={labelStyle}>{t("addSheet.field.yearPub")}</label>
         <input type="number" min={1000} max={2100}
           value={form.year ?? ""} onChange={e => set("year", e.target.value ? Number(e.target.value) : undefined)}
           placeholder="2024" style={{ ...fieldStyle, width: 120 }} />
@@ -337,24 +378,24 @@ function ManualTab({ onCreated, onClose }: {
 
       {/* abstract */}
       <div style={{ marginBottom: 12 }}>
-        <label style={labelStyle}>抄録</label>
+        <label style={labelStyle}>{t("addSheet.field.abstract")}</label>
         <textarea value={form.abstract_ ?? ""} onChange={e => set("abstract_", e.target.value || undefined)}
-          rows={4} placeholder="Abstract…"
+          rows={4} placeholder={t("addSheet.field.abstractPlaceholder")}
           style={{ ...fieldStyle, resize: "vertical", lineHeight: 1.55 }} />
       </div>
 
       {/* notes */}
       <div style={{ marginBottom: 12 }}>
-        <label style={labelStyle}>ノート</label>
+        <label style={labelStyle}>{t("addSheet.field.notes")}</label>
         <textarea value={form.notes ?? ""} onChange={e => set("notes", e.target.value || undefined)}
-          rows={3} placeholder="メモ…"
+          rows={3} placeholder={t("addSheet.field.notesPlaceholder")}
           style={{ ...fieldStyle, resize: "vertical", lineHeight: 1.55 }} />
       </div>
 
       {error && (
         <div style={{
           marginBottom: 12, padding: "8px 12px", borderRadius: 6,
-          background: "oklch(0.95 0.04 15)", color: "oklch(0.45 0.13 15)",
+          background: "var(--danger-bg)", color: "var(--danger-text)",
           fontSize: 12,
         }}>{error}</div>
       )}
@@ -371,13 +412,13 @@ function ManualTab({ onCreated, onClose }: {
           border: "1px solid var(--border-strong)",
           background: "var(--surface)", color: "var(--text)",
           fontSize: 12, cursor: "pointer",
-        }}>キャンセル</button>
+        }}>{t("common.cancel")}</button>
         <button onClick={handleAdd} disabled={!form.title.trim() || saving} style={{
           padding: "5px 14px", borderRadius: 5, border: "none",
           background: "var(--accent-strong)", color: "white",
           fontSize: 12, fontWeight: 500, cursor: "pointer",
           opacity: !form.title.trim() || saving ? 0.5 : 1,
-        }}>{saving ? "追加中…" : "ライブラリに追加"}</button>
+        }}>{saving ? t("addSheet.addingToLibrary") : t("addSheet.addToLibrary")}</button>
       </div>
     </div>
   );
@@ -395,6 +436,7 @@ function BibtexTab({ onClose, onImported }: {
   onClose: () => void;
   onImported: () => void;
 }) {
+  const { t } = useTranslation();
   const [content, setContent] = useState("");
   const [phase, setPhase] = useState<"input" | "loading" | "done" | "error">("input");
   const [result, setResult] = useState<ImportResult | null>(null);
@@ -434,7 +476,7 @@ function BibtexTab({ onClose, onImported }: {
           {phase === "error" && (
             <div style={{
               marginTop: 10, padding: "8px 12px", borderRadius: 6,
-              background: "oklch(0.95 0.04 15)", color: "oklch(0.45 0.13 15)",
+              background: "var(--danger-bg)", color: "var(--danger-text)",
               fontSize: 12,
             }}>{error}</div>
           )}
@@ -447,7 +489,7 @@ function BibtexTab({ onClose, onImported }: {
               border: "1px solid var(--border-strong)",
               background: "var(--surface)", color: "var(--text)",
               fontSize: 12, cursor: "pointer",
-            }}>キャンセル</button>
+            }}>{t("common.cancel")}</button>
             <button
               onClick={handleImport}
               disabled={!content.trim() || phase === "loading"}
@@ -457,7 +499,7 @@ function BibtexTab({ onClose, onImported }: {
                 fontSize: 12, fontWeight: 500, cursor: "pointer",
                 opacity: !content.trim() || phase === "loading" ? 0.5 : 1,
               }}
-            >{phase === "loading" ? "インポート中…" : "インポート"}</button>
+            >{phase === "loading" ? t("addSheet.bibtex.importing") : t("addSheet.bibtex.import")}</button>
           </div>
         </>
       ) : (
@@ -469,27 +511,27 @@ function BibtexTab({ onClose, onImported }: {
             marginBottom: 14,
           }}>
             <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)", marginBottom: 8 }}>
-              インポート完了
+              {t("addSheet.bibtex.completeTitle")}
             </div>
             <div style={{ display: "flex", gap: 24 }}>
               <div>
                 <div style={{ fontSize: 24, fontWeight: 700, color: "var(--accent-strong)", fontVariantNumeric: "tabular-nums" }}>
                   {result!.imported}
                 </div>
-                <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>件 追加</div>
+                <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>{t("addSheet.bibtex.addedSuffix")}</div>
               </div>
               {result!.skipped > 0 && (
                 <div>
                   <div style={{ fontSize: 24, fontWeight: 700, color: "var(--text-mute)", fontVariantNumeric: "tabular-nums" }}>
                     {result!.skipped}
                   </div>
-                  <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>件 スキップ</div>
+                  <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>{t("addSheet.bibtex.skippedSuffix")}</div>
                 </div>
               )}
             </div>
             {result!.errors.length > 0 && (
               <div style={{ marginTop: 12, fontSize: 11, color: "var(--text-mute)" }}>
-                <div style={{ marginBottom: 4, fontWeight: 600 }}>スキップされたエントリ:</div>
+                <div style={{ marginBottom: 4, fontWeight: 600 }}>{t("addSheet.bibtex.errorsLabel")}</div>
                 {result!.errors.slice(0, 5).map((e, i) => (
                   <div key={i} style={{ fontFamily: "var(--mono)", color: "var(--text-faint)" }}>{e}</div>
                 ))}
@@ -501,7 +543,7 @@ function BibtexTab({ onClose, onImported }: {
               padding: "5px 14px", borderRadius: 5, border: "none",
               background: "var(--accent-strong)", color: "white",
               fontSize: 12, fontWeight: 500, cursor: "pointer",
-            }}>閉じる</button>
+            }}>{t("common.close")}</button>
           </div>
         </div>
       )}
@@ -511,16 +553,17 @@ function BibtexTab({ onClose, onImported }: {
 
 // ── メインコンポーネント ──────────────────────────────────────────────────────
 
-const TABS: { id: AddTab; label: string }[] = [
-  { id: "doi",    label: "DOI" },
-  { id: "arxiv",  label: "arXiv" },
-  { id: "isbn",   label: "ISBN" },
-  { id: "bibtex", label: "BibTeX 貼付" },
-  { id: "manual", label: "手動入力" },
-];
-
-export function AddSheet({ onClose, onCreated, onImported }: AddSheetProps) {
+export function AddSheet({ onClose, onCreated, onImported, onSelectExisting }: AddSheetProps) {
+  const { t } = useTranslation();
   const [tab, setTab] = useState<AddTab>("doi");
+
+  const TABS: { id: AddTab; label: string }[] = [
+    { id: "doi",    label: "DOI" },
+    { id: "arxiv",  label: "arXiv" },
+    { id: "isbn",   label: "ISBN" },
+    { id: "bibtex", label: t("addSheet.tab.bibtex") },
+    { id: "manual", label: t("addSheet.tab.manual") },
+  ];
 
   return (
     <div
@@ -544,9 +587,9 @@ export function AddSheet({ onClose, onCreated, onImported }: AddSheetProps) {
       >
         {/* header */}
         <div style={{ padding: "14px 18px 12px", borderBottom: "1px solid var(--border)" }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>文献を追加</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{t("addSheet.title")}</div>
           <div style={{ fontSize: 11.5, color: "var(--text-faint)", marginTop: 3 }}>
-            識別子から自動でメタデータを取得するか、手動で入力してください
+            {t("addSheet.subtitle")}
           </div>
         </div>
 
@@ -565,7 +608,7 @@ export function AddSheet({ onClose, onCreated, onImported }: AddSheetProps) {
 
         {/* content */}
         {(tab === "doi" || tab === "arxiv" || tab === "isbn") && (
-          <IdentifierTab key={tab} tabId={tab} onCreated={onCreated} onClose={onClose} />
+          <IdentifierTab key={tab} tabId={tab} onCreated={onCreated} onClose={onClose} onSelectExisting={onSelectExisting} />
         )}
         {tab === "bibtex" && <BibtexTab onClose={onClose} onImported={onImported} />}
         {tab === "manual" && <ManualTab onCreated={onCreated} onClose={onClose} />}

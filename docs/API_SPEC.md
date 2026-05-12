@@ -89,6 +89,49 @@ type EntryInput = {
 type LlmSettings = {
   provider: "openai" | "anthropic";
   model: string;
+  summary_source: "abstract" | "fulltext"; // 要約入力ソース（v0.1.0 から）
+};
+
+type HighlightColor = "yellow" | "green" | "blue";
+
+type Highlight = {
+  id: number;
+  entry_id: number;
+  page: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: HighlightColor;
+  text: string;
+  note?: string;
+  created_at: string;
+};
+
+type HighlightInput = {
+  entry_id: number;
+  page: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: HighlightColor;
+  text: string;
+  note?: string;
+};
+
+// 要約ストリーミングイベント（tauri::ipc::Channel 経由で送出）
+type SummaryStreamEvent =
+  | { kind: "start"; model: string }
+  | { kind: "delta"; text: string }
+  | { kind: "done"; full_text: string }
+  | { kind: "error"; message: string };
+
+type UpdateInfo = {
+  version: string;
+  date?: string;
+  notes?: string;
+  available: boolean;
 };
 ```
 
@@ -255,15 +298,58 @@ type ImportResult = { imported: number; skipped: number };
 `export_bibtex` で `entry_ids` を省略した場合は全件エクスポート。  
 `sync_bib_file` は指定パスの `.bib` ファイルを常に最新状態に保つ（LaTeX Workshop連携用）。
 
+### ハイライト（highlights）— v0.1.0 追加
+
+詳細ビューの PDF テキスト選択 → ハイライト保存に使う。座標は pdf.js の PDF ポイント（左下原点）。
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `get_highlights` | `entry_id: i64` | `Result<Vec<Highlight>>` — ページ昇順、同ページ内は `y` 降順 |
+| `create_highlight` | `input: HighlightInput` | `Result<Highlight>` |
+| `update_highlight` | `id: i64, color?: HighlightColor, note?: String` | `Result<Highlight>` — 部分更新 |
+| `delete_highlight` | `id: i64` | `Result<()>` |
+
+メタパネル「ハイライト」タブの一覧表示で、クリックすると該当ページにジャンプする想定。
+
 ### LLM
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `summarize_entry` | `entry_id: i64` | `Result<String>` |
+| `generate_summary` | `entry_id: i64, source: "abstract" \| "fulltext", channel: Channel<SummaryStreamEvent>` | `Result<()>` — ストリーミング送出。完了時にDB側 `entries.summary` も更新 |
 | `get_llm_settings` | — | `LlmSettings` |
 | `save_llm_settings` | `settings: LlmSettings` | `Result<()>` |
+| `get_api_key` | `provider: "openai" \| "anthropic"` | `Result<Option<String>>` — OSキーチェーンから取得（マスク表示用） |
+| `set_api_key` | `provider: "openai" \| "anthropic", key: String` | `Result<()>` |
+| `delete_api_key` | `provider: "openai" \| "anthropic"` | `Result<()>` |
+| `test_llm_connection` | `provider: "openai" \| "anthropic", model: String` | `Result<()>` — 軽量プロンプトで疎通確認 |
 
-APIキーはOSキーチェーンに保存するため、`LlmSettings` には含まない。
+APIキーはOSキーチェーン（`keyring` クレート経由）に保存するため、`LlmSettings` には含まない。`generate_summary` の `channel` 引数は `tauri::ipc::Channel<SummaryStreamEvent>` で、トークン到着ごとに `delta` イベントが届く。
+
+### バックアップ / エクスポート（v0.1.0 追加）
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `run_backup` | — | `Result<String>` — 作成された .db のパス。`VACUUM INTO` 使用 |
+| `list_backups` | — | `Result<Vec<BackupInfo>>` — `<app_data_dir>/backups/` 配下のメタ情報 |
+| `restore_backup` | `path: String` | `Result<()>` — 確認ダイアログ後、アプリ再起動して復元 |
+| `export_database` | `path: String, format: "json" \| "bibtex" \| "markdown"` | `Result<()>` |
+
+```ts
+type BackupInfo = { path: string; created_at: string; size_bytes: number };
+```
+
+自動バックアップは Rust 側で起動時 + 24h 間隔のタイマーから呼ばれる。フロントからの手動呼び出しも可能。
+
+### アップデーター（v0.1.0 追加）
+
+`tauri-plugin-updater` のラッパー。
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `check_for_updates` | — | `Result<UpdateInfo>` |
+| `apply_update` | — | `Result<()>` — ダウンロード+検証+再起動 |
+| `get_updater_channel` | — | `"stable" \| "beta"` |
+| `set_updater_channel` | `channel: "stable" \| "beta"` | `Result<()>` |
 
 ### アプリ設定（settings）
 

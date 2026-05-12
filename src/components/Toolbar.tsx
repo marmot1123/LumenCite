@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { Icon } from "./icons";
 import type { SearchScope, ViewMode } from "../types";
 
@@ -11,8 +12,12 @@ interface ToolbarProps {
   searchScope: SearchScope;
   onSearchScopeChange: (scope: SearchScope) => void;
   onAddOpen: () => void;
+  onImport: () => void;
   onExportBibtex: () => void;
   exportDisabled?: boolean;
+  inTrash?: boolean;
+  onEmptyTrash?: () => void;
+  emptyTrashDisabled?: boolean;
 }
 
 interface ViewTabsProps {
@@ -20,16 +25,28 @@ interface ViewTabsProps {
   onViewModeChange: (mode: ViewMode) => void;
 }
 
-function ToolbarBtn({ icon, label, onClick, primary }: {
+function ToolbarBtn({ icon, label, onClick, primary, danger, disabled, title }: {
   icon: Parameters<typeof Icon>[0]["name"];
   label?: string;
   onClick?: () => void;
   primary?: boolean;
+  danger?: boolean;
+  disabled?: boolean;
+  title?: string;
 }) {
   const [hover, setHover] = useState(false);
+  const iconColor = disabled
+    ? "var(--text-faint)"
+    : primary
+      ? "white"
+      : danger
+        ? "var(--danger-strong)"
+        : "var(--text-mute)";
   return (
     <button
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
+      title={title}
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
       style={{
@@ -37,26 +54,42 @@ function ToolbarBtn({ icon, label, onClick, primary }: {
         padding: label ? "5px 9px 5px 8px" : "5px 6px",
         borderRadius: 6,
         border: "1px solid transparent",
-        background: primary ? "var(--accent-strong)" : hover ? "var(--hover)" : "transparent",
-        color: primary ? "white" : "var(--text)",
-        fontSize: 12, fontWeight: 500, cursor: "pointer",
+        background: primary
+          ? "var(--accent-strong)"
+          : hover && !disabled
+            ? "var(--hover)"
+            : "transparent",
+        color: disabled
+          ? "var(--text-faint)"
+          : primary
+            ? "white"
+            : danger
+              ? "var(--danger-text)"
+              : "var(--text)",
+        fontSize: 12, fontWeight: 500,
+        cursor: disabled ? "not-allowed" : "pointer",
         transition: "background 80ms ease",
       }}
     >
-      <Icon name={icon} size={13} color={primary ? "white" : "var(--text-mute)"} />
+      <Icon name={icon} size={13} color={iconColor} />
       {label && <span>{label}</span>}
     </button>
   );
 }
 
-const TABS: { id: ViewMode; label: string; icon: Parameters<typeof Icon>[0]["name"]; enabled: boolean }[] = [
-  { id: "table",    label: "表",           icon: "list",  enabled: true },
-  { id: "covers",   label: "カバー",       icon: "grid",  enabled: true },
-  { id: "timeline", label: "タイムライン", icon: "clock", enabled: false },
-  { id: "graph",    label: "引用グラフ",   icon: "sync",  enabled: false },
+const TABS: { id: ViewMode; icon: Parameters<typeof Icon>[0]["name"]; enabled: boolean }[] = [
+  { id: "table",    icon: "list",  enabled: true },
+  { id: "covers",   icon: "grid",  enabled: true },
+  { id: "timeline", icon: "clock", enabled: false },
+  { id: "graph",    icon: "sync",  enabled: false },
 ];
 
 export function ViewTabs({ viewMode, onViewModeChange }: ViewTabsProps) {
+  const { t } = useTranslation();
+  const subtitle =
+    viewMode === "table" ? t("toolbar.viewMode.tableDesc")
+    : viewMode === "covers" ? t("toolbar.viewMode.coversDesc")
+    : "";
   return (
     <div style={{
       display: "flex", alignItems: "center", gap: 2,
@@ -64,26 +97,26 @@ export function ViewTabs({ viewMode, onViewModeChange }: ViewTabsProps) {
       borderBottom: "1px solid var(--border)",
       background: "var(--surface)",
     }}>
-      {TABS.map(t => {
-        const active = viewMode === t.id;
+      {TABS.map(tab => {
+        const active = viewMode === tab.id;
         return (
-          <button key={t.id}
-            onClick={() => t.enabled && onViewModeChange(t.id)}
-            disabled={!t.enabled}
+          <button key={tab.id}
+            onClick={() => tab.enabled && onViewModeChange(tab.id)}
+            disabled={!tab.enabled}
             style={{
               display: "inline-flex", alignItems: "center", gap: 5,
               padding: "0 10px", height: 34,
               border: "none", background: "transparent",
               fontSize: 12, fontWeight: active ? 600 : 500,
-              color: !t.enabled ? "var(--text-faint)" : active ? "var(--text)" : "var(--text-mute)",
-              cursor: t.enabled ? "pointer" : "not-allowed",
-              opacity: t.enabled ? 1 : 0.55,
+              color: !tab.enabled ? "var(--text-faint)" : active ? "var(--text)" : "var(--text-mute)",
+              cursor: tab.enabled ? "pointer" : "not-allowed",
+              opacity: tab.enabled ? 1 : 0.55,
               borderBottom: active ? "2px solid var(--accent-strong)" : "2px solid transparent",
               marginBottom: -1,
             }}>
-            <Icon name={t.icon} size={12} color={active ? "var(--text)" : "var(--text-mute)"} />
-            {t.label}
-            {!t.enabled && (
+            <Icon name={tab.icon} size={12} color={active ? "var(--text)" : "var(--text-mute)"} />
+            {t(`toolbar.viewMode.${tab.id}`)}
+            {!tab.enabled && (
               <span style={{
                 fontSize: 9.5, padding: "1px 4px", borderRadius: 3,
                 background: "var(--surface-2)", color: "var(--text-faint)",
@@ -94,17 +127,16 @@ export function ViewTabs({ viewMode, onViewModeChange }: ViewTabsProps) {
         );
       })}
       <div style={{ flex: 1 }} />
-      <span style={{ fontSize: 11, color: "var(--text-faint)" }}>
-        {viewMode === "table" ? "メタデータ重視" : viewMode === "covers" ? "PDFサムネイル" : ""}
-      </span>
+      <span style={{ fontSize: 11, color: "var(--text-faint)" }}>{subtitle}</span>
     </div>
   );
 }
 
 function ScopeToggle({ scope, onChange }: { scope: SearchScope; onChange: (s: SearchScope) => void }) {
+  const { t } = useTranslation();
   const opts: { id: SearchScope; label: string }[] = [
-    { id: "meta",     label: "メタ" },
-    { id: "fulltext", label: "全文" },
+    { id: "meta",     label: t("toolbar.searchScope.meta") },
+    { id: "fulltext", label: t("toolbar.searchScope.fulltext") },
   ];
   return (
     <div style={{
@@ -134,7 +166,8 @@ function ScopeToggle({ scope, onChange }: { scope: SearchScope; onChange: (s: Se
   );
 }
 
-export function Toolbar({ title, subtitle, count, search, onSearchChange, searchScope, onSearchScopeChange, onAddOpen, onExportBibtex, exportDisabled }: ToolbarProps) {
+export function Toolbar({ title, subtitle, count, search, onSearchChange, searchScope, onSearchScopeChange, onAddOpen, onImport, onExportBibtex, exportDisabled, inTrash, onEmptyTrash, emptyTrashDisabled }: ToolbarProps) {
+  const { t } = useTranslation();
   return (
     <header style={{ flexShrink: 0, borderBottom: "1px solid var(--border)", background: "var(--surface)" }}>
       {/* row 1 */}
@@ -158,13 +191,26 @@ export function Toolbar({ title, subtitle, count, search, onSearchChange, search
           )}
         </div>
         <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-          <ToolbarBtn icon="upload" label="インポート" />
-          <ToolbarBtn
-            icon="download"
-            label="BibTeX 書き出し"
-            onClick={exportDisabled ? undefined : onExportBibtex}
-          />
-          <ToolbarBtn icon="plus" label="文献を追加" primary onClick={onAddOpen} />
+          {inTrash ? (
+            <ToolbarBtn
+              icon="trash"
+              label={t("toolbar.emptyTrash")}
+              danger
+              disabled={emptyTrashDisabled}
+              onClick={onEmptyTrash}
+              title={emptyTrashDisabled ? t("toolbar.emptyTrashEmpty") : t("toolbar.emptyTrashWarn")}
+            />
+          ) : (
+            <>
+              <ToolbarBtn icon="upload" label={t("toolbar.import")} onClick={onImport} />
+              <ToolbarBtn
+                icon="download"
+                label={t("toolbar.exportBibtex")}
+                onClick={exportDisabled ? undefined : onExportBibtex}
+              />
+              <ToolbarBtn icon="plus" label={t("toolbar.addEntry")} primary onClick={onAddOpen} />
+            </>
+          )}
         </div>
       </div>
 
@@ -180,11 +226,12 @@ export function Toolbar({ title, subtitle, count, search, onSearchChange, search
         }}>
           <Icon name="search" size={12} color="var(--text-faint)" />
           <input
+            id="toolbar-search"
             value={search}
             onChange={e => onSearchChange(e.target.value)}
             placeholder={searchScope === "fulltext"
-              ? "PDF本文を検索…"
-              : "タイトル・著者・DOI で検索…"}
+              ? t("toolbar.searchPlaceholder.fulltext")
+              : t("toolbar.searchPlaceholder.meta")}
             style={{
               flex: 1, border: "none", outline: "none", background: "transparent",
               fontSize: 12.5, color: "var(--text)",
@@ -192,11 +239,11 @@ export function Toolbar({ title, subtitle, count, search, onSearchChange, search
           />
           <ScopeToggle scope={searchScope} onChange={onSearchScopeChange} />
         </div>
-        <ToolbarBtn icon="filter" label="フィルタ" />
+        <ToolbarBtn icon="filter" label={t("toolbar.filter")} />
         <div style={{ width: 1, height: 18, background: "var(--border)" }} />
-        <ToolbarBtn icon="columns" label="列" />
+        <ToolbarBtn icon="columns" label={t("toolbar.columns")} />
         <div style={{ flex: 1 }} />
-        <ToolbarBtn icon="sortAsc" label="並び替え" />
+        <ToolbarBtn icon="sortAsc" label={t("toolbar.sort")} />
       </div>
     </header>
   );

@@ -33,6 +33,11 @@ pub async fn delete_setting(pool: &SqlitePool, key: &str) -> Result<(), sqlx::Er
 /// BibTeX 同期先パスの設定キー。
 pub const BIBTEX_SYNC_PATH_KEY: &str = "bibtex_sync_path";
 
+pub const LLM_PROVIDER_KEY: &str = "llm.provider";
+pub const LLM_MODEL_KEY: &str = "llm.model";
+pub const LLM_SUMMARY_SOURCE_KEY: &str = "llm.summary_source";
+pub const LLM_SUMMARY_PROMPT_KEY: &str = "llm.summary_prompt";
+
 #[cfg(test)]
 mod tests {
     use super::*;

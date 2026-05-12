@@ -1,3 +1,5 @@
+import { useTranslation } from "react-i18next";
+
 interface StatusBarProps {
   total: number;
   filtered: number;
@@ -6,6 +8,8 @@ interface StatusBarProps {
 }
 
 export function StatusBar({ total, filtered, selectedId, indexingCount = 0 }: StatusBarProps) {
+  const { t } = useTranslation();
+  const selectionState = selectedId != null ? t("statusBar.selectionOne") : t("statusBar.selectionNone");
   return (
     <div style={{
       flexShrink: 0, borderTop: "1px solid var(--border)",
@@ -15,10 +19,10 @@ export function StatusBar({ total, filtered, selectedId, indexingCount = 0 }: St
       fontSize: 11, color: "var(--text-faint)",
     }}>
       <span style={{ fontVariantNumeric: "tabular-nums" }}>
-        {filtered} / {total} 件
+        {t("statusBar.entriesCount", { filtered, total })}
       </span>
       <span style={{ width: 1, height: 10, background: "var(--border)", flexShrink: 0 }} />
-      <span>選択中: {selectedId != null ? "1 件" : "なし"}</span>
+      <span>{t("statusBar.selectionLabel", { state: selectionState })}</span>
       {indexingCount > 0 && (
         <>
           <span style={{ width: 1, height: 10, background: "var(--border)", flexShrink: 0 }} />
@@ -28,7 +32,7 @@ export function StatusBar({ total, filtered, selectedId, indexingCount = 0 }: St
               background: "oklch(0.7 0.15 90)",
               animation: "pulse 1.4s ease-in-out infinite",
             }} />
-            PDF全文インデックス中… ({indexingCount})
+            {t("statusBar.indexingPdf", { count: indexingCount })}
           </span>
         </>
       )}

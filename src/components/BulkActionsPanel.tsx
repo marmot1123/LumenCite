@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 import { Icon } from "./icons";
 import type { Collection } from "../types";
 
@@ -38,6 +39,7 @@ export function BulkActionsPanel({
   onClearSelection, onTrash, onRestore, onPurge,
   onAddToCollection, onAddTag, onExportBibtex,
 }: BulkActionsPanelProps) {
+  const { t } = useTranslation();
   const [confirmPurge, setConfirmPurge] = useState(false);
   const [tagInput, setTagInput] = useState("");
   const [collectionPicker, setCollectionPicker] = useState<number | "">("");
@@ -69,21 +71,21 @@ export function BulkActionsPanel({
         display: "flex", alignItems: "center", gap: 10,
       }}>
         <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 2 }}>選択中</div>
+          <div style={{ fontSize: 11, color: "var(--text-faint)", marginBottom: 2 }}>{t("bulk.selectedHeader")}</div>
           <div style={{ fontSize: 18, fontWeight: 600, color: "var(--text)" }}>
-            {count} 件
+            {t("bulk.selectedCount", { count })}
           </div>
         </div>
         <button
           onClick={onClearSelection}
-          title="選択を解除 (Esc)"
+          title={t("bulk.clearSelection")}
           style={{
             padding: "4px 8px", borderRadius: 5,
             border: "1px solid var(--border-strong)",
             background: "var(--surface)", color: "var(--text-mute)",
             fontSize: 11, cursor: "pointer",
           }}
-        >解除</button>
+        >{t("bulk.clear")}</button>
       </div>
 
       {/* body */}
@@ -101,7 +103,7 @@ export function BulkActionsPanel({
               }}
             >
               <Icon name="ext" size={12} />
-              {count} 件を復元
+              {t("bulk.restoreCount", { count })}
             </button>
 
             {!confirmPurge ? (
@@ -110,17 +112,17 @@ export function BulkActionsPanel({
                 style={{
                   padding: "8px 12px", borderRadius: 6,
                   border: "none", background: "transparent",
-                  color: "oklch(0.55 0.18 15)",
+                  color: "var(--danger-strong)",
                   fontSize: 12.5, cursor: "pointer",
                 }}
-              >{count} 件を永久削除</button>
+              >{t("bulk.purgeCount", { count })}</button>
             ) : (
               <div style={{
                 padding: "10px", borderRadius: 7,
-                background: "oklch(0.96 0.03 15)", border: "1px solid oklch(0.88 0.06 15)",
+                background: "var(--danger-bg)", border: "1px solid var(--danger-border)",
               }}>
-                <div style={{ fontSize: 11.5, color: "oklch(0.45 0.1 15)", marginBottom: 8 }}>
-                  {count} 件を完全に削除しますか？元に戻せません。
+                <div style={{ fontSize: 11.5, color: "var(--danger-text)", marginBottom: 8 }}>
+                  {t("bulk.purgeConfirm", { count })}
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
                   <button
@@ -131,15 +133,15 @@ export function BulkActionsPanel({
                       background: "var(--surface)", color: "var(--text)",
                       fontSize: 11, cursor: "pointer",
                     }}
-                  >キャンセル</button>
+                  >{t("bulk.confirmCancel")}</button>
                   <button
                     onClick={onPurge}
                     style={{
                       flex: 1, padding: "4px 10px", borderRadius: 4, border: "none",
-                      background: "oklch(0.55 0.18 15)", color: "white",
+                      background: "var(--danger-strong)", color: "white",
                       fontSize: 11, fontWeight: 600, cursor: "pointer",
                     }}
-                  >永久削除する</button>
+                  >{t("bulk.confirmPurge")}</button>
                 </div>
               </div>
             )}
@@ -159,24 +161,24 @@ export function BulkActionsPanel({
                 }}
               >
                 <Icon name="download" size={12} />
-                BibTeX を書き出し
+                {t("bulk.exportBibtex")}
               </button>
               <button
                 onClick={onTrash}
                 style={{
                   padding: "8px 12px", borderRadius: 6,
                   border: "none", background: "transparent",
-                  color: "oklch(0.55 0.18 15)",
+                  color: "var(--danger-strong)",
                   fontSize: 12.5, cursor: "pointer",
                 }}
-              >{count} 件をゴミ箱へ</button>
+              >{t("bulk.trashCount", { count })}</button>
             </div>
 
             {/* collection picker */}
             <div style={{ marginBottom: 18 }}>
-              <SectionLabel>コレクションに追加</SectionLabel>
+              <SectionLabel>{t("bulk.addToCollection")}</SectionLabel>
               {flat.length === 0 ? (
-                <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>コレクションがありません</div>
+                <div style={{ fontSize: 11.5, color: "var(--text-faint)" }}>{t("bulk.emptyCollections")}</div>
               ) : (
                 <div style={{ display: "flex", gap: 6 }}>
                   <select
@@ -188,7 +190,7 @@ export function BulkActionsPanel({
                       borderRadius: 5, background: "var(--surface)", color: "var(--text)",
                     }}
                   >
-                    <option value="">— 選択 —</option>
+                    <option value="">{t("bulk.selectCollection")}</option>
                     {flat.map(({ col, depth }) => (
                       <option key={col.id} value={col.id}>
                         {"  ".repeat(depth) + col.name}
@@ -211,14 +213,14 @@ export function BulkActionsPanel({
                       color: collectionPicker === "" ? "var(--text-faint)" : "var(--text)",
                       cursor: collectionPicker === "" ? "default" : "pointer",
                     }}
-                  >追加</button>
+                  >{t("bulk.add")}</button>
                 </div>
               )}
             </div>
 
             {/* tag input */}
             <div>
-              <SectionLabel>タグを追加</SectionLabel>
+              <SectionLabel>{t("bulk.addTag")}</SectionLabel>
               <div style={{ display: "flex", gap: 6 }}>
                 <input
                   ref={tagRef}
@@ -227,7 +229,7 @@ export function BulkActionsPanel({
                   onKeyDown={e => {
                     if (e.key === "Enter") { submitTag(); e.preventDefault(); }
                   }}
-                  placeholder="タグ名…"
+                  placeholder={t("bulk.tagPlaceholder")}
                   style={{
                     flex: 1, padding: "5px 8px", fontSize: 12,
                     border: "1px solid var(--border-strong)",
@@ -245,7 +247,7 @@ export function BulkActionsPanel({
                     color: !tagInput.trim() ? "var(--text-faint)" : "var(--text)",
                     cursor: !tagInput.trim() ? "default" : "pointer",
                   }}
-                >追加</button>
+                >{t("bulk.add")}</button>
               </div>
             </div>
           </>

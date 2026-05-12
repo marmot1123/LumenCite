@@ -1,4 +1,5 @@
 import { useState, useCallback } from "react";
+import { useTranslation } from "react-i18next";
 import { Icon, TypeIcon } from "./icons";
 import { TagPill } from "./TagPill";
 import type { EntrySummary, Density } from "../types";
@@ -132,16 +133,18 @@ function formatAuthors(authors: EntrySummary["authors"]): string {
 
 // ── row ───────────────────────────────────────────────────────────────────────
 
-function Row({ entry, selected, onClick, onStartDrag, isDragging, density, widths, onToggleStar }: {
+function Row({ entry, selected, onClick, onDoubleClick, onStartDrag, isDragging, density, widths, onToggleStar }: {
   entry: EntrySummary;
   selected: boolean;
   onClick: (mods: { meta?: boolean; shift?: boolean }) => void;
+  onDoubleClick?: () => void;
   onStartDrag: (id: number, e: React.MouseEvent) => void;
   isDragging: boolean;
   density: Density;
   widths: Record<ColKey, number>;
   onToggleStar: (id: number, starred: boolean) => void;
 }) {
+  const { t } = useTranslation();
   const [hover, setHover] = useState(false);
   const rowH = density === "compact" ? 30 : density === "comfortable" ? 42 : 36;
 
@@ -151,6 +154,7 @@ function Row({ entry, selected, onClick, onStartDrag, isDragging, density, width
         if (isDragging) return;
         onClick({ meta: e.metaKey || e.ctrlKey, shift: e.shiftKey });
       }}
+      onDoubleClick={onDoubleClick}
       onMouseDown={(e) => {
         // Shift+Click は範囲選択（テキスト選択ではなく行選択）なので preventDefault でデフォルト動作を抑止。
         // ドラッグ開始は通常クリックのみ（Cmd/Shift では選択操作を優先）。
@@ -208,7 +212,7 @@ function Row({ entry, selected, onClick, onStartDrag, isDragging, density, width
           letterSpacing: "-0.005em",
         }}>{entry.title}</div>
         {entry.has_attachment && (
-          <span style={{ color: "var(--text-mute)", flexShrink: 0 }} title="PDF添付あり">
+          <span style={{ color: "var(--text-mute)", flexShrink: 0 }} title={t("entriesTable.hasPdf")}>
             <Icon name="paperclip" size={12} />
           </span>
         )}
@@ -272,15 +276,19 @@ interface EntriesTableProps {
   entries: EntrySummary[];
   selectedIds: Set<number>;
   onSelect: (id: number, mods: { meta?: boolean; shift?: boolean }) => void;
+  onOpenDetail?: (id: number) => void;
   sort: { key: string; dir: "asc" | "desc" };
   onSort: (key: string) => void;
   density: Density;
   draggingId: number | null;
   onStartDrag: (id: number, e: React.MouseEvent) => void;
   onToggleStar: (id: number, starred: boolean) => void;
+  isEmptyLibrary?: boolean;
+  onAddEntry?: () => void;
 }
 
-export function EntriesTable({ entries, selectedIds, onSelect, sort, onSort, density, draggingId, onStartDrag, onToggleStar }: EntriesTableProps) {
+export function EntriesTable({ entries, selectedIds, onSelect, onOpenDetail, sort, onSort, density, draggingId, onStartDrag, onToggleStar, isEmptyLibrary, onAddEntry }: EntriesTableProps) {
+  const { t } = useTranslation();
   const [widths, setWidths] = useState<Record<ColKey, number>>(loadColWidths);
 
   const resize = useCallback((col: ColKey, delta: number) => {
@@ -307,25 +315,25 @@ export function EntriesTable({ entries, selectedIds, onSelect, sort, onSort, den
         }}>
           <div style={{ width: 28, flexShrink: 0 }} />
           <div style={{ width: 28, flexShrink: 0 }} />
-          <ColumnHeader label="タイトル" width={widths.title} sortable
+          <ColumnHeader label={t("entriesTable.colTitle")} width={widths.title} sortable
             sorted={sort.key === "title" ? sort.dir : null}
             onSort={() => onSort("title")}
             onResize={d => resize("title", d)} />
-          <ColumnHeader label="著者" width={widths.authors} sortable
+          <ColumnHeader label={t("entriesTable.colAuthors")} width={widths.authors} sortable
             sorted={sort.key === "authors" ? sort.dir : null}
             onSort={() => onSort("authors")}
             onResize={d => resize("authors", d)} />
-          <ColumnHeader label="雑誌" width={widths.journal}
+          <ColumnHeader label={t("entriesTable.colJournal")} width={widths.journal}
             onResize={d => resize("journal", d)} />
-          <ColumnHeader label="年" width={widths.year} sortable
+          <ColumnHeader label={t("entriesTable.colYear")} width={widths.year} sortable
             sorted={sort.key === "year" ? sort.dir : null}
             onSort={() => onSort("year")}
             onResize={d => resize("year", d)} />
-          <ColumnHeader label="種別" width={widths.venue}
+          <ColumnHeader label={t("entriesTable.colVenue")} width={widths.venue}
             onResize={d => resize("venue", d)} />
-          <ColumnHeader label="タグ" width={widths.tags}
+          <ColumnHeader label={t("entriesTable.colTags")} width={widths.tags}
             onResize={d => resize("tags", d)} />
-          <ColumnHeader label="追加日" width={widths.added} align="right" sortable
+          <ColumnHeader label={t("entriesTable.colAdded")} width={widths.added} align="right" sortable
             sorted={sort.key === "added" ? sort.dir : null}
             onSort={() => onSort("added")} />
         </div>
@@ -333,18 +341,53 @@ export function EntriesTable({ entries, selectedIds, onSelect, sort, onSort, den
         {/* rows */}
         <div style={{ minWidth: totalW }}>
           {entries.length === 0 ? (
-            <div style={{
-              padding: "60px 20px", textAlign: "center",
-              color: "var(--text-faint)", fontSize: 13,
-            }}>
-              該当する文献はありません
-            </div>
+            isEmptyLibrary ? (
+              <div style={{
+                padding: "80px 24px 60px", textAlign: "center",
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 12,
+              }}>
+                <div style={{ fontSize: 15, fontWeight: 600, color: "var(--text)" }}>
+                  {t("entriesTable.emptyLibTitle")}
+                </div>
+                <div style={{
+                  fontSize: 12.5, color: "var(--text-mute)", lineHeight: 1.7, maxWidth: 360,
+                }}>
+                  {t("entriesTable.emptyLibBody")}<br />
+                  {t("entriesTable.emptyLibBody2")}
+                </div>
+                {onAddEntry && (
+                  <button
+                    onClick={onAddEntry}
+                    style={{
+                      marginTop: 6,
+                      padding: "7px 14px", borderRadius: 6,
+                      border: "none", background: "var(--accent-strong)",
+                      color: "white", fontSize: 12.5, fontWeight: 500,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {t("entriesTable.emptyAction")}
+                  </button>
+                )}
+                <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 2 }}>
+                  {t("entriesTable.emptyShortcut")}
+                </div>
+              </div>
+            ) : (
+              <div style={{
+                padding: "60px 20px", textAlign: "center",
+                color: "var(--text-faint)", fontSize: 13,
+              }}>
+                {t("entriesTable.noResults")}
+              </div>
+            )
           ) : entries.map(e => (
             <Row
               key={e.id}
               entry={e}
               selected={selectedIds.has(e.id)}
               onClick={(mods) => onSelect(e.id, mods)}
+              onDoubleClick={onOpenDetail ? () => onOpenDetail(e.id) : undefined}
               onStartDrag={onStartDrag}
               isDragging={draggingId !== null}
               density={density}

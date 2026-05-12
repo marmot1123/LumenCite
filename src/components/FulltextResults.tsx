@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { useTranslation } from "react-i18next";
 import { Icon, TypeIcon } from "./icons";
 import type { FulltextHit } from "../types";
 
@@ -37,6 +38,7 @@ function Snippet({ text }: { text: string }) {
 }
 
 export function FulltextResults({ hits, query, selectedId, onSelect }: Props) {
+  const { t } = useTranslation();
   if (!query.trim()) {
     return (
       <div style={{
@@ -44,8 +46,8 @@ export function FulltextResults({ hits, query, selectedId, onSelect }: Props) {
         flexDirection: "column", gap: 6, color: "var(--text-faint)",
         background: "var(--surface)",
       }}>
-        <div style={{ fontSize: 14, color: "var(--text-mute)", fontWeight: 500 }}>PDF全文検索</div>
-        <div style={{ fontSize: 12 }}>キーワードを入力すると本文を横断検索します</div>
+        <div style={{ fontSize: 14, color: "var(--text-mute)", fontWeight: 500 }}>{t("fulltext.headerTitle")}</div>
+        <div style={{ fontSize: 12 }}>{t("fulltext.headerHint")}</div>
       </div>
     );
   }
@@ -57,8 +59,8 @@ export function FulltextResults({ hits, query, selectedId, onSelect }: Props) {
         flexDirection: "column", gap: 6, color: "var(--text-faint)",
         background: "var(--surface)",
       }}>
-        <div style={{ fontSize: 13, color: "var(--text-mute)" }}>「{query}」 に該当する本文はありません</div>
-        <div style={{ fontSize: 11 }}>PDFが添付されているか、インデックスが完了しているか確認してください</div>
+        <div style={{ fontSize: 13, color: "var(--text-mute)" }}>{t("fulltext.noBody", { query })}</div>
+        <div style={{ fontSize: 11 }}>{t("fulltext.noBodyHelp")}</div>
       </div>
     );
   }
@@ -110,7 +112,7 @@ export function FulltextResults({ hits, query, selectedId, onSelect }: Props) {
                   fontSize: 11, fontWeight: 500, cursor: "pointer",
                   fontVariantNumeric: "tabular-nums",
                 }}
-                title={`P.${hit.page} を開く`}
+                title={t("fulltext.openPage", { page: hit.page })}
               >
                 <Icon name="ext" size={10} color="var(--text-mute)" />
                 P.{hit.page}

@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Icon, TypeIcon } from "./icons";
 import { TagPill } from "./TagPill";
-import { EXTRA_FIELDS_BY_TYPE, EXTRA_FIELD_LABELS } from "../types";
+import { MathMarkdown } from "./MathMarkdown";
+import { EXTRA_FIELDS_BY_TYPE, EXTRA_FIELD_LABEL_KEYS } from "../types";
 import type { Attachment, Collection, EntryDetail, EntryType, Tag } from "../types";
 
 interface DetailPanelProps {
@@ -22,6 +24,9 @@ interface DetailPanelProps {
   onRemoveTag: (tagId: number) => void;
   onAttachmentsChanged?: () => void;
   onAttachmentAdded?: (attachmentId: number) => void;
+  onUpdateField?: (field: "abstract_" | "notes", value: string) => void;
+  onSelectEntry?: (id: number) => void;
+  onSummarize?: () => void;
 }
 
 function flattenCollections(cols: Collection[], depth = 0): { col: Collection; depth: number }[] {
@@ -32,23 +37,24 @@ function flattenCollections(cols: Collection[], depth = 0): { col: Collection; d
 }
 
 // extra_fields を「型固有の優先順 → それ以外（アルファベット順）」で並べる
+// label は i18n キー（呼び出し側で t() で展開）
 function orderedExtraFields(
   entryType: EntryType,
   extra: Record<string, string>,
-): { key: string; label: string; value: string }[] {
+): { key: string; labelKey: string; value: string }[] {
   const defs = EXTRA_FIELDS_BY_TYPE[entryType] ?? [];
   const definedKeys = new Set(defs.map(d => d.key));
-  const ordered: { key: string; label: string; value: string }[] = [];
+  const ordered: { key: string; labelKey: string; value: string }[] = [];
 
   for (const def of defs) {
     const v = extra[def.key];
-    if (v && v.trim()) ordered.push({ key: def.key, label: def.label, value: v });
+    if (v && v.trim()) ordered.push({ key: def.key, labelKey: def.labelKey, value: v });
   }
   const orphans = Object.entries(extra)
     .filter(([k, v]) => !definedKeys.has(k) && v?.trim())
     .sort(([a], [b]) => a.localeCompare(b));
   for (const [k, v] of orphans) {
-    ordered.push({ key: k, label: EXTRA_FIELD_LABELS[k] ?? k, value: v });
+    ordered.push({ key: k, labelKey: EXTRA_FIELD_LABEL_KEYS[k] ?? "", value: v });
   }
   return ordered;
 }
@@ -83,24 +89,110 @@ function Tab({ label, active, onClick }: { label: string; active: boolean; onCli
   );
 }
 
-function ActionBtn({ icon, label, primary, onClick }: {
+function ActionBtn({ icon, label, primary, onClick, disabled, title }: {
   icon?: Parameters<typeof Icon>[0]["name"];
   label: string;
   primary?: boolean;
   onClick?: () => void;
+  disabled?: boolean;
+  title?: string;
 }) {
   return (
-    <button onClick={onClick} style={{
+    <button onClick={onClick} disabled={disabled} title={title} style={{
       display: "inline-flex", alignItems: "center", gap: 5,
       padding: "5px 9px", borderRadius: 5,
       border: primary ? "none" : "1px solid var(--border-strong)",
       background: primary ? "var(--accent-strong)" : "var(--surface)",
       color: primary ? "white" : "var(--text)",
-      fontSize: 11.5, fontWeight: 500, cursor: "pointer",
+      fontSize: 11.5, fontWeight: 500,
+      cursor: disabled ? "not-allowed" : "pointer",
+      opacity: disabled ? 0.5 : 1,
     }}>
       {icon && <Icon name={icon} size={11} color={primary ? "white" : "var(--text-mute)"} />}
       {label}
     </button>
+  );
+}
+
+// 抄録／ノートのインライン編集用 textarea。フォーカス時に枠線が現れ、blur で
+// 値が変わっていれば onSave を呼ぶ。Esc で編集を破棄してフォーカスを外す。
+function EditableText({
+  value,
+  placeholder,
+  minRows,
+  onSave,
+}: {
+  value: string;
+  placeholder: string;
+  minRows: number;
+  onSave: (next: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // entry 切替や外部更新で value が変わったら draft をリセット
+  useEffect(() => { setDraft(value); }, [value]);
+
+  useEffect(() => {
+    if (editing) textareaRef.current?.focus();
+  }, [editing]);
+
+  const commit = () => {
+    if (draft !== value) onSave(draft);
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <textarea
+        ref={textareaRef}
+        value={draft}
+        placeholder={placeholder}
+        onChange={e => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={e => {
+          if (e.key === "Escape") {
+            setDraft(value);
+            setEditing(false);
+          }
+        }}
+        rows={minRows}
+        style={{
+          width: "100%",
+          fontSize: 12.5, lineHeight: 1.65,
+          color: "var(--text)",
+          padding: "8px 10px",
+          background: "var(--surface-2)",
+          border: "1px solid var(--border-strong)",
+          borderRadius: 6,
+          resize: "vertical", outline: "none",
+          fontFamily: "inherit",
+          boxSizing: "border-box",
+        }}
+      />
+    );
+  }
+
+  return (
+    <div
+      onClick={() => setEditing(true)}
+      style={{
+        padding: "8px 10px",
+        borderRadius: 6,
+        border: "1px solid transparent",
+        cursor: "text",
+        fontSize: 12.5,
+        color: "var(--text)",
+        minHeight: minRows * 18,
+      }}
+    >
+      {value ? (
+        <MathMarkdown value={value} />
+      ) : (
+        <span style={{ color: "var(--text-faint)" }}>{placeholder}</span>
+      )}
+    </div>
   );
 }
 
@@ -114,7 +206,8 @@ const panelStyle = (width: number): React.CSSProperties => ({
   overflow: "hidden",
 });
 
-export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore, onToggleStar, allCollections, onAddToCollection, onRemoveFromCollection, allTags, onAddTag, onRemoveTag, onAttachmentsChanged, onAttachmentAdded }: DetailPanelProps) {
+export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore, onToggleStar, allCollections, onAddToCollection, onRemoveFromCollection, allTags, onAddTag, onRemoveTag, onAttachmentsChanged, onAttachmentAdded, onUpdateField, onSelectEntry, onSummarize }: DetailPanelProps) {
+  const { t } = useTranslation();
   const [tab, setTab] = useState<TabId>("info");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [bibtexLabel, setBibtexLabel] = useState("BibTeX");
@@ -206,10 +299,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     try {
       const bib = await invoke<string>("export_bibtex", { entryIds: [entry.id] });
       await writeText(bib);
-      setBibtexLabel("コピーしました");
+      setBibtexLabel(t("detailPanel.copied"));
       setTimeout(() => setBibtexLabel("BibTeX"), 2000);
     } catch {
-      setBibtexLabel("エラー");
+      setBibtexLabel(t("detailPanel.copyError"));
       setTimeout(() => setBibtexLabel("BibTeX"), 2000);
     }
   };
@@ -220,8 +313,9 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         <div style={{
           flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
           padding: 24, color: "var(--text-faint)", fontSize: 12.5, textAlign: "center", lineHeight: 1.6,
+          whiteSpace: "pre-line",
         }}>
-          文献を選択すると<br/>詳細が表示されます
+          {t("detailPanel.noSelection")}
         </div>
       </aside>
     );
@@ -249,7 +343,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
           <div style={{ flex: 1 }} />
           <button
             onClick={onToggleStar}
-            title={entry.starred ? "お気に入りから外す" : "お気に入りに追加"}
+            title={entry.starred ? t("detailPanel.starOn") : t("detailPanel.starOff")}
             style={{
               width: 26, height: 26, padding: 0, border: "none", background: "transparent",
               borderRadius: 5, cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center",
@@ -278,7 +372,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
           <div style={{ display: "flex", gap: 6, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
             {inTrash ? (
               <>
-                <ActionBtn icon="ext" label="復元" primary onClick={onRestore} />
+                <ActionBtn icon="ext" label={t("detailPanel.restore")} primary onClick={onRestore} />
                 <div style={{ flex: 1 }} />
                 <button
                   onClick={() => setConfirmDelete(true)}
@@ -287,22 +381,28 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                     background: "transparent", color: "var(--text-faint)",
                     fontSize: 11, cursor: "pointer",
                   }}
-                >永久削除</button>
+                >{t("detailPanel.purge")}</button>
               </>
             ) : (
               <>
                 {entry.attachments.length > 0 ? (
-                  <ActionBtn icon="ext" label="PDFを開く" primary onClick={handleOpenPdf} />
+                  <ActionBtn icon="ext" label={t("detailPanel.openPdf")} primary onClick={handleOpenPdf} />
                 ) : (
                   <ActionBtn
                     icon="paperclip"
-                    label={attaching ? "添付中…" : "PDFを添付"}
+                    label={attaching ? t("detailPanel.attaching") : t("detailPanel.attachPdf")}
                     onClick={handleAttachPdf}
                   />
                 )}
-                <ActionBtn icon="sparkle" label="要約" />
+                <ActionBtn
+                  icon="sparkle"
+                  label={t("detailPanel.summarize")}
+                  onClick={onSummarize}
+                  disabled={!onSummarize}
+                  title={t("summary.title")}
+                />
                 <ActionBtn icon="download" label={bibtexLabel} onClick={handleCopyBibtex} />
-                <ActionBtn label="編集" onClick={onEdit} />
+                <ActionBtn label={t("detailPanel.edit")} onClick={onEdit} />
                 <div style={{ flex: 1 }} />
                 <button
                   onClick={() => setConfirmDelete(true)}
@@ -311,7 +411,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                     background: "transparent", color: "var(--text-faint)",
                     fontSize: 11, cursor: "pointer",
                   }}
-                >削除</button>
+                >{t("detailPanel.delete")}</button>
               </>
             )}
           </div>
@@ -319,10 +419,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
           <div style={{
             display: "flex", alignItems: "center", gap: 8, marginTop: 12,
             padding: "7px 10px", borderRadius: 7,
-            background: "oklch(0.96 0.03 15)", border: "1px solid oklch(0.88 0.06 15)",
+            background: "var(--danger-bg)", border: "1px solid var(--danger-border)",
           }}>
-            <span style={{ fontSize: 11.5, color: "oklch(0.45 0.1 15)", flex: 1 }}>
-              {inTrash ? "完全に削除しますか？元に戻せません。" : "この文献をゴミ箱へ移動しますか？"}
+            <span style={{ fontSize: 11.5, color: "var(--danger-text)", flex: 1 }}>
+              {inTrash ? t("detailPanel.purgeConfirm") : t("detailPanel.trashConfirm")}
             </span>
             <button
               onClick={() => setConfirmDelete(false)}
@@ -332,15 +432,15 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                 background: "var(--surface)", color: "var(--text)",
                 fontSize: 11, cursor: "pointer",
               }}
-            >キャンセル</button>
+            >{t("detailPanel.cancel")}</button>
             <button
               onClick={onDelete}
               style={{
                 padding: "3px 9px", borderRadius: 4, border: "none",
-                background: "oklch(0.55 0.18 15)", color: "white",
+                background: "var(--danger-strong)", color: "white",
                 fontSize: 11, fontWeight: 600, cursor: "pointer",
               }}
-            >{inTrash ? "永久削除する" : "ゴミ箱へ"}</button>
+            >{inTrash ? t("detailPanel.purgeOk") : t("detailPanel.ok")}</button>
           </div>
         )}
       </div>
@@ -350,10 +450,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         display: "flex", borderBottom: "1px solid var(--border)",
         padding: "0 14px", flexShrink: 0,
       }}>
-        <Tab label="情報" active={tab === "info"} onClick={() => setTab("info")} />
-        <Tab label="抄録" active={tab === "abstract"} onClick={() => setTab("abstract")} />
-        <Tab label="ノート" active={tab === "notes"} onClick={() => setTab("notes")} />
-        <Tab label="関連" active={tab === "related"} onClick={() => setTab("related")} />
+        <Tab label={t("detailPanel.tab.info")} active={tab === "info"} onClick={() => setTab("info")} />
+        <Tab label={t("detailPanel.tab.abstract")} active={tab === "abstract"} onClick={() => setTab("abstract")} />
+        <Tab label={t("detailPanel.tab.notes")} active={tab === "notes"} onClick={() => setTab("notes")} />
+        <Tab label={t("detailPanel.tab.related")} active={tab === "related"} onClick={() => setTab("related")} />
       </div>
 
       {/* body */}
@@ -365,8 +465,8 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
               if (items.length === 0) return null;
               return (
                 <div style={{ marginBottom: 4, paddingBottom: 10, borderBottom: "1px solid var(--border)" }}>
-                  {items.map(({ key, label, value }) => (
-                    <Field key={key} label={label} value={value} />
+                  {items.map(({ key, labelKey, value }) => (
+                    <Field key={key} label={labelKey ? t(labelKey as any) : key} value={value} />
                   ))}
                 </div>
               );
@@ -376,14 +476,14 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
             <Field label="arXiv" value={entry.arxiv_id} mono />
             <Field label="ISBN" value={entry.isbn} mono />
             <Field label="URL" value={entry.url} mono />
-            <Field label="掲載年" value={entry.year} />
-            <Field label="追加日" value={entry.created_at ? entry.created_at.slice(0, 10) : undefined} />
+            <Field label={t("detailPanel.venueYear")} value={entry.year} />
+            <Field label={t("detailPanel.addedAt")} value={entry.created_at ? entry.created_at.slice(0, 10) : undefined} />
 
             <div style={{ marginTop: 4, marginBottom: 14 }}>
               <div style={{
                 fontSize: 10.5, fontWeight: 600, color: "var(--text-faint)",
                 textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6,
-              }}>添付ファイル</div>
+              }}>{t("detailPanel.attachmentsLabel2")}</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 {entry.attachments.map(att => (
                   <div key={att.id} style={{
@@ -411,7 +511,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                         display: "inline-flex", alignItems: "center", justifyContent: "center",
                         borderRadius: 3, color: "var(--text-faint)",
                       }}
-                      title="削除"
+                      title={t("detailPanel.removeAttachment2")}
                     >
                       <Icon name="close" size={9} color="var(--text-faint)" />
                     </button>
@@ -430,10 +530,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                   }}
                 >
                   <Icon name="plus" size={9} color="var(--text-faint)" />
-                  {attaching ? "添付中…" : "PDFを追加"}
+                  {attaching ? t("detailPanel.attaching") : t("detailPanel.addPdf")}
                 </button>
                 {attachError && (
-                  <div style={{ fontSize: 11, color: "oklch(0.55 0.18 15)", marginTop: 2 }}>
+                  <div style={{ fontSize: 11, color: "var(--danger-strong)", marginTop: 2 }}>
                     {attachError}
                   </div>
                 )}
@@ -444,13 +544,13 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
               <div style={{
                 fontSize: 10.5, fontWeight: 600, color: "var(--text-faint)",
                 textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6,
-              }}>タグ</div>
+              }}>{t("detailPanel.tagsLabel2")}</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
-                {entry.tags.map(t => (
+                {entry.tags.map(tag => (
                   <TagPill
-                    key={t.id}
-                    name={t.name}
-                    onRemove={() => onRemoveTag(t.id)}
+                    key={tag.id}
+                    name={tag.name}
+                    onRemove={() => onRemoveTag(tag.id)}
                   />
                 ))}
                 <div ref={tagInputRef} style={{ position: "relative", display: "inline-flex" }}>
@@ -466,7 +566,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                       }}
                     >
                       <Icon name="plus" size={9} color="var(--text-faint)" />
-                      追加
+                      {t("detailPanel.addTag")}
                     </button>
                   ) : (
                     <>
@@ -481,7 +581,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                             e.preventDefault();
                           }
                         }}
-                        placeholder="タグ名…"
+                        placeholder={t("detailPanel.tagsPlaceholder2")}
                         style={{
                           width: 120, padding: "2px 8px",
                           borderRadius: 999,
@@ -506,10 +606,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                             boxShadow: "0 4px 12px rgba(0,0,0,0.1)",
                             zIndex: 100, minWidth: 140, padding: "3px 0",
                           }}>
-                            {suggestions.map(t => (
+                            {suggestions.map(s => (
                               <button
-                                key={t.id}
-                                onMouseDown={e => { e.preventDefault(); submitTag(t.name); }}
+                                key={s.id}
+                                onMouseDown={e => { e.preventDefault(); submitTag(s.name); }}
                                 style={{
                                   display: "block", width: "100%", padding: "4px 10px",
                                   border: "none", background: "transparent", textAlign: "left",
@@ -517,7 +617,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                                 }}
                                 onMouseEnter={e => (e.currentTarget.style.background = "var(--hover)")}
                                 onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
-                              >{t.name}</button>
+                              >{s.name}</button>
                             ))}
                           </div>
                         );
@@ -532,7 +632,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
               <div style={{
                 fontSize: 10.5, fontWeight: 600, color: "var(--text-faint)",
                 textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6,
-              }}>コレクション</div>
+              }}>{t("detailPanel.collectionsLabel2")}</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                 {(entry.collections ?? []).map(col => (
                   <div key={col.id} style={{
@@ -551,7 +651,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                         display: "inline-flex", alignItems: "center", justifyContent: "center",
                         borderRadius: 3, color: "var(--text-faint)",
                       }}
-                      title="コレクションから削除"
+                      title={t("detailPanel.removeFromCollection")}
                     >
                       <Icon name="close" size={9} color="var(--text-faint)" />
                     </button>
@@ -569,7 +669,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                     }}
                   >
                     <Icon name="plus" size={9} color="var(--text-faint)" />
-                    コレクションに追加
+                    {t("detailPanel.addToCollection2")}
                   </button>
                   {showColDropdown && (() => {
                     const entryColIds = new Set(entry.collections.map(c => c.id));
@@ -586,7 +686,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                       }}>
                         {available.length === 0 ? (
                           <div style={{ padding: "8px 14px", fontSize: 12, color: "var(--text-faint)" }}>
-                            利用可能なコレクションがありません
+                            {t("detailPanel.noCollections")}
                           </div>
                         ) : available.map(({ col, depth }) => (
                           <button
@@ -616,35 +716,90 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         )}
 
         {tab === "abstract" && (
-          <div style={{ fontSize: 12.5, lineHeight: 1.65, color: "var(--text)" }}>
-            {entry.abstract_ || (
-              <span style={{ color: "var(--text-faint)" }}>抄録は登録されていません。</span>
-            )}
-          </div>
+          onUpdateField && !inTrash ? (
+            <EditableText
+              key={`abs-${entry.id}`}
+              value={entry.abstract_ ?? ""}
+              placeholder={t("detailPanel.abstractPlaceholder")}
+              minRows={6}
+              onSave={v => onUpdateField("abstract_", v)}
+            />
+          ) : (
+            <div style={{ fontSize: 12.5, lineHeight: 1.65, color: "var(--text)", padding: "8px 10px", whiteSpace: "pre-wrap" }}>
+              {entry.abstract_ || (
+                <span style={{ color: "var(--text-faint)" }}>{t("detailPanel.abstractEmpty")}</span>
+              )}
+            </div>
+          )
         )}
 
         {tab === "notes" && (
-          entry.notes ? (
-            <div style={{ fontSize: 12.5, lineHeight: 1.65, color: "var(--text)", whiteSpace: "pre-wrap" }}>
-              {entry.notes}
-            </div>
+          onUpdateField && !inTrash ? (
+            <EditableText
+              key={`notes-${entry.id}`}
+              value={entry.notes ?? ""}
+              placeholder={t("detailPanel.notesPlaceholder")}
+              minRows={5}
+              onSave={v => onUpdateField("notes", v)}
+            />
           ) : (
-            <div style={{ padding: "40px 0", textAlign: "center", color: "var(--text-faint)", fontSize: 12 }}>
-              <div style={{ marginBottom: 8 }}>ノートはまだありません</div>
-              <button style={{
-                padding: "5px 11px", borderRadius: 5,
-                border: "1px solid var(--border-strong)",
-                background: "var(--surface)", color: "var(--text)",
-                fontSize: 11.5, cursor: "pointer",
-              }}>ノートを作成</button>
+            <div style={{ fontSize: 12.5, lineHeight: 1.65, color: "var(--text)", padding: "8px 10px", whiteSpace: "pre-wrap" }}>
+              {entry.notes || (
+                <span style={{ color: "var(--text-faint)" }}>{t("detailPanel.notesEmpty")}</span>
+              )}
             </div>
           )
         )}
 
         {tab === "related" && (
-          <div style={{ fontSize: 12, color: "var(--text-faint)", lineHeight: 1.6 }}>
-            arXiv プレプリント版や、引用関係にある文献がここに表示されます。
-          </div>
+          entry.relations.length === 0 ? (
+            <div style={{ fontSize: 12, color: "var(--text-faint)", lineHeight: 1.6, whiteSpace: "pre-line" }}>
+              {t("detailPanel.relatedEmpty")}
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {entry.relations.map(rel => (
+                <button
+                  key={`${rel.direction}-${rel.relation_type}-${rel.entry.id}`}
+                  onClick={() => onSelectEntry?.(rel.entry.id)}
+                  disabled={!onSelectEntry}
+                  style={{
+                    display: "flex", flexDirection: "column", alignItems: "stretch", gap: 4,
+                    padding: "8px 10px", borderRadius: 6,
+                    border: "1px solid var(--border)",
+                    background: "var(--surface)",
+                    cursor: onSelectEntry ? "pointer" : "default",
+                    textAlign: "left",
+                  }}
+                  onMouseEnter={e => { if (onSelectEntry) e.currentTarget.style.background = "var(--hover)"; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = "var(--surface)"; }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <TypeIcon type={rel.entry.entry_type as EntryType} size={11} />
+                    <span style={{
+                      fontSize: 10.5, color: "var(--text-faint)",
+                      textTransform: "uppercase", letterSpacing: "0.04em",
+                    }}>
+                      {rel.direction === "from" ? `→ ${rel.relation_type}` : `← ${rel.relation_type}`}
+                    </span>
+                    {rel.entry.year && (
+                      <span style={{ fontSize: 10.5, color: "var(--text-faint)", marginLeft: "auto", fontVariantNumeric: "tabular-nums" }}>
+                        {rel.entry.year}
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12.5, color: "var(--text)", lineHeight: 1.4, fontWeight: 500 }}>
+                    {rel.entry.title}
+                  </div>
+                  {rel.entry.authors.length > 0 && (
+                    <div style={{ fontSize: 11, color: "var(--text-mute)", lineHeight: 1.4 }}>
+                      {rel.entry.authors.map(a => a.name).join(", ")}
+                    </div>
+                  )}
+                </button>
+              ))}
+            </div>
+          )
         )}
       </div>
     </aside>

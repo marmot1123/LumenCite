@@ -32,6 +32,42 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "category": "Productivity",
+    "shortDescription": "Reference and bibliography management for researchers",
+    "longDescription": "LumenCite is a desktop reference manager for researchers, integrating PDF reading, BibTeX sync for LaTeX workflows, and LLM-assisted summarization.",
+    "macOS": {
+      "signingIdentity": "-",
+      "hardenedRuntime": true,
+      "minimumSystemVersion": "11.0",
+      "entitlements": null,
+      "providerShortName": null
+    },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com",
+      "tsp": false,
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": false,
+      "pubkey": "REPLACE_WITH_TAURI_SIGNER_PUBKEY",
+      "endpoints": [
+        "https://github.com/OWNER/REPO/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

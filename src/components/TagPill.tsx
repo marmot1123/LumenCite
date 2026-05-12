@@ -1,3 +1,5 @@
+import { useTranslation } from "react-i18next";
+
 const TAG_COLOR_LIST = ["amber", "blue", "green", "violet", "rose", "cyan"] as const;
 type TagColorKey = typeof TAG_COLOR_LIST[number] | "neutral";
 
@@ -19,6 +21,7 @@ export function tagColorForName(name: string): typeof TAG_COLORS.amber {
 }
 
 export function TagPill({ name, onRemove }: { name: string; onRemove?: () => void }) {
+  const { t } = useTranslation();
   const c = tagColorForName(name);
   return (
     <span style={{
@@ -34,7 +37,7 @@ export function TagPill({ name, onRemove }: { name: string; onRemove?: () => voi
       {onRemove && (
         <button
           onClick={onRemove}
-          title="タグを外す"
+          title={t("tag.removeTitle")}
           style={{
             width: 13, height: 13, padding: 0, marginLeft: 1,
             border: "none", background: "transparent", cursor: "pointer",

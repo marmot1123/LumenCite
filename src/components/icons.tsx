@@ -2,14 +2,15 @@ import {
   Search, Plus, ChevronDown, ChevronRight, Folder, Star,
   Paperclip, Library, Clock, Inbox, Trash2, Tag, ArrowUpDown,
   Filter, Columns2, Grid2x2, List, Download, Upload, RefreshCw,
-  Info, Sparkles, ExternalLink, X,
+  Info, Sparkles, ExternalLink, X, Settings, Highlighter, Printer,
 } from "lucide-react";
 
 type IconName =
   | "search" | "plus" | "chevronDown" | "chevronRight" | "folder"
   | "star" | "starFill" | "paperclip" | "library" | "clock" | "inbox"
   | "trash" | "tag" | "sortAsc" | "filter" | "columns" | "grid" | "list"
-  | "download" | "upload" | "sync" | "info" | "sparkle" | "ext" | "close";
+  | "download" | "upload" | "sync" | "info" | "sparkle" | "ext" | "close"
+  | "settings" | "highlighter" | "printer";
 
 interface IconProps {
   name: IconName;
@@ -46,6 +47,9 @@ export function Icon({ name, size = 14, color = "currentColor", strokeWidth = 1.
     case "sparkle":      return <Sparkles {...props} />;
     case "ext":          return <ExternalLink {...props} />;
     case "close":        return <X {...props} />;
+    case "settings":     return <Settings {...props} />;
+    case "highlighter":  return <Highlighter {...props} />;
+    case "printer":      return <Printer {...props} />;
     default:             return null;
   }
 }

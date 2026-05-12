@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { ExtraFieldInputs } from "./ExtraFieldInputs";
 import type { EntryDetail, EntryInput, EntryType } from "../types";
@@ -9,16 +10,10 @@ interface EditSheetProps {
   onSaved: (entry: EntryDetail) => void;
 }
 
-const ENTRY_TYPES: { value: EntryType; label: string }[] = [
-  { value: "article",        label: "論文（article）" },
-  { value: "book",           label: "書籍（book）" },
-  { value: "inproceedings",  label: "会議録（inproceedings）" },
-  { value: "thesis",         label: "学位論文（thesis）" },
-  { value: "webpage",        label: "Webページ（webpage）" },
-  { value: "misc",           label: "その他（misc）" },
-];
+const ENTRY_TYPES: EntryType[] = ["article", "book", "inproceedings", "thesis", "webpage", "misc"];
 
 export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
+  const { t } = useTranslation();
   const [form, setForm] = useState<EntryInput>({
     title:      entry.title,
     entry_type: entry.entry_type,
@@ -116,7 +111,7 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
       >
         {/* header */}
         <div style={{ padding: "14px 18px 12px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>文献を編集</div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{t("editSheet.title")}</div>
           <div style={{
             fontSize: 11.5, color: "var(--text-faint)", marginTop: 3,
             overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
@@ -128,25 +123,28 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
         {/* form body */}
         <div style={{ padding: "14px 18px 0", overflowY: "auto", flex: 1 }}>
           <div style={{ marginBottom: 12 }}>
-            <label style={labelStyle}>種別</label>
+            <label style={labelStyle}>{t("addSheet.field.type")}</label>
             <select value={form.entry_type} onChange={e => set("entry_type", e.target.value as EntryType)}
               style={{ ...fieldStyle, cursor: "pointer" }}>
-              {ENTRY_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+              {ENTRY_TYPES.map(type => (
+                <option key={type} value={type}>{t(`entryTypeLabel.${type}` as const)}</option>
+              ))}
             </select>
           </div>
 
           <div style={{ marginBottom: 12 }}>
-            <label style={labelStyle}>タイトル *</label>
+            <label style={labelStyle}>{t("addSheet.field.titleRequired")}</label>
             <input value={form.title} onChange={e => set("title", e.target.value)}
-              placeholder="論文・書籍のタイトル" style={fieldStyle} autoFocus />
+              placeholder={t("addSheet.field.titlePlaceholder")} style={fieldStyle} autoFocus />
           </div>
 
           <div style={{ marginBottom: 12 }}>
-            <label style={labelStyle}>著者</label>
+            <label style={labelStyle}>{t("addSheet.field.authors")}</label>
             {(form.author_names ?? [""]).map((name, i) => (
               <div key={i} style={{ display: "flex", gap: 6, marginBottom: 5 }}>
                 <input value={name} onChange={e => setAuthor(i, e.target.value)}
-                  placeholder={`著者 ${i + 1}`} style={{ ...fieldStyle, flex: 1 }} />
+                  placeholder={t("addSheet.field.authorPlaceholder", { index: i + 1 })}
+                  style={{ ...fieldStyle, flex: 1 }} />
                 {(form.author_names ?? []).length > 1 && (
                   <button onClick={() => removeAuthor(i)} style={{
                     padding: "0 8px", border: "1px solid var(--border-strong)",
@@ -159,11 +157,11 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
             <button onClick={addAuthor} style={{
               fontSize: 11.5, color: "var(--accent-strong)", border: "none",
               background: "transparent", cursor: "pointer", padding: "2px 0",
-            }}>+ 著者を追加</button>
+            }}>{t("addSheet.field.addAuthor")}</button>
           </div>
 
           <div style={{ marginBottom: 12 }}>
-            <label style={labelStyle}>出版年</label>
+            <label style={labelStyle}>{t("addSheet.field.yearPub")}</label>
             <input type="number" min={1000} max={2100}
               value={form.year ?? ""} onChange={e => set("year", e.target.value ? Number(e.target.value) : undefined)}
               placeholder="2024" style={{ ...fieldStyle, width: 120 }} />
@@ -197,23 +195,23 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
           />
 
           <div style={{ marginBottom: 12 }}>
-            <label style={labelStyle}>抄録</label>
+            <label style={labelStyle}>{t("addSheet.field.abstract")}</label>
             <textarea value={form.abstract_ ?? ""} onChange={e => set("abstract_", e.target.value || undefined)}
-              rows={4} placeholder="Abstract…"
+              rows={4} placeholder={t("addSheet.field.abstractPlaceholder")}
               style={{ ...fieldStyle, resize: "vertical", lineHeight: 1.55 }} />
           </div>
 
           <div style={{ marginBottom: 12 }}>
-            <label style={labelStyle}>ノート</label>
+            <label style={labelStyle}>{t("addSheet.field.notes")}</label>
             <textarea value={form.notes ?? ""} onChange={e => set("notes", e.target.value || undefined)}
-              rows={3} placeholder="メモ…"
+              rows={3} placeholder={t("addSheet.field.notesPlaceholder")}
               style={{ ...fieldStyle, resize: "vertical", lineHeight: 1.55 }} />
           </div>
 
           {error && (
             <div style={{
               marginBottom: 12, padding: "8px 12px", borderRadius: 6,
-              background: "oklch(0.95 0.04 15)", color: "oklch(0.45 0.13 15)",
+              background: "var(--danger-bg)", color: "var(--danger-text)",
               fontSize: 12,
             }}>{error}</div>
           )}
@@ -231,13 +229,13 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
             border: "1px solid var(--border-strong)",
             background: "var(--surface)", color: "var(--text)",
             fontSize: 12, cursor: "pointer",
-          }}>キャンセル</button>
+          }}>{t("common.cancel")}</button>
           <button onClick={handleSave} disabled={!form.title.trim() || saving} style={{
             padding: "5px 14px", borderRadius: 5, border: "none",
             background: "var(--accent-strong)", color: "white",
             fontSize: 12, fontWeight: 500, cursor: "pointer",
             opacity: !form.title.trim() || saving ? 0.5 : 1,
-          }}>{saving ? "保存中…" : "変更を保存"}</button>
+          }}>{saving ? t("editSheet.submitting") : t("editSheet.submit")}</button>
         </div>
       </div>
     </div>

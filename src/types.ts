@@ -1,9 +1,50 @@
 export type EntryType = "article" | "book" | "inproceedings" | "thesis" | "webpage" | "misc";
 export type ViewMode = "table" | "covers" | "timeline" | "graph";
 export type Density = "compact" | "default" | "comfortable";
-export type ThemeMode = "light" | "dark";
+export type ThemeMode = "light" | "dark" | "auto";
+export type ResolvedTheme = "light" | "dark";
 export type AccentName = "amber" | "indigo" | "teal" | "rose";
 export type SearchScope = "meta" | "fulltext";
+
+export interface ImportResult {
+  imported: number;
+  skipped: number;
+  errors: string[];
+}
+
+export type HighlightColor = "yellow" | "green" | "blue";
+
+export interface Highlight {
+  id: number;
+  entry_id: number;
+  page: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: HighlightColor;
+  text: string;
+  note: string | null;
+  created_at: string;
+}
+
+export interface HighlightInput {
+  entry_id: number;
+  page: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: HighlightColor;
+  text: string;
+  note?: string | null;
+}
+
+export interface HighlightUpdate {
+  color?: HighlightColor;
+  /** 空文字列を渡すとノートが NULL に戻る */
+  note?: string;
+}
 
 export interface Author {
   id: number;
@@ -71,6 +112,9 @@ export interface EntryDetail extends EntrySummary {
   url?: string;
   abstract_?: string;
   notes?: string;
+  summary?: string;
+  summary_model?: string;
+  summary_generated_at?: string;
   deleted_at?: string;
   extra_fields: Record<string, string>;
   attachments: Attachment[];
@@ -81,6 +125,24 @@ export interface EntryDetail extends EntrySummary {
   }[];
   collections: Collection[];
 }
+
+// LLM 要約関連
+export type LlmProvider = "openai" | "anthropic";
+export type SummarySource = "abstract" | "fulltext";
+
+export interface LlmSettings {
+  provider: LlmProvider;
+  model: string;
+  summary_source: SummarySource;
+  /** ユーザーが上書きできるシステムプロンプト。空文字なら backend の DEFAULT_SYSTEM_PROMPT が使われる */
+  summary_prompt: string;
+}
+
+export type SummaryStreamEvent =
+  | { kind: "start"; model: string }
+  | { kind: "delta"; text: string }
+  | { kind: "done"; full_text: string }
+  | { kind: "error"; message: string };
 
 export interface EntryInput {
   title: string;
@@ -98,65 +160,65 @@ export interface EntryInput {
   tag_ids?: number[];
 }
 
-// 型固有フィールドのメタデータ。BibTeX のフィールド名をキーに使う。
+/** 型固有フィールドのメタデータ。i18n キーで label / placeholder を引く。 */
 export interface ExtraFieldDef {
   key: string;
-  label: string;
-  placeholder?: string;
+  labelKey: string;
+  placeholderKey?: string;
   mono?: boolean;
 }
 
 export const EXTRA_FIELDS_BY_TYPE: Record<EntryType, ExtraFieldDef[]> = {
   article: [
-    { key: "journal",   label: "雑誌名",   placeholder: "Nature, NeurIPS, …" },
-    { key: "volume",    label: "巻",       placeholder: "612" },
-    { key: "issue",     label: "号",       placeholder: "7940" },
-    { key: "pages",     label: "ページ",   placeholder: "150-160" },
-    { key: "publisher", label: "出版社",   placeholder: "Springer Nature" },
+    { key: "journal",   labelKey: "extraField.journal",   placeholderKey: "extraFieldPlaceholder.journal" },
+    { key: "volume",    labelKey: "extraField.volume",    placeholderKey: "extraFieldPlaceholder.volume" },
+    { key: "issue",     labelKey: "extraField.issue",     placeholderKey: "extraFieldPlaceholder.issue" },
+    { key: "pages",     labelKey: "extraField.pages",     placeholderKey: "extraFieldPlaceholder.pages" },
+    { key: "publisher", labelKey: "extraField.publisher", placeholderKey: "extraFieldPlaceholder.publisher" },
   ],
   book: [
-    { key: "publisher", label: "出版社",   placeholder: "MIT Press" },
-    { key: "address",   label: "出版地",   placeholder: "Cambridge, MA" },
-    { key: "edition",   label: "版",       placeholder: "3rd" },
-    { key: "series",    label: "シリーズ", placeholder: "" },
-    { key: "pages",     label: "ページ数", placeholder: "1312" },
+    { key: "publisher", labelKey: "extraField.publisher",  placeholderKey: "extraFieldPlaceholder.publisherBook" },
+    { key: "address",   labelKey: "extraField.address",    placeholderKey: "extraFieldPlaceholder.address" },
+    { key: "edition",   labelKey: "extraField.edition",    placeholderKey: "extraFieldPlaceholder.edition" },
+    { key: "series",    labelKey: "extraField.series" },
+    { key: "pages",     labelKey: "extraField.pagesCount", placeholderKey: "extraFieldPlaceholder.pagesCount" },
   ],
   inproceedings: [
-    { key: "booktitle",    label: "会議名／論文集名", placeholder: "Proceedings of CVPR 2024" },
-    { key: "pages",        label: "ページ",          placeholder: "1234-1245" },
-    { key: "publisher",    label: "出版社",          placeholder: "IEEE" },
-    { key: "address",      label: "開催地",          placeholder: "Seattle, WA" },
-    { key: "organization", label: "主催",            placeholder: "" },
+    { key: "booktitle",    labelKey: "extraField.booktitle",    placeholderKey: "extraFieldPlaceholder.booktitle" },
+    { key: "pages",        labelKey: "extraField.pages",        placeholderKey: "extraFieldPlaceholder.pagesProc" },
+    { key: "publisher",    labelKey: "extraField.publisher",    placeholderKey: "extraFieldPlaceholder.publisherProc" },
+    { key: "address",      labelKey: "extraField.addressEvent", placeholderKey: "extraFieldPlaceholder.addressProc" },
+    { key: "organization", labelKey: "extraField.organization" },
   ],
   thesis: [
-    { key: "school",  label: "大学・研究機関", placeholder: "The University of Tokyo" },
-    { key: "address", label: "所在地",         placeholder: "Tokyo, Japan" },
+    { key: "school",  labelKey: "extraField.school",          placeholderKey: "extraFieldPlaceholder.school" },
+    { key: "address", labelKey: "extraField.addressLocation", placeholderKey: "extraFieldPlaceholder.addressLocation" },
   ],
   webpage: [
-    { key: "howpublished", label: "掲載元", placeholder: "Blog post / GitHub README 等" },
+    { key: "howpublished", labelKey: "extraField.howpublished", placeholderKey: "extraFieldPlaceholder.howpublished" },
   ],
   misc: [
-    { key: "howpublished", label: "掲載形態", placeholder: "Technical report 等" },
-    { key: "publisher",    label: "発行元",   placeholder: "" },
+    { key: "howpublished", labelKey: "extraField.howpublishedMisc", placeholderKey: "extraFieldPlaceholder.howpublishedMisc" },
+    { key: "publisher",    labelKey: "extraField.publisherMisc" },
   ],
 };
 
-// 既知の extra_field キー → 日本語ラベル（DetailPanel での表示用）
-export const EXTRA_FIELD_LABELS: Record<string, string> = {
-  journal:      "雑誌名",
-  booktitle:    "会議名／論文集名",
-  volume:       "巻",
-  issue:        "号",
-  number:       "号",
-  pages:        "ページ",
-  publisher:    "出版社",
-  address:      "出版地",
-  edition:      "版",
-  series:       "シリーズ",
-  school:       "大学・研究機関",
-  institution:  "所属機関",
-  organization: "主催",
-  chapter:      "章",
-  month:        "月",
-  howpublished: "掲載元",
+/** 既知の extra_field キー → i18n キー（DetailPanel 等での表示用） */
+export const EXTRA_FIELD_LABEL_KEYS: Record<string, string> = {
+  journal:      "extraField.journal",
+  booktitle:    "extraField.booktitle",
+  volume:       "extraField.volume",
+  issue:        "extraField.issue",
+  number:       "extraField.number",
+  pages:        "extraField.pages",
+  publisher:    "extraField.publisher",
+  address:      "extraField.address",
+  edition:      "extraField.edition",
+  series:       "extraField.series",
+  school:       "extraField.school",
+  institution:  "extraField.institution",
+  organization: "extraField.organization",
+  chapter:      "extraField.chapter",
+  month:        "extraField.month",
+  howpublished: "extraField.howpublished",
 };

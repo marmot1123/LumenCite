@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { EXTRA_FIELDS_BY_TYPE } from "../types";
 import type { EntryType } from "../types";
 
@@ -22,6 +23,7 @@ const labelStyle: React.CSSProperties = {
 // entry_type が切り替わったとき、新しい型に存在しないフィールドは
 // 値が入っていれば残す（誤って消えないように）。空なら捨てる。
 export function ExtraFieldInputs({ entryType, values, onChange }: ExtraFieldInputsProps) {
+  const { t } = useTranslation();
   const defs = EXTRA_FIELDS_BY_TYPE[entryType] ?? [];
   const definedKeys = new Set(defs.map(d => d.key));
   const orphanEntries = Object.entries(values).filter(([k, v]) => !definedKeys.has(k) && v?.trim());
@@ -37,11 +39,11 @@ export function ExtraFieldInputs({ entryType, values, onChange }: ExtraFieldInpu
     <>
       {defs.map(def => (
         <div key={def.key} style={{ marginBottom: 12 }}>
-          <label style={labelStyle}>{def.label}</label>
+          <label style={labelStyle}>{t(def.labelKey as any)}</label>
           <input
             value={values[def.key] ?? ""}
             onChange={e => setField(def.key, e.target.value)}
-            placeholder={def.placeholder}
+            placeholder={def.placeholderKey ? t(def.placeholderKey as any) : ""}
             style={{ ...fieldStyle, fontFamily: def.mono ? "var(--mono)" : undefined }}
           />
         </div>
@@ -52,7 +54,7 @@ export function ExtraFieldInputs({ entryType, values, onChange }: ExtraFieldInpu
           borderRadius: 6, border: "1px dashed var(--border-strong)",
           background: "var(--surface-2)",
         }}>
-          <div style={{ ...labelStyle, marginBottom: 6 }}>その他のフィールド</div>
+          <div style={{ ...labelStyle, marginBottom: 6 }}>{t("extraFieldInputs.otherFields")}</div>
           {orphanEntries.map(([k, v]) => (
             <div key={k} style={{ display: "flex", gap: 6, marginBottom: 5, alignItems: "center" }}>
               <span style={{
@@ -67,7 +69,7 @@ export function ExtraFieldInputs({ entryType, values, onChange }: ExtraFieldInpu
             </div>
           ))}
           <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 2 }}>
-            この種別では通常使われないフィールドです（BibTeX 取り込み時等に保存されたもの）
+            {t("extraFieldInputs.otherFieldsHelp")}
           </div>
         </div>
       )}

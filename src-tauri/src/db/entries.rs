@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::models::{Attachment, Author, Collection, EntryDetail, EntrySummary, EntryInput, SidebarCounts, Tag};
+use crate::models::{Attachment, Author, Collection, EntryDetail, EntryRelation, EntrySummary, EntryInput, SidebarCounts, Tag};
 use sqlx::{Row, SqlitePool};
 
 #[derive(sqlx::FromRow)]
@@ -284,9 +284,71 @@ pub async fn create_entry(
     get_entry(pool, entry_id).await
 }
 
+/// 単一 ID から EntrySummary を組み立てる。`get_entries` の内部ループと同じ
+/// クエリ群を 1 エントリに対して実行する。関連エントリ・将来の検索結果など
+/// ID リストから一括にサマリーを取りたいケースで使う。
+async fn load_entry_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, title, year, entry_type, created_at, starred FROM entries WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+
+    let authors: Vec<Author> = sqlx::query_as(
+        "SELECT a.id, a.name, a.given_name, a.family_name, a.orcid
+         FROM authors a
+         JOIN entry_authors ea ON ea.author_id = a.id
+         WHERE ea.entry_id = ?
+         ORDER BY ea.position",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+
+    let tags: Vec<Tag> = sqlx::query_as(
+        "SELECT t.id, t.name FROM tags t
+         JOIN entry_tags et ON et.tag_id = t.id
+         WHERE et.entry_id = ?",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+
+    let has_attachment: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM attachments WHERE entry_id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .map(|n| n > 0)
+    .unwrap_or(false);
+
+    let journal: Option<String> = sqlx::query_scalar(
+        "SELECT field_value FROM extra_fields WHERE entry_id = ? AND field_name = 'journal'",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(EntrySummary {
+        id: row.get("id"),
+        title: row.get("title"),
+        year: row.get("year"),
+        entry_type: row.get("entry_type"),
+        created_at: row.get("created_at"),
+        authors,
+        tags,
+        has_attachment,
+        journal,
+        starred: row.get::<i64, _>("starred") != 0,
+    })
+}
+
 pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, title, year, entry_type, doi, isbn, arxiv_id, url, abstract, notes,
+                summary, summary_model, summary_generated_at,
                 created_at, starred, deleted_at
          FROM entries WHERE id = ?",
     )
@@ -351,6 +413,32 @@ pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::
     })
     .collect();
 
+    // 関連エントリ。current が from 側か to 側かで direction を決め、もう一方の
+    // エントリ ID を取り出す。相手側がゴミ箱に入っていたら除外する。
+    let relation_rows = sqlx::query(
+        "SELECT
+             CASE WHEN r.from_entry_id = ?1 THEN r.to_entry_id ELSE r.from_entry_id END AS other_id,
+             CASE WHEN r.from_entry_id = ?1 THEN 'from' ELSE 'to' END AS direction,
+             r.relation_type AS relation_type
+         FROM entry_relations r
+         JOIN entries e ON e.id =
+             CASE WHEN r.from_entry_id = ?1 THEN r.to_entry_id ELSE r.from_entry_id END
+         WHERE (r.from_entry_id = ?1 OR r.to_entry_id = ?1)
+           AND e.deleted_at IS NULL",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut relations: Vec<EntryRelation> = Vec::with_capacity(relation_rows.len());
+    for r in relation_rows {
+        let other_id: i64 = r.get("other_id");
+        let direction: String = r.get("direction");
+        let relation_type: String = r.get("relation_type");
+        let entry = load_entry_summary(pool, other_id).await?;
+        relations.push(EntryRelation { entry, relation_type, direction });
+    }
+
     Ok(EntryDetail {
         id: row.get("id"),
         title: row.get("title"),
@@ -362,6 +450,9 @@ pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::
         url: row.get("url"),
         abstract_: row.get("abstract"),
         notes: row.get("notes"),
+        summary: row.get("summary"),
+        summary_model: row.get("summary_model"),
+        summary_generated_at: row.get("summary_generated_at"),
         created_at: row.get("created_at"),
         starred: row.get::<i64, _>("starred") != 0,
         deleted_at: row.get("deleted_at"),
@@ -370,9 +461,34 @@ pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::
         has_attachment,
         extra_fields,
         attachments,
-        relations: vec![],
+        relations,
         collections,
     })
+}
+
+/// LLM 生成要約を保存する。
+pub async fn set_summary(
+    pool: &SqlitePool,
+    id: i64,
+    summary: &str,
+    model: &str,
+) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query(
+        "UPDATE entries
+         SET summary = ?, summary_model = ?, summary_generated_at = datetime('now'),
+             updated_at = datetime('now')
+         WHERE id = ?",
+    )
+    .bind(summary)
+    .bind(model)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if rows == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
 }
 
 pub async fn get_entries(
@@ -778,6 +894,53 @@ pub async fn bulk_add_tag(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// ISBN は表記揺れ（ハイフン・空白・ハイフン無し）が多いので、英数字のみに
+/// 正規化したうえで大文字化（末尾のチェック桁 X 対策）する。
+fn normalize_isbn(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase()
+}
+
+/// DOI / arXiv ID / ISBN のいずれかが既存エントリと一致するか確認し、最初に
+/// 見つかった `entries.id` を返す。すべて None なら None。比較は DOI/arXiv は
+/// 大文字小文字無視、ISBN は記号を除いた英数字で正規化する。ゴミ箱内のエン
+/// トリは対象外。
+pub async fn find_duplicate_entry(
+    pool: &SqlitePool,
+    doi: Option<&str>,
+    arxiv_id: Option<&str>,
+    isbn: Option<&str>,
+) -> Result<Option<i64>, sqlx::Error> {
+    let doi_norm = doi.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let arxiv_norm = arxiv_id.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let isbn_norm = isbn.map(normalize_isbn).filter(|s| !s.is_empty());
+
+    if doi_norm.is_none() && arxiv_norm.is_none() && isbn_norm.is_none() {
+        return Ok(None);
+    }
+
+    // 値が None の引数は NULL を bind し、SQL 側で `? IS NOT NULL AND ...` で
+    // 弾く。`REPLACE(...)` で ISBN のハイフン／空白を除去してから比較する。
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM entries
+         WHERE deleted_at IS NULL
+           AND (
+                (?1 IS NOT NULL AND doi IS NOT NULL AND LOWER(doi) = ?1)
+             OR (?2 IS NOT NULL AND arxiv_id IS NOT NULL AND LOWER(arxiv_id) = ?2)
+             OR (?3 IS NOT NULL AND isbn IS NOT NULL
+                   AND UPPER(REPLACE(REPLACE(REPLACE(isbn, '-', ''), ' ', ''), char(9), '')) = ?3)
+           )
+         ORDER BY id ASC
+         LIMIT 1",
+    )
+    .bind(doi_norm)
+    .bind(arxiv_norm)
+    .bind(isbn_norm)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(id,)| id))
 }
 
 pub async fn set_starred(pool: &SqlitePool, id: i64, starred: bool) -> Result<(), sqlx::Error> {
@@ -1538,6 +1701,173 @@ mod tests {
     async fn delete_entry_not_found_returns_error(pool: SqlitePool) {
         let result = delete_entry(&pool, 9999).await;
         assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
+    }
+
+    // ── find_duplicate_entry ──────────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_matches_doi_case_insensitive(pool: SqlitePool) {
+        let existing = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/Example".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let hit = find_duplicate_entry(&pool, Some("10.1234/EXAMPLE"), None, None).await.unwrap();
+        assert_eq!(hit, Some(existing.id));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_matches_arxiv(pool: SqlitePool) {
+        let existing = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let hit = find_duplicate_entry(&pool, None, Some("2301.00001"), None).await.unwrap();
+        assert_eq!(hit, Some(existing.id));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_matches_isbn_ignoring_hyphens(pool: SqlitePool) {
+        let existing = create_entry(&pool, &EntryInput {
+            title: "Book".to_string(),
+            entry_type: "book".to_string(),
+            isbn: Some("978-0-387-31073-2".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let hit = find_duplicate_entry(&pool, None, None, Some("9780387310732")).await.unwrap();
+        assert_eq!(hit, Some(existing.id));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_excludes_trashed(pool: SqlitePool) {
+        let existing = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/example".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        trash_entry(&pool, existing.id).await.unwrap();
+
+        let hit = find_duplicate_entry(&pool, Some("10.1234/example"), None, None).await.unwrap();
+        assert_eq!(hit, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_returns_none_when_no_inputs(pool: SqlitePool) {
+        create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/example".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let hit = find_duplicate_entry(&pool, None, None, None).await.unwrap();
+        assert_eq!(hit, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_returns_none_when_no_match(pool: SqlitePool) {
+        create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/example".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let hit = find_duplicate_entry(&pool, Some("10.9999/other"), None, None).await.unwrap();
+        assert_eq!(hit, None);
+    }
+
+    // ── get_entry: relations ──────────────────────────────────────────────────
+
+    async fn link_relation(
+        pool: &SqlitePool,
+        from_id: i64,
+        to_id: i64,
+        relation_type: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO entry_relations (from_entry_id, to_entry_id, relation_type)
+             VALUES (?, ?, ?)",
+        )
+        .bind(from_id)
+        .bind(to_id)
+        .bind(relation_type)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_entry_loads_outbound_relation(pool: SqlitePool) {
+        let preprint = create_entry(&pool, &EntryInput {
+            title: "Preprint".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+        let published = create_entry(&pool, &EntryInput {
+            title: "Published".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+
+        link_relation(&pool, preprint.id, published.id, "preprint_of").await;
+
+        let loaded = get_entry(&pool, preprint.id).await.unwrap();
+        assert_eq!(loaded.relations.len(), 1);
+        let rel = &loaded.relations[0];
+        assert_eq!(rel.entry.id, published.id);
+        assert_eq!(rel.relation_type, "preprint_of");
+        assert_eq!(rel.direction, "from");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_entry_loads_inbound_relation(pool: SqlitePool) {
+        let preprint = create_entry(&pool, &EntryInput {
+            title: "Preprint".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+        let published = create_entry(&pool, &EntryInput {
+            title: "Published".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+
+        link_relation(&pool, preprint.id, published.id, "preprint_of").await;
+
+        let loaded = get_entry(&pool, published.id).await.unwrap();
+        assert_eq!(loaded.relations.len(), 1);
+        let rel = &loaded.relations[0];
+        assert_eq!(rel.entry.id, preprint.id);
+        assert_eq!(rel.relation_type, "preprint_of");
+        assert_eq!(rel.direction, "to");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_entry_excludes_trashed_related_entries(pool: SqlitePool) {
+        let a = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+        let b = create_entry(&pool, &EntryInput {
+            title: "B".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+
+        link_relation(&pool, a.id, b.id, "cites").await;
+        trash_entry(&pool, b.id).await.unwrap();
+
+        let loaded = get_entry(&pool, a.id).await.unwrap();
+        assert!(loaded.relations.is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]
