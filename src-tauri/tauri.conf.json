@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "lumencite",
+  "productName": "LumenCite",
   "version": "0.1.0",
   "identifier": "com.lumencite.app",
   "build": {
@@ -34,8 +34,11 @@
       "icons/icon.ico"
     ],
     "category": "Productivity",
+    "publisher": "Motoki Seki",
+    "copyright": "© 2026 Motoki Seki",
     "license": "MIT",
     "licenseFile": "../LICENSE",
+    "homepage": "https://github.com/marmot1123/lumencite",
     "shortDescription": "Reference and bibliography management for researchers",
     "longDescription": "LumenCite is a desktop reference manager for researchers, integrating PDF reading, BibTeX sync for LaTeX workflows, and LLM-assisted summarization.",
     "macOS": {
