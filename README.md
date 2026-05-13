@@ -5,8 +5,9 @@
 
 A desktop reference management application for researchers, built with **Tauri 2 + React + TypeScript**.
 
-<!-- 画像を docs/screenshots/ に配置したら下記のパスを差し替えてください -->
-<!-- ![Library view](docs/screenshots/library.png) -->
+![Library view](docs/screenshots/library_view.png)
+
+![Detail view](docs/screenshots/detail_view.png)
 
 ## Features
 
