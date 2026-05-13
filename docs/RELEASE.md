@@ -136,12 +136,12 @@ GitHub Releases にバイナリをアップロードする方式を採用。
 
 ```json
 "endpoints": [
-  "https://github.com/motoki317/lumencite/releases/latest/download/latest.json"
+  "https://github.com/marmot1123/lumencite/releases/latest/download/latest.json"
 ]
 ```
 
-> `motoki317/lumencite` の部分は実際のリポジトリ owner/name に合わせて要編集。
-> プライベートリポジトリの場合は `https://github.com/.../releases/download/v{{current_version}}/latest.json` 形式 + S3 や Cloudflare R2 等のホスティングが必要。
+> プライベートリポジトリのままアップデート配信する場合は、`https://github.com/.../releases/download/v{{current_version}}/latest.json` 形式 + S3 / Cloudflare R2 等のホスティングが追加で必要。
+> Public 化すれば認証不要で latest.json が取得できる。
 
 ---
 

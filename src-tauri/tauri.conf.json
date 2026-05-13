@@ -71,7 +71,7 @@
       "active": false,
       "pubkey": "REPLACE_WITH_TAURI_SIGNER_PUBKEY",
       "endpoints": [
-        "https://github.com/OWNER/REPO/releases/latest/download/latest.json"
+        "https://github.com/marmot1123/lumencite/releases/latest/download/latest.json"
       ]
     }
   }
