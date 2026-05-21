@@ -6,20 +6,22 @@ v0.1.0 配布対象: **macOS (Apple Silicon + Intel)** / **Windows** / **Linux (
 コード変更（`tauri.conf.json`, `.github/workflows/release.yml`）はリポジトリ側に同梱済みなので、
 ここに書いてある **外部サービスの登録 / 鍵生成 / GitHub Secrets の登録** が完了すれば自動リリースが動きます。
 
-> 所要時間の目安: Apple Developer Program の承認に 24〜48 時間、Windows 証明書発行に 1〜10 営業日（OV / EV）。
+> 所要時間の目安: Apple Developer Program の承認に 24〜48 時間。
 > **タグ付けの前に必ず先に着手すること**。
 
 ---
 
-## 全体像
+## 全体像 (v0.1.0)
 
 | ターゲット | 必要なもの | 必要な GitHub Secret |
 |---|---|---|
 | macOS | Apple Developer ID Application 証明書 + notarytool | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `KEYCHAIN_PASSWORD` |
-| Windows | コード署名証明書（OV または EV） | `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD` |
+| Windows | **v0.1.0 では未署名配布**（SmartScreen 警告が出るが「詳細情報→実行」で回避可能） | — |
 | Linux | 不要（署名は使わない） | — |
-| Tauri Updater | 署名鍵ペア | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
+| Tauri Updater | **v0.1.0 では無効化** (`tauri.conf.json` の `plugins.updater.active = false`) | — |
 | 全 OS | リリース作成権限 | `GITHUB_TOKEN`（GitHub Actions が自動付与） |
+
+> v0.1.0 で必要な GitHub Secrets は **macOS 関連の 7 個のみ**。Windows 署名鍵 と Tauri Updater 署名鍵は将来導入する。
 
 ---
 
@@ -64,84 +66,36 @@ GitHub の Settings > Secrets and variables > Actions > **New repository secret*
 
 ---
 
-## 2. Windows 側準備
+## 2. Windows 側準備（v0.1.0 ではスキップ）
 
-### 2-1. コード署名証明書の取得
+v0.1.0 では Windows のコード署名は **行わない**。理由:
 
-選択肢:
-- **OV (Organization Validation) 証明書** — 安価（年 USD 80〜200）。最初は SmartScreen 警告が出るが、ダウンロード実績が貯まると消える
-- **EV (Extended Validation) 証明書** — 高価（年 USD 300〜500）+ ハードウェアトークン必須。SmartScreen 警告が即時に出ない
+- OV / EV 証明書はコストと運用負荷（特に EV はハードウェアトークン必須）が大きい
+- 初回ダウンロードでは OV であっても SmartScreen 警告が出るため、CTA を「詳細情報 → 実行」で案内すれば未署名と体感的に大差ない
+- DL 実績が貯まってから判断するほうが投資対効果が読める
 
-主な発行元: DigiCert, Sectigo, SSL.com など。v0.1.0 では **OV 推奨**（コスト優先）。
+未署名の `.msi` インストーラがそのまま GitHub Releases に上がる。SmartScreen 警告のユーザー向け回避手順は README / リリースノートに記載済み。
 
-> EV を選んだ場合はハードウェア HSM 上に秘密鍵が保管されるため GitHub Actions での自動署名は困難。
-> その場合は手動で `signtool sign` を走らせるか、AzureKeyVault などのクラウド HSM を併用する。
-> 以下は OV ベースの手順。
-
-### 2-2. .pfx を Base64 化して GitHub Secrets に登録
-
-発行元から `.pfx` ファイル + パスワードが届く。
-
-```sh
-base64 -i cert.pfx -o cert-pfx-base64.txt
-```
-
-GitHub Secrets:
-
-| Name | 値 |
-|---|---|
-| `WINDOWS_CERTIFICATE` | base64 化した pfx |
-| `WINDOWS_CERTIFICATE_PASSWORD` | pfx のパスワード |
-
-ワークフロー側で `cert.pfx` に書き戻してから `tauri build` に渡す。
-
-`tauri.conf.json` の `bundle.windows.certificateThumbprint` は使わない（pfx パス指定方式を採る）。
+将来 OV / EV を導入する場合は、本ドキュメントの旧版（git log 参照）の手順 + `.github/workflows/release.yml` の Windows セクションを復活させる。
 
 ---
 
-## 3. Tauri Updater 署名鍵
+## 3. Tauri Updater（v0.1.0 では無効化）
 
-`tauri-plugin-updater` は、更新バイナリの真正性を ed25519 署名で検証する。**秘密鍵は厳重に管理**。
+v0.1.0 では `tauri.conf.json` の `plugins.updater.active = false` のままリリースする。理由:
 
-### 3-1. 鍵生成
+- 署名鍵を 1 度発行すると **永続的に管理しなければならない**（紛失するとアップデート配信が断たれる）
+- v0.1.x の間は手動 DL 運用で十分
 
-リポジトリ直下で:
+将来有効化する手順:
 
-```sh
-pnpm tauri signer generate -w ~/.tauri/lumencite-updater.key
-```
+1. リポジトリ直下で `pnpm tauri signer generate -w ~/.tauri/lumencite-updater.key`
+2. 出力された公開鍵を `tauri.conf.json` の `plugins.updater.pubkey` にコピーし、`active: true` に変更
+3. GitHub Secrets に `TAURI_SIGNING_PRIVATE_KEY` (秘密鍵全文) と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` を登録
+4. `.github/workflows/release.yml` の `env:` に上記 2 つを追加、`with: includeUpdaterJson: true` に変更
+5. **秘密鍵は 1Password 等で別途保管**（紛失すると永久に updater 互換性が切れる）
 
-- パスワードを設定（空も可だが GitHub Actions に渡しにくくなるので設定推奨）
-- 公開鍵が `~/.tauri/lumencite-updater.key.pub` に出力される
-- 公開鍵の内容を `src-tauri/tauri.conf.json` の `plugins.updater.pubkey` にコピー（リポジトリにコミット OK）
-
-### 3-2. GitHub Secrets に登録
-
-| Name | 値 |
-|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | `~/.tauri/lumencite-updater.key` の中身（全文） |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 3-1 で設定したパスワード |
-
-> **秘密鍵を失うと、過去の updater 署名と互換性のある新バイナリを発行できなくなる**。
-> 1Password 等のパスワードマネージャに別途保管しておくこと。
-
----
-
-## 4. updater エンドポイントの準備
-
-GitHub Releases にバイナリをアップロードする方式を採用。
-
-- `tauri-action` が自動的に `latest.json` を生成して Release アセットにアップロードする
-- `tauri.conf.json` の `plugins.updater.endpoints` に以下を設定（既に設定済み）:
-
-```json
-"endpoints": [
-  "https://github.com/marmot1123/lumencite/releases/latest/download/latest.json"
-]
-```
-
-> プライベートリポジトリのままアップデート配信する場合は、`https://github.com/.../releases/download/v{{current_version}}/latest.json` 形式 + S3 / Cloudflare R2 等のホスティングが追加で必要。
-> Public 化すれば認証不要で latest.json が取得できる。
+エンドポイントは GitHub Releases の `latest.json` を参照する設定で既に入っている (`tauri.conf.json` 参照)。
 
 ---
 
@@ -173,8 +127,7 @@ git push origin main --tags
 |---|---|
 | `errSecInternalComponent` | `KEYCHAIN_PASSWORD` 未設定 or 値が間違っている |
 | `Notarization failed` | `APPLE_PASSWORD` は **通常パスワードではなく App-Specific Password** を使う |
-| `signtool: timestamp server error` | `timestampUrl` を `http://timestamp.digicert.com` に変更 |
-| `Failed to sign with updater key` | `TAURI_SIGNING_PRIVATE_KEY` に改行が欠落していないか確認 |
+| `User interaction is not allowed` | keychain unlock 失敗。`KEYCHAIN_PASSWORD` の再確認 |
 
 ---
 
@@ -194,13 +147,12 @@ git push origin main --tags
 - [ ] Apple Developer Program 加入完了
 - [ ] Developer ID Application 証明書 発行 & ローカル登録
 - [ ] App-Specific Password 発行
-- [ ] Windows コード署名証明書 発注 & 受領
-- [ ] `pnpm tauri signer generate` で updater 鍵ペア生成
-- [ ] `tauri.conf.json` の `plugins.updater.pubkey` を実値に置換
-- [ ] `tauri.conf.json` の `plugins.updater.endpoints` のリポジトリパスを実値に置換
-- [ ] GitHub Secrets 12 個を登録（上記表参照）
+- [ ] GitHub Secrets **7 個**を登録（`APPLE_*` × 6 + `KEYCHAIN_PASSWORD`）
+- [ ] `package.json` / `src-tauri/Cargo.toml` / `src-tauri/tauri.conf.json` の version が一致
+- [ ] `CHANGELOG.md` に v0.1.0 エントリを追記
 - [ ] 試しに `v0.1.0-rc.1` タグでドライランしてワークフローを通す
-- [ ] 各 OS でインストール検証
+- [ ] 各 OS でインストール検証（macOS: Gatekeeper 通過 / Windows: SmartScreen「詳細情報→実行」/ Linux: AppImage 起動）
+- [ ] ドラフトリリースの公開（GitHub UI から手動で「Publish release」）
 
 ---
 

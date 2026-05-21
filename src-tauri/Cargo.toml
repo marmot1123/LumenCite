@@ -1,8 +1,11 @@
 [package]
 name = "lumencite"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Reference and bibliography management for researchers"
+authors = ["Motoki Seki <marmot.motoki@gmail.com>"]
+license = "MIT"
+homepage = "https://github.com/marmot1123/lumencite"
+repository = "https://github.com/marmot1123/lumencite"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
