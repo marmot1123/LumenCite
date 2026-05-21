@@ -61,6 +61,7 @@
 - 引用スタイル対応（CSL）
 - ブラウザWebクリッパー
 - ハイライトのカスタム色 / カラーピッカー UI
+- **Homebrew Cask 登録**（macOS 配布チャネル拡充 — v0.1.0 リリースから 1–2 ヶ月後、DL 実績ができてから `homebrew/homebrew-cask` に PR 申請）
 
 ---
 
