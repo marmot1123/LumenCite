@@ -116,7 +116,9 @@ git push origin main --tags
 
 タグプッシュで `.github/workflows/release.yml` が起動し:
 
-1. macOS arm64 / macOS x64 / Windows x64 / Linux x64 の 4 ターゲットで `tauri build` を並列実行
+1. macOS universal (arm64 + x86_64) / Windows x64 / Linux x64 の 3 ターゲットで `tauri build` を並列実行
+   - macOS は `macos-14` (Apple Silicon) ランナー上で `--target universal-apple-darwin` を指定し、`lipo` で 1 つの `.app` / `.dmg` に統合
+   - 旧 `macos-13` (Intel) ランナーは GitHub 側の供給不足で恒常的に queue 待ちが長いため使わない
 2. 各バイナリを署名 + macOS は notarize
 3. `latest.json` を生成して updater 用 ed25519 鍵で署名
 4. GitHub Release を作成し、すべてのアセットをアップロード
