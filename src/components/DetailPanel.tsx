@@ -27,6 +27,7 @@ interface DetailPanelProps {
   onUpdateField?: (field: "abstract_" | "notes", value: string) => void;
   onSelectEntry?: (id: number) => void;
   onSummarize?: () => void;
+  onOpenDetail?: () => void;
 }
 
 function flattenCollections(cols: Collection[], depth = 0): { col: Collection; depth: number }[] {
@@ -206,7 +207,7 @@ const panelStyle = (width: number): React.CSSProperties => ({
   overflow: "hidden",
 });
 
-export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore, onToggleStar, allCollections, onAddToCollection, onRemoveFromCollection, allTags, onAddTag, onRemoveTag, onAttachmentsChanged, onAttachmentAdded, onUpdateField, onSelectEntry, onSummarize }: DetailPanelProps) {
+export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore, onToggleStar, allCollections, onAddToCollection, onRemoveFromCollection, allTags, onAddTag, onRemoveTag, onAttachmentsChanged, onAttachmentAdded, onUpdateField, onSelectEntry, onSummarize, onOpenDetail }: DetailPanelProps) {
   const { t } = useTranslation();
   const [tab, setTab] = useState<TabId>("info");
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -273,15 +274,6 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
       setAttachError(e?.message ?? String(e));
     } finally {
       setAttaching(false);
-    }
-  };
-
-  const handleOpenPdf = async () => {
-    if (!entry || entry.attachments.length === 0) return;
-    try {
-      await invoke("open_pdf_viewer", { id: entry.attachments[0].id });
-    } catch (e) {
-      console.error(e);
     }
   };
 
@@ -386,7 +378,13 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
             ) : (
               <>
                 {entry.attachments.length > 0 ? (
-                  <ActionBtn icon="ext" label={t("detailPanel.openPdf")} primary onClick={handleOpenPdf} />
+                  <ActionBtn
+                    icon="ext"
+                    label={t("detailPanel.openDetail")}
+                    primary
+                    onClick={onOpenDetail}
+                    disabled={!onOpenDetail}
+                  />
                 ) : (
                   <ActionBtn
                     icon="paperclip"

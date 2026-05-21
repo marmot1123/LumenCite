@@ -918,6 +918,7 @@ export default function App() {
           onUpdateField={handleUpdateField}
           onSelectEntry={selectSingle}
           onSummarize={detail ? () => setShowSummary(true) : undefined}
+          onOpenDetail={detail ? () => setScreen("detail") : undefined}
         />
       )}
 
