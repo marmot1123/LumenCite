@@ -18,6 +18,14 @@ use crate::llm::tools::{self, ToolContext};
 /// 暴走防止のためのデフォルト最大ターン数。
 pub const DEFAULT_MAX_TURNS: usize = 12;
 
+/// セッションに system_prompt が無い場合に使う既定のチャット用システムプロンプト。
+pub const DEFAULT_CHAT_SYSTEM_PROMPT: &str = "You are a research assistant embedded in LumenCite, \
+a reference manager. Answer the user's questions about their library by calling the provided tools \
+to search the full text and read entries before answering — do not rely on prior knowledge for \
+library-specific facts. Cite the entries you used by id and title. Be concise and precise. \
+When the user asks you to modify the library (tag, note, create, etc.), use the appropriate tool. \
+Reply in the same language as the user.";
+
 /// ループのスカラ設定。
 pub struct ChatLoopParams<'a> {
     pub api_key: &'a str,

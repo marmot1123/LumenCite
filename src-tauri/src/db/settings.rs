@@ -38,6 +38,9 @@ pub const LLM_MODEL_KEY: &str = "llm.model";
 pub const LLM_SUMMARY_SOURCE_KEY: &str = "llm.summary_source";
 pub const LLM_SUMMARY_PROMPT_KEY: &str = "llm.summary_prompt";
 
+/// Chat のツール別自動承認ホワイトリスト（JSON: tool_name -> bool）。
+pub const CHAT_TOOL_WHITELIST_KEY: &str = "chat.tool_whitelist";
+
 #[cfg(test)]
 mod tests {
     use super::*;

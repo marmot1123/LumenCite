@@ -1,9 +1,4 @@
 //! Anthropic Messages API のストリーミングクライアント。
-//
-// chat (tool use) 用のヘルパは `AnthropicProvider::stream_chat` 経由でのみ使われるが、
-// その入口（`provider_for` / agentic ループ #10）がまだ未配線のため、非テストビルドでは
-// dead_code 警告になる。配線され次第解消する想定のスキャフォルドなので、ここでは抑制する。
-#![allow(dead_code)]
 
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;

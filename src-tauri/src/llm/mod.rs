@@ -203,6 +203,9 @@ pub struct ChatTurnResult {
     pub text: String,
     /// このターンで要求されたツール呼び出し（完成形）
     pub tool_calls: Vec<ToolCallSpec>,
+    /// LLM がターンを終えた理由。プロバイダが設定する診断用フィールド
+    /// （ループは tool_calls の有無で継続判定するため現状は読まない）。
+    #[allow(dead_code)]
     pub stop_reason: StopReason,
 }
 
@@ -230,8 +233,6 @@ pub trait ChatProvider: Send + Sync {
 }
 
 /// プロバイダ名から `ChatProvider` 実装を返す。
-// #11 の `chat_send_message` コマンドで配線されるまで非テストビルドでは未使用。
-#[allow(dead_code)]
 pub fn provider_for(name: &str) -> Result<Box<dyn ChatProvider>, LlmError> {
     match name {
         "openai" => Ok(Box::new(openai::OpenAiProvider)),

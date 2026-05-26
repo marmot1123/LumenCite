@@ -241,6 +241,8 @@ pub async fn append_message(
 }
 
 /// スコープ対象の entry 集合を入れ替える（全削除 → 再登録）。ScopePicker 編集用。
+// #17 の ScopePicker スコープ更新コマンドで配線されるまで、バイナリからは未使用。
+#[allow(dead_code)]
 pub async fn set_session_entries(
     pool: &SqlitePool,
     session_id: i64,
