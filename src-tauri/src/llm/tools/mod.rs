@@ -32,6 +32,8 @@ pub enum ToolError {
     UnknownTool(String),
     InvalidArguments(String),
     Db(sqlx::Error),
+    /// ツールは見つかったが実行が論理的に失敗した（MCP 呼び出しなど #13 で使用）。
+    #[allow(dead_code)]
     Execution(String),
 }
 

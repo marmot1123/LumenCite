@@ -2,6 +2,7 @@
 //! Server-Sent Events で配信されるトークンをコールバックで呼び出し元へ流す。
 
 pub mod anthropic;
+pub mod chat;
 pub mod openai;
 pub mod tools;
 
@@ -229,6 +230,8 @@ pub trait ChatProvider: Send + Sync {
 }
 
 /// プロバイダ名から `ChatProvider` 実装を返す。
+// #11 の `chat_send_message` コマンドで配線されるまで非テストビルドでは未使用。
+#[allow(dead_code)]
 pub fn provider_for(name: &str) -> Result<Box<dyn ChatProvider>, LlmError> {
     match name {
         "openai" => Ok(Box::new(openai::OpenAiProvider)),
