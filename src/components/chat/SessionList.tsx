@@ -5,6 +5,7 @@ import { useChatStore } from "../../chat/store";
 import { useTheme } from "../../hooks/useTheme";
 import { relativeTime, sessionGroup, type SessionGroup } from "../../chat/format";
 import { ChatIcon } from "./ChatIcon";
+import { Icon } from "../icons";
 import type { ChatSession, Density } from "../../types";
 
 export function ProviderBadge({ provider, model }: { provider: string; model: string }) {
@@ -38,9 +39,10 @@ export function ScopeChip({ session, dense }: { session: ChatSession; dense?: bo
 interface SessionListProps {
   onNew: () => void;
   onBack: () => void;
+  onOpenSettings: () => void;
 }
 
-export function SessionList({ onNew, onBack }: SessionListProps) {
+export function SessionList({ onNew, onBack, onOpenSettings }: SessionListProps) {
   const { t } = useTranslation();
   const { density } = useTheme();
   const sessions = useChatStore((s) => s.sessions);
@@ -119,11 +121,20 @@ export function SessionList({ onNew, onBack }: SessionListProps) {
       </div>
 
       {/* Footer */}
-      <div style={{ padding: "10px 14px 12px", borderTop: "1px solid var(--border)", fontSize: 10.5, color: "var(--text-faint)", display: "flex", alignItems: "center", gap: 7 }}>
+      <div style={{ padding: "8px 10px 10px 14px", borderTop: "1px solid var(--border)", fontSize: 10.5, color: "var(--text-faint)", display: "flex", alignItems: "center", gap: 7 }}>
         <span style={{ width: 5, height: 5, borderRadius: "50%", background: "oklch(0.68 0.13 150)", boxShadow: "0 0 0 3px oklch(0.68 0.13 150 / 0.18)" }} />
         <span>{t("chat.storedLocally")}</span>
         <span style={{ flex: 1 }} />
         <span style={{ fontFamily: "var(--mono)" }}>chat.db</span>
+        <button
+          onClick={onOpenSettings}
+          title={`${t("settings.title")} (⌘,)`}
+          style={{ width: 24, height: 24, padding: 0, marginLeft: 2, border: "1px solid transparent", background: "transparent", borderRadius: 5, cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", color: "var(--text-mute)" }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = "var(--hover)"; e.currentTarget.style.borderColor = "var(--border)"; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.borderColor = "transparent"; }}
+        >
+          <Icon name="settings" size={14} color="var(--text-mute)" />
+        </button>
       </div>
     </aside>
   );

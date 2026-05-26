@@ -720,8 +720,43 @@ export default function App() {
 
   const label = viewLabel(selectedView, collections, t);
 
+  // 画面に依存しない共通オーバーレイ（設定モーダル・コマンドパレット）。
+  // library / detail / chat いずれの画面でも ⌘, やコマンドパレットが効くよう全分岐で描画する。
+  const globalOverlays = (
+    <>
+      {showSettings && (
+        <SettingsModal
+          onClose={() => { setShowSettings(false); setSettingsInitialTab(undefined); }}
+          onOpenBibtexSync={() => { setShowSettings(false); setShowBibtexSync(true); }}
+          initialTab={settingsInitialTab}
+        />
+      )}
+      <CommandPalette
+        open={showPalette}
+        onClose={() => setShowPalette(false)}
+        entries={entries}
+        onSelectEntry={selectSingle}
+        onOpenDetail={(id) => { selectSingle(id); setScreen("detail"); }}
+        onNewEntry={() => setShowAdd(true)}
+        onOpenChat={() => setScreen("chat")}
+        onOpenSettings={() => setShowSettings(true)}
+        onOpenBibtexSync={() => setShowBibtexSync(true)}
+        onSyncBibtexNow={() => { void invoke("sync_bibtex_now"); }}
+        onSelectView={setSelectedView}
+      />
+    </>
+  );
+
   if (screen === "chat") {
-    return <ChatScreen onBack={() => setScreen("library")} />;
+    return (
+      <>
+        <ChatScreen
+          onBack={() => setScreen("library")}
+          onOpenSettings={() => setShowSettings(true)}
+        />
+        {globalOverlays}
+      </>
+    );
   }
 
   if (screen === "detail" && detail) {
@@ -736,6 +771,7 @@ export default function App() {
           onOpenInWindow={(attachmentId) => { void invoke("open_pdf_viewer", { id: attachmentId }); }}
           onSummarize={() => setShowSummary(true)}
         />
+        {globalOverlays}
         {showSummary && (
           <SummarySheet
             entry={detail}
@@ -945,13 +981,7 @@ export default function App() {
         />
       )}
 
-      {showSettings && (
-        <SettingsModal
-          onClose={() => { setShowSettings(false); setSettingsInitialTab(undefined); }}
-          onOpenBibtexSync={() => { setShowSettings(false); setShowBibtexSync(true); }}
-          initialTab={settingsInitialTab}
-        />
-      )}
+      {globalOverlays}
 
       {showSummary && detail && (
         <SummarySheet
@@ -1049,20 +1079,6 @@ export default function App() {
           </div>
         </div>
       )}
-
-      <CommandPalette
-        open={showPalette}
-        onClose={() => setShowPalette(false)}
-        entries={entries}
-        onSelectEntry={selectSingle}
-        onOpenDetail={(id) => { selectSingle(id); setScreen("detail"); }}
-        onNewEntry={() => setShowAdd(true)}
-        onOpenChat={() => setScreen("chat")}
-        onOpenSettings={() => setShowSettings(true)}
-        onOpenBibtexSync={() => setShowBibtexSync(true)}
-        onSyncBibtexNow={() => { void invoke("sync_bibtex_now"); }}
-        onSelectView={setSelectedView}
-      />
 
       {dragEntryId !== null && (
         <div style={{

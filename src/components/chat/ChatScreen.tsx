@@ -13,9 +13,10 @@ import { ChatIcon } from "./ChatIcon";
 
 interface ChatScreenProps {
   onBack: () => void;
+  onOpenSettings: () => void;
 }
 
-export function ChatScreen({ onBack }: ChatScreenProps) {
+export function ChatScreen({ onBack, onOpenSettings }: ChatScreenProps) {
   const sessions = useChatStore((s) => s.sessions);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const loadSessions = useChatStore((s) => s.loadSessions);
@@ -31,7 +32,7 @@ export function ChatScreen({ onBack }: ChatScreenProps) {
 
   return (
     <div style={{ width: "100%", height: "100%", background: "var(--bg)", color: "var(--text)", display: "flex", overflow: "hidden" }}>
-      <SessionList onNew={() => setNewSessionOpen(true)} onBack={onBack} />
+      <SessionList onNew={() => setNewSessionOpen(true)} onBack={onBack} onOpenSettings={onOpenSettings} />
 
       <main style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, position: "relative" }}>
         {activeSession ? (
