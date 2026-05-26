@@ -53,16 +53,59 @@ pub trait ChatLoopHost: Send {
     fn is_cancelled(&self) -> bool;
 }
 
+/// assistant の各 `tool_use` には、直後に対応する `tool_result` が必要（OpenAI / Anthropic とも）。
+/// 中断された過去ターンなどで結果の無い tool_call が履歴に残っていると API が 400 を返すため、
+/// 欠けている tool_call にはプレースホルダの tool_result を補完して会話を整合させる。
+pub fn reconcile_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    use std::collections::HashSet;
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut i = 0;
+    while i < messages.len() {
+        let calls = match (&messages[i].role, &messages[i].tool_calls) {
+            (Role::Assistant, Some(c)) if !c.is_empty() => c.clone(),
+            _ => {
+                out.push(messages[i].clone());
+                i += 1;
+                continue;
+            }
+        };
+        out.push(messages[i].clone());
+        // 直後の連続する tool メッセージを引き継ぎつつ、見えた tool_call_id を記録
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut j = i + 1;
+        while j < messages.len() && messages[j].role == Role::Tool {
+            if let Some(id) = &messages[j].tool_call_id {
+                seen.insert(id.clone());
+            }
+            out.push(messages[j].clone());
+            j += 1;
+        }
+        // 結果の無い tool_call にプレースホルダを補完
+        for c in &calls {
+            if !seen.contains(&c.call_id) {
+                out.push(ChatMessage::tool_result(
+                    &c.call_id,
+                    "(tool result unavailable: the previous run was interrupted)",
+                ));
+            }
+        }
+        i = j;
+    }
+    out
+}
+
 /// agentic ループを実行する。`messages` は事前の会話（直近の user メッセージを含む）。
 /// 生成された assistant / tool メッセージは `db::chat` に永続化し、`host` へ通知する。
 pub async fn run_chat_loop(
     provider: &dyn ChatProvider,
     ctx: &ToolContext<'_>,
     tools: &[ToolSpec],
-    mut messages: Vec<ChatMessage>,
+    messages: Vec<ChatMessage>,
     params: &ChatLoopParams<'_>,
     host: &mut dyn ChatLoopHost,
 ) -> Result<(), LlmError> {
+    // 過去ターンの未完了 tool_call を補完してから開始する。
+    let mut messages = reconcile_tool_results(messages);
     for _turn in 0..params.max_turns {
         if host.is_cancelled() {
             break;
@@ -331,6 +374,46 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn reconcile_fills_missing_tool_results() {
+        // assistant(tool_use a, b) の直後に a の結果しか無い → b の結果を補完する。
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text("")],
+            tool_calls: Some(vec![
+                ToolCallSpec { call_id: "a".into(), tool_name: "x".into(), arguments: serde_json::json!({}) },
+                ToolCallSpec { call_id: "b".into(), tool_name: "y".into(), arguments: serde_json::json!({}) },
+            ]),
+            tool_call_id: None,
+        };
+        let msgs = vec![
+            ChatMessage::user_text("hi"),
+            assistant,
+            ChatMessage::tool_result("a", "res-a"),
+        ];
+        let out = reconcile_tool_results(msgs);
+        // user, assistant, tool(a), tool(b 補完) = 4
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[3].role, Role::Tool);
+        assert_eq!(out[3].tool_call_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn reconcile_leaves_complete_conversations_untouched() {
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text("ok")],
+            tool_calls: Some(vec![ToolCallSpec {
+                call_id: "a".into(),
+                tool_name: "x".into(),
+                arguments: serde_json::json!({}),
+            }]),
+            tool_call_id: None,
+        };
+        let msgs = vec![assistant, ChatMessage::tool_result("a", "res")];
+        assert_eq!(reconcile_tool_results(msgs).len(), 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]
