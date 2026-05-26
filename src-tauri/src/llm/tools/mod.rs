@@ -25,6 +25,8 @@ pub struct ToolContext<'a> {
     pub scope_mode: &'a str,
     /// scope_mode="entries" のときの対象 entry_id 集合（"all" のときは無視）
     pub scope_entry_ids: &'a [i64],
+    /// MCP クライアント（`mcp_*` ツールのルーティング用）。テスト等で無い場合は None。
+    pub mcp: Option<&'a crate::mcp::McpManager>,
 }
 
 #[derive(Debug)]
@@ -32,8 +34,7 @@ pub enum ToolError {
     UnknownTool(String),
     InvalidArguments(String),
     Db(sqlx::Error),
-    /// ツールは見つかったが実行が論理的に失敗した（MCP 呼び出しなど #13 で使用）。
-    #[allow(dead_code)]
+    /// ツールは見つかったが実行が論理的に失敗した（MCP 呼び出しの失敗など）。
     Execution(String),
 }
 
@@ -64,10 +65,17 @@ pub fn all_tool_specs() -> Vec<ToolSpec> {
 }
 
 /// `ToolCallSpec` を実行し、LLM に返すツール結果テキストを得る。
-pub async fn execute_tool(
-    ctx: &ToolContext<'_>,
-    call: &ToolCallSpec,
-) -> Result<String, ToolError> {
+pub async fn execute_tool(ctx: &ToolContext<'_>, call: &ToolCallSpec) -> Result<String, ToolError> {
+    // MCP ツールは外部サーバーへルーティングする。
+    if call.tool_name.starts_with("mcp_") {
+        return match ctx.mcp {
+            Some(mcp) => mcp
+                .call(&call.tool_name, &call.arguments)
+                .await
+                .map_err(|e| ToolError::Execution(e.to_string())),
+            None => Err(ToolError::UnknownTool(call.tool_name.clone())),
+        };
+    }
     if let Some(r) = search::try_execute(ctx, call).await {
         return r;
     }

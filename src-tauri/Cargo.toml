@@ -31,7 +31,7 @@ nom-bibtex = "0.6"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-dialog = "2"
 pdf-extract = "0.9"
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "process", "io-util"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 futures-util = "0.3"
 eventsource-stream = "0.2"

@@ -229,6 +229,7 @@ mod tests {
             session_id: 1,
             scope_mode: "all",
             scope_entry_ids: &[],
+            mcp: None,
         }
     }
 
@@ -336,6 +337,7 @@ mod tests {
             session_id: 1,
             scope_mode: "entries",
             scope_entry_ids: &scope_ids,
+            mcp: None,
         };
         let call = make_call("fulltext_search", json!({ "query": "quantum" }));
 

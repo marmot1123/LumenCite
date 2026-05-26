@@ -3,6 +3,7 @@ mod bibtex;
 mod db;
 mod keychain;
 mod llm;
+mod mcp;
 mod metadata;
 mod models;
 
@@ -33,6 +34,8 @@ pub struct AppState {
     pub sync_tx: UnboundedSender<()>,
     /// 進行中チャットの承認待ち・中断状態を保持する共有ランタイム。
     pub chat: Arc<ChatRuntime>,
+    /// 外部 MCP サーバーのクライアント（Chat ツールへマージ）。
+    pub mcp: Arc<mcp::McpManager>,
 }
 
 /// BibTeX 同期結果を UI に通知するイベントペイロード。
@@ -1175,6 +1178,59 @@ async fn set_chat_session_scope(
         .map_err(|e| e.to_string())
 }
 
+// ── MCP クライアント ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<mcp::McpServerConfig>, String> {
+    let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    Ok(mcp::parse_servers_config(&json))
+}
+
+#[tauri::command]
+async fn add_mcp_server(
+    state: State<'_, AppState>,
+    config: mcp::McpServerConfig,
+) -> Result<(), String> {
+    let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut servers = mcp::parse_servers_config(&json);
+    servers.retain(|s| s.id != config.id);
+    servers.push(config.clone());
+    db::settings::set_setting(
+        &state.db,
+        db::settings::MCP_SERVERS_KEY,
+        &mcp::serialize_servers_config(&servers),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    state.mcp.start(config).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut servers = mcp::parse_servers_config(&json);
+    servers.retain(|s| s.id != id);
+    db::settings::set_setting(
+        &state.db,
+        db::settings::MCP_SERVERS_KEY,
+        &mcp::serialize_servers_config(&servers),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    state.mcp.stop(&id).await;
+    Ok(())
+}
+
 #[tauri::command]
 async fn approve_tool_call(
     state: State<'_, AppState>,
@@ -1259,7 +1315,8 @@ async fn chat_send_message(
             return Err(e.to_string());
         }
     };
-    let tools = llm::tools::all_tool_specs();
+    let mut tools = llm::tools::all_tool_specs();
+    tools.extend(state.mcp.tool_specs().await);
 
     let cancel = state.chat.begin(session_id);
     let mut host = ChannelHost {
@@ -1274,6 +1331,7 @@ async fn chat_send_message(
         session_id,
         scope_mode: &session.scope_mode,
         scope_entry_ids: &entry_ids,
+        mcp: Some(state.mcp.as_ref()),
     };
     let params = llm::chat::ChatLoopParams {
         api_key: &api_key,
@@ -1734,10 +1792,26 @@ pub fn run() {
                 run_sync_task(pool_for_task, handle, sync_rx).await;
             });
 
+            let mcp = Arc::new(mcp::McpManager::default());
             app.manage(AppState {
                 db: pool.clone(),
                 sync_tx,
                 chat: Arc::new(ChatRuntime::default()),
+                mcp: mcp.clone(),
+            });
+
+            // 設定済みの MCP サーバーをバックグラウンドで起動する。
+            let mcp_pool = pool.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(Some(json)) =
+                    db::settings::get_setting(&mcp_pool, db::settings::MCP_SERVERS_KEY).await
+                {
+                    for cfg in mcp::parse_servers_config(&json) {
+                        if let Err(e) = mcp.start(cfg).await {
+                            eprintln!("MCP server start failed: {e}");
+                        }
+                    }
+                }
             });
 
             // メニューバー: アプリ名サブメニューに「Settings…」を追加（macOS / Windows / Linux）。
@@ -1837,6 +1911,9 @@ pub fn run() {
             approve_tool_call,
             cancel_chat_stream,
             generate_chat_title,
+            list_mcp_servers,
+            add_mcp_server,
+            remove_mcp_server,
             run_backup_now,
             list_backups,
             open_backup_folder,

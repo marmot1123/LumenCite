@@ -450,6 +450,7 @@ mod tests {
             session_id: 1,
             scope_mode: "all",
             scope_entry_ids: &[],
+            mcp: None,
         }
     }
 

@@ -41,6 +41,9 @@ pub const LLM_SUMMARY_PROMPT_KEY: &str = "llm.summary_prompt";
 /// Chat のツール別自動承認ホワイトリスト（JSON: tool_name -> bool）。
 pub const CHAT_TOOL_WHITELIST_KEY: &str = "chat.tool_whitelist";
 
+/// 外部 MCP サーバー設定（Claude Desktop の mcpServers 互換 JSON）。
+pub const MCP_SERVERS_KEY: &str = "mcp.servers";
+
 #[cfg(test)]
 mod tests {
     use super::*;

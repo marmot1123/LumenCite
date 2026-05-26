@@ -317,6 +317,7 @@ mod tests {
             session_id,
             scope_mode: "all",
             scope_entry_ids: &[],
+            mcp: None,
         };
         let tools = tools::all_tool_specs();
         run_chat_loop(
@@ -444,6 +445,7 @@ mod tests {
             session_id: sid,
             scope_mode: "all",
             scope_entry_ids: &[],
+            mcp: None,
         };
         let tools = tools::all_tool_specs();
         let p = ChatLoopParams {
