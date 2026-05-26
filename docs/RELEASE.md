@@ -18,10 +18,11 @@ v0.1.0 配布対象: **macOS (Apple Silicon + Intel)** / **Windows** / **Linux (
 | macOS | Apple Developer ID Application 証明書 + notarytool | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `KEYCHAIN_PASSWORD` |
 | Windows | **v0.1.0 では未署名配布**（SmartScreen 警告が出るが「詳細情報→実行」で回避可能） | — |
 | Linux | 不要（署名は使わない） | — |
-| Tauri Updater | **v0.1.0 では無効化** (`tauri.conf.json` の `plugins.updater.active = false`) | — |
+| Tauri Updater (macOS) | **v0.2.0 で有効化（macOS のみ）**。ed25519 鍵で `latest.json` を検証 | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
+| Tauri Updater (Windows) | **v0.2.1 へ送り**（コード署名と同時に導入） | — |
 | 全 OS | リリース作成権限 | `GITHUB_TOKEN`（GitHub Actions が自動付与） |
 
-> v0.1.0 で必要な GitHub Secrets は **macOS 関連の 7 個のみ**。Windows 署名鍵 と Tauri Updater 署名鍵は将来導入する。
+> v0.2.0 で必要な GitHub Secrets は **macOS 関連 7 個 + Tauri Updater 署名鍵 2 個** の計 9 個。Windows 署名鍵は v0.2.1 で導入する。
 
 ---
 
@@ -80,19 +81,16 @@ v0.1.0 では Windows のコード署名は **行わない**。理由:
 
 ---
 
-## 3. Tauri Updater（v0.1.0 では無効化）
+## 3. Tauri Updater（v0.2.0 で macOS のみ有効化）
 
-v0.1.0 では `tauri.conf.json` の `plugins.updater.active = false` のままリリースする。理由:
+v0.2.0 で **macOS のみ** auto-updater を有効化した。Windows updater はコード署名と同時に v0.2.1 へ送る（未署名のままでは updater が検証で弾かれるため）。
 
-- 署名鍵を 1 度発行すると **永続的に管理しなければならない**（紛失するとアップデート配信が断たれる）
-- v0.1.x の間は手動 DL 運用で十分
-
-将来有効化する手順:
+有効化手順（v0.2.0 で実施済み・記録用）:
 
 1. リポジトリ直下で `pnpm tauri signer generate -w ~/.tauri/lumencite-updater.key`
-2. 出力された公開鍵を `tauri.conf.json` の `plugins.updater.pubkey` にコピーし、`active: true` に変更
-3. GitHub Secrets に `TAURI_SIGNING_PRIVATE_KEY` (秘密鍵全文) と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` を登録
-4. `.github/workflows/release.yml` の `env:` に上記 2 つを追加、`with: includeUpdaterJson: true` に変更
+2. 出力された公開鍵を `tauri.conf.json` の `plugins.updater.pubkey` にコピーし、`active: true` に変更（旧 `"REPLACE_WITH_TAURI_SIGNER_PUBKEY"` を置換）
+3. GitHub Secrets に `TAURI_SIGNING_PRIVATE_KEY`（秘密鍵全文）と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` を登録
+4. `.github/workflows/release.yml` の tauri-action ステップに上記 2 つの env を渡し、`with: includeUpdaterJson: true` に変更。**macOS ジョブのみ updater asset を生成**し、Windows ジョブは未署名 `.msi` のみ出力（`latest.json` の windows セクションは省略 or 空）
 5. **秘密鍵は 1Password 等で別途保管**（紛失すると永久に updater 互換性が切れる）
 
 エンドポイントは GitHub Releases の `latest.json` を参照する設定で既に入っている (`tauri.conf.json` 参照)。
