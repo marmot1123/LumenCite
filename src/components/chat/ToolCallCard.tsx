@@ -5,9 +5,9 @@ import { useTranslation } from "react-i18next";
 import { ChatIcon, type ChatIconName } from "./ChatIcon";
 import type { UiToolCall } from "../../types";
 
-type ToolKind = "read" | "write" | "approve" | "delete" | "mcp";
+export type ToolKind = "read" | "write" | "approve" | "delete" | "mcp";
 
-const KIND_META: Record<ToolKind, { fg: string; bg: string; bd: string; label: string; glyph: ChatIconName }> = {
+export const KIND_META: Record<ToolKind, { fg: string; bg: string; bd: string; label: string; glyph: ChatIconName }> = {
   read: { fg: "var(--tc-read-fg)", bg: "var(--tc-read-bg)", bd: "var(--tc-read-bd)", label: "read", glyph: "search" },
   write: { fg: "var(--tc-write-fg)", bg: "var(--tc-write-bg)", bd: "var(--tc-write-bd)", label: "write", glyph: "pencil" },
   approve: { fg: "var(--tc-approve-fg)", bg: "var(--tc-approve-bg)", bd: "var(--tc-approve-bd)", label: "approval required", glyph: "warn" },
@@ -16,7 +16,7 @@ const KIND_META: Record<ToolKind, { fg: string; bg: string; bd: string; label: s
 };
 
 /** tool_name から表示カテゴリを導出（承認ポリシーと同じ分類）。 */
-function toolKind(name: string): ToolKind {
+export function toolKind(name: string): ToolKind {
   if (name.startsWith("mcp_")) return "mcp";
   if (name.startsWith("delete_")) return "delete";
   if (name === "create_entry" || name === "update_entry") return "approve";

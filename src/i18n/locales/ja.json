@@ -530,6 +530,8 @@
     "toolRejected": "拒否済み",
     "thinking": "思考中…",
     "contextTitle": "コンテキスト",
+    "contextScope": "対象の文献",
+    "contextTools": "このセッションで使ったツール",
     "approvalPolicyTitle": "承認ポリシー",
     "approvalPolicyBody": "読み取り系は自動、create / update / MCP write は都度承認、delete は常時承認です。",
     "toolRunning": "実行中…",

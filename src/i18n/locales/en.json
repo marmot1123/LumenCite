@@ -530,6 +530,8 @@
     "toolRejected": "Rejected",
     "thinking": "Thinking…",
     "contextTitle": "Context",
+    "contextScope": "In scope",
+    "contextTools": "Tools used this session",
     "approvalPolicyTitle": "Approval policy",
     "approvalPolicyBody": "Reads run automatically; create / update / MCP writes need approval each time; delete always asks.",
     "toolRunning": "Running…",
