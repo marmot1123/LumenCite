@@ -220,7 +220,11 @@ pub trait ChatProvider: Send + Sync {
         system: &str,
         messages: &[ChatMessage],
         tools: &[ToolSpec],
-        on_delta: &mut (dyn FnMut(&str) + Send),
+        // HRTB (`for<'a>`) is required: under async_trait an elided `FnMut(&str)`
+        // pins the &str to the method lifetime and cannot be called with strings
+        // produced inside the async body (E0597). The explicit higher-ranked bound
+        // lets implementations forward streamed deltas.
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> Result<ChatTurnResult, LlmError>;
 }
 
