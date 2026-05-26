@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../../chat/store";
 import { ChatIcon } from "./ChatIcon";
 import { EntryPicker, ScopeModeButton } from "./EntryPicker";
+import { MODEL_PRESETS, defaultModelFor } from "../../lib/models";
 import type { EntrySummary, LlmProvider, LlmSettings, ScopeMode } from "../../types";
 
 interface NewSessionDialogProps {
@@ -31,6 +32,12 @@ export function NewSessionDialog({ onClose }: NewSessionDialogProps) {
       }
     })();
   }, []);
+
+  // プロバイダ切替時はモデルもそのプロバイダの既定へ揃える（provider と model の不整合を防ぐ）。
+  const selectProvider = (next: LlmProvider) => {
+    setProvider(next);
+    setModel(defaultModelFor(next));
+  };
 
   const toggle = (e: EntrySummary) => {
     setPicked((prev) => {
@@ -64,14 +71,20 @@ export function NewSessionDialog({ onClose }: NewSessionDialogProps) {
         <div style={{ padding: "16px 18px 8px" }}>
           <FieldLabel>{t("chat.providerModel")}</FieldLabel>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <Pill dotColor="oklch(0.62 0.14 35)" label="Anthropic" active={provider === "anthropic"} onClick={() => setProvider("anthropic")} />
-            <Pill dotColor="oklch(0.55 0.13 165)" label="OpenAI" active={provider === "openai"} onClick={() => setProvider("openai")} />
-            <input
+            <Pill dotColor="oklch(0.62 0.14 35)" label="Anthropic" active={provider === "anthropic"} onClick={() => selectProvider("anthropic")} />
+            <Pill dotColor="oklch(0.55 0.13 165)" label="OpenAI" active={provider === "openai"} onClick={() => selectProvider("openai")} />
+            <select
               value={model}
               onChange={(e) => setModel(e.target.value)}
-              placeholder={t("chat.model")}
-              style={{ flex: 1, minWidth: 0, padding: "5px 10px", borderRadius: 5, border: "1px solid var(--border-strong)", background: "var(--surface)", fontSize: 12, fontFamily: "var(--mono)", color: "var(--text)" }}
-            />
+              style={{ flex: 1, minWidth: 0, padding: "5px 10px", borderRadius: 5, border: "1px solid var(--border-strong)", background: "var(--surface)", fontSize: 12, fontFamily: "var(--mono)", color: "var(--text)", cursor: "pointer" }}
+            >
+              {!MODEL_PRESETS[provider].some((m) => m.id === model) && model && (
+                <option value={model}>{model}</option>
+              )}
+              {MODEL_PRESETS[provider].map((m) => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
           </div>
         </div>
 
