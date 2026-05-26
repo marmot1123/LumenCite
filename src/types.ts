@@ -160,6 +160,86 @@ export interface EntryInput {
   tag_ids?: number[];
 }
 
+// ── Chat (v0.2.0) ────────────────────────────────────────────────────────────
+
+export type ScopeMode = "all" | "entries";
+export type ChatRole = "user" | "assistant" | "tool";
+
+/** backend の chat_sessions 行（entry_count を投影）。 */
+export interface ChatSession {
+  id: number;
+  title: string;
+  provider: string;
+  model: string;
+  system_prompt: string | null;
+  scope_mode: ScopeMode;
+  entry_count: number;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+}
+
+/** assistant のツール呼び出し 1 件（LLM 由来）。 */
+export interface ToolCallSpec {
+  call_id: string;
+  tool_name: string;
+  /** JSON 引数 */
+  arguments: unknown;
+}
+
+/** backend が返す chat_messages の生行。 */
+export interface ChatMessageRow {
+  id: number;
+  session_id: number;
+  role: ChatRole;
+  content: string;
+  /** assistant のツール呼び出し列の JSON 文字列 */
+  tool_calls: string | null;
+  tool_call_id: string | null;
+  created_at: string;
+  position: number;
+}
+
+export interface SessionWithMessages {
+  session: ChatSession;
+  messages: ChatMessageRow[];
+  entry_ids: number[];
+}
+
+/** chat_send_message の Channel<ChatStreamEvent> で届くイベント。
+ *  backend の serde(tag = "kind", rename_all = "snake_case") と一致させる。 */
+export type ChatStreamEvent =
+  | { kind: "session_started"; session_id: number }
+  | { kind: "delta"; text: string }
+  | { kind: "tool_call_proposed"; call_id: string; tool_name: string; args_preview: string; needs_approval: boolean }
+  | { kind: "tool_call_executed"; call_id: string; result_summary: string }
+  | { kind: "message_persisted"; message_id: number; role: ChatRole }
+  | { kind: "done" }
+  | { kind: "error"; message: string };
+
+// ── Chat UI view models ──
+export type ToolCallState = "needs_approval" | "running" | "done" | "rejected";
+
+export interface UiToolCall {
+  call_id: string;
+  tool_name: string;
+  /** 引数のプレビュー文字列（stream は args_preview、履歴復元時は arguments の JSON）。 */
+  args_preview: string;
+  needs_approval: boolean;
+  state: ToolCallState;
+  result_summary?: string;
+}
+
+export interface UiChatMessage {
+  /** 永続化前は undefined */
+  id?: number;
+  role: ChatRole;
+  content: string;
+  tool_calls: UiToolCall[];
+  /** delta を受信中の assistant メッセージか */
+  streaming?: boolean;
+}
+
 /** 型固有フィールドのメタデータ。i18n キーで label / placeholder を引く。 */
 export interface ExtraFieldDef {
   key: string;

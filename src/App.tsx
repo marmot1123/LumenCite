@@ -21,6 +21,7 @@ import { SettingsModal } from "./components/SettingsModal";
 import { DetailView } from "./components/detail/DetailView";
 import { SummarySheet } from "./components/detail/SummarySheet";
 import { CommandPalette } from "./components/CommandPalette";
+import { ChatScreen } from "./components/chat/ChatScreen";
 
 import type { EntrySummary, EntryDetail, EntryInput, Collection, Tag, ViewMode, SearchScope, FulltextHit, SidebarCounts, ImportResult } from "./types";
 
@@ -129,7 +130,7 @@ export default function App() {
   const [showEdit, setShowEdit] = useState(false);
   const [showBibtexSync, setShowBibtexSync] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [screen, setScreen] = useState<"library" | "detail">("library");
+  const [screen, setScreen] = useState<"library" | "detail" | "chat">("library");
   const [showSummary, setShowSummary] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<"appearance" | "llm" | "bibtex" | "updates" | "data" | "about" | undefined>(undefined);
@@ -382,7 +383,7 @@ export default function App() {
   // - Delete/Backspace: 選択をゴミ箱へ（通常ビュー）
   // - Cmd/Ctrl+Backspace: 選択を永久削除（ゴミ箱ビューのみ）
   useEffect(() => {
-    const isModalOpen = showAdd || showEdit || showBibtexSync || showSettings || showPalette || screen === "detail";
+    const isModalOpen = showAdd || showEdit || showBibtexSync || showSettings || showPalette || screen === "detail" || screen === "chat";
     const isEditableTarget = (t: EventTarget | null) => {
       const el = t as HTMLElement | null;
       if (!el) return false;
@@ -394,6 +395,14 @@ export default function App() {
       // Esc: 選択解除（モーダルが開いているときは触らない）
       if (e.key === "Escape") {
         if (!isModalOpen && selectedIds.size > 0) clearSelection();
+        return;
+      }
+
+      // Cmd/Ctrl+J: チャット画面の表示/非表示（暫定の入口。#18 でコマンドパレット等から正式化）
+      if ((e.metaKey || e.ctrlKey) && (e.key === "j" || e.key === "J")) {
+        if (showAdd || showEdit || showBibtexSync || showSettings) return;
+        e.preventDefault();
+        setScreen(s => (s === "chat" ? "library" : "chat"));
         return;
       }
 
@@ -710,6 +719,10 @@ export default function App() {
   };
 
   const label = viewLabel(selectedView, collections, t);
+
+  if (screen === "chat") {
+    return <ChatScreen onBack={() => setScreen("library")} />;
+  }
 
   if (screen === "detail" && detail) {
     return (
