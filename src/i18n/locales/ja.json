@@ -460,6 +460,7 @@
     },
     "action": {
       "newEntry": "新規エントリ",
+      "openChat": "チャットを開く",
       "import": "BibTeX をインポート",
       "bibtexSync": "BibTeX 同期設定を開く",
       "bibtexSyncNow": "BibTeX を今すぐ同期",

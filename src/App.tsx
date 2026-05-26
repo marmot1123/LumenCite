@@ -1057,6 +1057,7 @@ export default function App() {
         onSelectEntry={selectSingle}
         onOpenDetail={(id) => { selectSingle(id); setScreen("detail"); }}
         onNewEntry={() => setShowAdd(true)}
+        onOpenChat={() => setScreen("chat")}
         onOpenSettings={() => setShowSettings(true)}
         onOpenBibtexSync={() => setShowBibtexSync(true)}
         onSyncBibtexNow={() => { void invoke("sync_bibtex_now"); }}

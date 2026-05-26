@@ -460,6 +460,7 @@
     },
     "action": {
       "newEntry": "New entry",
+      "openChat": "Open chat",
       "import": "Import BibTeX",
       "bibtexSync": "Open BibTeX sync settings",
       "bibtexSyncNow": "Sync BibTeX now",
