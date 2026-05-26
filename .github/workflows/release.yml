@@ -92,6 +92,10 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Tauri updater 署名鍵 (ed25519)。全プラットフォームで成果物に署名するが、
+          # latest.json は macOS ジョブのみが生成する（下記 includeUpdaterJson 参照）。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "LumenCite ${{ github.ref_name }}"
@@ -106,10 +110,11 @@ jobs:
 
             ## Notes
 
-            - The auto-updater is **disabled** in v0.1.0. Future releases must be downloaded manually from this page.
+            - The auto-updater is **enabled on macOS** (signed updates). **Windows and Linux** still update by manual download from this page; Windows signing + updater are planned for a later release.
           releaseDraft: true
           prerelease: false
-          includeUpdaterJson: false
+          # latest.json は macOS ジョブのみ生成（macOS のみ auto-updater 有効）。
+          includeUpdaterJson: ${{ startsWith(matrix.platform, 'macos') }}
           args: ${{ matrix.args }}
 
       - name: Cleanup macOS keychain
