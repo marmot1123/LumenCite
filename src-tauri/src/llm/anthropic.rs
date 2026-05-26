@@ -82,7 +82,7 @@ fn build_messages_body(
     messages: &[ChatMessage],
     tools: &[ToolSpec],
 ) -> Value {
-    let out_messages: Vec<Value> = messages.iter().map(convert_message).collect();
+    let out_messages = build_messages(messages);
 
     let mut body = json!({
         "model": model,
@@ -112,7 +112,34 @@ fn build_messages_body(
     body
 }
 
-/// 1 つの `ChatMessage` を Anthropic の message オブジェクトへ変換する。
+/// `ChatMessage` 列を Anthropic の messages 配列へ変換する。
+/// Anthropic は 1 つの assistant ターンの `tool_use` 群に対する `tool_result` を、直後の
+/// **1 つの** user メッセージにまとめて要求するため、連続する Tool メッセージを 1 件に統合する。
+fn build_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].role == Role::Tool {
+            let mut blocks = Vec::new();
+            while i < messages.len() && messages[i].role == Role::Tool {
+                blocks.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": messages[i].tool_call_id.clone().unwrap_or_default(),
+                    "content": concat_text(&messages[i].content),
+                }));
+                i += 1;
+            }
+            out.push(json!({ "role": "user", "content": blocks }));
+        } else {
+            out.push(convert_message(&messages[i]));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 1 つの `ChatMessage`（User / Assistant）を Anthropic の message オブジェクトへ変換する。
+/// Tool は [`build_messages`] がまとめて処理するためここでは通常通らない。
 fn convert_message(msg: &ChatMessage) -> Value {
     match msg.role {
         Role::Tool => {
@@ -511,6 +538,37 @@ mod tests {
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], json!("text"));
+    }
+
+    #[test]
+    fn body_coalesces_consecutive_tool_results_into_one_user_message() {
+        // 1 ターンで 2 ツール → assistant(tool_use×2) の直後は tool_result×2 を持つ
+        // 単一 user メッセージでなければ Anthropic に拒否される。
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text("")],
+            tool_calls: Some(vec![
+                ToolCallSpec { call_id: "a".into(), tool_name: "x".into(), arguments: json!({}) },
+                ToolCallSpec { call_id: "b".into(), tool_name: "y".into(), arguments: json!({}) },
+            ]),
+            tool_call_id: None,
+        };
+        let msgs = vec![
+            ChatMessage::user_text("hi"),
+            assistant,
+            ChatMessage::tool_result("a", "res-a"),
+            ChatMessage::tool_result("b", "res-b"),
+        ];
+        let body = build_messages_body("claude", "", &msgs, &[]);
+        let out = body["messages"].as_array().unwrap();
+        // user, assistant, (merged tool user) = 3 件
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2]["role"], json!("user"));
+        let results = out[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["type"], json!("tool_result"));
+        assert_eq!(results[0]["tool_use_id"], json!("a"));
+        assert_eq!(results[1]["tool_use_id"], json!("b"));
     }
 
     #[test]
