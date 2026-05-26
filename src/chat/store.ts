@@ -41,6 +41,7 @@ interface ChatStore extends ChatMessagesState {
   cancelStream: () => Promise<void>;
   archiveSession: (id: number) => Promise<void>;
   renameSession: (id: number, title: string) => Promise<void>;
+  setScope: (scopeMode: ScopeMode, entryIds: number[]) => Promise<void>;
   /** 最初のターン後に自動タイトル生成。失敗は握り潰す。 */
   maybeGenerateTitle: (id: number) => Promise<void>;
   reset: () => void;
@@ -162,6 +163,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   renameSession: async (id, title) => {
     const updated = await invoke<ChatSession>("update_chat_session_title", { id, title });
     set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? updated : x)) }));
+  },
+
+  setScope: async (scopeMode, entryIds) => {
+    const sid = get().activeSessionId;
+    if (sid == null) return;
+    const updated = await invoke<ChatSession>("set_chat_session_scope", {
+      id: sid,
+      scopeMode,
+      entryIds,
+    });
+    set((s) => ({
+      sessions: s.sessions.map((x) => (x.id === sid ? updated : x)),
+      entryIds,
+    }));
   },
 
   maybeGenerateTitle: async (id) => {

@@ -1164,6 +1164,18 @@ async fn archive_chat_session(state: State<'_, AppState>, id: i64) -> Result<(),
 }
 
 #[tauri::command]
+async fn set_chat_session_scope(
+    state: State<'_, AppState>,
+    id: i64,
+    scope_mode: String,
+    entry_ids: Vec<i64>,
+) -> Result<db::chat::ChatSession, String> {
+    db::chat::set_scope(&state.db, id, &scope_mode, &entry_ids)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn approve_tool_call(
     state: State<'_, AppState>,
     call_id: String,
@@ -1820,6 +1832,7 @@ pub fn run() {
             get_chat_session,
             update_chat_session_title,
             archive_chat_session,
+            set_chat_session_scope,
             chat_send_message,
             approve_tool_call,
             cancel_chat_stream,

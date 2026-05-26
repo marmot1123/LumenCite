@@ -240,9 +240,7 @@ pub async fn append_message(
     .await
 }
 
-/// スコープ対象の entry 集合を入れ替える（全削除 → 再登録）。ScopePicker 編集用。
-// #17 の ScopePicker スコープ更新コマンドで配線されるまで、バイナリからは未使用。
-#[allow(dead_code)]
+/// スコープ対象の entry 集合を入れ替える（全削除 → 再登録）。
 pub async fn set_session_entries(
     pool: &SqlitePool,
     session_id: i64,
@@ -281,6 +279,33 @@ pub async fn get_session_entries(
     .bind(session_id)
     .fetch_all(pool)
     .await
+}
+
+/// scope_mode と対象 entry 集合をまとめて更新する（ScopePicker の「適用」）。
+pub async fn set_scope(
+    pool: &SqlitePool,
+    id: i64,
+    scope_mode: &str,
+    entry_ids: &[i64],
+) -> Result<ChatSession, sqlx::Error> {
+    if !valid_scope_mode(scope_mode) {
+        return Err(sqlx::Error::Protocol(format!(
+            "invalid scope_mode: {scope_mode}"
+        )));
+    }
+    let rows = sqlx::query(
+        "UPDATE chat_sessions SET scope_mode = ?, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(scope_mode)
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if rows == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    set_session_entries(pool, id, entry_ids).await?;
+    get_session(pool, id).await
 }
 
 #[cfg(test)]
@@ -450,6 +475,24 @@ mod tests {
         let ids = get_session_entries(&pool, s.id).await.unwrap();
         assert_eq!(ids, vec![e2, e3]);
         assert_eq!(get_session(&pool, s.id).await.unwrap().entry_count, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_scope_updates_mode_and_entries(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "A").await;
+        let e2 = make_entry(&pool, "B").await;
+        let s = create_session(&pool, &session("all", vec![])).await.unwrap();
+
+        let updated = set_scope(&pool, s.id, "entries", &[e1, e2]).await.unwrap();
+        assert_eq!(updated.scope_mode, "entries");
+        assert_eq!(updated.entry_count, 2);
+
+        // "all" に戻すと entry をクリアする運用
+        let back = set_scope(&pool, s.id, "all", &[]).await.unwrap();
+        assert_eq!(back.scope_mode, "all");
+        assert_eq!(back.entry_count, 0);
+
+        assert!(set_scope(&pool, s.id, "bogus", &[]).await.is_err());
     }
 
     #[sqlx::test(migrations = "./migrations")]

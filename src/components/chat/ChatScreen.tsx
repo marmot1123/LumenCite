@@ -1,66 +1,57 @@
-// ChatScreen — 3 ペインレイアウト（左 SessionList / 中央 会話 / 右 ContextPanel）。
-// 会話ペインの MessageList / Composer / SessionHeader は #16/#17 で作り込み済みコンポーネントに、
-// New chat は #17 の NewSessionDialog に置き換える。
+// ChatScreen — 3 ペインレイアウト（左 SessionList / 中央 会話 / 右 ContextPanel）+ オーバーレイ。
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../../chat/store";
 import { SessionList } from "./SessionList";
 import { SessionHeader } from "./SessionHeader";
 import { MessageList } from "./MessageList";
 import { Composer } from "./Composer";
 import { ContextPanel } from "./ContextPanel";
+import { ScopePicker } from "./ScopePicker";
+import { NewSessionDialog } from "./NewSessionDialog";
 import { ChatIcon } from "./ChatIcon";
-import type { LlmSettings } from "../../types";
 
 interface ChatScreenProps {
   onBack: () => void;
 }
 
 export function ChatScreen({ onBack }: ChatScreenProps) {
-  const { t } = useTranslation();
   const sessions = useChatStore((s) => s.sessions);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const loadSessions = useChatStore((s) => s.loadSessions);
-  const createSession = useChatStore((s) => s.createSession);
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
+  const [scopeOpen, setScopeOpen] = useState(false);
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
 
   useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
 
-  // #17 で NewSessionDialog に置き換える暫定の即時作成。
-  const handleNewChat = async () => {
-    const settings = await invoke<LlmSettings>("get_llm_settings");
-    await createSession({
-      title: t("chat.newChat"),
-      provider: settings.provider,
-      model: settings.model,
-      scopeMode: "all",
-      entryIds: [],
-    });
-  };
-
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
 
   return (
     <div style={{ width: "100%", height: "100%", background: "var(--bg)", color: "var(--text)", display: "flex", overflow: "hidden" }}>
-      <SessionList onNew={handleNewChat} onBack={onBack} />
+      <SessionList onNew={() => setNewSessionOpen(true)} onBack={onBack} />
 
       <main style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, position: "relative" }}>
         {activeSession ? (
           <>
             <SessionHeader
               session={activeSession}
+              scopeOpen={scopeOpen}
+              onScopeOpen={() => setScopeOpen((o) => !o)}
               rightPanelOpen={rightPanelOpen}
               onToggleRightPanel={() => setRightPanelOpen((o) => !o)}
             />
             <MessageList />
             <Composer />
+            {scopeOpen && <ScopePicker session={activeSession} onClose={() => setScopeOpen(false)} />}
           </>
         ) : (
-          <EmptyConversation onNew={handleNewChat} />
+          <EmptyConversation onNew={() => setNewSessionOpen(true)} />
         )}
+
+        {newSessionOpen && <NewSessionDialog onClose={() => setNewSessionOpen(false)} />}
       </main>
 
       {activeSession && rightPanelOpen && <ContextPanel />}
