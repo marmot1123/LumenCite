@@ -25,3 +25,6 @@ dist-ssr
 
 # Claude Code agent worktrees (transient)
 .claude/worktrees/
+
+# Bundled pdfium dynamic library (downloaded for OCR; not committed)
+src-tauri/pdfium/

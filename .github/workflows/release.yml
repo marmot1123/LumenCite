@@ -19,7 +19,8 @@ jobs:
           # macos-14 (Apple Silicon) ランナーでビルドする。
           # macos-13 (Intel) ランナーは供給不足で恒常的に queue 待ちが長いため使わない。
           - platform: macos-14
-            args: "--target universal-apple-darwin"
+            # --config で pdfium 同梱のオーバーレイをマージ（CI ビルド時のみ。dev/テストには影響しない）
+            args: "--target universal-apple-darwin --config tauri.release-macos.conf.json"
             label: macos-universal
           - platform: ubuntu-22.04
             args: ""
@@ -61,6 +62,17 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+
+      # OCR 用 pdfium (Universal) を取得して bundle.macOS.frameworks の参照先へ置く。
+      - name: Download pdfium (macOS)
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          mkdir -p src-tauri/pdfium tmp-pdfium
+          curl -fL -o tmp-pdfium/pdfium.tgz \
+            https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-univ.tgz
+          tar -xzf tmp-pdfium/pdfium.tgz -C tmp-pdfium
+          cp tmp-pdfium/lib/libpdfium.dylib src-tauri/pdfium/libpdfium.dylib
+          rm -rf tmp-pdfium
 
       # ── macOS 署名用 keychain セットアップ ──────────────────────
       - name: Import macOS signing certificate

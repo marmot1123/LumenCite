@@ -164,23 +164,32 @@ fn rasterize(path: &Path, pages: Option<&[i64]>) -> Result<Vec<(i64, String)>, T
     Ok(out)
 }
 
-/// pdfium 動的ライブラリを、実行ファイル隣 → カレント → システムの順で探してバインドする。
-/// バンドル配布時は実行ファイルと同じディレクトリに同梱する。
+/// pdfium 動的ライブラリを複数の候補から探してバインドする。
+/// 候補: 実行ファイル隣 / macOS バンドルの Contents/Frameworks / Resources /
+/// `pdfium`（dev では src-tauri/pdfium） / カレント → 最後にシステムライブラリ。
 fn bind_pdfium() -> Result<
     std::boxed::Box<dyn pdfium_render::prelude::PdfiumLibraryBindings>,
     String,
 > {
     use pdfium_render::prelude::*;
+    use std::path::PathBuf;
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let name = Pdfium::pdfium_platform_library_name_at_path(dir);
-            if let Ok(b) = Pdfium::bind_to_library(&name) {
-                return Ok(b);
-            }
+            dirs.push(dir.to_path_buf()); // Contents/MacOS, または通常のバイナリ隣
+            dirs.push(dir.join("../Frameworks")); // macOS .app バンドル同梱先
+            dirs.push(dir.join("../Resources"));
         }
     }
-    if let Ok(b) = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./")) {
-        return Ok(b);
+    dirs.push(PathBuf::from("pdfium")); // dev: src-tauri/pdfium
+    dirs.push(PathBuf::from("."));
+
+    for dir in dirs {
+        let name = Pdfium::pdfium_platform_library_name_at_path(&dir);
+        if let Ok(b) = Pdfium::bind_to_library(&name) {
+            return Ok(b);
+        }
     }
     Pdfium::bind_to_system_library().map_err(|e| format!("pdfium library not found: {e}"))
 }
