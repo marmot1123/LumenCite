@@ -525,7 +525,12 @@
     "thinking": "Thinking…",
     "contextTitle": "Context",
     "approvalPolicyTitle": "Approval policy",
-    "approvalPolicyBody": "Reads run automatically; create / update / MCP writes need approval each time; delete always asks."
+    "approvalPolicyBody": "Reads run automatically; create / update / MCP writes need approval each time; delete always asks.",
+    "toolRunning": "Running…",
+    "toolPending": "Pending approval",
+    "approvalBarText": "This tool call needs approval. The conversation pauses until you decide.",
+    "argumentsLabel": "arguments",
+    "resultLabel": "result"
   },
   "settings": {
     "title": "Settings",

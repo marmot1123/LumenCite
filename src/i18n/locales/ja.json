@@ -525,7 +525,12 @@
     "thinking": "思考中…",
     "contextTitle": "コンテキスト",
     "approvalPolicyTitle": "承認ポリシー",
-    "approvalPolicyBody": "読み取り系は自動、create / update / MCP write は都度承認、delete は常時承認です。"
+    "approvalPolicyBody": "読み取り系は自動、create / update / MCP write は都度承認、delete は常時承認です。",
+    "toolRunning": "実行中…",
+    "toolPending": "承認待ち",
+    "approvalBarText": "このツール呼び出しは承認が必要です。承認するまで会話は進みません。",
+    "argumentsLabel": "引数",
+    "resultLabel": "結果"
   },
   "settings": {
     "title": "設定",
