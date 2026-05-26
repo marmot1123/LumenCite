@@ -230,6 +230,7 @@ mod tests {
             scope_mode: "all",
             scope_entry_ids: &[],
             mcp: None,
+            app_data_dir: std::path::Path::new(""),
         }
     }
 
@@ -338,6 +339,7 @@ mod tests {
             scope_mode: "entries",
             scope_entry_ids: &scope_ids,
             mcp: None,
+            app_data_dir: std::path::Path::new(""),
         };
         let call = make_call("fulltext_search", json!({ "query": "quantum" }));
 

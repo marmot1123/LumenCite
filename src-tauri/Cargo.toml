@@ -39,4 +39,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 async-trait = "0.1"
+# OCR: スキャン PDF のページラスタライズ（pdfium 動的ライブラリを実行時にロード）
+pdfium-render = { version = "0.8", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
 

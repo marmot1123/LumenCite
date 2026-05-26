@@ -451,6 +451,7 @@ mod tests {
             scope_mode: "all",
             scope_entry_ids: &[],
             mcp: None,
+            app_data_dir: std::path::Path::new(""),
         }
     }
 

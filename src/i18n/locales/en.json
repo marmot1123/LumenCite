@@ -129,6 +129,10 @@
     "header": {
       "cite": "Cite",
       "summarize": "Summarize",
+      "ocr": "OCR",
+      "ocrRunning": "Running OCR…",
+      "ocrDone": "OCR complete: {{summary}}",
+      "ocrError": "OCR failed: {{error}}",
       "download": "Download",
       "print": "Print",
       "more": "More",

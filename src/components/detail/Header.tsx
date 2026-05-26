@@ -7,6 +7,8 @@ interface HeaderProps {
   onBack: () => void;
   onToggleStar: () => void;
   onSummarize?: () => void;
+  onOcr?: () => void;
+  ocrBusy?: boolean;
   onDownload?: () => void;
   onPrint?: () => void;
   onMore?: () => void;
@@ -34,7 +36,7 @@ function HeaderBtn({ children, onClick, title, ariaLabel }: {
   );
 }
 
-export function Header({ entry, onBack, onToggleStar, onSummarize, onDownload, onPrint, onMore }: HeaderProps) {
+export function Header({ entry, onBack, onToggleStar, onSummarize, onOcr, ocrBusy, onDownload, onPrint, onMore }: HeaderProps) {
   const { t } = useTranslation();
   return (
     <header style={{
@@ -67,6 +69,12 @@ export function Header({ entry, onBack, onToggleStar, onSummarize, onDownload, o
         <Icon name="sparkle" size={13} color="var(--text-mute)" />
         <span>{t("detail.header.summarize")}</span>
       </HeaderBtn>
+      {onOcr && (
+        <HeaderBtn onClick={ocrBusy ? undefined : onOcr} title={ocrBusy ? t("detail.header.ocrRunning") : t("detail.header.ocr")}>
+          <Icon name="search" size={13} color="var(--text-mute)" />
+          <span>{ocrBusy ? t("detail.header.ocrRunning") : t("detail.header.ocr")}</span>
+        </HeaderBtn>
+      )}
       <HeaderBtn onClick={onDownload} title={t("detail.header.download")}>
         <Icon name="download" size={13} color="var(--text-mute)" />
       </HeaderBtn>

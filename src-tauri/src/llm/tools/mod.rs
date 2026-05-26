@@ -12,10 +12,12 @@
 
 pub mod approval;
 pub mod mutate;
+pub mod ocr;
 pub mod search;
 
 use super::{ToolCallSpec, ToolSpec};
 use sqlx::SqlitePool;
+use std::path::Path;
 
 /// ツール実行時に渡されるコンテキスト。検索系はこのスコープを尊重する。
 pub struct ToolContext<'a> {
@@ -27,6 +29,8 @@ pub struct ToolContext<'a> {
     pub scope_entry_ids: &'a [i64],
     /// MCP クライアント（`mcp_*` ツールのルーティング用）。テスト等で無い場合は None。
     pub mcp: Option<&'a crate::mcp::McpManager>,
+    /// アプリデータディレクトリ（添付ファイルの相対パス解決用。OCR で使用）。
+    pub app_data_dir: &'a Path,
 }
 
 #[derive(Debug)]
@@ -61,6 +65,7 @@ impl From<sqlx::Error> for ToolError {
 pub fn all_tool_specs() -> Vec<ToolSpec> {
     let mut specs = search::specs();
     specs.extend(mutate::specs());
+    specs.extend(ocr::specs());
     specs
 }
 
@@ -80,6 +85,9 @@ pub async fn execute_tool(ctx: &ToolContext<'_>, call: &ToolCallSpec) -> Result<
         return r;
     }
     if let Some(r) = mutate::try_execute(ctx, call).await {
+        return r;
+    }
+    if let Some(r) = ocr::try_execute(ctx, call).await {
         return r;
     }
     Err(ToolError::UnknownTool(call.tool_name.clone()))

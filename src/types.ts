@@ -136,6 +136,9 @@ export interface LlmSettings {
   summary_source: SummarySource;
   /** ユーザーが上書きできるシステムプロンプト。空文字なら backend の DEFAULT_SYSTEM_PROMPT が使われる */
   summary_prompt: string;
+  /** OCR 用プロバイダ/モデル。未指定（null）なら provider/model にフォールバック */
+  ocr_provider?: LlmProvider | null;
+  ocr_model?: string | null;
 }
 
 export type SummaryStreamEvent =

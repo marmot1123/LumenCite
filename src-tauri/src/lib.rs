@@ -36,6 +36,8 @@ pub struct AppState {
     pub chat: Arc<ChatRuntime>,
     /// 外部 MCP サーバーのクライアント（Chat ツールへマージ）。
     pub mcp: Arc<mcp::McpManager>,
+    /// アプリデータディレクトリ（添付ファイルの相対パス解決用）。
+    pub app_data_dir: PathBuf,
 }
 
 /// BibTeX 同期結果を UI に通知するイベントペイロード。
@@ -739,6 +741,11 @@ pub struct LlmSettings {
     pub model: String,
     pub summary_source: String,   // "abstract" | "fulltext"
     pub summary_prompt: String,   // 空文字なら llm::DEFAULT_SYSTEM_PROMPT
+    /// OCR 用プロバイダ/モデル。空/None なら provider/model にフォールバック。
+    #[serde(default)]
+    pub ocr_provider: Option<String>,
+    #[serde(default)]
+    pub ocr_model: Option<String>,
 }
 
 #[tauri::command]
@@ -760,7 +767,13 @@ async fn get_llm_settings(state: State<'_, AppState>) -> Result<LlmSettings, Str
     let summary_prompt = db::settings::get_setting(&state.db, db::settings::LLM_SUMMARY_PROMPT_KEY)
         .await.map_err(|e| e.to_string())?
         .unwrap_or_default();
-    Ok(LlmSettings { provider, model, summary_source, summary_prompt })
+    let ocr_provider = db::settings::get_setting(&state.db, db::settings::LLM_OCR_PROVIDER_KEY)
+        .await.map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty());
+    let ocr_model = db::settings::get_setting(&state.db, db::settings::LLM_OCR_MODEL_KEY)
+        .await.map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty());
+    Ok(LlmSettings { provider, model, summary_source, summary_prompt, ocr_provider, ocr_model })
 }
 
 #[tauri::command]
@@ -772,6 +785,10 @@ async fn save_llm_settings(state: State<'_, AppState>, settings: LlmSettings) ->
     db::settings::set_setting(&state.db, db::settings::LLM_SUMMARY_SOURCE_KEY, &settings.summary_source)
         .await.map_err(|e| e.to_string())?;
     db::settings::set_setting(&state.db, db::settings::LLM_SUMMARY_PROMPT_KEY, &settings.summary_prompt)
+        .await.map_err(|e| e.to_string())?;
+    db::settings::set_setting(&state.db, db::settings::LLM_OCR_PROVIDER_KEY, settings.ocr_provider.as_deref().unwrap_or(""))
+        .await.map_err(|e| e.to_string())?;
+    db::settings::set_setting(&state.db, db::settings::LLM_OCR_MODEL_KEY, settings.ocr_model.as_deref().unwrap_or(""))
         .await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1231,6 +1248,21 @@ async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(),
     Ok(())
 }
 
+// ── OCR ──────────────────────────────────────────────────────────────────────
+
+/// 詳細ビューの「OCR を実行」ボタン用。ユーザー操作なので承認は不要（クリック＝同意）。
+/// LLM ツール `ocr_pdf` と内部実装（run_ocr）を共有する。
+#[tauri::command]
+async fn ocr_pdf(
+    state: State<'_, AppState>,
+    entry_id: i64,
+    pages: Option<Vec<i64>>,
+) -> Result<String, String> {
+    llm::tools::ocr::run_ocr(&state.db, &state.app_data_dir, entry_id, pages)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn approve_tool_call(
     state: State<'_, AppState>,
@@ -1332,6 +1364,7 @@ async fn chat_send_message(
         scope_mode: &session.scope_mode,
         scope_entry_ids: &entry_ids,
         mcp: Some(state.mcp.as_ref()),
+        app_data_dir: &state.app_data_dir,
     };
     let params = llm::chat::ChatLoopParams {
         api_key: &api_key,
@@ -1798,6 +1831,7 @@ pub fn run() {
                 sync_tx,
                 chat: Arc::new(ChatRuntime::default()),
                 mcp: mcp.clone(),
+                app_data_dir: data_dir.clone(),
             });
 
             // 設定済みの MCP サーバーをバックグラウンドで起動する。
@@ -1914,6 +1948,7 @@ pub fn run() {
             list_mcp_servers,
             add_mcp_server,
             remove_mcp_server,
+            ocr_pdf,
             run_backup_now,
             list_backups,
             open_backup_folder,

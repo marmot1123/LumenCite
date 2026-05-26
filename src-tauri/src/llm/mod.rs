@@ -3,6 +3,7 @@
 
 pub mod anthropic;
 pub mod chat;
+pub mod ocr;
 pub mod openai;
 pub mod tools;
 

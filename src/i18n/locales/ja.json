@@ -129,6 +129,10 @@
     "header": {
       "cite": "引用",
       "summarize": "要約",
+      "ocr": "OCR",
+      "ocrRunning": "OCR 実行中…",
+      "ocrDone": "OCR 完了: {{summary}}",
+      "ocrError": "OCR 失敗: {{error}}",
       "download": "ダウンロード",
       "print": "印刷",
       "more": "その他",

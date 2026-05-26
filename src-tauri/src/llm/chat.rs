@@ -318,6 +318,7 @@ mod tests {
             scope_mode: "all",
             scope_entry_ids: &[],
             mcp: None,
+            app_data_dir: std::path::Path::new(""),
         };
         let tools = tools::all_tool_specs();
         run_chat_loop(
@@ -446,6 +447,7 @@ mod tests {
             scope_mode: "all",
             scope_entry_ids: &[],
             mcp: None,
+            app_data_dir: std::path::Path::new(""),
         };
         let tools = tools::all_tool_specs();
         let p = ChatLoopParams {
