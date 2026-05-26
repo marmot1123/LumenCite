@@ -132,19 +132,22 @@ fn convert_message(msg: &ChatMessage) -> Value {
             } else {
                 "assistant"
             };
+            // Anthropic は空のテキスト content block を拒否する（"text content blocks must be
+            // non-empty"）。ツールのみ呼んだ（テキスト無し）assistant ターンでは空テキストを除外する。
             let mut blocks: Vec<Value> = msg
                 .content
                 .iter()
-                .map(|b| match b {
-                    ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-                    ContentBlock::Image { media_type, data } => json!({
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } if text.trim().is_empty() => None,
+                    ContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
+                    ContentBlock::Image { media_type, data } => Some(json!({
                         "type": "image",
                         "source": {
                             "type": "base64",
                             "media_type": media_type,
                             "data": data,
                         }
-                    }),
+                    })),
                 })
                 .collect();
             if let Some(calls) = &msg.tool_calls {
@@ -156,6 +159,10 @@ fn convert_message(msg: &ChatMessage) -> Value {
                         "input": c.arguments,
                     }));
                 }
+            }
+            // content 配列が空になるのも拒否されるため、最低 1 ブロックを保証する。
+            if blocks.is_empty() {
+                blocks.push(json!({ "type": "text", "text": "(no content)" }));
             }
             json!({ "role": role, "content": blocks })
         }
@@ -470,6 +477,40 @@ mod tests {
         assert_eq!(content[1]["name"], json!("search"));
         // input must be a JSON object, not a string
         assert_eq!(content[1]["input"], json!({ "q": "rust" }));
+    }
+
+    #[test]
+    fn body_omits_empty_text_block_for_tool_only_turn() {
+        // テキスト無しでツールだけ呼んだ assistant ターン: 空テキストブロックを出さない。
+        let assistant = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text("")],
+            tool_calls: Some(vec![ToolCallSpec {
+                call_id: "toolu_1".into(),
+                tool_name: "search".into(),
+                arguments: json!({}),
+            }]),
+            tool_call_id: None,
+        };
+        let body = build_messages_body("claude", "", &[assistant], &[]);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "empty text block should be dropped");
+        assert_eq!(content[0]["type"], json!("tool_use"));
+    }
+
+    #[test]
+    fn body_guards_against_empty_content_array() {
+        // 空テキストのみ・ツール無しでも content 配列を空にしない。
+        let msg = ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::text("   ")],
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let body = build_messages_body("claude", "", &[msg], &[]);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], json!("text"));
     }
 
     #[test]
