@@ -7,6 +7,7 @@ interface HeaderProps {
   onBack: () => void;
   onToggleStar: () => void;
   onSummarize?: () => void;
+  onChat?: () => void;
   onOcr?: () => void;
   ocrBusy?: boolean;
   onDownload?: () => void;
@@ -36,7 +37,7 @@ function HeaderBtn({ children, onClick, title, ariaLabel }: {
   );
 }
 
-export function Header({ entry, onBack, onToggleStar, onSummarize, onOcr, ocrBusy, onDownload, onPrint, onMore }: HeaderProps) {
+export function Header({ entry, onBack, onToggleStar, onSummarize, onChat, onOcr, ocrBusy, onDownload, onPrint, onMore }: HeaderProps) {
   const { t } = useTranslation();
   return (
     <header style={{
@@ -65,6 +66,12 @@ export function Header({ entry, onBack, onToggleStar, onSummarize, onOcr, ocrBus
         <Icon name={entry.starred ? "starFill" : "star"} size={13}
               color={entry.starred ? "oklch(0.72 0.14 70)" : "var(--text-mute)"} />
       </HeaderBtn>
+      {onChat && (
+        <HeaderBtn onClick={onChat} title={t("detail.header.chat")}>
+          <Icon name="chat" size={13} color="var(--text-mute)" />
+          <span>{t("detail.header.chat")}</span>
+        </HeaderBtn>
+      )}
       <HeaderBtn onClick={onSummarize} title={t("detail.header.summarize")}>
         <Icon name="sparkle" size={13} color="var(--text-mute)" />
         <span>{t("detail.header.summarize")}</span>

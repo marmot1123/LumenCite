@@ -129,6 +129,7 @@
     "header": {
       "cite": "Cite",
       "summarize": "Summarize",
+      "chat": "Chat",
       "ocr": "OCR",
       "ocrRunning": "Running OCR…",
       "ocrDone": "OCR complete: {{summary}}",
@@ -289,6 +290,7 @@
     "confirmPurge": "Delete permanently",
     "trashCount": "Move {{count}} to trash",
     "exportBibtex": "Export BibTeX",
+    "chatWith": "Chat about {{count}} selected",
     "addToCollection": "Add to collection",
     "emptyCollections": "No collections",
     "selectCollection": "— Select —",

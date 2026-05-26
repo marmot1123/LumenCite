@@ -22,6 +22,7 @@ interface DetailViewProps {
   onSelectEntry: (id: number) => void;
   onOpenInWindow?: (attachmentId: number) => void;
   onSummarize: () => void;
+  onChat: () => void;
 }
 
 function readNum(key: string, fallback: number): number {
@@ -56,6 +57,7 @@ function readMetaTab(): MetaTabId {
 export function DetailView({
   entry, onBack, onToggleStar, onUpdateNotes, onSelectEntry, onOpenInWindow,
   onSummarize,
+  onChat,
 }: DetailViewProps) {
   const { t } = useTranslation();
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
@@ -281,6 +283,7 @@ export function DetailView({
         onBack={onBack}
         onToggleStar={onToggleStar}
         onSummarize={onSummarize}
+        onChat={onChat}
         onOcr={primaryAttachment ? handleOcr : undefined}
         ocrBusy={ocrBusy}
         onDownload={primaryAttachment ? () => onOpenInWindow?.(primaryAttachment.id) : undefined}

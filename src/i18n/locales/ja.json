@@ -129,6 +129,7 @@
     "header": {
       "cite": "引用",
       "summarize": "要約",
+      "chat": "Chat",
       "ocr": "OCR",
       "ocrRunning": "OCR 実行中…",
       "ocrDone": "OCR 完了: {{summary}}",
@@ -289,6 +290,7 @@
     "confirmPurge": "永久削除する",
     "trashCount": "{{count}} 件をゴミ箱へ",
     "exportBibtex": "BibTeX を書き出し",
+    "chatWith": "選択した {{count}} 件で Chat",
     "addToCollection": "コレクションに追加",
     "emptyCollections": "コレクションがありません",
     "selectCollection": "— 選択 —",

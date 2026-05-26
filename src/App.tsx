@@ -22,8 +22,9 @@ import { DetailView } from "./components/detail/DetailView";
 import { SummarySheet } from "./components/detail/SummarySheet";
 import { CommandPalette } from "./components/CommandPalette";
 import { ChatScreen } from "./components/chat/ChatScreen";
+import { useChatStore } from "./chat/store";
 
-import type { EntrySummary, EntryDetail, EntryInput, Collection, Tag, ViewMode, SearchScope, FulltextHit, SidebarCounts, ImportResult } from "./types";
+import type { EntrySummary, EntryDetail, EntryInput, Collection, Tag, ViewMode, SearchScope, FulltextHit, SidebarCounts, ImportResult, LlmSettings } from "./types";
 
 const EMPTY_COUNTS: SidebarCounts = {
   total: 0, starred: 0, unfiled: 0, trash: 0, collections: {}, tags: {},
@@ -720,6 +721,24 @@ export default function App() {
 
   const label = viewLabel(selectedView, collections, t);
 
+  // 指定文献をスコープにした新規 Chat セッションを作って Chat 画面へ遷移する。
+  // ids が空ならライブラリ全体スコープ。
+  const startChatWithEntries = async (ids: number[]) => {
+    try {
+      const settings = await invoke<LlmSettings>("get_llm_settings");
+      await useChatStore.getState().createSession({
+        title: t("chat.newChat"),
+        provider: settings.provider,
+        model: settings.model,
+        scopeMode: ids.length > 0 ? "entries" : "all",
+        entryIds: ids,
+      });
+      setScreen("chat");
+    } catch (e) {
+      console.error("failed to start chat", e);
+    }
+  };
+
   // 画面に依存しない共通オーバーレイ（設定モーダル・コマンドパレット）。
   // library / detail / chat いずれの画面でも ⌘, やコマンドパレットが効くよう全分岐で描画する。
   const globalOverlays = (
@@ -770,6 +789,7 @@ export default function App() {
           onSelectEntry={(id) => { selectSingle(id); }}
           onOpenInWindow={(attachmentId) => { void invoke("open_pdf_viewer", { id: attachmentId }); }}
           onSummarize={() => setShowSummary(true)}
+          onChat={() => { void startChatWithEntries([detail.id]); }}
         />
         {globalOverlays}
         {showSummary && (
@@ -939,6 +959,7 @@ export default function App() {
           onAddToCollection={handleBulkAddToCollection}
           onAddTag={handleBulkAddTag}
           onExportBibtex={handleBulkExport}
+          onChatWith={() => { void startChatWithEntries([...selectedIds]); }}
         />
       ) : (
         <DetailPanel

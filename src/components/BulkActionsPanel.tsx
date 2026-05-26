@@ -15,6 +15,7 @@ interface BulkActionsPanelProps {
   onAddToCollection: (collectionId: number) => void;
   onAddTag: (name: string) => void;
   onExportBibtex: () => void;
+  onChatWith: () => void;
 }
 
 function flattenCollections(cols: Collection[], depth = 0): { col: Collection; depth: number }[] {
@@ -37,7 +38,7 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 export function BulkActionsPanel({
   width, count, inTrash, allCollections,
   onClearSelection, onTrash, onRestore, onPurge,
-  onAddToCollection, onAddTag, onExportBibtex,
+  onAddToCollection, onAddTag, onExportBibtex, onChatWith,
 }: BulkActionsPanelProps) {
   const { t } = useTranslation();
   const [confirmPurge, setConfirmPurge] = useState(false);
@@ -150,6 +151,18 @@ export function BulkActionsPanel({
           <>
             {/* primary actions */}
             <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 18 }}>
+              <button
+                onClick={onChatWith}
+                style={{
+                  padding: "8px 12px", borderRadius: 6, border: "none",
+                  background: "var(--accent-strong)", color: "#fff",
+                  fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                  display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
+                }}
+              >
+                <Icon name="sparkle" size={12} color="#fff" />
+                {t("bulk.chatWith", { count })}
+              </button>
               <button
                 onClick={onExportBibtex}
                 style={{
