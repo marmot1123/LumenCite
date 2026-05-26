@@ -4,7 +4,32 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use super::{build_user_prompt, LlmError};
+use super::{
+    build_user_prompt, ChatMessage, ChatProvider, ChatTurnResult, LlmError, ToolSpec,
+};
+
+/// tool use 対応の chat プロバイダ（#7 で実装）。
+pub struct OpenAiProvider;
+
+#[async_trait::async_trait]
+impl ChatProvider for OpenAiProvider {
+    async fn stream_chat(
+        &self,
+        _api_key: &str,
+        _model: &str,
+        _system: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolSpec],
+        _on_delta: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<ChatTurnResult, LlmError> {
+        // TODO(#7): /v1/chat/completions に stream=true + tools を投げ、
+        // text delta は on_delta へ、tool_calls の delta は組み立てて ChatTurnResult に返す。
+        // ContentBlock::Image は data URL (image_url) として messages に載せる。
+        Err(LlmError::Stream(
+            "OpenAiProvider::stream_chat not implemented".into(),
+        ))
+    }
+}
 
 const ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 

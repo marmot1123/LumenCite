@@ -4,7 +4,32 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use super::{build_user_prompt, LlmError};
+use super::{
+    build_user_prompt, ChatMessage, ChatProvider, ChatTurnResult, LlmError, ToolSpec,
+};
+
+/// tool use 対応の chat プロバイダ（#7 で実装）。
+pub struct AnthropicProvider;
+
+#[async_trait::async_trait]
+impl ChatProvider for AnthropicProvider {
+    async fn stream_chat(
+        &self,
+        _api_key: &str,
+        _model: &str,
+        _system: &str,
+        _messages: &[ChatMessage],
+        _tools: &[ToolSpec],
+        _on_delta: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<ChatTurnResult, LlmError> {
+        // TODO(#7): /v1/messages に stream=true + tools を投げ、content_block_delta(text) は
+        // on_delta へ、tool_use ブロック（input_json_delta を連結）は ChatTurnResult.tool_calls へ。
+        // ContentBlock::Image は { type: image, source: { type: base64, media_type, data } } として載せる。
+        Err(LlmError::Stream(
+            "AnthropicProvider::stream_chat not implemented".into(),
+        ))
+    }
+}
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
