@@ -560,7 +560,8 @@
     "scopeButton": "scope",
     "charsCount": "{{count}} chars",
     "archivedToast": "Archived “{{title}}”",
-    "undo": "Undo"
+    "undo": "Undo",
+    "changeModel": "Change provider / model"
   },
   "settings": {
     "title": "Settings",

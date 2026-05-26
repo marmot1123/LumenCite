@@ -1205,6 +1205,18 @@ async fn set_chat_session_scope(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn set_chat_session_model(
+    state: State<'_, AppState>,
+    id: i64,
+    provider: String,
+    model: String,
+) -> Result<db::chat::ChatSession, String> {
+    db::chat::set_model(&state.db, id, &provider, &model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── MCP クライアント ─────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1952,6 +1964,7 @@ pub fn run() {
             archive_chat_session,
             unarchive_chat_session,
             set_chat_session_scope,
+            set_chat_session_model,
             chat_send_message,
             approve_tool_call,
             cancel_chat_stream,

@@ -321,6 +321,26 @@ pub async fn set_scope(
     get_session(pool, id).await
 }
 
+/// セッションの provider / model を変更する（ヘッダのモデルバッジから）。
+pub async fn set_model(
+    pool: &SqlitePool,
+    id: i64,
+    provider: &str,
+    model: &str,
+) -> Result<ChatSession, sqlx::Error> {
+    let rows = sqlx::query("UPDATE chat_sessions SET provider = ?, model = ? WHERE id = ?")
+        .bind(provider)
+        .bind(model)
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if rows == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    get_session(pool, id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +513,15 @@ mod tests {
         let ids = get_session_entries(&pool, s.id).await.unwrap();
         assert_eq!(ids, vec![e2, e3]);
         assert_eq!(get_session(&pool, s.id).await.unwrap().entry_count, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_model_changes_provider_and_model(pool: SqlitePool) {
+        let s = create_session(&pool, &session("all", vec![])).await.unwrap();
+        let updated = set_model(&pool, s.id, "openai", "gpt-4o").await.unwrap();
+        assert_eq!(updated.provider, "openai");
+        assert_eq!(updated.model, "gpt-4o");
+        assert!(set_model(&pool, 9999, "openai", "gpt-4o").await.is_err());
     }
 
     #[sqlx::test(migrations = "./migrations")]

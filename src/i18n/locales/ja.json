@@ -560,7 +560,8 @@
     "scopeButton": "scope",
     "charsCount": "{{count}} 文字",
     "archivedToast": "「{{title}}」をアーカイブしました",
-    "undo": "元に戻す"
+    "undo": "元に戻す",
+    "changeModel": "プロバイダ / モデルを変更"
   },
   "settings": {
     "title": "設定",
