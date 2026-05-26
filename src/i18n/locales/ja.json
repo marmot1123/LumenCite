@@ -567,10 +567,26 @@
     "nav": {
       "appearance": "外観",
       "llm": "LLM",
+      "chat": "Chat",
       "bibtex": "BibTeX 同期",
       "updates": "アップデート",
       "data": "データ",
       "about": "情報"
+    },
+    "chat": {
+      "description": "外部 MCP ツールサーバーと、確認なしで実行するチャットツールを設定します。",
+      "mcpTitle": "MCP サーバー",
+      "mcpDesc": "チャットの LLM が（承認制で）呼び出せる外部 MCP サーバー。Claude Desktop の mcpServers 設定と互換です。",
+      "mcpId": "id",
+      "mcpCommand": "コマンド",
+      "mcpArgs": "引数（スペース区切り）",
+      "mcpAdd": "サーバーを追加",
+      "mcpRemove": "削除",
+      "whitelistTitle": "ツールの自動承認",
+      "whitelistDesc": "書き換え系ツールを自動実行するか都度確認するか。読み取り系は常に自動、delete と MCP write は常に確認（ここでは変更不可）です。",
+      "auto": "自動",
+      "confirm": "都度確認",
+      "whitelistNote": "変更は以降のツール呼び出しに適用されます。"
     },
     "appearance": {
       "language": "言語",
@@ -614,7 +630,11 @@
       "systemPrompt": "システムプロンプト",
       "systemPromptDesc": "要約 LLM への指示。空欄ならデフォルト（英語の汎用要約）。「日本語で要約してください」のように言語指定もここに書けます。",
       "systemPromptPlaceholder": "例: 日本語で 3〜5 文の要約を作ってください。",
-      "systemPromptReset": "デフォルトに戻す"
+      "systemPromptReset": "デフォルトに戻す",
+      "ocrTitle": "OCR モデル",
+      "ocrDesc": "スキャン PDF の OCR に使う Vision モデル。未指定なら上のチャット用プロバイダ/モデルを使います。",
+      "ocrFollow": "チャットと同じ",
+      "ocrModelPlaceholder": "モデル ID（例: gpt-4o）"
     },
     "bibtex": {
       "title": "BibTeX 自動同期",

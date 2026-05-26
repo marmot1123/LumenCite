@@ -567,10 +567,26 @@
     "nav": {
       "appearance": "Appearance",
       "llm": "LLM",
+      "chat": "Chat",
       "bibtex": "BibTeX sync",
       "updates": "Updates",
       "data": "Data",
       "about": "About"
+    },
+    "chat": {
+      "description": "Configure external MCP tool servers and which chat tools run without asking.",
+      "mcpTitle": "MCP servers",
+      "mcpDesc": "External Model Context Protocol servers whose tools the chat assistant can call (always with your approval). Compatible with Claude Desktop's mcpServers config.",
+      "mcpId": "id",
+      "mcpCommand": "command",
+      "mcpArgs": "args (space-separated)",
+      "mcpAdd": "Add server",
+      "mcpRemove": "Remove",
+      "whitelistTitle": "Tool auto-approval",
+      "whitelistDesc": "Which write tools run automatically vs. ask each time. Reads are always automatic; delete and MCP writes always ask and can't be changed here.",
+      "auto": "Automatic",
+      "confirm": "Ask each time",
+      "whitelistNote": "Changes apply to new tool calls."
     },
     "appearance": {
       "language": "Language",
@@ -614,7 +630,11 @@
       "systemPrompt": "System prompt",
       "systemPromptDesc": "Instructions for the summarization LLM. Leave empty to use the default. Add a sentence like 'Reply in Japanese.' here to force the output language.",
       "systemPromptPlaceholder": "e.g. Summarize in Japanese in 3–5 sentences.",
-      "systemPromptReset": "Reset to default"
+      "systemPromptReset": "Reset to default",
+      "ocrTitle": "OCR model",
+      "ocrDesc": "Vision model used to OCR scanned PDFs. Defaults to the chat provider/model above.",
+      "ocrFollow": "Same as chat",
+      "ocrModelPlaceholder": "Model id (e.g. gpt-4o)"
     },
     "bibtex": {
       "title": "BibTeX auto sync",

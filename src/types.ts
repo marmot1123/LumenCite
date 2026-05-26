@@ -168,6 +168,14 @@ export interface EntryInput {
 export type ScopeMode = "all" | "entries";
 export type ChatRole = "user" | "assistant" | "tool";
 
+/** 外部 MCP サーバー設定（Claude Desktop の mcpServers 1 エントリ相当）。 */
+export interface McpServerConfig {
+  id: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
 /** backend の chat_sessions 行（entry_count を投影）。 */
 export interface ChatSession {
   id: number;
