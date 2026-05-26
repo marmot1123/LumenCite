@@ -554,7 +554,9 @@
     "addPapers": "Add papers",
     "start": "Start",
     "scopeButton": "scope",
-    "charsCount": "{{count}} chars"
+    "charsCount": "{{count}} chars",
+    "archivedToast": "Archived “{{title}}”",
+    "undo": "Undo"
   },
   "settings": {
     "title": "Settings",

@@ -190,6 +190,19 @@ pub async fn archive_session(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Err
     Ok(())
 }
 
+/// アーカイブを取り消す（`archived_at` を NULL に戻す）。一覧上の位置は元の updated_at を保つ。
+pub async fn unarchive_session(pool: &SqlitePool, id: i64) -> Result<ChatSession, sqlx::Error> {
+    let rows = sqlx::query("UPDATE chat_sessions SET archived_at = NULL WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if rows == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    get_session(pool, id).await
+}
+
 /// メッセージを末尾に追加する。`position` は当該セッション内の最大値 +1（最初は 0）。
 /// 追加に伴いセッションの `updated_at` を更新する。
 pub async fn append_message(
@@ -460,6 +473,11 @@ mod tests {
         assert!(list.is_empty());
         // 二重アーカイブはエラー
         assert!(archive_session(&pool, s.id).await.is_err());
+
+        // unarchive で一覧に戻る
+        let restored = unarchive_session(&pool, s.id).await.unwrap();
+        assert!(restored.archived_at.is_none());
+        assert_eq!(list_sessions(&pool, 50, 0).await.unwrap().len(), 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

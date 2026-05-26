@@ -554,7 +554,9 @@
     "addPapers": "文献を追加",
     "start": "開始",
     "scopeButton": "scope",
-    "charsCount": "{{count}} 文字"
+    "charsCount": "{{count}} 文字",
+    "archivedToast": "「{{title}}」をアーカイブしました",
+    "undo": "元に戻す"
   },
   "settings": {
     "title": "設定",

@@ -32,6 +32,8 @@ interface ChatStore extends ChatMessagesState {
   /** アクティブセッションのスコープ対象 entry 群 */
   entryIds: number[];
   loadingSessions: boolean;
+  /** 直近にアーカイブしたセッション（取り消しトースト表示用）。 */
+  archiveToast: { sessionId: number; title: string } | null;
 
   loadSessions: () => Promise<void>;
   openSession: (id: number) => Promise<void>;
@@ -40,6 +42,8 @@ interface ChatStore extends ChatMessagesState {
   approveToolCall: (callId: string, approved: boolean) => Promise<void>;
   cancelStream: () => Promise<void>;
   archiveSession: (id: number) => Promise<void>;
+  undoArchive: () => Promise<void>;
+  dismissArchiveToast: () => void;
   renameSession: (id: number, title: string) => Promise<void>;
   setScope: (scopeMode: ScopeMode, entryIds: number[]) => Promise<void>;
   /** 最初のターン後に自動タイトル生成。失敗は握り潰す。 */
@@ -59,6 +63,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   activeSessionId: null,
   entryIds: [],
   loadingSessions: false,
+  archiveToast: null,
 
   loadSessions: async () => {
     set({ loadingSessions: true });
@@ -148,6 +153,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   archiveSession: async (id) => {
+    const title = get().sessions.find((x) => x.id === id)?.title ?? "";
     await invoke("archive_chat_session", { id });
     set((s) => {
       const sessions = s.sessions.filter((x) => x.id !== id);
@@ -156,9 +162,25 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         sessions,
         activeSessionId: closing ? null : s.activeSessionId,
         messages: closing ? [] : s.messages,
+        archiveToast: { sessionId: id, title },
       };
     });
   },
+
+  undoArchive: async () => {
+    const toast = get().archiveToast;
+    if (!toast) return;
+    set({ archiveToast: null });
+    try {
+      await invoke("unarchive_chat_session", { id: toast.sessionId });
+      await get().loadSessions();
+      await get().openSession(toast.sessionId);
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  dismissArchiveToast: () => set({ archiveToast: null }),
 
   renameSession: async (id, title) => {
     const updated = await invoke<ChatSession>("update_chat_session_title", { id, title });

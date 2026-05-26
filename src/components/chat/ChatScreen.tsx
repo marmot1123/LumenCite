@@ -56,6 +56,43 @@ export function ChatScreen({ onBack, onOpenSettings }: ChatScreenProps) {
       </main>
 
       {activeSession && rightPanelOpen && <ContextPanel />}
+
+      <ArchiveToast />
+    </div>
+  );
+}
+
+function ArchiveToast() {
+  const { t } = useTranslation();
+  const toast = useChatStore((s) => s.archiveToast);
+  const undoArchive = useChatStore((s) => s.undoArchive);
+  const dismiss = useChatStore((s) => s.dismissArchiveToast);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(dismiss, 6000);
+    return () => clearTimeout(timer);
+  }, [toast, dismiss]);
+
+  if (!toast) return null;
+  return (
+    <div style={{ position: "absolute", left: "50%", bottom: 24, transform: "translateX(-50%)", zIndex: 60, display: "flex", alignItems: "center", gap: 14, padding: "9px 12px 9px 14px", borderRadius: 8, background: "var(--surface)", border: "1px solid var(--border-strong)", boxShadow: "0 8px 28px rgba(0,0,0,0.18)", fontSize: 12.5, color: "var(--text)", maxWidth: 460 }}>
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        {t("chat.archivedToast", { title: toast.title || t("chat.untitled") })}
+      </span>
+      <button
+        onClick={() => void undoArchive()}
+        style={{ flexShrink: 0, padding: "4px 12px", borderRadius: 6, border: "none", background: "var(--accent-strong)", color: "#fff", cursor: "pointer", fontSize: 12, fontWeight: 600 }}
+      >
+        {t("chat.undo")}
+      </button>
+      <button
+        onClick={dismiss}
+        title="Dismiss"
+        style={{ flexShrink: 0, width: 22, height: 22, padding: 0, border: "none", background: "transparent", color: "var(--text-faint)", cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+      >
+        <ChatIcon name="x" size={12} color="var(--text-faint)" />
+      </button>
     </div>
   );
 }
