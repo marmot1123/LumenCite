@@ -1834,6 +1834,58 @@ async fn find_duplicate_entry(
 
 // ── app setup ─────────────────────────────────────────────────────────────────
 
+/// DB 初期化失敗の分類。sqlx/Tauri 非依存にして、ダイアログ文言生成を単体テスト可能にする。
+#[derive(Debug, Clone, PartialEq)]
+enum DbInitFailure {
+    /// DB が現バイナリの知る最新より新しい schema を持つ（旧版で新版 DB を開いた＝ダウングレード非互換）。
+    /// 値は適用済みだが解決できなかった version。
+    NewerSchema(i64),
+    /// その他のマイグレーション失敗（チェックサム不一致・SQL エラー等）。
+    Migrate(String),
+    /// 接続 / オープン失敗（ロック・破損・権限など）。
+    Connect(String),
+}
+
+/// sqlx の `MigrateError` を `DbInitFailure` に分類する。`VersionMissing`（適用済み version が
+/// 解決対象に無い）は、新版で作られた DB を旧版で開いたダウングレードと解釈する。
+fn classify_migrate_error(e: &sqlx::migrate::MigrateError) -> DbInitFailure {
+    match e {
+        sqlx::migrate::MigrateError::VersionMissing(v) => DbInitFailure::NewerSchema(*v),
+        other => DbInitFailure::Migrate(other.to_string()),
+    }
+}
+
+/// 起動時 DB 初期化失敗をユーザーに見せる (タイトル, 本文)。日英併記でロケール非依存にする。
+fn db_init_dialog_text(failure: &DbInitFailure) -> (String, String) {
+    match failure {
+        DbInitFailure::NewerSchema(v) => (
+            "LumenCite — データベースを開けません / Cannot open database".to_string(),
+            format!(
+                "このライブラリは、より新しいバージョンの LumenCite で作成されています（schema v{v}）。\
+                 LumenCite を最新版に更新してから開いてください。データは安全です（削除されていません）。\
+                 \n\nThis library was created by a newer version of LumenCite (schema v{v}). \
+                 Please update LumenCite to the latest version, then reopen. Your data is safe."
+            ),
+        ),
+        DbInitFailure::Migrate(msg) => (
+            "LumenCite — データベースの更新に失敗 / Database update failed".to_string(),
+            format!(
+                "データベースの更新（マイグレーション）に失敗しました。再起動しても解決しない場合は、\
+                 最新版への更新やバックアップからの復元をご検討ください。\
+                 \n\nFailed to apply database migrations. If restarting does not help, \
+                 consider updating to the latest version or restoring from a backup.\n\n{msg}"
+            ),
+        ),
+        DbInitFailure::Connect(msg) => (
+            "LumenCite — データベースを開けません / Cannot open database".to_string(),
+            format!(
+                "データベースに接続できませんでした。別の LumenCite が起動していないか確認してください。\
+                 \n\nCould not open the database. Make sure another instance of LumenCite is not already running.\n\n{msg}"
+            ),
+        ),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1852,11 +1904,36 @@ pub fn run() {
                 .journal_mode(SqliteJournalMode::Wal)
                 .foreign_keys(true);
 
-            let pool = tauri::async_runtime::block_on(async {
-                let pool = SqlitePool::connect_with(options).await?;
-                sqlx::migrate!("./migrations").run(&pool).await?;
-                Ok::<_, Box<dyn std::error::Error>>(pool)
-            })?;
+            // DB 接続 + マイグレーション。失敗は `?` で setup 外に投げず、ここで握って
+            // ユーザー向けダイアログを表示してから安全終了する（旧版で新版 DB を開いた等で
+            // SIGABRT クラッシュしていた問題への対応）。
+            let pool = match tauri::async_runtime::block_on(async {
+                let pool = SqlitePool::connect_with(options)
+                    .await
+                    .map_err(|e| DbInitFailure::Connect(e.to_string()))?;
+                sqlx::migrate!("./migrations")
+                    .run(&pool)
+                    .await
+                    .map_err(|e| classify_migrate_error(&e))?;
+                Ok::<_, DbInitFailure>(pool)
+            }) {
+                Ok(pool) => pool,
+                Err(failure) => {
+                    eprintln!("DB init failed: {failure:?}");
+                    let (title, body) = db_init_dialog_text(&failure);
+                    // setup はメインスレッドで走るため、rfd のネイティブモーダルはイベントループ
+                    // 起動前でもインラインで表示できる（tauri-plugin-dialog の blocking_show は
+                    // run_on_main_thread 経由でここではデッドロックするので使わない）。
+                    let _ = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title(title)
+                        .set_description(body)
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                    // pool 未生成で先へ進めないため即終了（ダイアログ確認後）。
+                    std::process::exit(1);
+                }
+            };
 
             // BibTeX 自動同期のコーディネーター。各ミューテーションが sync_tx.send() で
             // 通知し、受信タスクが debounce して書き出す。
@@ -2003,6 +2080,33 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod db_init_tests {
+    use super::*;
+
+    #[test]
+    fn newer_schema_text_mentions_version_and_update_bilingually() {
+        let (title, body) = db_init_dialog_text(&DbInitFailure::NewerSchema(7));
+        assert!(!title.is_empty());
+        assert!(body.contains("v7"), "欠落 version を本文に含める");
+        assert!(body.contains("新しいバージョン"), "日本語の説明を含む");
+        assert!(body.contains("newer version"), "英語の説明を含む");
+        assert!(body.contains("安全") && body.contains("safe"), "データは安全である旨を日英で示す");
+    }
+
+    #[test]
+    fn migrate_text_includes_error_detail() {
+        let (_t, body) = db_init_dialog_text(&DbInitFailure::Migrate("checksum mismatch".into()));
+        assert!(body.contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn connect_text_includes_error_detail() {
+        let (_t, body) = db_init_dialog_text(&DbInitFailure::Connect("database is locked".into()));
+        assert!(body.contains("database is locked"));
+    }
 }
 
 #[cfg(test)]
