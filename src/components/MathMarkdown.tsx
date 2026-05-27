@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
+import remarkGfm from "remark-gfm";
 import rehypeKatex from "rehype-katex";
 
 interface MathMarkdownProps {
@@ -12,8 +13,8 @@ interface MathMarkdownProps {
 
 /**
  * Markdown + 数式（`$…$` 内インライン / `$$…$$` 内ディスプレイ）を描画する共通レンダラ。
- * remark-math が math ノードに変換し、rehype-katex が KaTeX 出力に変換する。
- * 編集時の textarea は使わず、表示用途のみで利用する。
+ * remark-gfm が表・打ち消し線・タスクリスト等の GitHub 拡張を、remark-math が math ノードを
+ * 変換し、rehype-katex が KaTeX 出力に変換する。編集時の textarea は使わず表示用途のみ。
  */
 export function MathMarkdown({ value, fallback, block = true }: MathMarkdownProps) {
   if (!value || !value.trim()) {
@@ -22,7 +23,7 @@ export function MathMarkdown({ value, fallback, block = true }: MathMarkdownProp
   return (
     <div className="lc-markdown" style={{ whiteSpace: block ? "normal" : "pre-wrap" }}>
       <ReactMarkdown
-        remarkPlugins={[remarkMath]}
+        remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeKatex]}
       >
         {value}

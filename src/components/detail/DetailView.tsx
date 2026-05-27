@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import * as pdfjsLib from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
@@ -21,6 +22,7 @@ interface DetailViewProps {
   onSelectEntry: (id: number) => void;
   onOpenInWindow?: (attachmentId: number) => void;
   onSummarize: () => void;
+  onChat: () => void;
 }
 
 function readNum(key: string, fallback: number): number {
@@ -55,12 +57,16 @@ function readMetaTab(): MetaTabId {
 export function DetailView({
   entry, onBack, onToggleStar, onUpdateNotes, onSelectEntry, onOpenInWindow,
   onSummarize,
+  onChat,
 }: DetailViewProps) {
+  const { t } = useTranslation();
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const [scrollTick, setScrollTick] = useState(0);
+  const [ocrBusy, setOcrBusy] = useState(false);
+  const [ocrMsg, setOcrMsg] = useState<string | null>(null);
 
   const [zoom, setZoom] = useState<number>(() => readNum("lc-detail-zoom", 100));
   const [leftOpen, setLeftOpen] = useState<boolean>(() => readBool("lc-detail-leftOpen", true));
@@ -103,6 +109,21 @@ export function DetailView({
 
   // PDF 読み込み
   const primaryAttachment = entry.attachments[0] ?? null;
+
+  // OCR（スキャン PDF を Vision で文字起こしして全文検索に取り込む）
+  const handleOcr = useCallback(async () => {
+    setOcrBusy(true);
+    setOcrMsg(t("detail.header.ocrRunning"));
+    try {
+      const summary = await invoke<string>("ocr_pdf", { entryId: entry.id });
+      setOcrMsg(t("detail.header.ocrDone", { summary }));
+    } catch (e) {
+      const msg = typeof e === "string" ? e : (e as Error)?.message ?? String(e);
+      setOcrMsg(t("detail.header.ocrError", { error: msg }));
+    } finally {
+      setOcrBusy(false);
+    }
+  }, [entry.id, t]);
   useEffect(() => {
     if (!primaryAttachment) {
       setDoc(null);
@@ -262,9 +283,20 @@ export function DetailView({
         onBack={onBack}
         onToggleStar={onToggleStar}
         onSummarize={onSummarize}
+        onChat={onChat}
+        onOcr={primaryAttachment ? handleOcr : undefined}
+        ocrBusy={ocrBusy}
         onDownload={primaryAttachment ? () => onOpenInWindow?.(primaryAttachment.id) : undefined}
         onPrint={primaryAttachment ? handlePrint : undefined}
       />
+      {ocrMsg && (
+        <div
+          onClick={() => setOcrMsg(null)}
+          style={{ flexShrink: 0, padding: "6px 14px", fontSize: 12, cursor: "pointer", background: "var(--surface-2)", borderBottom: "1px solid var(--border)", color: "var(--text-mute)" }}
+        >
+          {ocrMsg}
+        </div>
+      )}
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
         <div style={{
           flex: 1, display: "flex", flexDirection: "column", minWidth: 0,

@@ -18,10 +18,11 @@ v0.1.0 配布対象: **macOS (Apple Silicon + Intel)** / **Windows** / **Linux (
 | macOS | Apple Developer ID Application 証明書 + notarytool | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `KEYCHAIN_PASSWORD` |
 | Windows | **v0.1.0 では未署名配布**（SmartScreen 警告が出るが「詳細情報→実行」で回避可能） | — |
 | Linux | 不要（署名は使わない） | — |
-| Tauri Updater | **v0.1.0 では無効化** (`tauri.conf.json` の `plugins.updater.active = false`) | — |
+| Tauri Updater (macOS) | **v0.2.0 で有効化（macOS のみ）**。ed25519 鍵で `latest.json` を検証 | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
+| Tauri Updater (Windows) | **v0.2.1 へ送り**（コード署名と同時に導入） | — |
 | 全 OS | リリース作成権限 | `GITHUB_TOKEN`（GitHub Actions が自動付与） |
 
-> v0.1.0 で必要な GitHub Secrets は **macOS 関連の 7 個のみ**。Windows 署名鍵 と Tauri Updater 署名鍵は将来導入する。
+> v0.2.0 で必要な GitHub Secrets は **macOS 関連 7 個 + Tauri Updater 署名鍵 2 個** の計 9 個。Windows 署名鍵は v0.2.1 で導入する。
 
 ---
 
@@ -80,22 +81,31 @@ v0.1.0 では Windows のコード署名は **行わない**。理由:
 
 ---
 
-## 3. Tauri Updater（v0.1.0 では無効化）
+## 3. Tauri Updater（v0.2.0 で macOS のみ有効化）
 
-v0.1.0 では `tauri.conf.json` の `plugins.updater.active = false` のままリリースする。理由:
+v0.2.0 で **macOS のみ** auto-updater を有効化した。Windows updater はコード署名と同時に v0.2.1 へ送る（未署名のままでは updater が検証で弾かれるため）。
 
-- 署名鍵を 1 度発行すると **永続的に管理しなければならない**（紛失するとアップデート配信が断たれる）
-- v0.1.x の間は手動 DL 運用で十分
+実施状況（v0.2.0）:
 
-将来有効化する手順:
+- ✅ 鍵生成済み: `~/.tauri/lumencite-updater.key`（**空パスワード**）。公開鍵は `tauri.conf.json` の `plugins.updater.pubkey` に設定済み、`active: true`。`bundle.createUpdaterArtifacts: true`。
+- ✅ `release.yml`: `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` を tauri-action に渡し、`includeUpdaterJson` は **macOS ジョブのみ true**（`latest.json` は darwin エントリのみ → macOS だけ auto-update）。
+- ⏳ **リリース担当が手作業で必要**:
+  1. **秘密鍵を 1Password 等にバックアップ**（`~/.tauri/lumencite-updater.key`。紛失すると永久に updater 互換性が切れる）。
+  2. GitHub Secrets を 2 つ登録:
+     - `TAURI_SIGNING_PRIVATE_KEY` = `~/.tauri/lumencite-updater.key` の中身全文（`cat ~/.tauri/lumencite-updater.key`）
+     - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` = 空文字（空パスワードのため）
 
-1. リポジトリ直下で `pnpm tauri signer generate -w ~/.tauri/lumencite-updater.key`
-2. 出力された公開鍵を `tauri.conf.json` の `plugins.updater.pubkey` にコピーし、`active: true` に変更
-3. GitHub Secrets に `TAURI_SIGNING_PRIVATE_KEY` (秘密鍵全文) と `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` を登録
-4. `.github/workflows/release.yml` の `env:` に上記 2 つを追加、`with: includeUpdaterJson: true` に変更
-5. **秘密鍵は 1Password 等で別途保管**（紛失すると永久に updater 互換性が切れる）
+エンドポイントは GitHub Releases の `latest.json` を参照する設定で既に入っている (`tauri.conf.json` 参照)。Windows / Linux は updater 非対象（手動 DL。Windows は v0.2.1 で署名と同時に対応）。
 
-エンドポイントは GitHub Releases の `latest.json` を参照する設定で既に入っている (`tauri.conf.json` 参照)。
+---
+
+## 4. pdfium（OCR 用ネイティブライブラリ）
+
+OCR（スキャン PDF の Vision 文字起こし）は実行時に **pdfium 動的ライブラリ**を必要とする（`pdfium-render` がロード）。
+
+- **配布 (.dmg)**: `release.yml` の macOS ジョブが [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) の `pdfium-mac-univ.tgz` を取得し `src-tauri/pdfium/libpdfium.dylib` に置く。`tauri.release-macos.conf.json`（`--config` でマージ）の `bundle.macOS.frameworks` で `.app/Contents/Frameworks/` に同梱され、`bind_pdfium` がそこを探す。**base の `tauri.conf.json` には frameworks を入れない**（dylib 不在で `cargo build`/`tauri dev` が壊れるため）。
+- **ローカル開発で OCR を試す**: `pdfium-mac-univ.tgz` を展開し `lib/libpdfium.dylib` を `src-tauri/pdfium/libpdfium.dylib` に置く（`bind_pdfium` がカレント `pdfium/` も探す）。未配置でも OCR 以外は動く。
+- `src-tauri/pdfium/` は gitignore 済み（バイナリは非コミット）。Windows / Linux の pdfium 同梱は OCR を各 OS で配布する段階で別途対応。
 
 ---
 

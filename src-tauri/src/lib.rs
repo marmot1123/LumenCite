@@ -3,6 +3,7 @@ mod bibtex;
 mod db;
 mod keychain;
 mod llm;
+mod mcp;
 mod metadata;
 mod models;
 
@@ -14,7 +15,10 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode},
     SqlitePool,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{
     ipc::Channel,
@@ -22,11 +26,18 @@ use tauri::{
     AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::oneshot;
 
 pub struct AppState {
     pub db: SqlitePool,
     /// BibTeX 自動同期リクエストを送る送信側。受信側のタスクが debounce して実行する。
     pub sync_tx: UnboundedSender<()>,
+    /// 進行中チャットの承認待ち・中断状態を保持する共有ランタイム。
+    pub chat: Arc<ChatRuntime>,
+    /// 外部 MCP サーバーのクライアント（Chat ツールへマージ）。
+    pub mcp: Arc<mcp::McpManager>,
+    /// アプリデータディレクトリ（添付ファイルの相対パス解決用）。
+    pub app_data_dir: PathBuf,
 }
 
 /// BibTeX 同期結果を UI に通知するイベントペイロード。
@@ -730,6 +741,11 @@ pub struct LlmSettings {
     pub model: String,
     pub summary_source: String,   // "abstract" | "fulltext"
     pub summary_prompt: String,   // 空文字なら llm::DEFAULT_SYSTEM_PROMPT
+    /// OCR 用プロバイダ/モデル。空/None なら provider/model にフォールバック。
+    #[serde(default)]
+    pub ocr_provider: Option<String>,
+    #[serde(default)]
+    pub ocr_model: Option<String>,
 }
 
 #[tauri::command]
@@ -751,7 +767,13 @@ async fn get_llm_settings(state: State<'_, AppState>) -> Result<LlmSettings, Str
     let summary_prompt = db::settings::get_setting(&state.db, db::settings::LLM_SUMMARY_PROMPT_KEY)
         .await.map_err(|e| e.to_string())?
         .unwrap_or_default();
-    Ok(LlmSettings { provider, model, summary_source, summary_prompt })
+    let ocr_provider = db::settings::get_setting(&state.db, db::settings::LLM_OCR_PROVIDER_KEY)
+        .await.map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty());
+    let ocr_model = db::settings::get_setting(&state.db, db::settings::LLM_OCR_MODEL_KEY)
+        .await.map_err(|e| e.to_string())?
+        .filter(|s| !s.trim().is_empty());
+    Ok(LlmSettings { provider, model, summary_source, summary_prompt, ocr_provider, ocr_model })
 }
 
 #[tauri::command]
@@ -763,6 +785,10 @@ async fn save_llm_settings(state: State<'_, AppState>, settings: LlmSettings) ->
     db::settings::set_setting(&state.db, db::settings::LLM_SUMMARY_SOURCE_KEY, &settings.summary_source)
         .await.map_err(|e| e.to_string())?;
     db::settings::set_setting(&state.db, db::settings::LLM_SUMMARY_PROMPT_KEY, &settings.summary_prompt)
+        .await.map_err(|e| e.to_string())?;
+    db::settings::set_setting(&state.db, db::settings::LLM_OCR_PROVIDER_KEY, settings.ocr_provider.as_deref().unwrap_or(""))
+        .await.map_err(|e| e.to_string())?;
+    db::settings::set_setting(&state.db, db::settings::LLM_OCR_MODEL_KEY, settings.ocr_model.as_deref().unwrap_or(""))
         .await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -902,6 +928,537 @@ async fn save_entry_summary(
         .map_err(|e| e.to_string())?;
     request_sync(&state);
     Ok(())
+}
+
+// ── chat（agentic LLM チャット）─────────────────────────────────────────────
+
+/// agentic ループの進行をフロントへ流す Tauri レベルのストリーミングイベント。
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ChatStreamEvent {
+    SessionStarted {
+        session_id: i64,
+    },
+    Delta {
+        text: String,
+    },
+    ToolCallProposed {
+        call_id: String,
+        tool_name: String,
+        args_preview: String,
+        needs_approval: bool,
+    },
+    ToolCallExecuted {
+        call_id: String,
+        result_summary: String,
+    },
+    MessagePersisted {
+        message_id: i64,
+        role: String,
+    },
+    Done,
+    Error {
+        message: String,
+    },
+}
+
+/// 進行中チャットの承認待ち・中断状態を保持する共有ランタイム。
+#[derive(Default)]
+pub struct ChatRuntime {
+    /// call_id -> 承認待ちの送信側
+    pending: Mutex<HashMap<String, PendingApproval>>,
+    /// session_id -> 中断フラグ
+    cancels: Mutex<HashMap<i64, Arc<AtomicBool>>>,
+}
+
+struct PendingApproval {
+    session_id: i64,
+    tx: oneshot::Sender<bool>,
+}
+
+impl ChatRuntime {
+    /// セッションの中断フラグを作成・登録して返す。
+    fn begin(&self, session_id: i64) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.cancels.lock().unwrap().insert(session_id, flag.clone());
+        flag
+    }
+
+    /// セッション終了時の後始末（中断フラグと残った承認待ちを除去）。
+    fn finish(&self, session_id: i64) {
+        self.cancels.lock().unwrap().remove(&session_id);
+        self.pending.lock().unwrap().retain(|_, p| p.session_id != session_id);
+    }
+
+    /// ツール承認待ちを登録し、決定を待つ受信側を返す。
+    fn register_approval(&self, session_id: i64, call_id: &str) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(call_id.to_string(), PendingApproval { session_id, tx });
+        rx
+    }
+
+    /// UI からの承認/拒否を該当する待ちに伝える。
+    fn resolve_approval(&self, call_id: &str, approved: bool) {
+        if let Some(p) = self.pending.lock().unwrap().remove(call_id) {
+            let _ = p.tx.send(approved);
+        }
+    }
+
+    /// セッションを中断する。中断フラグを立て、当該セッションの承認待ちは拒否扱いで解放する。
+    fn cancel(&self, session_id: i64) {
+        if let Some(flag) = self.cancels.lock().unwrap().get(&session_id) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        let mut pending = self.pending.lock().unwrap();
+        let ids: Vec<String> = pending
+            .iter()
+            .filter(|(_, p)| p.session_id == session_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in ids {
+            if let Some(p) = pending.remove(&id) {
+                let _ = p.tx.send(false);
+            }
+        }
+    }
+}
+
+/// `ChatLoopHost` を Tauri Channel + ChatRuntime に橋渡しする実装。
+struct ChannelHost {
+    channel: Channel<ChatStreamEvent>,
+    runtime: Arc<ChatRuntime>,
+    session_id: i64,
+    cancel: Arc<AtomicBool>,
+}
+
+fn role_label(role: llm::Role) -> String {
+    match role {
+        llm::Role::User => "user",
+        llm::Role::Assistant => "assistant",
+        llm::Role::Tool => "tool",
+    }
+    .to_string()
+}
+
+/// UI 表示用に文字列を最大 `max` 文字へ丸める。
+fn clip_text(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
+#[async_trait::async_trait]
+impl llm::chat::ChatLoopHost for ChannelHost {
+    fn on_delta(&mut self, text: &str) {
+        let _ = self
+            .channel
+            .send(ChatStreamEvent::Delta { text: text.to_string() });
+    }
+
+    async fn on_tool_proposed(&mut self, call: &llm::ToolCallSpec, needs_approval: bool) {
+        let _ = self.channel.send(ChatStreamEvent::ToolCallProposed {
+            call_id: call.call_id.clone(),
+            tool_name: call.tool_name.clone(),
+            args_preview: clip_text(&call.arguments.to_string(), 200),
+            needs_approval,
+        });
+    }
+
+    async fn request_approval(&mut self, call: &llm::ToolCallSpec) -> bool {
+        let rx = self.runtime.register_approval(self.session_id, &call.call_id);
+        rx.await.unwrap_or(false)
+    }
+
+    async fn on_tool_executed(&mut self, call_id: &str, result_summary: &str) {
+        let _ = self.channel.send(ChatStreamEvent::ToolCallExecuted {
+            call_id: call_id.to_string(),
+            result_summary: clip_text(result_summary, 500),
+        });
+    }
+
+    async fn on_message_persisted(&mut self, message_id: i64, role: llm::Role) {
+        let _ = self.channel.send(ChatStreamEvent::MessagePersisted {
+            message_id,
+            role: role_label(role),
+        });
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+}
+
+/// DB の chat_messages 行を、プロバイダに渡す `llm::ChatMessage` 列へ変換する。
+fn db_messages_to_chat(rows: &[db::chat::ChatMessage]) -> Vec<llm::ChatMessage> {
+    rows.iter()
+        .map(|r| match r.role.as_str() {
+            "assistant" => {
+                let tool_calls = r
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|s| serde_json::from_str::<Vec<llm::ToolCallSpec>>(s).ok())
+                    .filter(|v| !v.is_empty());
+                llm::ChatMessage {
+                    role: llm::Role::Assistant,
+                    content: vec![llm::ContentBlock::text(r.content.clone())],
+                    tool_calls,
+                    tool_call_id: None,
+                }
+            }
+            "tool" => llm::ChatMessage::tool_result(
+                r.tool_call_id.clone().unwrap_or_default(),
+                r.content.clone(),
+            ),
+            _ => llm::ChatMessage::user_text(r.content.clone()),
+        })
+        .collect()
+}
+
+#[tauri::command]
+async fn list_chat_sessions(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<db::chat::ChatSession>, String> {
+    db::chat::list_sessions(&state.db, limit.unwrap_or(100), offset.unwrap_or(0))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_chat_session(
+    state: State<'_, AppState>,
+    title: String,
+    provider: String,
+    model: String,
+    scope_mode: String,
+    entry_ids: Vec<i64>,
+) -> Result<db::chat::ChatSession, String> {
+    db::chat::create_session(
+        &state.db,
+        &db::chat::NewChatSession {
+            title,
+            provider,
+            model,
+            system_prompt: None,
+            scope_mode,
+            entry_ids,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_chat_session(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<db::chat::SessionWithMessages, String> {
+    db::chat::get_session_with_messages(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_chat_session_title(
+    state: State<'_, AppState>,
+    id: i64,
+    title: String,
+) -> Result<db::chat::ChatSession, String> {
+    db::chat::update_title(&state.db, id, &title)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn archive_chat_session(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    db::chat::archive_session(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn unarchive_chat_session(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<db::chat::ChatSession, String> {
+    db::chat::unarchive_session(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_chat_session_scope(
+    state: State<'_, AppState>,
+    id: i64,
+    scope_mode: String,
+    entry_ids: Vec<i64>,
+) -> Result<db::chat::ChatSession, String> {
+    db::chat::set_scope(&state.db, id, &scope_mode, &entry_ids)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_chat_session_model(
+    state: State<'_, AppState>,
+    id: i64,
+    provider: String,
+    model: String,
+) -> Result<db::chat::ChatSession, String> {
+    db::chat::set_model(&state.db, id, &provider, &model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ── MCP クライアント ─────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<mcp::McpServerConfig>, String> {
+    let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    Ok(mcp::parse_servers_config(&json))
+}
+
+#[tauri::command]
+async fn add_mcp_server(
+    state: State<'_, AppState>,
+    config: mcp::McpServerConfig,
+) -> Result<(), String> {
+    let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut servers = mcp::parse_servers_config(&json);
+    servers.retain(|s| s.id != config.id);
+    servers.push(config.clone());
+    db::settings::set_setting(
+        &state.db,
+        db::settings::MCP_SERVERS_KEY,
+        &mcp::serialize_servers_config(&servers),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    state.mcp.start(config).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let mut servers = mcp::parse_servers_config(&json);
+    servers.retain(|s| s.id != id);
+    db::settings::set_setting(
+        &state.db,
+        db::settings::MCP_SERVERS_KEY,
+        &mcp::serialize_servers_config(&servers),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    state.mcp.stop(&id).await;
+    Ok(())
+}
+
+// ── OCR ──────────────────────────────────────────────────────────────────────
+
+/// 詳細ビューの「OCR を実行」ボタン用。ユーザー操作なので承認は不要（クリック＝同意）。
+/// LLM ツール `ocr_pdf` と内部実装（run_ocr）を共有する。
+#[tauri::command]
+async fn ocr_pdf(
+    state: State<'_, AppState>,
+    entry_id: i64,
+    pages: Option<Vec<i64>>,
+) -> Result<String, String> {
+    llm::tools::ocr::run_ocr(&state.db, &state.app_data_dir, entry_id, pages)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn approve_tool_call(
+    state: State<'_, AppState>,
+    call_id: String,
+    approved: bool,
+) -> Result<(), String> {
+    state.chat.resolve_approval(&call_id, approved);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_chat_stream(state: State<'_, AppState>, session_id: i64) -> Result<(), String> {
+    state.chat.cancel(session_id);
+    Ok(())
+}
+
+/// agentic ループのエントリポイント。user メッセージを永続化し、会話履歴を読み込み、
+/// ループを実行して進行を `channel` で配信する。
+#[tauri::command]
+async fn chat_send_message(
+    state: State<'_, AppState>,
+    session_id: i64,
+    user_text: String,
+    channel: Channel<ChatStreamEvent>,
+) -> Result<(), String> {
+    let pool = state.db.clone();
+    let session = db::chat::get_session(&pool, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let account = keychain::account_for_api_key(&session.provider);
+    let api_key = match keychain::get(&account) {
+        Ok(Some(k)) if !k.trim().is_empty() => k,
+        _ => {
+            let _ = channel.send(ChatStreamEvent::Error {
+                message: "API key is not configured".to_string(),
+            });
+            return Err("API key is not configured".to_string());
+        }
+    };
+
+    let _ = channel.send(ChatStreamEvent::SessionStarted { session_id });
+
+    // user メッセージを永続化
+    let user_row = db::chat::append_message(
+        &pool,
+        &db::chat::NewChatMessage {
+            session_id,
+            role: "user".to_string(),
+            content: user_text,
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let _ = channel.send(ChatStreamEvent::MessagePersisted {
+        message_id: user_row.id,
+        role: "user".to_string(),
+    });
+
+    // 会話履歴・スコープ・ホワイトリストを読み込む
+    let swm = db::chat::get_session_with_messages(&pool, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let messages = db_messages_to_chat(&swm.messages);
+    let entry_ids = swm.entry_ids;
+    let whitelist = db::settings::get_setting(&pool, db::settings::CHAT_TOOL_WHITELIST_KEY)
+        .await
+        .ok()
+        .flatten();
+    let system = session
+        .system_prompt
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| llm::chat::DEFAULT_CHAT_SYSTEM_PROMPT.to_string());
+
+    let provider = match llm::provider_for(&session.provider) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = channel.send(ChatStreamEvent::Error { message: e.to_string() });
+            return Err(e.to_string());
+        }
+    };
+    let mut tools = llm::tools::all_tool_specs();
+    tools.extend(state.mcp.tool_specs().await);
+
+    let cancel = state.chat.begin(session_id);
+    let mut host = ChannelHost {
+        channel: channel.clone(),
+        runtime: state.chat.clone(),
+        session_id,
+        cancel,
+    };
+
+    let ctx = llm::tools::ToolContext {
+        pool: &pool,
+        session_id,
+        scope_mode: &session.scope_mode,
+        scope_entry_ids: &entry_ids,
+        mcp: Some(state.mcp.as_ref()),
+        app_data_dir: &state.app_data_dir,
+    };
+    let params = llm::chat::ChatLoopParams {
+        api_key: &api_key,
+        model: &session.model,
+        system: &system,
+        whitelist: whitelist.as_deref(),
+        max_turns: llm::chat::DEFAULT_MAX_TURNS,
+    };
+
+    let result =
+        llm::chat::run_chat_loop(provider.as_ref(), &ctx, &tools, messages, &params, &mut host)
+            .await;
+    state.chat.finish(session_id);
+
+    match result {
+        Ok(()) => {
+            let _ = channel.send(ChatStreamEvent::Done);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = channel.send(ChatStreamEvent::Error { message: msg.clone() });
+            Err(msg)
+        }
+    }
+}
+
+/// セッションの最初の数メッセージから簡潔なタイトルを LLM 生成し、保存して返す。
+#[tauri::command]
+async fn generate_chat_title(state: State<'_, AppState>, session_id: i64) -> Result<String, String> {
+    let session = db::chat::get_session(&state.db, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let swm = db::chat::get_session_with_messages(&state.db, session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut body = String::new();
+    for m in swm.messages.iter().take(4) {
+        if m.role == "tool" {
+            continue;
+        }
+        body.push_str(&format!("{}: {}\n", m.role, m.content));
+    }
+    if body.trim().is_empty() {
+        return Ok(session.title);
+    }
+
+    let account = keychain::account_for_api_key(&session.provider);
+    let api_key = keychain::get(&account)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "API key is not configured".to_string())?;
+
+    let raw = llm::generate_summary(
+        &session.provider,
+        &session.model,
+        &api_key,
+        "Generate a concise 3-6 word title summarizing this chat. \
+         Reply with only the title — no quotes and no trailing punctuation.",
+        "Conversation",
+        &body,
+        |_| {},
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let title = raw.trim().trim_matches('"').trim().to_string();
+    let title = if title.is_empty() { session.title } else { title };
+    db::chat::update_title(&state.db, session_id, &title)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(title)
 }
 
 // ── バックアップ / エクスポート ─────────────────────────────────────────────
@@ -1290,7 +1847,28 @@ pub fn run() {
                 run_sync_task(pool_for_task, handle, sync_rx).await;
             });
 
-            app.manage(AppState { db: pool.clone(), sync_tx });
+            let mcp = Arc::new(mcp::McpManager::default());
+            app.manage(AppState {
+                db: pool.clone(),
+                sync_tx,
+                chat: Arc::new(ChatRuntime::default()),
+                mcp: mcp.clone(),
+                app_data_dir: data_dir.clone(),
+            });
+
+            // 設定済みの MCP サーバーをバックグラウンドで起動する。
+            let mcp_pool = pool.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(Some(json)) =
+                    db::settings::get_setting(&mcp_pool, db::settings::MCP_SERVERS_KEY).await
+                {
+                    for cfg in mcp::parse_servers_config(&json) {
+                        if let Err(e) = mcp.start(cfg).await {
+                            eprintln!("MCP server start failed: {e}");
+                        }
+                    }
+                }
+            });
 
             // メニューバー: アプリ名サブメニューに「Settings…」を追加（macOS / Windows / Linux）。
             // 標準的なショートカット ⌘+, (macOS) / Ctrl+, (他 OS) を割り当てる。
@@ -1379,6 +1957,22 @@ pub fn run() {
             test_llm_connection,
             generate_summary,
             save_entry_summary,
+            list_chat_sessions,
+            create_chat_session,
+            get_chat_session,
+            update_chat_session_title,
+            archive_chat_session,
+            unarchive_chat_session,
+            set_chat_session_scope,
+            set_chat_session_model,
+            chat_send_message,
+            approve_tool_call,
+            cancel_chat_stream,
+            generate_chat_title,
+            list_mcp_servers,
+            add_mcp_server,
+            remove_mcp_server,
+            ocr_pdf,
             run_backup_now,
             list_backups,
             open_backup_folder,
@@ -1387,4 +1981,91 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod chat_command_tests {
+    use super::*;
+
+    fn row(role: &str, content: &str, tool_calls: Option<&str>, tool_call_id: Option<&str>) -> db::chat::ChatMessage {
+        db::chat::ChatMessage {
+            id: 1,
+            session_id: 1,
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: tool_calls.map(|s| s.to_string()),
+            tool_call_id: tool_call_id.map(|s| s.to_string()),
+            created_at: String::new(),
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn db_messages_to_chat_maps_roles_and_tool_calls() {
+        let tc_json = r#"[{"call_id":"c1","tool_name":"list_tags","arguments":{}}]"#;
+        let rows = vec![
+            row("user", "hi", None, None),
+            row("assistant", "let me look", Some(tc_json), None),
+            row("tool", "no tags", None, Some("c1")),
+        ];
+        let msgs = db_messages_to_chat(&rows);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, llm::Role::User);
+        assert!(msgs[0].tool_calls.is_none());
+
+        assert_eq!(msgs[1].role, llm::Role::Assistant);
+        let calls = msgs[1].tool_calls.as_ref().expect("assistant tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_name, "list_tags");
+
+        assert_eq!(msgs[2].role, llm::Role::Tool);
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn db_messages_ignores_blank_tool_calls() {
+        // 空配列 JSON は None に潰す
+        let rows = vec![row("assistant", "hello", Some("[]"), None)];
+        let msgs = db_messages_to_chat(&rows);
+        assert!(msgs[0].tool_calls.is_none());
+    }
+
+    #[test]
+    fn clip_text_truncates_with_ellipsis() {
+        assert_eq!(clip_text("short", 10), "short");
+        assert_eq!(clip_text("abcdefghij", 5), "abcde…");
+    }
+
+    #[tokio::test]
+    async fn runtime_resolve_approval_delivers_decision() {
+        let rt = ChatRuntime::default();
+        let rx = rt.register_approval(7, "call-1");
+        rt.resolve_approval("call-1", true);
+        assert_eq!(rx.await.unwrap(), true);
+        // 解決済みなので二度目は何も起きない（パニックしない）
+        rt.resolve_approval("call-1", false);
+    }
+
+    #[tokio::test]
+    async fn runtime_cancel_denies_pending_and_sets_flag() {
+        let rt = ChatRuntime::default();
+        let flag = rt.begin(42);
+        let rx = rt.register_approval(42, "call-x");
+        rt.cancel(42);
+        assert!(flag.load(Ordering::SeqCst), "cancel flag should be set");
+        assert_eq!(rx.await.unwrap(), false, "pending approval should be denied");
+        rt.finish(42);
+    }
+
+    #[tokio::test]
+    async fn runtime_cancel_only_affects_its_own_session() {
+        let rt = ChatRuntime::default();
+        let _flag_a = rt.begin(1);
+        let _flag_b = rt.begin(2);
+        let rx_b = rt.register_approval(2, "b-call");
+        rt.cancel(1); // 別セッションを中断
+        // セッション 2 の承認待ちは残っている → 明示的に許可できる
+        rt.resolve_approval("b-call", true);
+        assert_eq!(rx_b.await.unwrap(), true);
+    }
 }

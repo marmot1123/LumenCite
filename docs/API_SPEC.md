@@ -90,6 +90,8 @@ type LlmSettings = {
   provider: "openai" | "anthropic";
   model: string;
   summary_source: "abstract" | "fulltext"; // 要約入力ソース（v0.1.0 から）
+  ocr_provider?: "openai" | "anthropic";    // v0.2.0: OCR 用プロバイダ。未指定なら provider にフォールバック
+  ocr_model?: string;                        // v0.2.0: OCR 用モデル。未指定なら model にフォールバック
 };
 
 type HighlightColor = "yellow" | "green" | "blue";
@@ -132,6 +134,75 @@ type UpdateInfo = {
   date?: string;
   notes?: string;
   available: boolean;
+};
+
+// === Chat / MCP / OCR（v0.2.0 追加） ===
+
+type ChatRole = "user" | "assistant" | "tool";
+type ScopeMode = "all" | "entries"; // DB 全体検索 / 特定文献に絞る
+
+type ChatSession = {
+  id: number;
+  title: string;
+  provider: string;
+  model: string;
+  system_prompt?: string;
+  scope_mode: ScopeMode;
+  entry_count: number; // scope_mode='entries' のとき紐づく文献数
+  created_at: string;
+  updated_at: string;
+  archived_at?: string;
+};
+
+// LLM のツール呼び出し 1 件（assistant メッセージに付随）
+type ToolCallSpec = {
+  call_id: string;
+  tool_name: string; // 例 "fulltext_search" / "add_tag" / "mcp_obsidian_append_note"
+  arguments: Record<string, unknown>; // JSON 引数
+};
+
+type ChatMessage = {
+  id: number;
+  session_id: number;
+  role: ChatRole;
+  content: string;
+  tool_calls?: ToolCallSpec[]; // role='assistant' のとき
+  tool_call_id?: string;       // role='tool' のとき
+  created_at: string;
+  position: number;
+};
+
+type SessionWithMessages = {
+  session: ChatSession;
+  messages: ChatMessage[];
+  entry_ids: number[]; // scope の対象 entry 集合
+};
+
+// LLM に渡すツール定義。OpenAI / Anthropic 形式へは Rust 側で変換
+type ToolSpec = {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>; // JSON Schema
+  needs_approval: boolean;              // ホワイトリスト評価結果
+};
+
+// agentic ループのストリーミングイベント（tauri::ipc::Channel 経由）
+// Rust enum を serde(tag = "kind", rename_all = "snake_case") で送出する
+type ChatStreamEvent =
+  | { kind: "session_started"; session_id: number }
+  | { kind: "delta"; text: string } // assistant の自然言語ストリーム
+  | { kind: "tool_call_proposed"; call_id: string; tool_name: string; args_preview: string; needs_approval: boolean }
+  | { kind: "tool_call_executed"; call_id: string; result_summary: string }
+  | { kind: "message_persisted"; message_id: number; role: ChatRole }
+  | { kind: "done" }
+  | { kind: "error"; message: string };
+
+// MCP サーバー設定（Claude Desktop の mcpServers 互換）
+type McpServerConfig = {
+  id: string;       // サーバー識別子。ツールプレフィックス mcp_<id>_<tool> にも使う
+  command: string;  // 起動コマンド
+  args?: string[];
+  env?: Record<string, string>;
 };
 ```
 
@@ -357,3 +428,50 @@ type BackupInfo = { path: string; created_at: string; size_bytes: number };
 |---------|------|--------|
 | `get_setting` | `key: String` | `Option<String>` |
 | `set_setting` | `key: String, value: String` | `Result<()>` |
+
+### Chat（v0.2.0 追加）
+
+agentic LLM Chat のセッション管理と会話ループ。`chat_send_message` が中核で、tool_call があれば承認チェック → 実行 → 結果を会話に追加 → 再度 LLM 呼び出し、を完了まで反復する。
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `list_chat_sessions` | `limit?: i64, offset?: i64` | `Result<Vec<ChatSession>>` — `updated_at` 降順。サイドバー用 |
+| `create_chat_session` | `title: String, provider: String, model: String, scope_mode: ScopeMode, entry_ids: Vec<i64>` | `Result<ChatSession>` |
+| `get_chat_session` | `id: i64` | `Result<SessionWithMessages>` — セッションを開く |
+| `update_chat_session_title` | `id: i64, title: String` | `Result<()>` |
+| `archive_chat_session` | `id: i64` | `Result<()>` — ソフト削除（`archived_at` をセット） |
+| `chat_send_message` | `session_id: i64, user_text: String, channel: Channel<ChatStreamEvent>` | `Result<()>` — **agentic ループのエントリポイント** |
+| `approve_tool_call` | `call_id: String, approved: bool` | `Result<()>` — UI の承認/拒否を進行中ループへ返す |
+| `cancel_chat_stream` | `session_id: i64` | `Result<()>` — 進行中ストリームの中断。部分応答は保存される |
+| `generate_chat_title` | `session_id: i64` | `Result<String>` — 自動タイトル生成（最初のターン後にバックグラウンドで呼ぶ） |
+
+`chat_send_message` の `channel` は `tauri::ipc::Channel<ChatStreamEvent>`。`tool_call_proposed` の `needs_approval=true` を受けたら UI は承認ダイアログを出し、`approve_tool_call` で応答する。承認制御はツール別ホワイトリスト（DATA_MODEL の `chat.tool_whitelist` 参照）に従う:
+
+- read 系（`fulltext_search` / `get_entry` / `list_*`）: 常に自動
+- `add_tag` / `update_notes` / `attach_ocr_text` / `add_to_collection`: デフォルト自動（設定で都度承認に変更可）
+- `create_entry` / `update_entry`: 都度承認
+- `delete_*` / MCP の write 系: 常時確認（ホワイトリストで上書き不可）
+
+`create_entry` / `update_entry` は基本フィールド（`title` / `entry_type` / `year` / `abstract` / `doi` / `isbn` / `arxiv_id` / `url` / `notes` / `author_names`）に加え、型固有フィールドを `extra_fields`（`{string: string}`）で受け付ける（`journal` / `volume` / `issue` / `number` / `pages` / `publisher` / `booktitle` / `address` / `edition` / `series` / `school` / `institution` / `organization` / `howpublished` など、`DATA_MODEL.md` の `entries.extra_fields` 参照）。`update_entry` では指定したキーのみ上書き/追加し、未指定の既存 `extra_fields` は保持する。
+
+ホワイトリストの上書きは `get_setting("chat.tool_whitelist")` / `set_setting` で読み書きする（専用コマンドは設けない）。
+
+### MCP クライアント（v0.2.0 追加）
+
+外部 MCP サーバー（Obsidian 等）を stdio で起動し、`tools/list` を取得して Chat ツールスキーマへ動的マージする（プレフィックス `mcp_<id>_<tool>`）。LLM がそのツールを呼ぶと内部で JSON-RPC により当該サーバーへ転送する。
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `list_mcp_servers` | — | `Result<Vec<McpServerConfig>>` |
+| `add_mcp_server` | `config: McpServerConfig` | `Result<()>` — 設定保存 + プロセス起動 |
+| `remove_mcp_server` | `id: String` | `Result<()>` — プロセス停止 + 設定削除 |
+
+設定は `settings` の `mcp.servers` キーに JSON（Claude Desktop の `mcpServers` 互換）で保存する。
+
+### OCR（v0.2.0 追加）
+
+テキストレイヤーのないスキャン PDF を LLM Vision で OCR し、結果を `fulltext` にページ単位で保存する。詳細ビューの手動ボタンと LLM ツール（`ocr_pdf` / `attach_ocr_text`）で内部実装を共有する。
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `ocr_pdf` | `entry_id: i64, pages?: Vec<i64>` | `Result<()>` — `pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック |

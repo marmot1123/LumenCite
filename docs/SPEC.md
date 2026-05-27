@@ -53,11 +53,62 @@
 
 ---
 
-## Phase 2
+## v0.2.0
 
-- 複数文献の横断質問（LLM Chat タブ — 詳細ビューに第5タブ or 独立画面）
-- LLM結果のMarkdownノート保存
-- MCPサーバー実装（Obsidian等との双方向連携）
+v0.1.0 で文献管理 / PDF ビュー / 単一エントリの LLM 要約まで揃った。v0.2.0 は LumenCite を **「研究の壁打ち相手」** として実用化するフェーズ。実装プランは `~/.claude/plans/v0-2-0-goofy-tome.md` を参照。
+
+### Agentic LLM Chat（複数文献横断）
+- **独立スクリーン**として Chat 画面を追加（App の `screen` 状態に `"chat"`）。サイドバー / コマンドパレット（⌘K）/ ライブラリ複数選択 / 詳細ビューから起動
+- **Agentic keyword retrieval**: LLM が `fulltext_search`（FTS5）を tool 経由で反復呼び出ししながら回答を組み立てる
+- **コンテキストスコープ（ハイブリッド）**: セッションごとに「DB 全体検索（`scope_mode='all'`）」/「特定文献に絞る（`'entries'`）」を切替
+- **ツール呼び出し UI**: 検索・DB 書き換え・MCP 呼び出しを折りたたみ可能ブロックで全展開可視化。**ストリーミング中断ボタン**あり
+- ストリーミング配信は `tauri::ipc::Channel<ChatStreamEvent>`（既存 `SummarySheet` の Channel 受信パターンを踏襲）
+
+### チャット履歴の永続化
+- `chat_sessions` / `chat_messages` / `chat_session_entries` の 3 テーブル（migration 0007）に保存
+- アプリ再起動後もサイドバーから過去セッションを再開できる
+- タイトルは最初のターン後に LLM が自動生成（ユーザー編集可）
+
+### LLM への DB 書き換え権限（tool use）
+- タグ付け・ノート追記・OCR 結果保存などを対話で実行
+- **ツール別ホワイトリストで承認制御**:
+  - read 系（`fulltext_search` / `get_entry` / `list_*`）: 常に自動承認
+  - `add_tag` / `update_notes` / `attach_ocr_text` / `add_to_collection`: デフォルト自動（設定で都度承認に変更可）
+  - `create_entry` / `update_entry`: 都度承認
+  - `delete_*` / MCP の write 系: 常時確認（ホワイトリストで上書き不可）
+- ホワイトリストの上書きは `settings` の `chat.tool_whitelist` キーに JSON 保存
+- ロールバック専用 UI は設けず、既存の trash + 日次バックアップ（14 世代）で対応
+
+### MCP クライアント
+- Chat 内 LLM が外部 MCP サーバー（Obsidian 等）のツールを利用可能
+- stdio で外部 MCP サーバープロセスを起動・管理し、起動時に `tools/list` を取得して Chat ツールスキーマへ動的マージ（プレフィックス `mcp_<server>_<tool>`）
+- サーバー設定は Claude Desktop の `mcpServers` JSON 互換形式
+- **クライアントのみ**。LumenCite を MCP サーバーとして公開するのは v0.3.0
+
+### スキャン PDF の LLM Vision OCR
+- テキストレイヤーのないスキャン PDF を LLM Vision で OCR し、`fulltext` に保存して全文検索可能にする
+- トリガーは **LLM ツール（`ocr_pdf`）経由** と **詳細ビューの手動ボタン** の両対応
+- **OCR プロバイダ設定を Chat とは独立**に保持（将来のローカル LLM 対応に備える）。未設定時は Chat プロバイダへフォールバック
+
+### macOS auto-updater 有効化
+- v0.1.0 で見送った `tauri-plugin-updater` を **macOS のみ有効化**。GitHub Releases の `latest.json` を ed25519 鍵で検証
+- Windows のコード署名 + updater は v0.2.1（Certum 取得後）に送り
+
+### v0.2.0 スコープ外（将来）
+- MCP **サーバー**実装（v0.3.0）
+- Windows コード署名 + Windows updater（v0.2.1）
+- Homebrew Cask 登録（DL 実績が育ってから別作業 → Phase 2 参照）
+- CSL / Web クリッパー / カスタムハイライト色（Phase 2 残）
+- 古典的 RAG（埋め込みベクトル検索）— v0.3.0 で FTS5 agentic 運用結果を見て判断
+- ローカル LLM プロバイダ（Ollama / LM Studio）— v0.3.0+。OCR プロバイダ独立化は本バージョンで先行整備済み
+
+---
+
+## Phase 2（残り）
+
+> ✅ v0.2.0 で消化: 複数文献の横断 Chat / LLM 結果の DB（ノート）書き込み / MCP **クライアント** → 上記「v0.2.0」セクション参照
+
+- MCP **サーバー**実装（Obsidian 等から LumenCite を参照可能に — v0.3.0）
 - 引用スタイル対応（CSL）
 - ブラウザWebクリッパー
 - ハイライトのカスタム色 / カラーピッカー UI

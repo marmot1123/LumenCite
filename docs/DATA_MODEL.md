@@ -160,6 +160,56 @@ SQLite FTS5 を使用。ページ単位でインデックスする。
 
 tokenizer: `trigram`（PDF 添付フェーズで `unicode61` から変更予定）
 
+v0.2.0 の **LLM Vision OCR**（`ocr_pdf` / `attach_ocr_text`）はスキャン PDF の認識結果を**この同じテーブル**にページ単位で書き込み、以後 `fulltext_search` でヒットするようにする（スキーマ変更なし）。
+
+---
+
+### Chat 関連テーブル（v0.2.0 追加 / migration 0007）
+
+agentic LLM Chat のセッションとメッセージ履歴を永続化する。`migrations/0007_chat.sql` で追加。
+
+#### `chat_sessions` — チャットセッション
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `id` | INTEGER PK | |
+| `title` | TEXT NOT NULL | LLM 自動生成（ユーザー編集可） |
+| `provider` | TEXT NOT NULL | `openai` / `anthropic` 等 |
+| `model` | TEXT NOT NULL | モデル識別子 |
+| `system_prompt` | TEXT | セッション固有のシステムプロンプト（任意） |
+| `scope_mode` | TEXT NOT NULL | `all`（DB 全体検索）/ `entries`（特定文献に絞る）。DEFAULT `'all'` |
+| `created_at` | TEXT NOT NULL | |
+| `updated_at` | TEXT NOT NULL | |
+| `archived_at` | TEXT | ソフト削除（NULL = アクティブ） |
+
+#### `chat_messages` — メッセージ履歴
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `id` | INTEGER PK | |
+| `session_id` | INTEGER FK → chat_sessions | ON DELETE CASCADE |
+| `role` | TEXT NOT NULL | `user` / `assistant` / `tool` |
+| `content` | TEXT NOT NULL | 本文（tool メッセージは結果テキスト） |
+| `tool_calls` | TEXT | JSON: assistant のツール呼び出し列（任意） |
+| `tool_call_id` | TEXT | `role='tool'` の結果が紐づく呼び出し ID（任意） |
+| `created_at` | TEXT NOT NULL | |
+| `position` | INTEGER NOT NULL | セッション内の並び順 |
+
+#### `chat_session_entries` — セッション↔文献（scope の対象集合）
+
+`scope_mode='all'` のとき空（DB 全体検索）。`'entries'` のとき、ここに含まれる `entry_id` 集合だけが FTS5 検索の対象。
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `session_id` | INTEGER FK → chat_sessions | ON DELETE CASCADE |
+| `entry_id` | INTEGER FK → entries | ON DELETE CASCADE |
+
+`PRIMARY KEY (session_id, entry_id)`
+
+インデックス:
+- `idx_chat_messages_session ON chat_messages(session_id, position)`
+- `idx_chat_sessions_updated ON chat_sessions(updated_at DESC)`
+
 ---
 
 ### `extra_fields` — BibTeX型固有フィールド
@@ -193,7 +243,16 @@ LLM APIキー等の機密情報は **OS キーチェーン**（macOS Keychain / 
 | `updater.channel` | `stable` \| `beta` | アップデートチャネル |
 | `pdf.last_page.<entry_id>` | 整数文字列 | エントリごとの最終閲覧ページ |
 
-OS キーチェーン側のサービス名: `com.lumencite.LumenCite`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。
+#### キー追加（v0.2.0）
+
+| キー | 値 | 用途 |
+|------|------|------|
+| `llm.ocr_provider` | `openai` \| `anthropic`（未設定可） | OCR 用 LLM プロバイダ。未設定なら `llm.provider` にフォールバック |
+| `llm.ocr_model` | モデル識別子（未設定可） | OCR 用モデル。未設定なら `llm.model` にフォールバック |
+| `chat.tool_whitelist` | JSON | ツール別自動承認のデフォルト上書き。`delete_*` / MCP write 系は上書き不可 |
+| `mcp.servers` | JSON | 外部 MCP サーバー設定。Claude Desktop の `mcpServers` 互換形式 |
+
+OS キーチェーン側のサービス名: `com.lumencite.LumenCite`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。MCP サーバーに渡す秘匿情報（API キー等）が必要な場合も、平文を `settings` に置かず環境変数 or キーチェーン経由とする。
 
 ---
 

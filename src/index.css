@@ -37,6 +37,60 @@ html, body, #root {
   --warn-strong:   oklch(0.55 0.15 70);
   --success-text:  oklch(0.55 0.12 145);
   --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Chat ToolCallCard トークン (v0.2.0) — light。dark は :root[data-theme="dark"] で上書き。
+     5 系統: read / write / approve / delete / mcp。 */
+  --tc-read-bg:    oklch(0.975 0.004 80);
+  --tc-read-bd:    oklch(0.91 0.005 80);
+  --tc-read-fg:    oklch(0.45 0.01 70);
+  --tc-write-bg:   oklch(0.97 0.025 170);
+  --tc-write-bd:   oklch(0.86 0.04 170);
+  --tc-write-fg:   oklch(0.42 0.08 170);
+  --tc-approve-bg: oklch(0.97 0.06 75);
+  --tc-approve-bd: oklch(0.78 0.13 75);
+  --tc-approve-fg: oklch(0.42 0.12 65);
+  --tc-delete-bg:  oklch(0.97 0.04 20);
+  --tc-delete-bd:  oklch(0.78 0.14 20);
+  --tc-delete-fg:  oklch(0.46 0.16 20);
+  --tc-mcp-bg:     oklch(0.96 0.04 285);
+  --tc-mcp-bd:     oklch(0.82 0.08 285);
+  --tc-mcp-fg:     oklch(0.42 0.13 285);
+}
+
+/* Chat ToolCallCard トークン — dark。useTheme.ts が data-theme を設定する。 */
+:root[data-theme="dark"] {
+  --tc-read-bg:    oklch(0.33 0.004 80);
+  --tc-read-bd:    oklch(0.40 0.004 80);
+  --tc-read-fg:    oklch(0.72 0.005 80);
+  --tc-write-bg:   oklch(0.34 0.025 170);
+  --tc-write-bd:   oklch(0.45 0.04 170);
+  --tc-write-fg:   oklch(0.78 0.08 170);
+  --tc-approve-bg: oklch(0.36 0.04 75);
+  --tc-approve-bd: oklch(0.55 0.10 75);
+  --tc-approve-fg: oklch(0.82 0.12 75);
+  --tc-delete-bg:  oklch(0.34 0.04 20);
+  --tc-delete-bd:  oklch(0.50 0.10 20);
+  --tc-delete-fg:  oklch(0.80 0.14 20);
+  --tc-mcp-bg:     oklch(0.33 0.03 285);
+  --tc-mcp-bd:     oklch(0.46 0.06 285);
+  --tc-mcp-fg:     oklch(0.80 0.10 285);
+}
+
+/* Chat 用アニメーション (v0.2.0) */
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+.lc-chat-caret {
+  display: inline-block;
+  width: 6px;
+  height: 14px;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent-strong);
+  animation: blink 1s steps(2) infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulseApprove {
+  0%, 100% { box-shadow: 0 0 0 0 var(--tc-approve-bd); }
+  50%      { box-shadow: 0 0 0 3px var(--accent-ring); }
 }
 
 button { font-family: inherit; }
@@ -133,6 +187,29 @@ input, textarea { font-family: inherit; }
   color: var(--text-mute);
 }
 .lc-markdown hr { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
+/* GFM 表 (remark-gfm) */
+.lc-markdown table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 0.95em;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.lc-markdown th, .lc-markdown td {
+  border: 1px solid var(--border);
+  padding: 4px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.lc-markdown th {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+.lc-markdown tr:nth-child(even) td { background: color-mix(in oklch, var(--surface-2) 50%, transparent); }
+/* GFM タスクリスト・打ち消し線 */
+.lc-markdown li input[type="checkbox"] { margin-right: 6px; }
+.lc-markdown del { color: var(--text-faint); }
 .lc-markdown .katex { font-size: 1em; }
 .lc-markdown .katex-display { margin: 0.5em 0; overflow-x: auto; overflow-y: hidden; }
 

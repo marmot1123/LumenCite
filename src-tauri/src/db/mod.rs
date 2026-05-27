@@ -1,4 +1,5 @@
 pub mod attachments;
+pub mod chat;
 pub mod collections;
 pub mod entries;
 pub mod fulltext;

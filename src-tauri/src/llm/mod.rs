@@ -2,7 +2,10 @@
 //! Server-Sent Events で配信されるトークンをコールバックで呼び出し元へ流す。
 
 pub mod anthropic;
+pub mod chat;
+pub mod ocr;
 pub mod openai;
+pub mod tools;
 
 use std::fmt;
 
@@ -92,4 +95,149 @@ pub async fn test_connection(provider: &str, model: &str, api_key: &str) -> Resu
     )
     .await?;
     Ok(())
+}
+
+// =====================================================================
+// Chat (v0.2.0): tool use 対応のマルチターン会話
+// =====================================================================
+//
+// `generate_summary` 系（単発要約）とは別系統。agentic ループ（src/llm/chat.rs, #10）が
+// この `ChatProvider` を呼んでツール呼び出しを反復する。フロントへ送る Tauri レベルの
+// `ChatStreamEvent`（session_started / tool_call_proposed / ...）は #10/#11 で別途定義する。
+// ここで定義するのは「LLM 1 回呼び出し」のプロバイダ抽象まで。
+
+/// チャットメッセージのロール。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    User,
+    Assistant,
+    Tool,
+}
+
+/// マルチモーダル content block。Vision OCR（#12）で画像を載せるため text/image を持つ。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text { text: String },
+    /// base64 エンコードされた画像。`media_type` 例: "image/png" / "image/jpeg"
+    Image { media_type: String, data: String },
+}
+
+impl ContentBlock {
+    pub fn text(s: impl Into<String>) -> Self {
+        ContentBlock::Text { text: s.into() }
+    }
+}
+
+/// assistant が要求した 1 件のツール呼び出し。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallSpec {
+    /// プロバイダ横断で一意な呼び出し ID（tool 結果の突き合わせに使う）
+    pub call_id: String,
+    /// 例: "fulltext_search" / "add_tag" / "mcp_obsidian_append_note"
+    pub tool_name: String,
+    /// JSON オブジェクト（ツール引数）
+    pub arguments: serde_json::Value,
+}
+
+/// LLM に提示するツール定義。`parameters` は JSON Schema（object）。
+/// `needs_approval` は既定値であり、最終的な承認可否は
+/// `tools::approval::should_auto_approve` がセッションのホワイトリストを見て決める。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+    pub needs_approval: bool,
+}
+
+/// プロバイダ非依存の 1 メッセージ。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChatMessage {
+    pub role: Role,
+    pub content: Vec<ContentBlock>,
+    /// role=Assistant がツール呼び出しを行った場合に入る
+    pub tool_calls: Option<Vec<ToolCallSpec>>,
+    /// role=Tool の結果が紐づく呼び出し ID
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// テキストのみの user メッセージ。
+    pub fn user_text(s: impl Into<String>) -> Self {
+        ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::text(s)],
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// tool 実行結果メッセージ。
+    pub fn tool_result(call_id: impl Into<String>, result: impl Into<String>) -> Self {
+        ChatMessage {
+            role: Role::Tool,
+            content: vec![ContentBlock::text(result)],
+            tool_calls: None,
+            tool_call_id: Some(call_id.into()),
+        }
+    }
+}
+
+/// LLM がターンを終えた理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopReason {
+    /// 通常終了（これ以上ツールを呼ばない）
+    EndTurn,
+    /// ツール呼び出しを要求して停止
+    ToolUse,
+    /// トークン上限到達
+    MaxTokens,
+    Other(String),
+}
+
+/// 1 ターン（LLM 1 回呼び出し）の結果。
+#[derive(Debug, Clone)]
+pub struct ChatTurnResult {
+    /// このターンで生成された自然言語テキスト全体（on_delta で逐次流したものの連結）
+    pub text: String,
+    /// このターンで要求されたツール呼び出し（完成形）
+    pub tool_calls: Vec<ToolCallSpec>,
+    /// LLM がターンを終えた理由。プロバイダが設定する診断用フィールド
+    /// （ループは tool_calls の有無で継続判定するため現状は読まない）。
+    #[allow(dead_code)]
+    pub stop_reason: StopReason,
+}
+
+/// tool use 対応の chat ストリーミングを行うプロバイダ抽象。
+///
+/// - `on_delta` は assistant の自然言語テキストのトークン到着ごとに呼ばれる。
+/// - ツール呼び出しは（ストリーミングで組み立てたうえで）完成形を
+///   `ChatTurnResult.tool_calls` として返す。
+/// - `messages` の `ContentBlock::Image` は各プロバイダのマルチモーダル形式へ変換する。
+#[async_trait::async_trait]
+pub trait ChatProvider: Send + Sync {
+    async fn stream_chat(
+        &self,
+        api_key: &str,
+        model: &str,
+        system: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        // HRTB (`for<'a>`) is required: under async_trait an elided `FnMut(&str)`
+        // pins the &str to the method lifetime and cannot be called with strings
+        // produced inside the async body (E0597). The explicit higher-ranked bound
+        // lets implementations forward streamed deltas.
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<ChatTurnResult, LlmError>;
+}
+
+/// プロバイダ名から `ChatProvider` 実装を返す。
+pub fn provider_for(name: &str) -> Result<Box<dyn ChatProvider>, LlmError> {
+    match name {
+        "openai" => Ok(Box::new(openai::OpenAiProvider)),
+        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider)),
+        other => Err(LlmError::UnsupportedProvider(other.to_string())),
+    }
 }

@@ -7,6 +7,9 @@ interface HeaderProps {
   onBack: () => void;
   onToggleStar: () => void;
   onSummarize?: () => void;
+  onChat?: () => void;
+  onOcr?: () => void;
+  ocrBusy?: boolean;
   onDownload?: () => void;
   onPrint?: () => void;
   onMore?: () => void;
@@ -34,7 +37,7 @@ function HeaderBtn({ children, onClick, title, ariaLabel }: {
   );
 }
 
-export function Header({ entry, onBack, onToggleStar, onSummarize, onDownload, onPrint, onMore }: HeaderProps) {
+export function Header({ entry, onBack, onToggleStar, onSummarize, onChat, onOcr, ocrBusy, onDownload, onPrint, onMore }: HeaderProps) {
   const { t } = useTranslation();
   return (
     <header style={{
@@ -63,10 +66,22 @@ export function Header({ entry, onBack, onToggleStar, onSummarize, onDownload, o
         <Icon name={entry.starred ? "starFill" : "star"} size={13}
               color={entry.starred ? "oklch(0.72 0.14 70)" : "var(--text-mute)"} />
       </HeaderBtn>
+      {onChat && (
+        <HeaderBtn onClick={onChat} title={t("detail.header.chat")}>
+          <Icon name="chat" size={13} color="var(--text-mute)" />
+          <span>{t("detail.header.chat")}</span>
+        </HeaderBtn>
+      )}
       <HeaderBtn onClick={onSummarize} title={t("detail.header.summarize")}>
         <Icon name="sparkle" size={13} color="var(--text-mute)" />
         <span>{t("detail.header.summarize")}</span>
       </HeaderBtn>
+      {onOcr && (
+        <HeaderBtn onClick={ocrBusy ? undefined : onOcr} title={ocrBusy ? t("detail.header.ocrRunning") : t("detail.header.ocr")}>
+          <Icon name="search" size={13} color="var(--text-mute)" />
+          <span>{ocrBusy ? t("detail.header.ocrRunning") : t("detail.header.ocr")}</span>
+        </HeaderBtn>
+      )}
       <HeaderBtn onClick={onDownload} title={t("detail.header.download")}>
         <Icon name="download" size={13} color="var(--text-mute)" />
       </HeaderBtn>

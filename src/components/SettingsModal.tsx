@@ -6,10 +6,12 @@ import { useTheme } from "../hooks/useTheme";
 import { useLanguage } from "../hooks/useLanguage";
 import { Icon } from "./icons";
 import { checkForUpdate, applyUpdate, type UpdateAvailable } from "../lib/updater";
+import { ChatSettingsTab } from "./settings/ChatSettingsTab";
+import { MODEL_PRESETS, defaultModelFor } from "../lib/models";
 import LumenciteLogo from "../../design/logo-exports/lumencite.svg?url";
 import type { AccentName, Density, LlmProvider, LlmSettings, SummarySource, ThemeMode } from "../types";
 
-type TabId = "appearance" | "llm" | "bibtex" | "updates" | "data" | "about";
+type TabId = "appearance" | "llm" | "chat" | "bibtex" | "updates" | "data" | "about";
 
 const REPO_URL = "https://github.com/marmot1123/lumencite";
 const SPONSORS_URL = "https://github.com/sponsors/marmot1123";
@@ -22,11 +24,12 @@ interface SettingsModalProps {
   initialTab?: TabId;
 }
 
-const APP_VERSION = "0.1.0";
+const APP_VERSION = "0.2.0";
 
 const TABS: { id: TabId; iconName: Parameters<typeof Icon>[0]["name"] }[] = [
   { id: "appearance", iconName: "sparkle" },
   { id: "llm",        iconName: "info" },
+  { id: "chat",       iconName: "chat" },
   { id: "bibtex",     iconName: "sync" },
   { id: "updates",    iconName: "download" },
   { id: "data",       iconName: "library" },
@@ -40,24 +43,6 @@ const ACCENT_SWATCHES: { id: AccentName; color: string; labelKey: "settings.appe
   { id: "rose",   color: "oklch(0.58 0.16 15)",   labelKey: "settings.appearance.accentRose" },
 ];
 
-const MODEL_PRESETS: Record<LlmProvider, { id: string; label: string }[]> = {
-  openai: [
-    { id: "gpt-4o-mini",   label: "gpt-4o-mini" },
-    { id: "gpt-4o",        label: "gpt-4o" },
-    { id: "gpt-4.1-mini",  label: "gpt-4.1-mini" },
-    { id: "gpt-4.1",       label: "gpt-4.1" },
-    { id: "o4-mini",       label: "o4-mini" },
-  ],
-  anthropic: [
-    { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5" },
-    { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6" },
-    { id: "claude-opus-4-7",           label: "Claude Opus 4.7" },
-  ],
-};
-
-function defaultModelFor(provider: LlmProvider): string {
-  return MODEL_PRESETS[provider][0].id;
-}
 
 function Section({ title, description, children }: {
   title: string;
@@ -225,6 +210,8 @@ function LlmTab() {
   const [model, setModel] = useState("");
   const [source, setSource] = useState<SummarySource>("abstract");
   const [summaryPrompt, setSummaryPrompt] = useState("");
+  const [ocrProvider, setOcrProvider] = useState<"" | LlmProvider>(""); // "" = chat と同じ
+  const [ocrModel, setOcrModel] = useState("");
   const [defaultPrompt, setDefaultPrompt] = useState("");
   const [hasKey, setHasKey] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
@@ -247,6 +234,8 @@ function LlmTab() {
         setModel(settings.model);
         setSource(settings.summary_source);
         setSummaryPrompt(settings.summary_prompt);
+        setOcrProvider(settings.ocr_provider ?? "");
+        setOcrModel(settings.ocr_model ?? "");
         setDefaultPrompt(defaultP);
         const has = await invoke<boolean>("has_api_key", { provider: settings.provider });
         if (!cancelled) setHasKey(has);
@@ -264,13 +253,26 @@ function LlmTab() {
   }, [provider, loaded]);
 
   const persistSettings = (next: Partial<LlmSettings>) => {
+    // 現在の state を基準に next で上書き。ocr_* を必ず含めて消えないようにする。
     const payload: LlmSettings = {
-      provider: next.provider ?? provider,
-      model: next.model ?? model,
-      summary_source: next.summary_source ?? source,
-      summary_prompt: next.summary_prompt ?? summaryPrompt,
+      provider,
+      model,
+      summary_source: source,
+      summary_prompt: summaryPrompt,
+      ocr_provider: ocrProvider || null,
+      ocr_model: ocrModel || null,
+      ...next,
     };
     invoke("save_llm_settings", { settings: payload }).catch(console.error);
+  };
+
+  const handleOcrProviderChange = (next: "" | LlmProvider) => {
+    setOcrProvider(next);
+    persistSettings({ ocr_provider: next || null });
+  };
+  const handleOcrModelChange = (next: string) => {
+    setOcrModel(next);
+    persistSettings({ ocr_model: next || null });
   };
 
   const handleProviderChange = (next: LlmProvider) => {
@@ -426,6 +428,31 @@ function LlmTab() {
             { id: "fulltext", label: t("settings.llm.sourceFulltext") },
           ]}
         />
+      </Section>
+
+      <Section title={t("settings.llm.ocrTitle")} description={t("settings.llm.ocrDesc")}>
+        <Segmented<"" | LlmProvider>
+          value={ocrProvider}
+          onChange={handleOcrProviderChange}
+          options={[
+            { id: "", label: t("settings.llm.ocrFollow") },
+            { id: "openai", label: t("settings.llm.providerOpenai") },
+            { id: "anthropic", label: t("settings.llm.providerAnthropic") },
+          ]}
+        />
+        {ocrProvider !== "" && (
+          <input
+            value={ocrModel}
+            onChange={e => setOcrModel(e.target.value)}
+            onBlur={() => handleOcrModelChange(ocrModel)}
+            placeholder={t("settings.llm.ocrModelPlaceholder")}
+            style={{
+              marginTop: 8, width: "100%", padding: "7px 10px", borderRadius: 6,
+              border: "1px solid var(--border-strong)", background: "var(--surface)",
+              color: "var(--text)", fontSize: 12.5, fontFamily: "var(--mono)",
+            }}
+          />
+        )}
       </Section>
 
       <Section title={t("settings.llm.systemPrompt")} description={t("settings.llm.systemPromptDesc")}>
@@ -819,6 +846,7 @@ export function SettingsModal({ onClose, onOpenBibtexSync, initialTab }: Setting
           }}>
             {active === "appearance" && <AppearanceTab />}
             {active === "llm" && <LlmTab />}
+            {active === "chat" && <ChatSettingsTab />}
             {active === "bibtex" && <BibtexTab onOpenBibtexSync={onOpenBibtexSync} />}
             {active === "updates" && <UpdatesTab />}
             {active === "data" && <DataTab />}

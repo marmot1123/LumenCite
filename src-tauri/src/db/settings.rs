@@ -38,6 +38,16 @@ pub const LLM_MODEL_KEY: &str = "llm.model";
 pub const LLM_SUMMARY_SOURCE_KEY: &str = "llm.summary_source";
 pub const LLM_SUMMARY_PROMPT_KEY: &str = "llm.summary_prompt";
 
+/// Chat のツール別自動承認ホワイトリスト（JSON: tool_name -> bool）。
+pub const CHAT_TOOL_WHITELIST_KEY: &str = "chat.tool_whitelist";
+
+/// 外部 MCP サーバー設定（Claude Desktop の mcpServers 互換 JSON）。
+pub const MCP_SERVERS_KEY: &str = "mcp.servers";
+
+/// OCR 用 LLM プロバイダ / モデル（未設定なら chat の provider / model にフォールバック）。
+pub const LLM_OCR_PROVIDER_KEY: &str = "llm.ocr_provider";
+pub const LLM_OCR_MODEL_KEY: &str = "llm.ocr_model";
+
 #[cfg(test)]
 mod tests {
     use super::*;

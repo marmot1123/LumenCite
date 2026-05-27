@@ -1,6 +1,6 @@
 [package]
 name = "lumencite"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reference and bibliography management for researchers"
 authors = ["Motoki Seki <marmot.motoki@gmail.com>"]
 license = "MIT"
@@ -31,11 +31,16 @@ nom-bibtex = "0.6"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-dialog = "2"
 pdf-extract = "0.9"
-tokio = { version = "1", features = ["sync", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "macros", "process", "io-util"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 futures-util = "0.3"
 eventsource-stream = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+async-trait = "0.1"
+# OCR: スキャン PDF のページラスタライズ（pdfium 動的ライブラリを実行時にロード）
+pdfium-render = { version = "0.8", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
 

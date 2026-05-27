@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>LumenCite — Chat</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;450;500;550;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Serif:ital,wght@0,400;0,500;0,600;1,400;1,500&family=Noto+Sans+JP:wght@400;500;600&display=swap" rel="stylesheet" />
+
+<template id="__bundler_thumbnail">
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f3eedb"/><stop offset="100%" stop-color="#e8d8a8"/>
+    </linearGradient>
+  </defs>
+  <rect width="200" height="200" fill="url(#g)"/>
+  <g transform="translate(46,52)" fill="none" stroke="#9a6a18" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M14 18h60a8 8 0 0 1 8 8v40a8 8 0 0 1-8 8H40l-18 14v-14h-8a8 8 0 0 1-8-8V26a8 8 0 0 1 8-8z"/>
+    <path d="M26 38h40M26 52h28" stroke-width="5"/>
+  </g>
+</svg>
+</template>
+
+<style>
+  :root {
+    --bg: oklch(0.985 0.003 80);
+    --surface: #ffffff;
+    --surface-2: oklch(0.975 0.004 80);
+    --sidebar: oklch(0.972 0.004 80);
+    --border: oklch(0.92 0.005 80);
+    --border-subtle: oklch(0.95 0.004 80);
+    --border-strong: oklch(0.86 0.006 80);
+    --text: oklch(0.22 0.01 70);
+    --text-mute: oklch(0.5 0.008 70);
+    --text-faint: oklch(0.65 0.005 70);
+    --row-hover: oklch(0.965 0.005 80);
+    --row-selected: oklch(0.955 0.02 70);
+    --hover: oklch(0.95 0.005 80);
+    --accent-strong: oklch(0.62 0.14 65);
+    --accent-soft: oklch(0.95 0.04 70);
+    --accent-ring: oklch(0.7 0.13 65 / 0.25);
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+    /* Tool card semantic colors */
+    --tc-read-bg:    oklch(0.975 0.004 80);
+    --tc-read-bd:    oklch(0.91 0.005 80);
+    --tc-read-fg:    oklch(0.45 0.01 70);
+    --tc-write-bg:   oklch(0.97 0.025 170);
+    --tc-write-bd:   oklch(0.86 0.04 170);
+    --tc-write-fg:   oklch(0.42 0.08 170);
+    --tc-approve-bg: oklch(0.97 0.06 75);
+    --tc-approve-bd: oklch(0.78 0.13 75);
+    --tc-approve-fg: oklch(0.42 0.12 65);
+    --tc-delete-bg:  oklch(0.97 0.04 20);
+    --tc-delete-bd:  oklch(0.78 0.14 20);
+    --tc-delete-fg:  oklch(0.46 0.16 20);
+    --tc-mcp-bg:     oklch(0.96 0.04 285);
+    --tc-mcp-bd:     oklch(0.82 0.08 285);
+    --tc-mcp-fg:     oklch(0.42 0.13 285);
+  }
+
+  * { box-sizing: border-box; }
+  html, body, #root { margin: 0; padding: 0; height: 100%; }
+  body {
+    font-family: "IBM Plex Sans", "Noto Sans JP", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: oklch(0.93 0.005 80);
+    color: var(--text);
+    overflow: hidden;
+  }
+
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: oklch(0.7 0.005 80 / 0.3); border-radius: 999px;
+    border: 2px solid transparent; background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover { background: oklch(0.55 0.005 80 / 0.5); border: 2px solid transparent; background-clip: padding-box; }
+
+  input::placeholder, textarea::placeholder { color: var(--text-faint); }
+  button { font-family: inherit; }
+  textarea { font-family: inherit; }
+
+  .stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(ellipse at 30% 20%, oklch(0.96 0.02 70) 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 90%, oklch(0.94 0.03 50) 0%, transparent 55%),
+      oklch(0.92 0.005 80);
+    overflow: hidden;
+  }
+  .stage.dark {
+    background:
+      radial-gradient(ellipse at 30% 20%, oklch(0.32 0.025 70) 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 90%, oklch(0.28 0.03 50) 0%, transparent 55%),
+      oklch(0.22 0.004 80);
+  }
+  .scale-wrap { width: 1400px; height: 900px; transform-origin: center center; flex-shrink: 0; }
+
+  .mac-window {
+    width: 100%; height: 100%;
+    border-radius: 12px; overflow: hidden;
+    background: var(--surface);
+    box-shadow:
+      0 0 0 1px oklch(0 0 0 / 0.08),
+      0 1px 0 oklch(1 0 0 / 0.6) inset,
+      0 30px 60px oklch(0 0 0 / 0.18),
+      0 8px 20px oklch(0 0 0 / 0.10);
+    display: flex; flex-direction: column;
+  }
+  .mac-titlebar {
+    height: 30px; flex-shrink: 0;
+    background: linear-gradient(to bottom, oklch(0.97 0.004 80), oklch(0.94 0.005 80));
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 12px;
+    position: relative;
+  }
+  .stage.dark .mac-titlebar {
+    background: linear-gradient(to bottom, oklch(0.26 0.005 80), oklch(0.22 0.005 80));
+    border-bottom-color: oklch(0.30 0.005 80);
+  }
+  .traffic { display: flex; gap: 8px; align-items: center; }
+  .traffic .dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    border: 0.5px solid oklch(0 0 0 / 0.1);
+  }
+  .traffic .red    { background: #ff5f57; }
+  .traffic .yellow { background: #febc2e; }
+  .traffic .green  { background: #28c940; }
+  .mac-tab {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    font-size: 12px; color: var(--text-mute); font-weight: 500;
+    display: flex; align-items: center; gap: 5px;
+  }
+  .mac-tab .file {
+    width: 11px; height: 11px; border-radius: 2px;
+    background: linear-gradient(140deg, oklch(0.78 0.16 75), oklch(0.62 0.16 50));
+  }
+  .mac-body { flex: 1; min-height: 0; }
+
+  /* Markdown body inside assistant messages */
+  .md { font-size: 13.5px; line-height: 1.66; color: var(--text); }
+  .md > *:first-child { margin-top: 0; }
+  .md > *:last-child { margin-bottom: 0; }
+  .md p { margin: 0 0 11px; text-wrap: pretty; }
+  .md h3 { font-size: 13.5px; font-weight: 600; margin: 18px 0 8px; letter-spacing: -0.005em; }
+  .md ul, .md ol { margin: 4px 0 12px; padding-left: 22px; }
+  .md li { margin: 3px 0; }
+  .md code:not(.block) {
+    font-family: var(--mono); font-size: 12px;
+    padding: 1px 5px; border-radius: 3px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .md .math-inline {
+    font-family: "IBM Plex Serif", "Computer Modern", Georgia, serif;
+    font-style: italic; font-size: 14px;
+    padding: 0 2px;
+  }
+  .md .math-display {
+    font-family: "IBM Plex Serif", "Computer Modern", Georgia, serif;
+    font-style: italic; font-size: 16px;
+    text-align: center; margin: 14px 0;
+    color: var(--text);
+  }
+  .md .math-display .tag {
+    float: right; font-style: normal; font-family: var(--mono);
+    font-size: 11px; color: var(--text-faint); padding-top: 4px;
+  }
+  .md .citation {
+    display: inline-block; vertical-align: super; line-height: 1;
+    font-size: 10px; font-family: var(--mono); font-weight: 500;
+    padding: 1px 4px; margin: 0 1px; border-radius: 3px;
+    background: var(--accent-soft); color: var(--accent-strong);
+    border: 1px solid color-mix(in oklch, var(--accent-strong) 25%, transparent);
+    cursor: pointer;
+  }
+
+  /* Typewriter caret */
+  .caret {
+    display: inline-block; width: 6px; height: 14px;
+    background: var(--accent-strong); margin-left: 2px;
+    vertical-align: -2px; border-radius: 1px;
+    animation: blink 1s steps(2) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spinner {
+    display: inline-block; width: 11px; height: 11px;
+    border: 1.4px solid currentColor; border-right-color: transparent;
+    border-radius: 50%; animation: spin 0.7s linear infinite;
+    vertical-align: -1px;
+  }
+
+  /* Subtle entry pulse for approval-pending card */
+  @keyframes pulseApprove {
+    0%, 100% { box-shadow: 0 0 0 0 oklch(0.78 0.13 75 / 0.0), 0 1px 0 rgba(0,0,0,0.02); }
+    50%      { box-shadow: 0 0 0 3px oklch(0.78 0.13 75 / 0.18), 0 1px 0 rgba(0,0,0,0.02); }
+  }
+  .pulse-approve { animation: pulseApprove 2.4s ease-in-out infinite; }
+</style>
+</head>
+<body>
+  <div id="stage" class="stage">
+    <div class="scale-wrap" id="scaleWrap">
+      <div class="mac-window">
+        <div class="mac-titlebar">
+          <div class="traffic">
+            <span class="dot red"></span>
+            <span class="dot yellow"></span>
+            <span class="dot green"></span>
+          </div>
+          <div class="mac-tab">
+            <span class="file"></span>
+            <span>LumenCite — Chat</span>
+          </div>
+        </div>
+        <div class="mac-body"><div id="root"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="starters/tweaks-panel.jsx"></script>
+  <script type="text/babel" src="chat-data.jsx"></script>
+  <script type="text/babel" src="chat-icons.jsx"></script>
+  <script type="text/babel" src="chat-sidebar.jsx"></script>
+  <script type="text/babel" src="chat-messages.jsx"></script>
+  <script type="text/babel" src="chat-composer.jsx"></script>
+  <script type="text/babel" src="chat-main.jsx"></script>
+
+  <script>
+    // Sync stage bg with theme
+    const obs = new MutationObserver(() => {
+      const bg = document.documentElement.style.getPropertyValue('--bg');
+      const dark = bg.includes('0.27') || bg.includes('0.18');
+      document.getElementById('stage').classList.toggle('dark', dark);
+    });
+    obs.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
+
+    // Scale to fit
+    const wrap = document.getElementById('scaleWrap');
+    function fit() {
+      const sx = window.innerWidth / 1400;
+      const sy = window.innerHeight / 900;
+      wrap.style.transform = 'scale(' + Math.min(sx, sy, 1) + ')';
+    }
+    fit(); window.addEventListener('resize', fit);
+  </script>
+</body>
+</html>

@@ -12,6 +12,7 @@ interface CommandPaletteProps {
   onSelectEntry: (id: number) => void;
   onOpenDetail: (id: number) => void;
   onNewEntry: () => void;
+  onOpenChat: () => void;
   onOpenSettings: () => void;
   onOpenBibtexSync: () => void;
   onSyncBibtexNow: () => void;
@@ -20,7 +21,7 @@ interface CommandPaletteProps {
 
 export function CommandPalette({
   open, onClose, entries, onSelectEntry, onOpenDetail,
-  onNewEntry, onOpenSettings, onOpenBibtexSync, onSyncBibtexNow,
+  onNewEntry, onOpenChat, onOpenSettings, onOpenBibtexSync, onSyncBibtexNow,
   onSelectView,
 }: CommandPaletteProps) {
   const { t } = useTranslation();
@@ -76,6 +77,10 @@ export function CommandPalette({
               <Command.Item value="new-entry add" onSelect={() => run(onNewEntry)}>
                 <span>{t("command.action.newEntry")}</span>
                 <span className="lc-cmdk-item-sub">⌘N</span>
+              </Command.Item>
+              <Command.Item value="chat new chat open assistant" onSelect={() => run(onOpenChat)}>
+                <span>{t("command.action.openChat")}</span>
+                <span className="lc-cmdk-item-sub">⌘J</span>
               </Command.Item>
               <Command.Item value="settings preferences" onSelect={() => run(onOpenSettings)}>
                 <span>{t("command.action.settings")}</span>

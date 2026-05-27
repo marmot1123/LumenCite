@@ -21,8 +21,10 @@ import { SettingsModal } from "./components/SettingsModal";
 import { DetailView } from "./components/detail/DetailView";
 import { SummarySheet } from "./components/detail/SummarySheet";
 import { CommandPalette } from "./components/CommandPalette";
+import { ChatScreen } from "./components/chat/ChatScreen";
+import { useChatStore } from "./chat/store";
 
-import type { EntrySummary, EntryDetail, EntryInput, Collection, Tag, ViewMode, SearchScope, FulltextHit, SidebarCounts, ImportResult } from "./types";
+import type { EntrySummary, EntryDetail, EntryInput, Collection, Tag, ViewMode, SearchScope, FulltextHit, SidebarCounts, ImportResult, LlmSettings } from "./types";
 
 const EMPTY_COUNTS: SidebarCounts = {
   total: 0, starred: 0, unfiled: 0, trash: 0, collections: {}, tags: {},
@@ -129,7 +131,7 @@ export default function App() {
   const [showEdit, setShowEdit] = useState(false);
   const [showBibtexSync, setShowBibtexSync] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [screen, setScreen] = useState<"library" | "detail">("library");
+  const [screen, setScreen] = useState<"library" | "detail" | "chat">("library");
   const [showSummary, setShowSummary] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<"appearance" | "llm" | "bibtex" | "updates" | "data" | "about" | undefined>(undefined);
@@ -382,7 +384,7 @@ export default function App() {
   // - Delete/Backspace: 選択をゴミ箱へ（通常ビュー）
   // - Cmd/Ctrl+Backspace: 選択を永久削除（ゴミ箱ビューのみ）
   useEffect(() => {
-    const isModalOpen = showAdd || showEdit || showBibtexSync || showSettings || showPalette || screen === "detail";
+    const isModalOpen = showAdd || showEdit || showBibtexSync || showSettings || showPalette || screen === "detail" || screen === "chat";
     const isEditableTarget = (t: EventTarget | null) => {
       const el = t as HTMLElement | null;
       if (!el) return false;
@@ -394,6 +396,14 @@ export default function App() {
       // Esc: 選択解除（モーダルが開いているときは触らない）
       if (e.key === "Escape") {
         if (!isModalOpen && selectedIds.size > 0) clearSelection();
+        return;
+      }
+
+      // Cmd/Ctrl+J: チャット画面の表示/非表示（暫定の入口。#18 でコマンドパレット等から正式化）
+      if ((e.metaKey || e.ctrlKey) && (e.key === "j" || e.key === "J")) {
+        if (showAdd || showEdit || showBibtexSync || showSettings) return;
+        e.preventDefault();
+        setScreen(s => (s === "chat" ? "library" : "chat"));
         return;
       }
 
@@ -711,6 +721,63 @@ export default function App() {
 
   const label = viewLabel(selectedView, collections, t);
 
+  // 指定文献をスコープにした新規 Chat セッションを作って Chat 画面へ遷移する。
+  // ids が空ならライブラリ全体スコープ。
+  const startChatWithEntries = async (ids: number[]) => {
+    try {
+      const settings = await invoke<LlmSettings>("get_llm_settings");
+      await useChatStore.getState().createSession({
+        title: t("chat.newChat"),
+        provider: settings.provider,
+        model: settings.model,
+        scopeMode: ids.length > 0 ? "entries" : "all",
+        entryIds: ids,
+      });
+      setScreen("chat");
+    } catch (e) {
+      console.error("failed to start chat", e);
+    }
+  };
+
+  // 画面に依存しない共通オーバーレイ（設定モーダル・コマンドパレット）。
+  // library / detail / chat いずれの画面でも ⌘, やコマンドパレットが効くよう全分岐で描画する。
+  const globalOverlays = (
+    <>
+      {showSettings && (
+        <SettingsModal
+          onClose={() => { setShowSettings(false); setSettingsInitialTab(undefined); }}
+          onOpenBibtexSync={() => { setShowSettings(false); setShowBibtexSync(true); }}
+          initialTab={settingsInitialTab}
+        />
+      )}
+      <CommandPalette
+        open={showPalette}
+        onClose={() => setShowPalette(false)}
+        entries={entries}
+        onSelectEntry={selectSingle}
+        onOpenDetail={(id) => { selectSingle(id); setScreen("detail"); }}
+        onNewEntry={() => setShowAdd(true)}
+        onOpenChat={() => setScreen("chat")}
+        onOpenSettings={() => setShowSettings(true)}
+        onOpenBibtexSync={() => setShowBibtexSync(true)}
+        onSyncBibtexNow={() => { void invoke("sync_bibtex_now"); }}
+        onSelectView={setSelectedView}
+      />
+    </>
+  );
+
+  if (screen === "chat") {
+    return (
+      <>
+        <ChatScreen
+          onBack={() => setScreen("library")}
+          onOpenSettings={() => setShowSettings(true)}
+        />
+        {globalOverlays}
+      </>
+    );
+  }
+
   if (screen === "detail" && detail) {
     return (
       <>
@@ -722,7 +789,9 @@ export default function App() {
           onSelectEntry={(id) => { selectSingle(id); }}
           onOpenInWindow={(attachmentId) => { void invoke("open_pdf_viewer", { id: attachmentId }); }}
           onSummarize={() => setShowSummary(true)}
+          onChat={() => { void startChatWithEntries([detail.id]); }}
         />
+        {globalOverlays}
         {showSummary && (
           <SummarySheet
             entry={detail}
@@ -890,6 +959,7 @@ export default function App() {
           onAddToCollection={handleBulkAddToCollection}
           onAddTag={handleBulkAddTag}
           onExportBibtex={handleBulkExport}
+          onChatWith={() => { void startChatWithEntries([...selectedIds]); }}
         />
       ) : (
         <DetailPanel
@@ -932,13 +1002,7 @@ export default function App() {
         />
       )}
 
-      {showSettings && (
-        <SettingsModal
-          onClose={() => { setShowSettings(false); setSettingsInitialTab(undefined); }}
-          onOpenBibtexSync={() => { setShowSettings(false); setShowBibtexSync(true); }}
-          initialTab={settingsInitialTab}
-        />
-      )}
+      {globalOverlays}
 
       {showSummary && detail && (
         <SummarySheet
@@ -1036,19 +1100,6 @@ export default function App() {
           </div>
         </div>
       )}
-
-      <CommandPalette
-        open={showPalette}
-        onClose={() => setShowPalette(false)}
-        entries={entries}
-        onSelectEntry={selectSingle}
-        onOpenDetail={(id) => { selectSingle(id); setScreen("detail"); }}
-        onNewEntry={() => setShowAdd(true)}
-        onOpenSettings={() => setShowSettings(true)}
-        onOpenBibtexSync={() => setShowBibtexSync(true)}
-        onSyncBibtexNow={() => { void invoke("sync_bibtex_now"); }}
-        onSelectView={setSelectedView}
-      />
 
       {dragEntryId !== null && (
         <div style={{
