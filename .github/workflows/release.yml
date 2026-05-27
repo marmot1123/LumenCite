@@ -19,8 +19,9 @@ jobs:
           # macos-14 (Apple Silicon) ランナーでビルドする。
           # macos-13 (Intel) ランナーは供給不足で恒常的に queue 待ちが長いため使わない。
           - platform: macos-14
-            # --config で pdfium 同梱のオーバーレイをマージ（CI ビルド時のみ。dev/テストには影響しない）
-            args: "--target universal-apple-darwin --config tauri.release-macos.conf.json"
+            # --config で pdfium 同梱のオーバーレイをマージ（CI ビルド時のみ。dev/テストには影響しない）。
+            # tauri-action はリポジトリルートを cwd にするためパスは src-tauri/ から書く。
+            args: "--target universal-apple-darwin --config src-tauri/tauri.release-macos.conf.json"
             label: macos-universal
           - platform: ubuntu-22.04
             args: ""
