@@ -452,6 +452,8 @@ agentic LLM Chat のセッション管理と会話ループ。`chat_send_message
 - `create_entry` / `update_entry`: 都度承認
 - `delete_*` / MCP の write 系: 常時確認（ホワイトリストで上書き不可）
 
+`create_entry` / `update_entry` は基本フィールド（`title` / `entry_type` / `year` / `abstract` / `doi` / `isbn` / `arxiv_id` / `url` / `notes` / `author_names`）に加え、型固有フィールドを `extra_fields`（`{string: string}`）で受け付ける（`journal` / `volume` / `issue` / `number` / `pages` / `publisher` / `booktitle` / `address` / `edition` / `series` / `school` / `institution` / `organization` / `howpublished` など、`DATA_MODEL.md` の `entries.extra_fields` 参照）。`update_entry` では指定したキーのみ上書き/追加し、未指定の既存 `extra_fields` は保持する。
+
 ホワイトリストの上書きは `get_setting("chat.tool_whitelist")` / `set_setting` で読み書きする（専用コマンドは設けない）。
 
 ### MCP クライアント（v0.2.0 追加）

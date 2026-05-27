@@ -8,6 +8,7 @@ use super::{ToolContext, ToolError};
 use crate::llm::{ToolCallSpec, ToolSpec};
 use crate::models::EntryInput;
 use serde_json::json;
+use std::collections::HashMap;
 
 /// write 系ツールの定義一覧。
 pub fn specs() -> Vec<ToolSpec> {
@@ -124,6 +125,14 @@ pub fn specs() -> Vec<ToolSpec> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "List of author names in display order."
+                    },
+                    "extra_fields": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Type-specific bibliographic fields as string key/value pairs. \
+                            Common keys: \"journal\", \"volume\", \"issue\", \"number\", \"pages\", \
+                            \"publisher\", \"booktitle\", \"address\", \"edition\", \"series\", \
+                            \"school\", \"institution\", \"organization\", \"howpublished\"."
                     }
                 },
                 "required": ["title"]
@@ -182,6 +191,16 @@ pub fn specs() -> Vec<ToolSpec> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Replacement author list (replaces existing authors entirely)."
+                    },
+                    "extra_fields": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Type-specific bibliographic fields to set/overwrite, as string \
+                            key/value pairs. Only the provided keys are changed; existing extra fields \
+                            not listed here are preserved. Common keys: \"journal\", \"volume\", \
+                            \"issue\", \"number\", \"pages\", \"publisher\", \"booktitle\", \"address\", \
+                            \"edition\", \"series\", \"school\", \"institution\", \"organization\", \
+                            \"howpublished\"."
                     }
                 },
                 "required": ["entry_id"]
@@ -312,6 +331,8 @@ async fn execute_create_entry(
         })
         .unwrap_or_default();
 
+    let extra_fields = parse_extra_fields(args).unwrap_or_default();
+
     let input = EntryInput {
         title,
         entry_type,
@@ -323,6 +344,7 @@ async fn execute_create_entry(
         url,
         notes,
         author_names,
+        extra_fields,
         ..Default::default()
     };
 
@@ -391,6 +413,10 @@ async fn execute_update_entry(
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
     }
+    // 既存の extra_fields に対し、指定されたキーだけを上書き/追加する（指定外は保持）。
+    if let Some(provided) = parse_extra_fields(args) {
+        input.extra_fields.extend(provided);
+    }
 
     crate::db::entries::update_entry(ctx.pool, entry_id, &input).await?;
 
@@ -421,6 +447,18 @@ fn parse_str(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| ToolError::InvalidArguments(format!("missing or invalid string field \"{}\"", key)))
+}
+
+/// `extra_fields` 引数を `{string: string}` の対として取り出す。
+/// 文字列以外の値は無視する。引数が無ければ `None`。
+fn parse_extra_fields(args: &serde_json::Value) -> Option<HashMap<String, String>> {
+    args.get("extra_fields")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
 }
 
 #[cfg(test)]
@@ -705,6 +743,67 @@ mod tests {
         assert_eq!(entry.title, "Updated Paper");
         assert_eq!(entry.year, Some(2020));
         assert_eq!(entry.doi.as_deref(), Some("10.1/test"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_persists_extra_fields(pool: SqlitePool) {
+        let ctx = make_ctx(&pool);
+        let c = call(
+            "create_entry",
+            json!({
+                "title": "Journal Paper",
+                "entry_type": "article",
+                "extra_fields": { "journal": "Nature", "volume": "42", "pages": "1-9" }
+            }),
+        );
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        let id: i64 = sqlx::query_scalar("SELECT id FROM entries WHERE title = ?")
+            .bind("Journal Paper")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let entry = crate::db::entries::get_entry(&pool, id).await.unwrap();
+        assert_eq!(entry.extra_fields.get("journal").map(String::as_str), Some("Nature"));
+        assert_eq!(entry.extra_fields.get("volume").map(String::as_str), Some("42"));
+        assert_eq!(entry.extra_fields.get("pages").map(String::as_str), Some("1-9"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_merges_extra_fields(pool: SqlitePool) {
+        // 既存の extra_fields: journal=Old, volume=1
+        let id = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Paper".to_string(),
+                entry_type: "article".to_string(),
+                extra_fields: HashMap::from([
+                    ("journal".to_string(), "Old Journal".to_string()),
+                    ("volume".to_string(), "1".to_string()),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        let ctx = make_ctx(&pool);
+        // journal を上書き + issue を追加。volume は触らない。
+        let c = call(
+            "update_entry",
+            json!({
+                "entry_id": id,
+                "extra_fields": { "journal": "New Journal", "issue": "3" }
+            }),
+        );
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        let entry = crate::db::entries::get_entry(&pool, id).await.unwrap();
+        assert_eq!(entry.extra_fields.get("journal").map(String::as_str), Some("New Journal"));
+        assert_eq!(entry.extra_fields.get("issue").map(String::as_str), Some("3"));
+        // 指定しなかった volume は保持される。
+        assert_eq!(entry.extra_fields.get("volume").map(String::as_str), Some("1"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
