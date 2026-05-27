@@ -100,11 +100,13 @@ function McpServers() {
         },
       });
       setId(""); setCommand(""); setArgs(""); setEnv("");
-      reload();
     } catch (e) {
       setError(typeof e === "string" ? e : String(e));
     } finally {
       setBusy(false);
+      // 成否に関わらず一覧を更新。起動失敗でも config は保存済みなので、
+      // 失敗サーバーが赤バッジ + 再起動ボタン付きで一覧に現れる。
+      reload();
     }
   };
 
