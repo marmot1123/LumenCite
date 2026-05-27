@@ -16,7 +16,7 @@ v0.1.0 配布対象: **macOS (Apple Silicon + Intel)** / **Windows** / **Linux (
 | ターゲット | 必要なもの | 必要な GitHub Secret |
 |---|---|---|
 | macOS | Apple Developer ID Application 証明書 + notarytool | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `KEYCHAIN_PASSWORD` |
-| Windows | **v0.1.0 では未署名配布**（SmartScreen 警告が出るが「詳細情報→実行」で回避可能） | — |
+| Windows | **v0.1.0 は未署名配布**（SmartScreen は「詳細情報→実行」で回避）。**v0.2.1 で Certum 個人名義の署名を導入予定**（§2） | （取得後）コード署名用の Secret を追加 |
 | Linux | 不要（署名は使わない） | — |
 | Tauri Updater (macOS) | **v0.2.0 で有効化（macOS のみ）**。ed25519 鍵で `latest.json` を検証 | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
 | Tauri Updater (Windows) | **v0.2.1 へ送り**（コード署名と同時に導入） | — |
@@ -67,17 +67,72 @@ GitHub の Settings > Secrets and variables > Actions > **New repository secret*
 
 ---
 
-## 2. Windows 側準備（v0.1.0 ではスキップ）
+## 2. Windows 側準備（v0.1.0 スキップ → v0.2.1 で Certum 個人名義を導入）
 
-v0.1.0 では Windows のコード署名は **行わない**。理由:
+### 2-0. 経緯と CA 選定（2026-05-27 決定）
 
-- OV / EV 証明書はコストと運用負荷（特に EV はハードウェアトークン必須）が大きい
-- 初回ダウンロードでは OV であっても SmartScreen 警告が出るため、CTA を「詳細情報 → 実行」で案内すれば未署名と体感的に大差ない
-- DL 実績が貯まってから判断するほうが投資対効果が読める
+v0.1.0 では Windows コード署名は **未署名で配布**（SmartScreen は「詳細情報 → 実行」で回避案内）。v0.2.1 で署名を導入する。CA は調査の結果 **Certum を「個人名義」で取得**する方針に決定した。
 
-未署名の `.msi` インストーラがそのまま GitHub Releases に上がる。SmartScreen 警告のユーザー向け回避手順は README / リリースノートに記載済み。
+- **DigiCert 等の OV は見送り**: 2023-06 の CA/Browser Forum 要件で秘密鍵は HSM 格納必須（`.pfx` DL 署名不可）。さらに OV は「組織」実在確認が必要で、**法人登記のない個人事業主だと検証が難航**（実際に DigiCert OV 申請が停滞）。
+- **Azure Trusted Signing（現 Artifact Signing）も不可**: 安価（~$10/月・クラウド HSM）だが、公式 FAQ（2026-05 時点）で個人開発者は **米国・カナダのみ**対象。**日本の個人は対象外**。EV も発行しない。
+- **Certum 個人名義が現実解**: 個人として申請でき、本人確認はパスポート + 英語の住所証明のみ。**D-U-N-S 番号不要**、**SimplySign（クラウド）でトークン輸入も不要**。費用 **€189/年**（概ね 3〜3.5 万円・為替次第）。証明書サブジェクトに本名が出る点だけ許容が必要。
+  - 屋号を載せたい場合は D-U-N-S 番号（東京商工リサーチ、¥3,300、約 1 週間）が追加で必要。
+  - 公開リポジトリなら Certum Open Source Code Signing（年 €30 前後）も候補（サブジェクト表記に制約）。
+- SmartScreen は個人/OV 証明書では当初警告が出るが、DL 実績で評価が育つ（即時評価は EV のみ）。
 
-将来 OV / EV を導入する場合は、本ドキュメントの旧版（git log 参照）の手順 + `.github/workflows/release.yml` の Windows セクションを復活させる。
+参考: [Certum 必要書類](https://support.certum.eu/en/code-signing-required-documents/) ／ [blog.craftz.dog（個人名義実例）](https://blog.craftz.dog/6b64c9ec806b/) ／ [Tauri v2 Windows 署名](https://v2.tauri.app/distribute/sign/windows/) ／ [defguard: Certum HSM + Tauri CI](https://defguard.net/blog/windows-codesign-certum-hsm/)
+
+### 2-1. 取得・導入チェックリスト（Certum 個人名義）
+
+クリティカルパスは Phase 2 の承認待ち（実日数 数日）。Phase 3〜6 は半日〜1 日程度。
+
+**Phase 0 — 事前準備（手元作業）**
+- [ ] パスポート（有効期限内）の顔写真ページを撮影
+- [ ] 英語の住所証明書（印字・ラテン文字・発行 13 ヶ月以内）を 1 つ。いずれか:
+  - ゆうちょ銀行の英語版残高証明書（窓口で「英語・住所表記付き」を依頼）※**残高金額は審査に無関係**
+  - 英語で出せる公共料金請求書（残高を見せたくない場合）
+- [ ] 証明書に載せる氏名のローマ字を**パスポート表記と一致**させる（例 `Motoki Seki`）。この氏名・住所が配布バイナリに埋まる点を最終確認
+- [ ] クレジットカード（€189 支払い用）
+
+**Phase 1 — 購入（Certum）**
+- [ ] [certum.eu / shop.certum.eu](https://shop.certum.eu/) でアカウント作成
+- [ ] 「Standard Code Signing — in the Cloud（SimplySign）」1 年（€189）を選択（USB トークン版でなくクラウド版）
+- [ ] **個人（individual）**として申請（corporation を選ばない＝VAT ID 不要）→ カード支払い
+
+**Phase 2 — 本人確認・アクティベーション**
+- [ ] 証明書アクティベーション開始 → 鍵長 **4096-bit** を選択
+- [ ] 本人確認方法 **Automatic Identity Verification（推奨）**
+- [ ] スマホでパスポートのライブ確認（顔＋パスポート）
+- [ ] パスポート画像＋英語住所証明をアップロード（指示によりパスワード付き zip をメール送付の場合あり）
+- [ ] 申請者情報・証明書情報（氏名＝パスポート表記）を入力 → **承認待ち**（不備があると往復）
+
+**Phase 3 — SimplySign セットアップ**
+- [ ] SimplySign モバイルアプリを導入・登録（署名時の OTP/認証用）
+- [ ] SimplySign Desktop を Windows にインストール（証明書を Windows 証明書ストア / `signtool` から見えるようにする）
+- [ ] 発行済み証明書がクラウドプロファイルに見えることを確認
+
+**Phase 4 — ローカル署名テスト（Windows 実機 / VM）**
+- [ ] `signtool sign /tr http://time.certum.pl/ /td sha256 /fd sha256 /a test.exe`
+- [ ] `signtool verify /pa /v test.exe` が成功
+- [ ] 証明書ストアの**拇印（thumbprint）**を控える（`certmgr.msc` / `Cert:\CurrentUser\My`）
+
+**Phase 5 — LumenCite ビルドへ組み込み**
+- [ ] ローカルビルド署名（最短）: `src-tauri/tauri.conf.json` の `bundle.windows` に
+  ```json
+  "windows": {
+    "certificateThumbprint": "<Phase4の拇印>",
+    "digestAlgorithm": "sha256",
+    "timestampUrl": "http://time.certum.pl/"
+  }
+  ```
+  （SimplySign Desktop で認証済みのマシンならストア経由で署名される）
+- [ ] CI（GitHub Actions）で自動署名する場合は `bundle.windows.signCommand`（`%1` が対象ファイル）でカスタム署名コマンドを指定。クラウド HSM を CI で回すのは難所なので defguard の記事を参照
+- [ ] **Windows updater 同時有効化**: `release.yml` の `includeUpdaterJson` を Windows ジョブでも `true`（現状 macOS のみ）→ `latest.json` に windows エントリ追加。updater 署名は**既存の ed25519 鍵を流用**（Authenticode とは別物、両方必要。§3 参照）
+
+**Phase 6 — 配布・確認**
+- [ ] 署名済み `.msi`/`.exe` を Release に添付し `signtool verify` で再確認
+- [ ] SmartScreen 警告が出る場合は DL 実績で評価が育つ。必要なら [Microsoft へ file submission](https://www.microsoft.com/en-us/wdsi/filesubmission)
+- [ ] 本ドキュメント §6 と README/CHANGELOG の「Windows 未署名」記述を更新
 
 ---
 
