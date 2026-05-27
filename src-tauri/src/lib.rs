@@ -1239,13 +1239,32 @@ async fn set_chat_session_model(
 
 // ── MCP クライアント ─────────────────────────────────────────────────────────
 
+/// 設定済み MCP サーバー 1 件 + 起動状態（UI の一覧表示用）。
+#[derive(serde::Serialize)]
+struct McpServerInfo {
+    id: String,
+    command: String,
+    args: Vec<String>,
+    env: std::collections::HashMap<String, String>,
+    /// 起動状態。未起動試行などで不明な場合は null。
+    status: Option<mcp::McpServerStatus>,
+}
+
 #[tauri::command]
-async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<mcp::McpServerConfig>, String> {
+async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>, String> {
     let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
         .await
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
-    Ok(mcp::parse_servers_config(&json))
+    let statuses = state.mcp.statuses().await;
+    let infos = mcp::parse_servers_config(&json)
+        .into_iter()
+        .map(|c| {
+            let status = statuses.get(&c.id).cloned();
+            McpServerInfo { id: c.id, command: c.command, args: c.args, env: c.env, status }
+        })
+        .collect();
+    Ok(infos)
 }
 
 #[tauri::command]

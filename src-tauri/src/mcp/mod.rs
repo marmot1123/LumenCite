@@ -31,6 +31,17 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
 }
 
+/// MCP サーバー 1 件の起動状態。`list_mcp_servers` で UI に返し、起動失敗を可視化する。
+/// serde: `{ "state": "running", "tool_count": N }` / `{ "state": "failed", "error": "..." }`
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum McpServerStatus {
+    /// 起動成功（ハンドシェイク + tools/list 完了）。`tool_count` は取得できたツール数。
+    Running { tool_count: usize },
+    /// 起動またはハンドシェイクに失敗。`error` は表示用メッセージ。
+    Failed { error: String },
+}
+
 #[derive(Debug)]
 pub enum McpError {
     Spawn(String),
@@ -239,14 +250,29 @@ impl ServerIo {
 }
 
 /// 起動中の MCP サーバー群を保持し、ツール一覧の提供と tools/call のルーティングを行う。
+/// `statuses` は起動成否を id 単位で記録し（失敗サーバーは `servers` に入らないため別管理）、
+/// UI に「起動失敗」を表示するために使う。
 #[derive(Default)]
 pub struct McpManager {
     servers: Mutex<HashMap<String, ServerHandle>>,
+    statuses: Mutex<HashMap<String, McpServerStatus>>,
 }
 
 impl McpManager {
     /// サーバーを起動し、初期化ハンドシェイク → tools/list でツールを登録する。
+    /// 成否に関わらず最新状態を `statuses` に記録してから結果を返す（失敗も UI に出すため）。
     pub async fn start(&self, config: McpServerConfig) -> Result<usize, McpError> {
+        let id = config.id.clone();
+        let result = self.start_inner(config).await;
+        let status = match &result {
+            Ok(tool_count) => McpServerStatus::Running { tool_count: *tool_count },
+            Err(e) => McpServerStatus::Failed { error: e.to_string() },
+        };
+        self.statuses.lock().await.insert(id, status);
+        result
+    }
+
+    async fn start_inner(&self, config: McpServerConfig) -> Result<usize, McpError> {
         // 既存の同 id は停止
         self.stop(&config.id).await;
 
@@ -298,11 +324,17 @@ impl McpManager {
         Ok(count)
     }
 
-    /// サーバーを停止してプロセスを終了する。
+    /// サーバーを停止してプロセスを終了し、記録した状態も消す。
     pub async fn stop(&self, id: &str) {
         if let Some(mut handle) = self.servers.lock().await.remove(id) {
             let _ = handle.child.start_kill();
         }
+        self.statuses.lock().await.remove(id);
+    }
+
+    /// id -> 起動状態のスナップショット。`list_mcp_servers` が設定一覧に重ねて UI へ返す。
+    pub async fn statuses(&self) -> HashMap<String, McpServerStatus> {
+        self.statuses.lock().await.clone()
     }
 
     /// 起動中の全サーバーのツール定義（プレフィックス済み）。
@@ -424,5 +456,45 @@ mod tests {
         assert_eq!(req["jsonrpc"], "2.0");
         assert_eq!(req["id"], 3);
         assert_eq!(req["method"], "tools/list");
+    }
+
+    fn bad_config(id: &str) -> McpServerConfig {
+        McpServerConfig {
+            id: id.to_string(),
+            // 存在しないバイナリ → spawn が即失敗する
+            command: "lumencite-nonexistent-mcp-binary-xyz".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_records_failed_status_for_bad_command() {
+        let mgr = McpManager::default();
+        let res = mgr.start(bad_config("bad")).await;
+        assert!(res.is_err(), "存在しないコマンドは起動失敗するはず");
+
+        match mgr.statuses().await.get("bad") {
+            Some(McpServerStatus::Failed { error }) => assert!(!error.is_empty()),
+            other => panic!("expected Failed status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_clears_recorded_status() {
+        let mgr = McpManager::default();
+        let _ = mgr.start(bad_config("bad")).await;
+        assert!(mgr.statuses().await.contains_key("bad"));
+
+        mgr.stop("bad").await;
+        assert!(!mgr.statuses().await.contains_key("bad"), "stop で状態も消える");
+    }
+
+    #[test]
+    fn status_serializes_with_state_tag() {
+        let running = serde_json::to_value(McpServerStatus::Running { tool_count: 3 }).unwrap();
+        assert_eq!(running, json!({ "state": "running", "tool_count": 3 }));
+        let failed = serde_json::to_value(McpServerStatus::Failed { error: "boom".into() }).unwrap();
+        assert_eq!(failed, json!({ "state": "failed", "error": "boom" }));
     }
 }
