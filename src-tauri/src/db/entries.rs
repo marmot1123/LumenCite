@@ -228,13 +228,16 @@ pub async fn create_entry(
 ) -> Result<EntryDetail, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
+    let citation_key = input.citation_key.as_deref().and_then(sanitize_citation_key);
+
     let result = sqlx::query(
-        "INSERT INTO entries (title, year, entry_type, doi, isbn, arxiv_id, url, abstract, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO entries (title, year, entry_type, citation_key, doi, isbn, arxiv_id, url, abstract, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&input.title)
     .bind(input.year)
     .bind(&input.entry_type)
+    .bind(&citation_key)
     .bind(&input.doi)
     .bind(&input.isbn)
     .bind(&input.arxiv_id)
@@ -347,7 +350,7 @@ async fn load_entry_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, 
 
 pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id, title, year, entry_type, doi, isbn, arxiv_id, url, abstract, notes,
+        "SELECT id, title, year, entry_type, citation_key, doi, isbn, arxiv_id, url, abstract, notes,
                 summary, summary_model, summary_generated_at,
                 created_at, starred, deleted_at
          FROM entries WHERE id = ?",
@@ -444,6 +447,7 @@ pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::
         title: row.get("title"),
         year: row.get("year"),
         entry_type: row.get("entry_type"),
+        citation_key: row.get("citation_key"),
         doi: row.get("doi"),
         isbn: row.get("isbn"),
         arxiv_id: row.get("arxiv_id"),
@@ -651,15 +655,18 @@ pub async fn update_entry(
 ) -> Result<EntryDetail, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
+    let citation_key = input.citation_key.as_deref().and_then(sanitize_citation_key);
+
     let rows_affected = sqlx::query(
         "UPDATE entries
-         SET title = ?, year = ?, entry_type = ?, doi = ?, isbn = ?, arxiv_id = ?,
+         SET title = ?, year = ?, entry_type = ?, citation_key = ?, doi = ?, isbn = ?, arxiv_id = ?,
              url = ?, abstract = ?, notes = ?, updated_at = datetime('now')
          WHERE id = ?",
     )
     .bind(&input.title)
     .bind(input.year)
     .bind(&input.entry_type)
+    .bind(&citation_key)
     .bind(&input.doi)
     .bind(&input.isbn)
     .bind(&input.arxiv_id)
@@ -902,6 +909,48 @@ fn normalize_isbn(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase()
 }
 
+/// BibTeX エントリキーとして安全な文字（英数字と `_ : - . / +`）のみを残す。
+/// トリム後に空になった場合は `None`（= 自動生成扱い）を返す。
+pub fn sanitize_citation_key(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '-' | '.' | '/' | '+'))
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// 固定 cite key が使用可能か（サニタイズ後に他エントリと重複しないか）を返す。
+/// 空キー（サニタイズ後 None）は自動生成扱いとして常に `true`。`exclude_id` には
+/// 編集中エントリ自身の id を渡し、自分との衝突を除外する。
+pub async fn is_citation_key_available(
+    pool: &SqlitePool,
+    key: &str,
+    exclude_id: Option<i64>,
+) -> Result<bool, sqlx::Error> {
+    let Some(k) = sanitize_citation_key(key) else {
+        return Ok(true);
+    };
+    let count: i64 = match exclude_id {
+        Some(id) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entries WHERE citation_key = ? AND id != ?",
+        )
+        .bind(&k)
+        .bind(id)
+        .fetch_one(pool)
+        .await?,
+        None => sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE citation_key = ?")
+            .bind(&k)
+            .fetch_one(pool)
+            .await?,
+    };
+    Ok(count == 0)
+}
+
 /// DOI / arXiv ID / ISBN のいずれかが既存エントリと一致するか確認し、最初に
 /// 見つかった `entries.id` を返す。すべて None なら None。比較は DOI/arXiv は
 /// 大文字小文字無視、ISBN は記号を除いた英数字で正規化する。ゴミ箱内のエン
@@ -1114,6 +1163,109 @@ mod tests {
         let entry2 = create_entry(&pool, &input2).await.unwrap();
 
         assert_eq!(entry1.authors[0].id, entry2.authors[0].id);
+    }
+
+    // ── citation_key ─────────────────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_stores_pinned_citation_key(pool: SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "Pinned".to_string(),
+            entry_type: "article".to_string(),
+            citation_key: Some("smith2020".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(entry.citation_key, Some("smith2020".to_string()));
+
+        let fetched = get_entry(&pool, entry.id).await.unwrap();
+        assert_eq!(fetched.citation_key, Some("smith2020".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_sanitizes_citation_key(pool: SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "Dirty".to_string(),
+            entry_type: "article".to_string(),
+            citation_key: Some("  smith {2020}, x ".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        // 空白・カンマ・波括弧は除去される
+        assert_eq!(entry.citation_key, Some("smith2020x".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_blank_citation_key_becomes_none(pool: SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "Auto".to_string(),
+            entry_type: "article".to_string(),
+            citation_key: Some("   ".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(entry.citation_key, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_changes_citation_key(pool: SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "P".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(entry.citation_key, None);
+
+        let updated = update_entry(&pool, entry.id, &EntryInput {
+            title: "P".to_string(),
+            entry_type: "article".to_string(),
+            citation_key: Some("custom:key-1".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(updated.citation_key, Some("custom:key-1".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn pinned_citation_key_must_be_unique(pool: SqlitePool) {
+        create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            citation_key: Some("dup2020".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let second = create_entry(&pool, &EntryInput {
+            title: "B".to_string(),
+            entry_type: "article".to_string(),
+            citation_key: Some("dup2020".to_string()),
+            ..Default::default()
+        }).await;
+        assert!(second.is_err(), "重複した固定キーは UNIQUE 制約で拒否されるべき");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn null_citation_keys_can_coexist(pool: SqlitePool) {
+        // citation_key NULL（自動）は複数行で許容される
+        create_entry(&pool, &EntryInput { title: "A".to_string(), entry_type: "article".to_string(), ..Default::default() }).await.unwrap();
+        create_entry(&pool, &EntryInput { title: "B".to_string(), entry_type: "article".to_string(), ..Default::default() }).await.unwrap();
+        let all = get_entries(&pool, None, None, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn is_citation_key_available_checks(pool: SqlitePool) {
+        let a = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            citation_key: Some("taken2020".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        // 既存と重複 → false
+        assert!(!is_citation_key_available(&pool, "taken2020", None).await.unwrap());
+        // 未使用 → true
+        assert!(is_citation_key_available(&pool, "free2021", None).await.unwrap());
+        // 自分自身を除外すれば自分のキーは使用可能
+        assert!(is_citation_key_available(&pool, "taken2020", Some(a.id)).await.unwrap());
+        // 空キー（自動）は常に true
+        assert!(is_citation_key_available(&pool, "   ", None).await.unwrap());
     }
 
     // ── get_entry ────────────────────────────────────────────────────────────

@@ -77,6 +77,57 @@ function Field({ label, value, mono }: { label: string; value?: string | number 
   );
 }
 
+/** .bib 同期で実際に割り当てられる cite key を表示し、\cite{} 用にコピーできる行。 */
+function CitationKeyField({ entry }: { entry: EntryDetail }) {
+  const { t } = useTranslation();
+  const [resolved, setResolved] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<string>("resolve_citation_key", { entryId: entry.id })
+      .then(k => { if (!cancelled) setResolved(k); })
+      .catch(() => { if (!cancelled) setResolved(null); });
+    return () => { cancelled = true; };
+  }, [entry.id, entry.citation_key]);
+
+  if (!resolved) return null;
+
+  const copy = async () => {
+    try {
+      await writeText(resolved);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* クリップボード不可時は何もしない */ }
+  };
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{
+        fontSize: 10.5, fontWeight: 600, color: "var(--text-faint)",
+        textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3,
+      }}>{t("detailPanel.citationKey")}</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <code style={{
+          fontSize: 12.5, fontFamily: "var(--mono)", color: "var(--text)",
+          background: "var(--surface-2)", border: "1px solid var(--border)",
+          borderRadius: 4, padding: "2px 7px", wordBreak: "break-all",
+        }}>{resolved}</code>
+        <button onClick={copy} title={t("detailPanel.citationKeyCopy")} style={{
+          fontSize: 11, color: copied ? "var(--text-mute)" : "var(--accent-strong)",
+          border: "none", background: "transparent", cursor: "pointer",
+          padding: "2px 4px", whiteSpace: "nowrap",
+        }}>{copied ? t("detailPanel.citationKeyCopied") : t("detailPanel.citationKeyCopy")}</button>
+      </div>
+      {!entry.citation_key && (
+        <div style={{ fontSize: 10, color: "var(--text-faint)", marginTop: 3 }}>
+          {t("detailPanel.citationKeyAuto")}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Tab({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
   return (
     <button onClick={onClick} style={{
@@ -470,6 +521,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
               );
             })()}
 
+            <CitationKeyField entry={entry} />
             <Field label="DOI" value={entry.doi} mono />
             <Field label="arXiv" value={entry.arxiv_id} mono />
             <Field label="ISBN" value={entry.isbn} mono />

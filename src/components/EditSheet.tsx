@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { ExtraFieldInputs } from "./ExtraFieldInputs";
@@ -18,6 +18,7 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
     title:      entry.title,
     entry_type: entry.entry_type,
     year:       entry.year,
+    citation_key: entry.citation_key,
     doi:        entry.doi,
     arxiv_id:   entry.arxiv_id,
     isbn:       entry.isbn,
@@ -30,9 +31,24 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
   });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [keyAvailable, setKeyAvailable] = useState(true);
 
   const set = <K extends keyof EntryInput>(key: K, value: EntryInput[K]) =>
     setForm(f => ({ ...f, [key]: value }));
+
+  // 固定 cite key の重複を 300ms デバウンスで事前チェックする（空なら自動扱いで常に OK）。
+  useEffect(() => {
+    const key = (form.citation_key ?? "").trim();
+    if (!key) { setKeyAvailable(true); return; }
+    let cancelled = false;
+    const h = setTimeout(async () => {
+      try {
+        const ok = await invoke<boolean>("is_citation_key_available", { key, excludeId: entry.id });
+        if (!cancelled) setKeyAvailable(ok);
+      } catch { /* チェック失敗時は保存側の UNIQUE 制約に委ねる */ }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(h); };
+  }, [form.citation_key, entry.id]);
 
   const setAuthor = (i: number, v: string) => {
     const authors = [...(form.author_names ?? [])];
@@ -47,7 +63,7 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
   };
 
   const handleSave = async () => {
-    if (!form.title.trim()) return;
+    if (!form.title.trim() || !keyAvailable) return;
     setSaving(true);
     setError("");
     const trimmedExtra: Record<string, string> = {};
@@ -59,6 +75,7 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
       ...form,
       title:      form.title.trim(),
       author_names: (form.author_names ?? []).map(a => a.trim()).filter(Boolean),
+      citation_key: form.citation_key?.trim() || undefined,
       doi:        form.doi?.trim()       || undefined,
       arxiv_id:   form.arxiv_id?.trim()  || undefined,
       isbn:       form.isbn?.trim()      || undefined,
@@ -168,6 +185,20 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
           </div>
 
           <div style={{ marginBottom: 12 }}>
+            <label style={labelStyle}>{t("addSheet.field.citationKey")}</label>
+            <input value={form.citation_key ?? ""} onChange={e => set("citation_key", e.target.value || undefined)}
+              placeholder={t("addSheet.field.citationKeyPlaceholder")}
+              style={{ ...fieldStyle, fontFamily: "var(--mono)",
+                ...(keyAvailable ? {} : { borderColor: "var(--danger-text)" }) }} />
+            <div style={{
+              fontSize: 10.5, marginTop: 4, lineHeight: 1.4,
+              color: keyAvailable ? "var(--text-faint)" : "var(--danger-text)",
+            }}>
+              {keyAvailable ? t("addSheet.field.citationKeyHint") : t("addSheet.field.citationKeyTaken")}
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 12 }}>
             <label style={labelStyle}>DOI</label>
             <input value={form.doi ?? ""} onChange={e => set("doi", e.target.value || undefined)}
               placeholder="10.1234/example" style={{ ...fieldStyle, fontFamily: "var(--mono)" }} />
@@ -230,11 +261,11 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
             background: "var(--surface)", color: "var(--text)",
             fontSize: 12, cursor: "pointer",
           }}>{t("common.cancel")}</button>
-          <button onClick={handleSave} disabled={!form.title.trim() || saving} style={{
+          <button onClick={handleSave} disabled={!form.title.trim() || saving || !keyAvailable} style={{
             padding: "5px 14px", borderRadius: 5, border: "none",
             background: "var(--accent-strong)", color: "white",
             fontSize: 12, fontWeight: 500, cursor: "pointer",
-            opacity: !form.title.trim() || saving ? 0.5 : 1,
+            opacity: !form.title.trim() || saving || !keyAvailable ? 0.5 : 1,
           }}>{saving ? t("editSheet.submitting") : t("editSheet.submit")}</button>
         </div>
       </div>

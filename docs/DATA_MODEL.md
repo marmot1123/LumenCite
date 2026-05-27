@@ -7,6 +7,7 @@
 | カラム | 型 | 備考 |
 |--------|-----|------|
 | `id` | INTEGER PK | |
+| `citation_key` | TEXT | BibTeX エントリキー（cite key）。NULL = 自動生成、値あり = ユーザーがピン留めした固定キー。`migrations/0008` で追加 |
 | `title` | TEXT NOT NULL | |
 | `year` | INTEGER | |
 | `entry_type` | TEXT NOT NULL | `article` `book` `inproceedings` `thesis` `webpage` `misc` 等（BibTeX型に対応） |
@@ -25,6 +26,17 @@
 | `updated_at` | TEXT | `datetime('now')` |
 
 型固有フィールド（`journal`, `volume`, `pages`, `publisher` 等）は `extra_fields` に格納する。
+
+#### `citation_key`（BibTeX エントリキー） — migration 0008
+
+LaTeX の `\cite{...}` で参照されるキー。LaTeX 連携が安定するよう永続化する。
+
+- **意味づけ**: `NULL` = 自動生成（後述）、非 NULL = ユーザーがピン留めした固定キー。Zotero の Better BibTeX における「pinned citation key」に相当する。
+- **一意性**: `CREATE UNIQUE INDEX ux_entries_citation_key ON entries(citation_key) WHERE citation_key IS NOT NULL` の部分インデックスで、非 NULL 値はグローバル一意。NULL（=自動）は複数行で許容。
+- **サニタイズ**: 保存時に英数字と `_ : - . / +` のみを残し、それ以外を除去。トリム後に空になれば `NULL`（=自動）にフォールバック。
+- **自動生成（NULL のとき）**: エクスポート時に `第一著者の姓 + 年`（著者なしはタイトル先頭語、年なしは `nd`）から生成し、**同一 `.bib` ファイル内**で重複したら接尾辞 `a` / `b` / `c` …（26 を超えたら `aa` `ab` …）を付与して一意化する。ピン留め済みキーは予約済みとして衝突を避ける。
+- **インポート**: 元 `.bib` の cite key をサニタイズして `citation_key` に保持する。既存キー（および同一インポート内で先に確定したキー）と衝突する場合は接尾辞 `a` / `b` / `c` … で一意化する。
+- **手動編集の衝突**: ユーザーが入力した固定キーが既存と重複する場合は UNIQUE 制約違反として保存を拒否する（自動の a/b/c は付けない）。UI は保存前に `is_citation_key_available` で事前チェックする。
 
 ---
 

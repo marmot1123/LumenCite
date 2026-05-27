@@ -241,6 +241,17 @@ async fn update_entry(
 }
 
 #[tauri::command]
+async fn is_citation_key_available(
+    state: State<'_, AppState>,
+    key: String,
+    exclude_id: Option<i64>,
+) -> Result<bool, String> {
+    db::entries::is_citation_key_available(&state.db, &key, exclude_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn delete_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     // attachments の cascade では fulltext は消えないので先に消す
     let _ = db::fulltext::unindex_entry(&state.db, id).await;
@@ -414,6 +425,15 @@ async fn export_bibtex(
     entry_ids: Option<Vec<i64>>,
 ) -> Result<String, String> {
     bibtex::export_bibtex(&state.db, entry_ids).await
+}
+
+/// 詳細ビュー用: 指定エントリが .bib 同期で実際に割り当てられる cite key を返す。
+#[tauri::command]
+async fn resolve_citation_key(
+    state: State<'_, AppState>,
+    entry_id: i64,
+) -> Result<String, String> {
+    bibtex::resolve_citation_key(&state.db, entry_id).await
 }
 
 #[tauri::command]
@@ -1899,6 +1919,7 @@ pub fn run() {
             get_entry,
             create_entry,
             update_entry,
+            is_citation_key_available,
             delete_entry,
             set_starred,
             trash_entry,
@@ -1929,6 +1950,7 @@ pub fn run() {
             pick_bibtex_file,
             import_bibtex_file,
             export_bibtex,
+            resolve_citation_key,
             save_bibtex,
             get_bibtex_sync_path,
             set_bibtex_sync_path,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nom_bibtex::Bibtex;
 use sqlx::{Row, SqlitePool};
@@ -13,15 +13,34 @@ pub async fn import_bibtex(pool: &SqlitePool, content: &str) -> Result<ImportRes
     let mut skipped = 0i64;
     let mut errors: Vec<String> = Vec::new();
 
+    // 既存の固定 cite key を予約集合に読み込み、インポート中に確定したキーも逐次追加して、
+    // .bib 内・DB 既存ともに衝突しないよう接尾辞 a/b/c で一意化する。
+    let mut used: HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT citation_key FROM entries WHERE citation_key IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .collect();
+
     for entry in bib.bibliographies() {
         match bibliography_to_input(entry) {
-            Some(input) => match create_entry(pool, &input).await {
-                Ok(_) => imported += 1,
-                Err(e) => {
-                    skipped += 1;
-                    errors.push(format!("{}: {}", entry.citation_key(), e));
+            Some(mut input) => {
+                // 元 .bib のキーをサニタイズして保持。衝突したら一意化する。
+                if let Some(base) =
+                    crate::db::entries::sanitize_citation_key(entry.citation_key())
+                {
+                    input.citation_key = Some(dedup_key(&base, &mut used));
                 }
-            },
+                match create_entry(pool, &input).await {
+                    Ok(_) => imported += 1,
+                    Err(e) => {
+                        skipped += 1;
+                        errors.push(format!("{}: {}", entry.citation_key(), e));
+                    }
+                }
+            }
             None => {
                 skipped += 1;
             }
@@ -157,13 +176,121 @@ pub async fn export_bibtex(
         .collect(),
     };
 
-    let mut parts = Vec::with_capacity(ids.len());
+    let mut entries = Vec::with_capacity(ids.len());
     for id in ids {
-        let entry = get_entry(pool, id).await.map_err(|e| e.to_string())?;
-        parts.push(entry_to_bibtex(&entry));
+        entries.push(get_entry(pool, id).await.map_err(|e| e.to_string())?);
     }
 
+    let keys = assign_keys(&entries);
+    let parts: Vec<String> = entries
+        .iter()
+        .zip(keys.iter())
+        .map(|(entry, key)| entry_to_bibtex(entry, key))
+        .collect();
+
     Ok(parts.join("\n"))
+}
+
+/// `(ピン留めキー, 自動 base)` の列に、export と同じ規則で最終的な cite key を割り当てる。
+/// ピン留め済みキー（`Some`）を先に予約し、自動（`None`）は base から `a`/`b`/`c`… の
+/// 接尾辞でファイル内一意化する。返り値は入力と同じ並び。export とプレビュー
+/// （`resolve_citation_key`）でこの 1 関数を共有し、両者のキーが必ず一致するようにする。
+fn assign_keys_from(items: &[(Option<String>, String)]) -> Vec<String> {
+    let mut used: HashSet<String> = items.iter().filter_map(|(k, _)| k.clone()).collect();
+    items
+        .iter()
+        .map(|(pinned, base)| match pinned {
+            Some(k) => k.clone(),
+            None => dedup_key(base, &mut used),
+        })
+        .collect()
+}
+
+/// 渡された順序の `EntryDetail` 群に export と同じ cite key を割り当てる。
+fn assign_keys(entries: &[EntryDetail]) -> Vec<String> {
+    let items: Vec<(Option<String>, String)> = entries
+        .iter()
+        .map(|e| (e.citation_key.clone(), make_citation_key(e)))
+        .collect();
+    assign_keys_from(&items)
+}
+
+#[derive(sqlx::FromRow)]
+struct KeyRow {
+    id: i64,
+    title: String,
+    year: Option<i64>,
+    citation_key: Option<String>,
+    first_author: Option<String>,
+}
+
+/// 指定エントリが `.bib` 同期（ゴミ箱を除く全エントリ書き出し）で実際に割り当てられる
+/// cite key を返す。`export_bibtex(None)` と同じ並び・同じ衝突回避を再現するため、
+/// 詳細ビューに「実際に書き出されるキー」を表示・コピーできる。
+/// 全 `EntryDetail` を読み込む代わりに base 生成に必要な列だけを取得して軽量化する。
+pub async fn resolve_citation_key(pool: &SqlitePool, entry_id: i64) -> Result<String, String> {
+    let rows: Vec<KeyRow> = sqlx::query_as(
+        "SELECT e.id, e.title, e.year, e.citation_key,
+                (SELECT a.name FROM entry_authors ea
+                   JOIN authors a ON a.id = ea.author_id
+                  WHERE ea.entry_id = e.id ORDER BY ea.position LIMIT 1) AS first_author
+         FROM entries e
+         WHERE e.deleted_at IS NULL
+         ORDER BY e.created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let items: Vec<(Option<String>, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.citation_key.clone(),
+                make_base_key(r.first_author.as_deref(), &r.title, r.year),
+            )
+        })
+        .collect();
+    let keys = assign_keys_from(&items);
+
+    if let Some(key) = rows.iter().zip(keys).find(|(r, _)| r.id == entry_id).map(|(_, k)| k) {
+        return Ok(key);
+    }
+
+    // ゴミ箱内など同期対象外のエントリ: ピン留めキー、なければ自動 base を返す。
+    let entry = get_entry(pool, entry_id).await.map_err(|e| e.to_string())?;
+    Ok(match &entry.citation_key {
+        Some(k) => k.clone(),
+        None => make_citation_key(&entry),
+    })
+}
+
+/// `base` が未使用ならそのまま、使われていれば `base` + `a`/`b`/`c`… と接尾辞を付けて
+/// 未使用のキーを返す。返したキーは `used` に登録する。
+fn dedup_key(base: &str, used: &mut HashSet<String>) -> String {
+    if used.insert(base.to_string()) {
+        return base.to_string();
+    }
+    let mut n = 1usize;
+    loop {
+        let candidate = format!("{}{}", base, suffix_letters(n));
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// 1 → "a", 26 → "z", 27 → "aa" のスプレッドシート列方式で接尾辞を生成する。
+fn suffix_letters(mut n: usize) -> String {
+    let mut s = Vec::new();
+    while n > 0 {
+        n -= 1;
+        s.push(b'a' + (n % 26) as u8);
+        n /= 26;
+    }
+    s.reverse();
+    String::from_utf8(s).unwrap()
 }
 
 /// 全エントリ（ゴミ箱を除く）の BibTeX を指定パスへ書き出す。
@@ -193,7 +320,7 @@ pub async fn sync_bibtex(pool: &SqlitePool, path: &std::path::Path) -> Result<()
     Ok(())
 }
 
-fn entry_to_bibtex(entry: &EntryDetail) -> String {
+fn entry_to_bibtex(entry: &EntryDetail, key: &str) -> String {
     let bib_type = match entry.entry_type.as_str() {
         "article"        => "article",
         "book"           => "book",
@@ -203,7 +330,6 @@ fn entry_to_bibtex(entry: &EntryDetail) -> String {
         _                => "misc",
     };
 
-    let key = make_citation_key(entry);
     let mut fields: Vec<String> = Vec::new();
 
     fields.push(format!("  title      = {{{}}}", entry.title));
@@ -249,13 +375,25 @@ fn entry_to_bibtex(entry: &EntryDetail) -> String {
 }
 
 fn make_citation_key(entry: &EntryDetail) -> String {
-    let author_part = entry.authors.first()
-        .map(|a| a.name.split_whitespace().last().unwrap_or(&a.name).to_lowercase())
-        .unwrap_or_else(|| {
-            entry.title.split_whitespace().next().unwrap_or("unknown").to_lowercase()
-        });
+    make_base_key(
+        entry.authors.first().map(|a| a.name.as_str()),
+        &entry.title,
+        entry.year,
+    )
+}
 
-    let year_part = entry.year.map(|y| y.to_string()).unwrap_or_else(|| "nd".to_string());
+/// 自動 cite key の base（接尾辞なし）を `第一著者の姓 + 年` で生成する。著者がいなければ
+/// タイトル先頭語、年がなければ `nd`。英数字と `_` 以外を除去する。
+/// `make_citation_key`（EntryDetail 経由）と `resolve_citation_key`（軽量行経由）で共有する。
+fn make_base_key(first_author: Option<&str>, title: &str, year: Option<i64>) -> String {
+    let author_part = match first_author {
+        Some(name) if !name.trim().is_empty() => {
+            name.split_whitespace().last().unwrap_or(name).to_lowercase()
+        }
+        _ => title.split_whitespace().next().unwrap_or("unknown").to_lowercase(),
+    };
+
+    let year_part = year.map(|y| y.to_string()).unwrap_or_else(|| "nd".to_string());
 
     format!("{}{}", author_part, year_part)
         .chars()
@@ -288,6 +426,25 @@ mod tests {
         assert_eq!(map_entry_type("phdthesis"),     "thesis");
         assert_eq!(map_entry_type("online"),        "webpage");
         assert_eq!(map_entry_type("techreport"),    "misc");
+    }
+
+    #[test]
+    fn suffix_letters_spreadsheet_style() {
+        assert_eq!(suffix_letters(1), "a");
+        assert_eq!(suffix_letters(2), "b");
+        assert_eq!(suffix_letters(26), "z");
+        assert_eq!(suffix_letters(27), "aa");
+        assert_eq!(suffix_letters(28), "ab");
+    }
+
+    #[test]
+    fn dedup_key_appends_suffixes() {
+        let mut used = HashSet::new();
+        assert_eq!(dedup_key("smith2020", &mut used), "smith2020");
+        assert_eq!(dedup_key("smith2020", &mut used), "smith2020a");
+        assert_eq!(dedup_key("smith2020", &mut used), "smith2020b");
+        // 別 base は独立
+        assert_eq!(dedup_key("jones2021", &mut used), "jones2021");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -394,6 +551,139 @@ mod tests {
 
         let bib = export_bibtex(&pool, Some(vec![entry.id])).await.unwrap();
         assert!(bib.contains("@article{smith2023,"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn import_preserves_citation_key(pool: sqlx::SqlitePool) {
+        let bib = r#"
+@article{vaswani2017attention,
+  title  = {Attention Is All You Need},
+  author = {Vaswani, Ashish},
+  year   = {2017}
+}
+"#;
+        import_bibtex(&pool, bib).await.unwrap();
+
+        let entries = crate::db::entries::get_entries(&pool, None, None, None).await.unwrap();
+        let detail = crate::db::entries::get_entry(&pool, entries[0].id).await.unwrap();
+        assert_eq!(detail.citation_key, Some("vaswani2017attention".to_string()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn import_dedups_colliding_citation_keys(pool: sqlx::SqlitePool) {
+        // 同じ cite key を持つ 2 エントリ（.bib では重複キーは不正だが防御的に処理する）
+        let bib = r#"
+@article{smith2020,
+  title  = {First},
+  author = {Smith, A},
+  year   = {2020}
+}
+@article{smith2020,
+  title  = {Second},
+  author = {Smith, B},
+  year   = {2020}
+}
+"#;
+        let result = import_bibtex(&pool, bib).await.unwrap();
+        assert_eq!(result.imported, 2);
+
+        let mut keys: Vec<String> = Vec::new();
+        for e in crate::db::entries::get_entries(&pool, None, None, None).await.unwrap() {
+            let d = crate::db::entries::get_entry(&pool, e.id).await.unwrap();
+            keys.push(d.citation_key.unwrap());
+        }
+        keys.sort();
+        assert_eq!(keys, vec!["smith2020".to_string(), "smith2020a".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_uses_pinned_citation_key(pool: sqlx::SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "Whatever".to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["John Smith".to_string()],
+            year: Some(2023),
+            citation_key: Some("mypinnedkey".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let bib = export_bibtex(&pool, Some(vec![entry.id])).await.unwrap();
+        // 自動生成の smith2023 ではなくピン留めキーが使われる
+        assert!(bib.contains("@article{mypinnedkey,"));
+        assert!(!bib.contains("smith2023"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_auto_dedups_same_author_year(pool: sqlx::SqlitePool) {
+        let a = create_entry(&pool, &EntryInput {
+            title: "Paper One".to_string(), entry_type: "article".to_string(),
+            author_names: vec!["John Smith".to_string()], year: Some(2020),
+            ..Default::default()
+        }).await.unwrap();
+        let b = create_entry(&pool, &EntryInput {
+            title: "Paper Two".to_string(), entry_type: "article".to_string(),
+            author_names: vec!["John Smith".to_string()], year: Some(2020),
+            ..Default::default()
+        }).await.unwrap();
+
+        let bib = export_bibtex(&pool, Some(vec![a.id, b.id])).await.unwrap();
+        assert!(bib.contains("@article{smith2020,"), "1件目は素の smith2020");
+        assert!(bib.contains("@article{smith2020a,"), "2件目は接尾辞付き smith2020a");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn resolve_citation_key_matches_export(pool: sqlx::SqlitePool) {
+        // 2 件とも自動キーが smith2020 になる → resolve は export と同じ a/b/c を返す
+        let first = create_entry(&pool, &EntryInput {
+            title: "First".to_string(), entry_type: "article".to_string(),
+            author_names: vec!["John Smith".to_string()], year: Some(2020),
+            ..Default::default()
+        }).await.unwrap();
+        let second = create_entry(&pool, &EntryInput {
+            title: "Second".to_string(), entry_type: "article".to_string(),
+            author_names: vec!["Jane Smith".to_string()], year: Some(2020),
+            ..Default::default()
+        }).await.unwrap();
+
+        // export_bibtex(None) は created_at DESC（second が先）。resolve も同順序で割り当てる。
+        let bib = export_bibtex(&pool, None).await.unwrap();
+        let k_first = resolve_citation_key(&pool, first.id).await.unwrap();
+        let k_second = resolve_citation_key(&pool, second.id).await.unwrap();
+
+        assert_ne!(k_first, k_second);
+        assert!(bib.contains(&format!("@article{{{},", k_first)));
+        assert!(bib.contains(&format!("@article{{{},", k_second)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn resolve_citation_key_returns_pinned(pool: sqlx::SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "P".to_string(), entry_type: "article".to_string(),
+            author_names: vec!["John Smith".to_string()], year: Some(2020),
+            citation_key: Some("pinned2020".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        assert_eq!(resolve_citation_key(&pool, entry.id).await.unwrap(), "pinned2020");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_auto_key_avoids_pinned_key(pool: sqlx::SqlitePool) {
+        // ピン留め "smith2020" と、自動なら smith2020 になる別エントリが衝突しないこと
+        let pinned = create_entry(&pool, &EntryInput {
+            title: "Pinned".to_string(), entry_type: "article".to_string(),
+            author_names: vec!["John Smith".to_string()], year: Some(2020),
+            citation_key: Some("smith2020".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        let auto = create_entry(&pool, &EntryInput {
+            title: "Auto".to_string(), entry_type: "article".to_string(),
+            author_names: vec!["Jane Smith".to_string()], year: Some(2020),
+            ..Default::default()
+        }).await.unwrap();
+
+        let bib = export_bibtex(&pool, Some(vec![pinned.id, auto.id])).await.unwrap();
+        assert!(bib.contains("@article{smith2020,"));
+        assert!(bib.contains("@article{smith2020a,"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
