@@ -593,6 +593,8 @@
       "mcpId": "id",
       "mcpCommand": "コマンド",
       "mcpArgs": "引数（スペース区切り）",
+      "mcpEnv": "環境変数（1行に KEY=VALUE、任意）",
+      "mcpEnvNote": "秘匿情報が必要なサーバー（例 OBSIDIAN_API_KEY）に使用します。アプリ設定にローカル保存されます。",
       "mcpAdd": "サーバーを追加",
       "mcpRemove": "削除",
       "whitelistTitle": "ツールの自動承認",

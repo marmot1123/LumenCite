@@ -593,6 +593,8 @@
       "mcpId": "id",
       "mcpCommand": "command",
       "mcpArgs": "args (space-separated)",
+      "mcpEnv": "env (one KEY=VALUE per line, optional)",
+      "mcpEnvNote": "Used for servers needing secrets (e.g. OBSIDIAN_API_KEY). Stored locally in app settings.",
       "mcpAdd": "Add server",
       "mcpRemove": "Remove",
       "whitelistTitle": "Tool auto-approval",
