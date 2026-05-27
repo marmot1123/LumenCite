@@ -51,6 +51,7 @@ pub struct EntryDetail {
     pub title: String,
     pub year: Option<i64>,
     pub entry_type: String,
+    pub citation_key: Option<String>,
     pub doi: Option<String>,
     pub isbn: Option<String>,
     pub arxiv_id: Option<String>,
@@ -113,6 +114,8 @@ pub struct EntryInput {
     pub title: String,
     pub year: Option<i64>,
     pub entry_type: String,
+    #[serde(default)]
+    pub citation_key: Option<String>,
     pub doi: Option<String>,
     pub isbn: Option<String>,
     pub arxiv_id: Option<String>,

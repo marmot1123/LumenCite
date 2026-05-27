@@ -241,6 +241,17 @@ async fn update_entry(
 }
 
 #[tauri::command]
+async fn is_citation_key_available(
+    state: State<'_, AppState>,
+    key: String,
+    exclude_id: Option<i64>,
+) -> Result<bool, String> {
+    db::entries::is_citation_key_available(&state.db, &key, exclude_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn delete_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     // attachments の cascade では fulltext は消えないので先に消す
     let _ = db::fulltext::unindex_entry(&state.db, id).await;
@@ -1899,6 +1910,7 @@ pub fn run() {
             get_entry,
             create_entry,
             update_entry,
+            is_citation_key_available,
             delete_entry,
             set_starred,
             trash_entry,

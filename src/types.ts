@@ -106,6 +106,8 @@ export interface SidebarCounts {
 }
 
 export interface EntryDetail extends EntrySummary {
+  /** BibTeX エントリキー。null/未設定なら export 時に自動生成される */
+  citation_key?: string;
   doi?: string;
   isbn?: string;
   arxiv_id?: string;
@@ -151,6 +153,8 @@ export interface EntryInput {
   title: string;
   year?: number;
   entry_type: EntryType;
+  /** 固定 cite key。省略/空文字なら自動生成（NULL 保存） */
+  citation_key?: string;
   doi?: string;
   isbn?: string;
   arxiv_id?: string;
