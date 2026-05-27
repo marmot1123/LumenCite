@@ -228,6 +228,7 @@ type McpServerConfig = {
 | `fetch_metadata_by_arxiv` | `arxiv_id: String` | `Result<EntryInput>` |
 | `fetch_metadata_by_isbn` | `isbn: String` | `Result<EntryInput>` |
 | `is_citation_key_available` | `key: String, exclude_id?: i64` | `Result<bool>` — 固定 cite key が使用可能か（サニタイズ後に他エントリと重複しないか）。`exclude_id` は編集中エントリ自身を除外。空キーは常に `true`（自動扱い） |
+| `resolve_citation_key` | `entry_id: i64` | `Result<String>` — `.bib` 同期（ゴミ箱を除く全件書き出し）で実際に割り当てられる cite key。`export_bibtex(None)` と同じ並び・衝突回避を再現。詳細ビューの表示/コピー用 |
 
 `create_entry` / `update_entry` の `EntryInput.citation_key` はサニタイズ後 `entries.citation_key` に保存する（空なら NULL = 自動）。既存の固定キーと重複する非 NULL 値は UNIQUE 制約で拒否される（`Result` の `Err`）。UI は保存前に `is_citation_key_available` で検証する。生成・重複回避の規則は `DATA_MODEL.md` の `citation_key` 節を参照。
 

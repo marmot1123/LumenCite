@@ -427,6 +427,15 @@ async fn export_bibtex(
     bibtex::export_bibtex(&state.db, entry_ids).await
 }
 
+/// 詳細ビュー用: 指定エントリが .bib 同期で実際に割り当てられる cite key を返す。
+#[tauri::command]
+async fn resolve_citation_key(
+    state: State<'_, AppState>,
+    entry_id: i64,
+) -> Result<String, String> {
+    bibtex::resolve_citation_key(&state.db, entry_id).await
+}
+
 #[tauri::command]
 async fn save_bibtex(
     app: tauri::AppHandle,
@@ -1941,6 +1950,7 @@ pub fn run() {
             pick_bibtex_file,
             import_bibtex_file,
             export_bibtex,
+            resolve_citation_key,
             save_bibtex,
             get_bibtex_sync_path,
             set_bibtex_sync_path,
