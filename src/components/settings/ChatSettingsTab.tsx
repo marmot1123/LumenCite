@@ -29,12 +29,27 @@ export function ChatSettingsTab() {
   );
 }
 
+/** `KEY=VALUE` の行群を環境変数マップに変換する。空行・`#` コメント・`=` 無しの行は無視。 */
+function parseEnv(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    if (key) out[key] = trimmed.slice(eq + 1).trim();
+  }
+  return out;
+}
+
 function McpServers() {
   const { t } = useTranslation();
   const [servers, setServers] = useState<McpServerConfig[]>([]);
   const [id, setId] = useState("");
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
+  const [env, setEnv] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -53,10 +68,10 @@ function McpServers() {
           id: id.trim(),
           command: command.trim(),
           args: args.trim() ? args.trim().split(/\s+/) : [],
-          env: {},
+          env: parseEnv(env),
         },
       });
-      setId(""); setCommand(""); setArgs("");
+      setId(""); setCommand(""); setArgs(""); setEnv("");
       reload();
     } catch (e) {
       setError(typeof e === "string" ? e : String(e));
@@ -81,6 +96,11 @@ function McpServers() {
                 <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {s.command} {s.args.join(" ")}
                 </div>
+                {Object.keys(s.env ?? {}).length > 0 && (
+                  <div style={{ fontSize: 10, color: "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    env: {Object.keys(s.env).join(", ")}
+                  </div>
+                )}
               </div>
               <button onClick={() => void remove(s.id)} title={t("settings.chat.mcpRemove")} style={iconBtn}>
                 <Icon name="trash" size={13} color="var(--danger-strong)" />
@@ -95,6 +115,15 @@ function McpServers() {
           <input value={command} onChange={(e) => setCommand(e.target.value)} placeholder={t("settings.chat.mcpCommand")} style={{ ...field, flex: 1 }} />
         </div>
         <input value={args} onChange={(e) => setArgs(e.target.value)} placeholder={t("settings.chat.mcpArgs")} style={field} />
+        <textarea
+          value={env}
+          onChange={(e) => setEnv(e.target.value)}
+          placeholder={t("settings.chat.mcpEnv")}
+          rows={2}
+          spellCheck={false}
+          style={{ ...field, resize: "vertical", lineHeight: 1.5 }}
+        />
+        <div style={{ fontSize: 10.5, color: "var(--text-faint)", lineHeight: 1.5 }}>{t("settings.chat.mcpEnvNote")}</div>
         {error && <div style={{ fontSize: 11.5, color: "var(--danger-strong)" }}>{error}</div>}
         <button onClick={() => void add()} disabled={busy || !id.trim() || !command.trim()} style={{ ...primaryBtn, opacity: busy || !id.trim() || !command.trim() ? 0.5 : 1 }}>
           <Icon name="plus" size={12} color="#fff" />

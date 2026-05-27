@@ -30,6 +30,10 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 nom-bibtex = "0.6"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-dialog = "2"
+# 起動時 DB 初期化失敗を Tauri イベントループ起動前に表示するためのネイティブダイアログ。
+# tauri-plugin-dialog の blocking_show は run_on_main_thread 経由で setup 中はデッドロックするため、
+# setup ではイベントループ非依存の rfd を直接使う（tauri-plugin-dialog が依存する版と統一）。
+rfd = "0.16"
 pdf-extract = "0.9"
 tokio = { version = "1", features = ["sync", "time", "macros", "process", "io-util"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
