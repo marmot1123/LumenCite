@@ -180,6 +180,16 @@ export interface McpServerConfig {
   env: Record<string, string>;
 }
 
+/** MCP サーバーの起動状態（backend の serde tag="state" と一致）。 */
+export type McpServerStatus =
+  | { state: "running"; tool_count: number }
+  | { state: "failed"; error: string };
+
+/** 設定済み MCP サーバー + 起動状態（list_mcp_servers の戻り値）。status が null なら状態不明。 */
+export interface McpServerInfo extends McpServerConfig {
+  status: McpServerStatus | null;
+}
+
 /** backend の chat_sessions 行（entry_count を投影）。 */
 export interface ChatSession {
   id: number;

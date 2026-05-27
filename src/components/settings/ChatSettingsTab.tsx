@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { Icon } from "../icons";
-import type { McpServerConfig } from "../../types";
+import type { McpServerInfo, McpServerStatus } from "../../types";
 
 // ホワイトリストで上書き可能なツールと既定の自動承認可否（backend approval.rs と一致）。
 const OVERRIDABLE_TOOLS: { name: string; defaultAuto: boolean }[] = [
@@ -43,9 +43,25 @@ function parseEnv(text: string): Record<string, string> {
   return out;
 }
 
+/** MCP サーバーの起動状態を色付きの小バッジで表示する。 */
+function McpStatusBadge({ status }: { status: McpServerStatus | null }) {
+  const { t } = useTranslation();
+  const base: React.CSSProperties = {
+    fontSize: 10, fontWeight: 600, padding: "1px 6px", borderRadius: 999,
+    whiteSpace: "nowrap", flexShrink: 0,
+  };
+  if (!status) {
+    return <span style={{ ...base, color: "var(--text-faint)", background: "var(--surface)" }}>{t("settings.chat.mcpStatusUnknown")}</span>;
+  }
+  if (status.state === "running") {
+    return <span style={{ ...base, color: "#15803d", background: "rgba(34,197,94,0.14)" }}>● {t("settings.chat.mcpStatusRunning", { count: status.tool_count })}</span>;
+  }
+  return <span style={{ ...base, color: "var(--danger-strong)", background: "var(--danger-bg)" }}>● {t("settings.chat.mcpStatusFailed")}</span>;
+}
+
 function McpServers() {
   const { t } = useTranslation();
-  const [servers, setServers] = useState<McpServerConfig[]>([]);
+  const [servers, setServers] = useState<McpServerInfo[]>([]);
   const [id, setId] = useState("");
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
@@ -54,9 +70,21 @@ function McpServers() {
   const [error, setError] = useState<string | null>(null);
 
   const reload = () => {
-    invoke<McpServerConfig[]>("list_mcp_servers").then(setServers).catch(() => setServers([]));
+    invoke<McpServerInfo[]>("list_mcp_servers").then(setServers).catch(() => setServers([]));
   };
   useEffect(reload, []);
+
+  // 既存サーバーの再起動（env 修正後など）。add_mcp_server は同 config を保存し直して
+  // start を走らせる。成否に関わらず backend が status を更新するので reload で反映する。
+  const retry = async (s: McpServerInfo) => {
+    setBusy(true);
+    try {
+      await invoke("add_mcp_server", {
+        config: { id: s.id, command: s.command, args: s.args, env: s.env },
+      });
+    } catch { /* status は backend 側で更新済み */ }
+    finally { setBusy(false); reload(); }
+  };
 
   const add = async () => {
     if (!id.trim() || !command.trim()) return;
@@ -72,11 +100,13 @@ function McpServers() {
         },
       });
       setId(""); setCommand(""); setArgs(""); setEnv("");
-      reload();
     } catch (e) {
       setError(typeof e === "string" ? e : String(e));
     } finally {
       setBusy(false);
+      // 成否に関わらず一覧を更新。起動失敗でも config は保存済みなので、
+      // 失敗サーバーが赤バッジ + 再起動ボタン付きで一覧に現れる。
+      reload();
     }
   };
 
@@ -92,7 +122,10 @@ function McpServers() {
           {servers.map((s) => (
             <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", borderRadius: 6, border: "1px solid var(--border)", background: "var(--surface-2)" }}>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)" }}>{s.id}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)" }}>{s.id}</span>
+                  <McpStatusBadge status={s.status} />
+                </div>
                 <div style={{ fontSize: 10.5, color: "var(--text-faint)", fontFamily: "var(--mono)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {s.command} {s.args.join(" ")}
                 </div>
@@ -101,7 +134,17 @@ function McpServers() {
                     env: {Object.keys(s.env).join(", ")}
                   </div>
                 )}
+                {s.status?.state === "failed" && (
+                  <div title={s.status.error} style={{ fontSize: 10, color: "var(--danger-strong)", marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {s.status.error}
+                  </div>
+                )}
               </div>
+              {s.status?.state === "failed" && (
+                <button onClick={() => void retry(s)} disabled={busy} title={t("settings.chat.mcpRetry")} style={{ ...iconBtn, opacity: busy ? 0.5 : 1 }}>
+                  <Icon name="sync" size={13} color="var(--text-mute)" />
+                </button>
+              )}
               <button onClick={() => void remove(s.id)} title={t("settings.chat.mcpRemove")} style={iconBtn}>
                 <Icon name="trash" size={13} color="var(--danger-strong)" />
               </button>

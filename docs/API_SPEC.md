@@ -206,6 +206,15 @@ type McpServerConfig = {
   args?: string[];
   env?: Record<string, string>;
 };
+
+// MCP サーバーの起動状態（list_mcp_servers が config に重ねて返す）
+type McpServerStatus =
+  | { state: "running"; tool_count: number } // 起動成功・取得ツール数
+  | { state: "failed"; error: string };       // 起動/ハンドシェイク失敗
+
+type McpServerInfo = McpServerConfig & {
+  status: McpServerStatus | null; // null = 状態不明（未起動試行）
+};
 ```
 
 ---
@@ -468,7 +477,7 @@ agentic LLM Chat のセッション管理と会話ループ。`chat_send_message
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `list_mcp_servers` | — | `Result<Vec<McpServerConfig>>` |
+| `list_mcp_servers` | — | `Result<Vec<McpServerInfo>>` — 設定 + 起動状態（起動失敗を UI に表示するため） |
 | `add_mcp_server` | `config: McpServerConfig` | `Result<()>` — 設定保存 + プロセス起動 |
 | `remove_mcp_server` | `id: String` | `Result<()>` — プロセス停止 + 設定削除 |
 
