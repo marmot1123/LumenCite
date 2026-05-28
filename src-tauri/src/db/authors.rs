@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn preserves_cjk_ideographs() {
-        assert_eq!(normalize_name("関 茂樹"), "関 茂樹");
+        assert_eq!(normalize_name("関 元樹"), "関 元樹");
     }
 
     #[test]
@@ -643,11 +643,11 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn get_or_create_author_matches_by_orcid(pool: SqlitePool) {
-        // 先に「関 茂樹」を ORCID 付きで登録
+        // 先に「関 元樹」を ORCID 付きで登録
         let mut tx = pool.begin().await.unwrap();
         let first = get_or_create_author(
             &mut tx,
-            &input_with_orcid("関 茂樹", "0000-0002-1825-0097"),
+            &input_with_orcid("関 元樹", "0000-0002-1825-0097"),
         )
         .await
         .unwrap();
@@ -664,8 +664,8 @@ mod tests {
         tx.commit().await.unwrap();
 
         assert_eq!(first.id, second.id, "ORCID 一致で既存著者にヒットすべき");
-        // 名前は既存 (関 茂樹) のまま、Seki M. では上書きしない
-        assert_eq!(second.name, "関 茂樹");
+        // 名前は既存 (関 元樹) のまま、Seki M. では上書きしない
+        assert_eq!(second.name, "関 元樹");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -813,7 +813,7 @@ mod tests {
             name: name.to_string(),
             given_name: Some("Given".to_string()),
             family_name: Some("Family".to_string()),
-            name_original: Some("関 茂樹".to_string()),
+            name_original: Some("関 元樹".to_string()),
             original_script: Some("Hani".to_string()),
             reading_family: Some("せき".to_string()),
             reading_given: Some("もとき".to_string()),
@@ -831,7 +831,7 @@ mod tests {
         assert_eq!(updated.name, "New Name");
         assert_eq!(updated.given_name.as_deref(), Some("Given"));
         assert_eq!(updated.family_name.as_deref(), Some("Family"));
-        assert_eq!(updated.name_original.as_deref(), Some("関 茂樹"));
+        assert_eq!(updated.name_original.as_deref(), Some("関 元樹"));
         assert_eq!(updated.reading_family.as_deref(), Some("せき"));
         assert_eq!(updated.email.as_deref(), Some("x@example.com"));
         assert!(updated.updated_at.is_some());
@@ -939,7 +939,7 @@ mod tests {
         // 漢字 / かなを update_author で付与（FTS 再同期込み）
         let updated = AuthorInput {
             name: "Seki".to_string(),
-            name_original: Some("関 茂樹".to_string()),
+            name_original: Some("関 元樹".to_string()),
             reading_family: Some("せき".to_string()),
             reading_given: Some("もとき".to_string()),
             ..Default::default()

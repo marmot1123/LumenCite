@@ -2388,9 +2388,9 @@ mod tests {
         // 後から漢字名と読み仮名を author に付与（M7 update_author 経由を想定したシナリオ）
         sqlx::query(
             "UPDATE authors
-             SET name_original = '関 茂樹',
+             SET name_original = '関 元樹',
                  family_name_original = '関',
-                 given_name_original = '茂樹',
+                 given_name_original = '元樹',
                  original_script = 'Hani',
                  reading_family = 'せき',
                  reading_given = 'もとき',

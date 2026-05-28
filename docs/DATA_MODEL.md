@@ -53,8 +53,8 @@ LaTeX の `\cite{...}` で参照されるキー。LaTeX 連携が安定するよ
 | `family_name` | TEXT | 姓（任意） |
 | `suffix` | TEXT | `Jr.` / `Sr.` / `III` 等。CSL の suffix に対応（v0.3.0 / migration 0009） |
 | `name_particle` | TEXT | `von` / `van der` / `de la` 等。CSL の non-dropping-particle に対応。`family_name` に混ぜない（v0.3.0 / migration 0009） |
-| `name_original` | TEXT | オリジナル言語表記のフルネーム（例 `関 茂樹` / `毛沢东`）。区切りが曖昧な言語向け（v0.3.0 / migration 0009） |
-| `given_name_original` | TEXT | オリジナル言語の名（例 `茂樹`）。分割できる場合のみ（v0.3.0 / migration 0009） |
+| `name_original` | TEXT | オリジナル言語表記のフルネーム（例 `関 元樹` / `毛沢东`）。区切りが曖昧な言語向け（v0.3.0 / migration 0009） |
+| `given_name_original` | TEXT | オリジナル言語の名（例 `元樹`）。分割できる場合のみ（v0.3.0 / migration 0009） |
 | `family_name_original` | TEXT | オリジナル言語の姓（例 `関`）。分割できる場合のみ（v0.3.0 / migration 0009） |
 | `original_script` | TEXT | ISO 15924 文字種コード（例 `Hani` 漢字 / `Hang` ハングル / `Cyrl` キリル）。正規化・ソート判定に利用（v0.3.0 / migration 0009） |
 | `reading_family` | TEXT | 姓の読み仮名（例 `せき`）。五十音ソート・かな検索用（v0.3.0 / migration 0009） |

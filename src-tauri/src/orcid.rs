@@ -505,13 +505,13 @@ mod tests {
             "other-names": {
                 "other-name": [
                     { "content": "Mo Seki" },        // ラテン文字のみ → skip
-                    { "content": "関 茂樹" },          // CJK → 拾う
+                    { "content": "関 元樹" },          // CJK → 拾う
                     { "content": "せき もとき" }       // Hiragana
                 ]
             }
         });
         let input = person_to_author_input(&body, "0000-0000-0000-0001");
-        assert_eq!(input.name_original.as_deref(), Some("関 茂樹"));
+        assert_eq!(input.name_original.as_deref(), Some("関 元樹"));
         assert_eq!(input.original_script.as_deref(), Some("Hani"));
     }
 
