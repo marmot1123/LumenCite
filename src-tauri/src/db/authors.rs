@@ -11,7 +11,29 @@
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::models::{Author, AuthorIdentifier, AuthorInput};
+use crate::models::{Author, AuthorIdentifier, AuthorInput, EntryInput};
+
+/// `EntryInput` から create/update に渡す著者リストを取り出す。
+///
+/// 優先順位:
+/// 1. `input.authors` (`Some`) — 構造化された AuthorInput をそのまま使う
+///    （bibtex の `{...}` literal / metadata の ORCID 等を伝搬する経路）
+/// 2. それ以外 — `input.author_names` を AuthorInput { name } にフォールバック
+///    （フロント既存のペイロード / 単純なテキスト入力）
+pub(crate) fn author_inputs_from(input: &EntryInput) -> Vec<AuthorInput> {
+    if let Some(rich) = input.authors.as_ref() {
+        rich.clone()
+    } else {
+        input
+            .author_names
+            .iter()
+            .map(|name| AuthorInput {
+                name: name.clone(),
+                ..Default::default()
+            })
+            .collect()
+    }
+}
 
 /// 著者名の照合用に正規化する。
 ///

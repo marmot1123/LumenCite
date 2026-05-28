@@ -220,6 +220,11 @@ pub struct EntryInput {
     pub author_ids: Vec<i64>,
     #[serde(default)]
     pub author_names: Vec<String>,
+    /// v0.3.0: 構造化された著者情報を渡すルート（bibtex literal / metadata の ORCID 等）。
+    /// `Some` のとき `author_names` は無視され、ここに含まれる AuthorInput がそのまま
+    /// `get_or_create_author` に渡される。フロント既存のペイロード互換のため `Option`。
+    #[serde(default)]
+    pub authors: Option<Vec<AuthorInput>>,
     #[serde(default)]
     pub tag_ids: Vec<i64>,
 }

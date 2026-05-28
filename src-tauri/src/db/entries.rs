@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use crate::db::authors::get_or_create_author;
+use crate::db::authors::{author_inputs_from, get_or_create_author};
 use crate::models::{
-    Attachment, Author, AuthorInput, Collection, EntryDetail, EntryInput, EntryRelation,
-    EntrySummary, SidebarCounts, Tag,
+    Attachment, Author, Collection, EntryDetail, EntryInput, EntryRelation, EntrySummary,
+    SidebarCounts, Tag,
 };
 use sqlx::{Row, SqlitePool};
 
@@ -306,17 +306,8 @@ pub async fn create_entry(
 
     let entry_id = result.last_insert_rowid();
 
-    for (pos, name) in input.author_names.iter().enumerate() {
-        // EntryInput.author_names は文字列のみなので AuthorInput.name に詰めて渡す。
-        // ORCID 付きで渡すルートは M6（metadata.rs 経由）で追加する。
-        let author = get_or_create_author(
-            &mut tx,
-            &AuthorInput {
-                name: name.clone(),
-                ..Default::default()
-            },
-        )
-        .await?;
+    for (pos, ai) in author_inputs_from(input).into_iter().enumerate() {
+        let author = get_or_create_author(&mut tx, &ai).await?;
         sqlx::query(
             "INSERT INTO entry_authors (entry_id, author_id, position) VALUES (?, ?, ?)",
         )
@@ -771,17 +762,8 @@ pub async fn update_entry(
         .execute(&mut *tx)
         .await?;
 
-    for (pos, name) in input.author_names.iter().enumerate() {
-        // EntryInput.author_names は文字列のみなので AuthorInput.name に詰めて渡す。
-        // ORCID 付きで渡すルートは M6（metadata.rs 経由）で追加する。
-        let author = get_or_create_author(
-            &mut tx,
-            &AuthorInput {
-                name: name.clone(),
-                ..Default::default()
-            },
-        )
-        .await?;
+    for (pos, ai) in author_inputs_from(input).into_iter().enumerate() {
+        let author = get_or_create_author(&mut tx, &ai).await?;
         sqlx::query(
             "INSERT INTO entry_authors (entry_id, author_id, position) VALUES (?, ?, ?)",
         )
