@@ -707,5 +707,95 @@
       "thanksTitle": "Built on shoulders of giants",
       "thanksBody": "Powered by Tauri, React, pdf.js, KaTeX, and many other open-source libraries."
     }
+  },
+  "authorEditor": {
+    "title": "Edit author",
+    "close": "Close",
+    "save": "Save",
+    "saving": "Saving…",
+    "cancel": "Cancel",
+    "saveHelp": "Saving rebuilds the search index for every entry that includes this author.",
+    "section": {
+      "name": "Name",
+      "original": "Original script",
+      "reading": "Reading (kana)",
+      "identifiers": "External identifiers",
+      "extra": "Additional info",
+      "merge": "Merge with another author"
+    },
+    "field": {
+      "displayName": "Display name",
+      "displayNameHelp": "Used in lists and citations.",
+      "givenName": "Given name",
+      "middleName": "Middle name",
+      "familyName": "Family name",
+      "suffix": "Suffix (Jr. / III, etc.)",
+      "nameParticle": "Particle (von / van der, etc.)",
+      "nameOriginal": "Original full name",
+      "givenNameOriginal": "Original given name",
+      "familyNameOriginal": "Original family name",
+      "originalScript": "Script",
+      "readingFamily": "Family reading",
+      "readingGiven": "Given reading",
+      "isOrganization": "Organization",
+      "isOrganizationHelp": "When on, the display name is treated as a literal organization name (CSL literal). Given/family fields are ignored.",
+      "email": "Email",
+      "homepageUrl": "Homepage URL",
+      "notes": "Notes",
+      "notesHelp": "Free-form memo (e.g. \"same-name different person\", \"renamed in 2024\").",
+      "orcid": "ORCID"
+    },
+    "script": {
+      "Latn": "Latin",
+      "Hani": "Han (CJK)",
+      "Hang": "Hangul",
+      "Cyrl": "Cyrillic",
+      "Arab": "Arabic",
+      "Hira": "Hiragana",
+      "Kana": "Katakana"
+    },
+    "scheme": {
+      "orcid": "ORCID",
+      "scopus": "Scopus Author ID",
+      "dblp": "DBLP",
+      "semantic_scholar": "Semantic Scholar",
+      "wikidata": "Wikidata",
+      "isni": "ISNI",
+      "viaf": "VIAF",
+      "researcher_id": "ResearcherID",
+      "google_scholar": "Google Scholar"
+    },
+    "identifier": {
+      "addRow": "Add identifier",
+      "remove": "Remove",
+      "schemePlaceholder": "scheme",
+      "valuePlaceholder": "value",
+      "urlPlaceholder": "URL (optional)"
+    },
+    "validation": {
+      "nameRequired": "Display name is required.",
+      "orcidFormat": "ORCID must be 0000-0000-0000-0000.",
+      "urlFormat": "URL must start with http(s)://",
+      "identifierIncomplete": "Identifiers need both a scheme and a value."
+    },
+    "merge": {
+      "intro": "If the same person was registered twice, merge the other record into this one.",
+      "searchPlaceholder": "Search authors to merge…",
+      "noResults": "No matching authors.",
+      "selfNotAllowed": "You cannot merge an author into itself.",
+      "linkedEntries": "{{count}} entries",
+      "confirmTitle": "Merge authors",
+      "confirmBody": "Merge \"{{from}}\" into \"{{into}}\". This cannot be undone (back up first if needed).",
+      "submit": "Merge into this author",
+      "submitting": "Merging…",
+      "success": "Merged."
+    },
+    "fetch": {
+      "button": "Fetch from ORCID",
+      "fetching": "Fetching…",
+      "summary": "Filled {{fields}} field(s) and added {{identifiers}} identifier(s). Existing values were preserved.",
+      "noChanges": "No new information to import.",
+      "invalidOrcid": "Enter ORCID as 0000-0000-0000-0000."
+    }
   }
 }

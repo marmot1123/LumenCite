@@ -46,12 +46,90 @@ export interface HighlightUpdate {
   note?: string;
 }
 
+/**
+ * 著者の外部識別子（ORCID 以外も含む）。v0.3.0 で導入。
+ * scheme は 'orcid' / 'scopus' / 'dblp' / 'semantic_scholar' / 'wikidata' /
+ * 'isni' / 'viaf' / 'researcher_id' / 'google_scholar' 等の小文字キー。
+ */
+export interface AuthorIdentifier {
+  author_id: number;
+  scheme: string;
+  value: string;
+  url?: string | null;
+}
+
+/** バックエンド `db::authors` 由来の Author 構造体。v0.3.0 で多言語名・読み仮名・団体著者対応。 */
 export interface Author {
   id: number;
   name: string;
-  given_name?: string;
-  family_name?: string;
-  orcid?: string;
+  given_name?: string | null;
+  middle_name?: string | null;
+  family_name?: string | null;
+  suffix?: string | null;
+  name_particle?: string | null;
+
+  /** オリジナル言語表記（漢字フルネーム等）。表示やソートの補助に使う。 */
+  name_original?: string | null;
+  given_name_original?: string | null;
+  family_name_original?: string | null;
+  /** ISO 15924 文字種コード（Hani / Hang / Cyrl / Latn / Arab ...） */
+  original_script?: string | null;
+
+  /** 五十音ソート・かな検索用 */
+  reading_family?: string | null;
+  reading_given?: string | null;
+
+  /** 団体著者フラグ（IEEE / OECD 等）。true なら given/family を無視し name を literal 扱い。 */
+  is_organization: boolean;
+
+  email?: string | null;
+  homepage_url?: string | null;
+  notes?: string | null;
+
+  /** 互換維持の専用カラム。識別子テーブルにも併記される。 */
+  orcid?: string | null;
+  updated_at?: string | null;
+
+  /** ORCID を含む全 identifier。`get_author` / `search_authors` で JOIN して詰める。 */
+  identifiers: AuthorIdentifier[];
+}
+
+/** identifiers の編集入力（url は省略可）。 */
+export interface AuthorIdentifierInput {
+  scheme: string;
+  value: string;
+  url?: string | null;
+}
+
+/**
+ * 著者の新規作成 / 更新 (`update_author`) で渡す入力。
+ * すべての文字列フィールドは省略可で、未指定 = null/未設定として保存される。
+ */
+export interface AuthorInput {
+  name: string;
+  given_name?: string | null;
+  middle_name?: string | null;
+  family_name?: string | null;
+  suffix?: string | null;
+  name_particle?: string | null;
+
+  name_original?: string | null;
+  given_name_original?: string | null;
+  family_name_original?: string | null;
+  original_script?: string | null;
+
+  reading_family?: string | null;
+  reading_given?: string | null;
+
+  is_organization?: boolean;
+
+  email?: string | null;
+  homepage_url?: string | null;
+  notes?: string | null;
+
+  orcid?: string | null;
+
+  identifiers?: AuthorIdentifierInput[];
 }
 
 export interface Tag {
@@ -164,6 +242,13 @@ export interface EntryInput {
   extra_fields?: Record<string, string>;
   author_ids?: number[];
   author_names?: string[];
+  /**
+   * v0.3.0: 構造化された著者情報を直接渡すルート。
+   * 指定すれば backend は `author_names` を無視してこちらを `get_or_create_author`
+   * に流す。AddSheet / EditSheet の AuthorEditor 経由の入力や bibtex / CrossRef
+   * 取り込みなどで使う。
+   */
+  authors?: AuthorInput[];
   tag_ids?: number[];
 }
 

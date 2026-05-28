@@ -5,10 +5,14 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { TagPill } from "../TagPill";
 import { Icon } from "../icons";
 import { MathMarkdown } from "../MathMarkdown";
+import { AuthorEditor } from "../AuthorEditor";
+import { AuthorChip } from "../AuthorChip";
 import type { EntryDetail } from "../../types";
 
 interface InfoTabProps {
   entry: EntryDetail;
+  /** AuthorEditor で著者が更新/統合された後、親に entry の再フェッチを依頼する。 */
+  onAuthorEdited?: () => void;
 }
 
 /** .bib 同期で実際に割り当てられる cite key を表示し、\cite{} 用にコピーできる行。 */
@@ -80,9 +84,9 @@ function Field({ label, value, mono }: { label: string; value?: string | number 
   );
 }
 
-export function InfoTab({ entry }: InfoTabProps) {
+export function InfoTab({ entry, onAuthorEdited }: InfoTabProps) {
   const { t } = useTranslation();
-  const authors = entry.authors.map(a => a.name).join(", ");
+  const [editingAuthorId, setEditingAuthorId] = useState<number | null>(null);
   const venue = entry.extra_fields?.journal ?? entry.extra_fields?.booktitle ?? null;
   const venueLine = venue && entry.year
     ? t("detail.info.venueYear", { venue, year: entry.year })
@@ -94,9 +98,20 @@ export function InfoTab({ entry }: InfoTabProps) {
         margin: 0, fontSize: 13.5, fontWeight: 600, lineHeight: 1.35,
         color: "var(--text)", letterSpacing: "-0.005em",
       }}>{entry.title}</h3>
-      {authors && (
-        <div style={{ marginTop: 8, fontSize: 11.5, color: "var(--text-mute)", lineHeight: 1.55 }}>
-          {authors}
+      {entry.authors.length > 0 && (
+        <div style={{
+          marginTop: 8, fontSize: 11.5, color: "var(--text-mute)", lineHeight: 1.6,
+          display: "flex", flexWrap: "wrap", alignItems: "center",
+          // チップ間の区切りはコンマ + 半角空白で擬似的に表現する（個々のチップに
+          // 余白を持たせて自然に折り返す）
+          gap: 0,
+        }}>
+          {entry.authors.map((a, i) => (
+            <span key={a.id} style={{ display: "inline-flex", alignItems: "center" }}>
+              <AuthorChip author={a} onClick={() => setEditingAuthorId(a.id)} />
+              {i < entry.authors.length - 1 && <span style={{ marginRight: 2 }}>,</span>}
+            </span>
+          ))}
         </div>
       )}
       {venueLine && (
@@ -154,6 +169,18 @@ export function InfoTab({ entry }: InfoTabProps) {
             ))}
           </div>
         </div>
+      )}
+
+      {editingAuthorId != null && (
+        <AuthorEditor
+          authorId={editingAuthorId}
+          onClose={() => setEditingAuthorId(null)}
+          onSaved={() => {
+            // 親に entry の再フェッチを依頼。チップに表示している
+            // 名前・原語・読み・団体フラグを最新化する。
+            onAuthorEdited?.();
+          }}
+        />
       )}
     </div>
   );

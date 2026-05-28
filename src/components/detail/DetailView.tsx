@@ -23,6 +23,8 @@ interface DetailViewProps {
   onOpenInWindow?: (attachmentId: number) => void;
   onSummarize: () => void;
   onChat: () => void;
+  /** info タブの AuthorEditor で著者が更新された後、親で entry の再フェッチを行う。 */
+  onAuthorEdited?: () => void;
 }
 
 function readNum(key: string, fallback: number): number {
@@ -58,6 +60,7 @@ export function DetailView({
   entry, onBack, onToggleStar, onUpdateNotes, onSelectEntry, onOpenInWindow,
   onSummarize,
   onChat,
+  onAuthorEdited,
 }: DetailViewProps) {
   const { t } = useTranslation();
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
@@ -347,6 +350,7 @@ export function DetailView({
             onDeleteHighlight={handleDeleteHighlight}
             onUpdateNotes={onUpdateNotes}
             onSelectEntry={onSelectEntry}
+            onAuthorEdited={onAuthorEdited}
           />
         )}
       </div>

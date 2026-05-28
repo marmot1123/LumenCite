@@ -790,6 +790,11 @@ export default function App() {
           onOpenInWindow={(attachmentId) => { void invoke("open_pdf_viewer", { id: attachmentId }); }}
           onSummarize={() => setShowSummary(true)}
           onChat={() => { void startChatWithEntries([detail.id]); }}
+          onAuthorEdited={() => {
+            // 著者表記が変われば一覧の表示・FTS インデックスにも波及するため両方再読込する
+            reloadDetail(detail.id);
+            loadEntries();
+          }}
         />
         {globalOverlays}
         {showSummary && (
@@ -989,6 +994,10 @@ export default function App() {
           onSelectEntry={selectSingle}
           onSummarize={detail ? () => setShowSummary(true) : undefined}
           onOpenDetail={detail ? () => setScreen("detail") : undefined}
+          onAuthorEdited={() => {
+            if (selectedId != null) reloadDetail(selectedId);
+            loadEntries();
+          }}
         />
       )}
 

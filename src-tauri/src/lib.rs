@@ -6,10 +6,11 @@ mod llm;
 mod mcp;
 mod metadata;
 mod models;
+mod orcid;
 
 use models::{
-    Attachment, Collection, EntryDetail, EntryInput, EntrySummary, FulltextHit, ImportResult,
-    SidebarCounts, Tag,
+    Attachment, Author, AuthorIdentifierInput, AuthorInput, Collection, EntryDetail, EntryInput,
+    EntrySummary, FulltextHit, ImportResult, SidebarCounts, Tag,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode},
@@ -272,6 +273,82 @@ async fn search_entries(
     db::entries::search_entries(&state.db, &query, collection_id, tag_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ── authors (v0.3.0 M7) ───────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn search_authors(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<Author>, String> {
+    db::authors::search_authors(&state.db, &query, limit.unwrap_or(20))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_author(state: State<'_, AppState>, id: i64) -> Result<Option<Author>, String> {
+    db::authors::get_author(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_author(
+    state: State<'_, AppState>,
+    id: i64,
+    input: AuthorInput,
+) -> Result<Author, String> {
+    let updated = db::authors::update_author(&state.db, id, &input)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 著者表記が変われば bib export 内容にも波及するので同期キックを送る
+    request_sync(&state);
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn merge_authors(
+    state: State<'_, AppState>,
+    from_id: i64,
+    into_id: i64,
+) -> Result<(), String> {
+    db::authors::merge_authors(&state.db, from_id, into_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    request_sync(&state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn add_author_identifier(
+    state: State<'_, AppState>,
+    author_id: i64,
+    input: AuthorIdentifierInput,
+) -> Result<(), String> {
+    db::authors::add_author_identifier(&state.db, author_id, &input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_author_identifier(
+    state: State<'_, AppState>,
+    author_id: i64,
+    scheme: String,
+) -> Result<(), String> {
+    db::authors::delete_author_identifier(&state.db, author_id, &scheme)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// ORCID Public API から著者情報を取得して AuthorInput を返す（M12）。
+/// state を取らないのは DB に触らない pure fetcher だから。
+#[tauri::command]
+async fn fetch_author_from_orcid(orcid: String) -> Result<AuthorInput, String> {
+    orcid::fetch_by_orcid(&orcid).await
 }
 
 // ── tags ──────────────────────────────────────────────────────────────────────
@@ -1954,6 +2031,18 @@ pub fn run() {
                 }
             };
 
+            // v0.3.0: 既存ライブラリの entries_fts.authors_text を新合成
+            // (name + name_original + reading_*) で 1 回だけ作り直す。フラグ既設なら no-op。
+            // 失敗してもアプリ起動は止めず、log だけ残してリトライさせる（次回起動で再試行）。
+            let fts_pool = pool.clone();
+            tauri::async_runtime::spawn(async move {
+                match db::entries::rebuild_authors_fts_once(&fts_pool).await {
+                    Ok(true) => eprintln!("entries_fts: rebuilt for v0.3.0 authors schema"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("entries_fts rebuild failed: {e}"),
+                }
+            });
+
             // BibTeX 自動同期のコーディネーター。各ミューテーションが sync_tx.send() で
             // 通知し、受信タスクが debounce して書き出す。
             let (sync_tx, sync_rx) = unbounded_channel::<()>();
@@ -2027,6 +2116,13 @@ pub fn run() {
             bulk_add_to_collection,
             bulk_add_tag,
             search_entries,
+            search_authors,
+            get_author,
+            update_author,
+            merge_authors,
+            add_author_identifier,
+            delete_author_identifier,
+            fetch_author_from_orcid,
             get_tags,
             create_tag,
             delete_tag,
