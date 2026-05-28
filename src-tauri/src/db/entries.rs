@@ -28,7 +28,18 @@ pub(crate) async fn sync_entries_fts(
              e.id,
              COALESCE(e.title, ''),
              COALESCE((
-                 SELECT GROUP_CONCAT(a.name, ' ')
+                 -- v0.3.0: 表記 (name) / 原語 (name_original) / 読み仮名 (reading_*) を
+                 -- 同じセルに入れて、trigram tokenizer で「関」「せき」「Seki」のいずれにも
+                 -- ヒットさせる。GROUP_CONCAT のセパレータはスペース。
+                 SELECT GROUP_CONCAT(
+                     TRIM(
+                         COALESCE(a.name, '')              || ' ' ||
+                         COALESCE(a.name_original, '')     || ' ' ||
+                         COALESCE(a.reading_family, '')    || ' ' ||
+                         COALESCE(a.reading_given, '')
+                     ),
+                     ' '
+                 )
                  FROM entry_authors ea
                  JOIN authors a ON a.id = ea.author_id
                  WHERE ea.entry_id = e.id
@@ -54,6 +65,42 @@ pub(crate) async fn sync_entries_fts(
     .await?;
 
     Ok(())
+}
+
+/// v0.3.0 アップグレード時の一括 FTS 再構築。
+///
+/// migration 0009 は authors 列の追加と author_identifiers のバックフィルしか行わず、
+/// 既存 entry の `entries_fts.authors_text` は v0.2.x のときの古い形 (name のみ) のまま
+/// 残っている。本関数は `settings.fts.authors_v030_rebuilt` フラグが未セットなら
+/// 全 entry の FTS を 1 回だけ再構築し、完了後にフラグを立てる。2 回目以降は no-op。
+///
+/// 戻り値: 実際に再構築が走ったら `true`、フラグ既設で skip したら `false`。
+///
+/// 起動時に `lib.rs::run` の setup 内で呼ぶ。再構築は SELECT + 個別 sync を
+/// 単一 tx でまとめる（数万件規模でも数秒で完了する想定）。失敗時はフラグを
+/// 立てずに Err を返すので、次回起動でリトライされる。
+pub async fn rebuild_authors_fts_once(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    use crate::db::settings;
+
+    if settings::get_setting(pool, settings::FTS_AUTHORS_V030_REBUILT_KEY)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM entries")
+        .fetch_all(pool)
+        .await?;
+
+    let mut tx = pool.begin().await?;
+    for id in ids {
+        sync_entries_fts(&mut tx, id).await?;
+    }
+    tx.commit().await?;
+
+    settings::set_setting(pool, settings::FTS_AUTHORS_V030_REBUILT_KEY, "1").await?;
+    Ok(true)
 }
 
 fn build_fts_match_expr(tokens: &[&str]) -> String {
@@ -2337,5 +2384,127 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, col_entry.id);
+    }
+
+    // ── v0.3.0 §8.4 FTS ────────────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn entries_fts_includes_original_name_and_reading(pool: SqlitePool) {
+        // 「Seki」名義で entry を作る（この時点で authors_text には "Seki" のみ）
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Some unrelated title".to_string(),
+                entry_type: "article".to_string(),
+                author_names: vec!["Seki".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // 後から漢字名と読み仮名を author に付与（M7 update_author 経由を想定したシナリオ）
+        sqlx::query(
+            "UPDATE authors
+             SET name_original = '関 茂樹',
+                 family_name_original = '関',
+                 given_name_original = '茂樹',
+                 original_script = 'Hani',
+                 reading_family = 'せき',
+                 reading_given = 'もとき',
+                 updated_at = datetime('now')
+             WHERE name = 'Seki'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // v0.3.0 のワンショット再構築で entries_fts.authors_text に反映される
+        let rebuilt = rebuild_authors_fts_once(&pool).await.unwrap();
+        assert!(rebuilt, "未実行フラグなら再構築が走るべき");
+
+        // 「関」（1 文字 CJK / LIKE フォールバックパス）
+        let hits_kanji = search_entries(&pool, "関", None, None).await.unwrap();
+        assert_eq!(hits_kanji.len(), 1, "漢字 '関' でヒットすべき");
+        assert_eq!(hits_kanji[0].id, entry.id);
+
+        // 「せき」（2 文字かな / LIKE フォールバック）
+        let hits_kana = search_entries(&pool, "せき", None, None).await.unwrap();
+        assert_eq!(hits_kana.len(), 1, "読み仮名 'せき' でヒットすべき");
+        assert_eq!(hits_kana[0].id, entry.id);
+
+        // 「Seki」（4 文字 ASCII / trigram FTS）
+        let hits_ascii = search_entries(&pool, "Seki", None, None).await.unwrap();
+        assert_eq!(hits_ascii.len(), 1, "ローマ字 'Seki' でヒットすべき");
+        assert_eq!(hits_ascii[0].id, entry.id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn rebuild_authors_fts_once_is_idempotent(pool: SqlitePool) {
+        // 初回は再構築が走る
+        let first = rebuild_authors_fts_once(&pool).await.unwrap();
+        assert!(first, "初回は再構築が走るべき");
+
+        // フラグが立つ
+        let flag = crate::db::settings::get_setting(
+            &pool,
+            crate::db::settings::FTS_AUTHORS_V030_REBUILT_KEY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(flag.as_deref(), Some("1"));
+
+        // 2 回目は no-op
+        let second = rebuild_authors_fts_once(&pool).await.unwrap();
+        assert!(!second, "フラグ既設なら skip すべき");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn new_entry_creation_already_indexes_with_v030_composition(pool: SqlitePool) {
+        // M4 で sync_entries_fts の SQL 自体を新形に変更したので、新規 create_entry の時点で
+        // authors_text に name_original / reading_* が含まれていれば rebuild なしでもヒットする。
+        // 先に著者を多言語フィールド付きで作っておく必要があるが、AuthorInput 経由は
+        // EntryInput からは届かないため、author を先に直接 INSERT して紐付ける。
+        sqlx::query(
+            "INSERT INTO authors (name, name_original, reading_family, updated_at)
+             VALUES ('Yamada', '山田', 'やまだ', datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let author_id: i64 = sqlx::query_scalar("SELECT id FROM authors WHERE name = 'Yamada'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Title".to_string(),
+                entry_type: "article".to_string(),
+                // author_names に "Yamada" を渡すと get_or_create_author が既存著者を name 完全一致で見つける
+                author_names: vec!["Yamada".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // 同じ著者 id が紐付いていること
+        let linked: i64 = sqlx::query_scalar(
+            "SELECT author_id FROM entry_authors WHERE entry_id = ?",
+        )
+        .bind(entry.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(linked, author_id);
+
+        // rebuild なしで漢字 / かな / ローマ字いずれもヒット
+        for q in ["山田", "やまだ", "Yamada"] {
+            let hits = search_entries(&pool, q, None, None).await.unwrap();
+            assert_eq!(hits.len(), 1, "{q} should hit without rebuild");
+            assert_eq!(hits[0].id, entry.id);
+        }
     }
 }

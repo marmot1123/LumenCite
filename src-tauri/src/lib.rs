@@ -1954,6 +1954,18 @@ pub fn run() {
                 }
             };
 
+            // v0.3.0: 既存ライブラリの entries_fts.authors_text を新合成
+            // (name + name_original + reading_*) で 1 回だけ作り直す。フラグ既設なら no-op。
+            // 失敗してもアプリ起動は止めず、log だけ残してリトライさせる（次回起動で再試行）。
+            let fts_pool = pool.clone();
+            tauri::async_runtime::spawn(async move {
+                match db::entries::rebuild_authors_fts_once(&fts_pool).await {
+                    Ok(true) => eprintln!("entries_fts: rebuilt for v0.3.0 authors schema"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("entries_fts rebuild failed: {e}"),
+                }
+            });
+
             // BibTeX 自動同期のコーディネーター。各ミューテーションが sync_tx.send() で
             // 通知し、受信タスクが debounce して書き出す。
             let (sync_tx, sync_rx) = unbounded_channel::<()>();
