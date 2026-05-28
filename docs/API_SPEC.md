@@ -16,10 +16,55 @@ type RelationType = "preprint_of" | "version_of" | "supplement_of";
 type Author = {
   id: number;
   name: string;
-  given_name?: string;
-  family_name?: string;
-  orcid?: string;
+  given_name?: string | null;
+  middle_name?: string | null;             // v0.3.0
+  family_name?: string | null;
+  suffix?: string | null;                  // v0.3.0
+  name_particle?: string | null;           // v0.3.0
+  name_original?: string | null;           // v0.3.0 — 原語表記フルネーム
+  given_name_original?: string | null;     // v0.3.0
+  family_name_original?: string | null;    // v0.3.0
+  original_script?: string | null;         // v0.3.0 — ISO 15924 (Hani/Hang/Cyrl/...)
+  reading_family?: string | null;          // v0.3.0 — 読み仮名（五十音ソート用）
+  reading_given?: string | null;           // v0.3.0
+  is_organization: boolean;                // v0.3.0 — 団体著者
+  email?: string | null;                   // v0.3.0
+  homepage_url?: string | null;            // v0.3.0
+  notes?: string | null;                   // v0.3.0
+  orcid?: string | null;                   // 互換維持の専用カラム
+  updated_at?: string | null;              // v0.3.0
+  identifiers: AuthorIdentifier[];         // v0.3.0 — JOIN で詰めた識別子配列
 };
+
+type AuthorIdentifier = {
+  author_id: number;
+  scheme: string;   // 'orcid' / 'scopus' / 'dblp' / 'semantic_scholar' / 'wikidata' / 'isni' / 'viaf' / 'researcher_id' / 'google_scholar'
+  value: string;
+  url?: string | null;
+};
+
+type AuthorInput = {  // v0.3.0 — update_author / EntryInput.authors で使う
+  name: string;
+  given_name?: string | null;
+  middle_name?: string | null;
+  family_name?: string | null;
+  suffix?: string | null;
+  name_particle?: string | null;
+  name_original?: string | null;
+  given_name_original?: string | null;
+  family_name_original?: string | null;
+  original_script?: string | null;
+  reading_family?: string | null;
+  reading_given?: string | null;
+  is_organization?: boolean;
+  email?: string | null;
+  homepage_url?: string | null;
+  notes?: string | null;
+  orcid?: string | null;
+  identifiers?: AuthorIdentifierInput[];
+};
+
+type AuthorIdentifierInput = { scheme: string; value: string; url?: string | null };
 
 type Tag = { id: number; name: string };
 
@@ -85,6 +130,7 @@ type EntryInput = {
   extra_fields?: Record<string, string>;
   author_ids?: number[];   // 既存著者のID（順序＝著者順）
   author_names?: string[]; // 新規著者名（IDがない場合）
+  authors?: AuthorInput[]; // v0.3.0 — 構造化された著者入力。Some の時は author_names を無視
   tag_ids?: number[];
 };
 
@@ -299,10 +345,21 @@ type SidebarCounts = {
 
 ### 著者（authors）
 
+v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `AuthorIdentifierInput` は冒頭の型定義を参照。
+名寄せロジック（ORCID → 正規化 name → INSERT）と FTS 再同期の詳細は `DATA_MODEL.md` の `authors` セクション。
+
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `search_authors` | `query: String` | `Vec<Author>` |
-| `merge_authors` | `from_id: i64, into_id: i64` | `Result<()>` |
+| `search_authors` | `query: String, limit?: i64` | `Result<Vec<Author>>` — name / name_original / orcid の部分一致。limit デフォルト 20 |
+| `get_author` | `id: i64` | `Result<Option<Author>>` — identifiers 込み |
+| `update_author` | `id: i64, input: AuthorInput` | `Result<Author>` — 全フィールド差し替え + identifiers 総差し替え + 関連 entry の FTS 再同期 |
+| `merge_authors` | `from_id: i64, into_id: i64` | `Result<()>` — entry_authors を `into` に集約、`from` を削除。identifiers は `into` 優先。関連 entry の FTS を再同期 |
+| `add_author_identifier` | `author_id: i64, input: AuthorIdentifierInput` | `Result<()>` — (author_id, scheme) で upsert。scheme='orcid' のときは `authors.orcid` 列も同期 |
+| `delete_author_identifier` | `author_id: i64, scheme: String` | `Result<()>` — scheme='orcid' のときは `authors.orcid` 列もクリア |
+
+`update_author` と `merge_authors` は `.bib` 同期キックを送るため、エクスポート先ファイルにも自動反映される。
+
+`(scheme, value)` は `author_identifiers` で UNIQUE 制約。同一の識別子値を別著者にぶら下げようとすると保存失敗（`Err`）になる — その状況は通常「名寄せが正しく機能していない」シグナルなので、`merge_authors` で 1 著者に統合してから再度設定する想定。
 
 ### コレクション（collections）
 
