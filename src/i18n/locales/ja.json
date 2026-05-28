@@ -707,5 +707,88 @@
       "thanksTitle": "依存関係への感謝",
       "thanksBody": "Tauri / React / pdf.js / KaTeX をはじめとした多数の OSS ライブラリの上に成り立っています。"
     }
+  },
+  "authorEditor": {
+    "title": "著者を編集",
+    "close": "閉じる",
+    "save": "保存",
+    "saving": "保存中…",
+    "cancel": "キャンセル",
+    "saveHelp": "保存すると、この著者を含む全文献の検索インデックスが自動的に更新されます。",
+    "section": {
+      "name": "名前",
+      "original": "原語表記",
+      "reading": "読み仮名",
+      "identifiers": "外部識別子",
+      "extra": "追加情報",
+      "merge": "同名著者と統合"
+    },
+    "field": {
+      "displayName": "表示名",
+      "displayNameHelp": "一覧や引用に表示される表記。",
+      "givenName": "ファーストネーム",
+      "middleName": "ミドルネーム",
+      "familyName": "ラストネーム",
+      "suffix": "サフィックス（Jr. / III 等）",
+      "nameParticle": "前置語（von / van der 等）",
+      "nameOriginal": "フル原語名",
+      "givenNameOriginal": "原語のファーストネーム",
+      "familyNameOriginal": "原語のラストネーム",
+      "originalScript": "文字種",
+      "readingFamily": "姓の読み",
+      "readingGiven": "名の読み",
+      "isOrganization": "団体著者",
+      "isOrganizationHelp": "オンにすると姓名の分割を無視し、表示名を団体名として扱います（CSL の literal 相当）。",
+      "email": "メールアドレス",
+      "homepageUrl": "ホームページ URL",
+      "notes": "メモ",
+      "notesHelp": "「同名別人」「2024 改姓」など、運用上のメモを自由に。",
+      "orcid": "ORCID"
+    },
+    "script": {
+      "Latn": "ラテン文字",
+      "Hani": "漢字",
+      "Hang": "ハングル",
+      "Cyrl": "キリル文字",
+      "Arab": "アラビア文字",
+      "Hira": "ひらがな",
+      "Kana": "カタカナ"
+    },
+    "scheme": {
+      "orcid": "ORCID",
+      "scopus": "Scopus Author ID",
+      "dblp": "DBLP",
+      "semantic_scholar": "Semantic Scholar",
+      "wikidata": "Wikidata",
+      "isni": "ISNI",
+      "viaf": "VIAF",
+      "researcher_id": "ResearcherID",
+      "google_scholar": "Google Scholar"
+    },
+    "identifier": {
+      "addRow": "識別子を追加",
+      "remove": "削除",
+      "schemePlaceholder": "scheme",
+      "valuePlaceholder": "値",
+      "urlPlaceholder": "URL（任意）"
+    },
+    "validation": {
+      "nameRequired": "表示名は必須です。",
+      "orcidFormat": "ORCID は 0000-0000-0000-0000 形式で入力してください。",
+      "urlFormat": "URL は http(s):// で始まる必要があります。",
+      "identifierIncomplete": "識別子は scheme と値の両方が必要です。"
+    },
+    "merge": {
+      "intro": "同じ人物を別著者として登録してしまった場合、もう一方をこの著者に統合できます。",
+      "searchPlaceholder": "統合したい著者名を検索…",
+      "noResults": "該当する著者が見つかりませんでした。",
+      "selfNotAllowed": "自分自身は統合対象に選べません。",
+      "linkedEntries": "{{count}} 件の文献",
+      "confirmTitle": "著者を統合",
+      "confirmBody": "「{{from}}」を「{{into}}」に統合します。この操作は取り消せません（必要なら統合前にバックアップを取ってください）。",
+      "submit": "この著者に統合",
+      "submitting": "統合中…",
+      "success": "統合しました。"
+    }
   }
 }
