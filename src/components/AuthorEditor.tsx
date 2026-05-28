@@ -327,7 +327,7 @@ export function AuthorEditor({ authorId, onClose, onSaved }: AuthorEditorProps) 
                         value={form.name_original ?? ""}
                         onChange={e => setForm({ ...form, name_original: e.target.value })}
                         style={inputStyle}
-                        placeholder="関 茂樹"
+                        placeholder="関 元樹"
                       />
                     </Field>
                     <Field label={t("authorEditor.field.originalScript")} narrow>
