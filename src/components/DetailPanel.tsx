@@ -5,6 +5,8 @@ import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Icon, TypeIcon } from "./icons";
 import { TagPill } from "./TagPill";
 import { MathMarkdown } from "./MathMarkdown";
+import { AuthorEditor } from "./AuthorEditor";
+import { AuthorChip } from "./AuthorChip";
 import { EXTRA_FIELDS_BY_TYPE, EXTRA_FIELD_LABEL_KEYS } from "../types";
 import type { Attachment, Collection, EntryDetail, EntryType, Tag } from "../types";
 
@@ -28,6 +30,8 @@ interface DetailPanelProps {
   onSelectEntry?: (id: number) => void;
   onSummarize?: () => void;
   onOpenDetail?: () => void;
+  /** AuthorEditor で著者の表記や identifier が更新された後、親に entry の再フェッチを依頼する。 */
+  onAuthorEdited?: () => void;
 }
 
 function flattenCollections(cols: Collection[], depth = 0): { col: Collection; depth: number }[] {
@@ -258,7 +262,7 @@ const panelStyle = (width: number): React.CSSProperties => ({
   overflow: "hidden",
 });
 
-export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore, onToggleStar, allCollections, onAddToCollection, onRemoveFromCollection, allTags, onAddTag, onRemoveTag, onAttachmentsChanged, onAttachmentAdded, onUpdateField, onSelectEntry, onSummarize, onOpenDetail }: DetailPanelProps) {
+export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore, onToggleStar, allCollections, onAddToCollection, onRemoveFromCollection, allTags, onAddTag, onRemoveTag, onAttachmentsChanged, onAttachmentAdded, onUpdateField, onSelectEntry, onSummarize, onOpenDetail, onAuthorEdited }: DetailPanelProps) {
   const { t } = useTranslation();
   const [tab, setTab] = useState<TabId>("info");
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -270,6 +274,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   const tagInputRef = useRef<HTMLDivElement>(null);
   const [attaching, setAttaching] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [editingAuthorId, setEditingAuthorId] = useState<number | null>(null);
 
   useEffect(() => {
     setConfirmDelete(false);
@@ -406,8 +411,16 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         }}>{entry.title}</h2>
 
         {entry.authors.length > 0 && (
-          <div style={{ marginTop: 8, fontSize: 12, color: "var(--text-mute)", lineHeight: 1.5 }}>
-            {entry.authors.map(a => a.name).join(", ")}
+          <div style={{
+            marginTop: 8, fontSize: 12, color: "var(--text-mute)", lineHeight: 1.55,
+            display: "flex", flexWrap: "wrap", alignItems: "center", gap: 0,
+          }}>
+            {entry.authors.map((a, i) => (
+              <span key={a.id} style={{ display: "inline-flex", alignItems: "center" }}>
+                <AuthorChip author={a} onClick={() => setEditingAuthorId(a.id)} />
+                {i < entry.authors.length - 1 && <span style={{ marginRight: 2 }}>,</span>}
+              </span>
+            ))}
           </div>
         )}
 
@@ -852,6 +865,14 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
           )
         )}
       </div>
+
+      {editingAuthorId != null && (
+        <AuthorEditor
+          authorId={editingAuthorId}
+          onClose={() => setEditingAuthorId(null)}
+          onSaved={() => { onAuthorEdited?.(); }}
+        />
+      )}
     </aside>
   );
 }
