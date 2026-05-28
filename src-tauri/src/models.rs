@@ -46,8 +46,7 @@ pub struct AuthorIdentifier {
 }
 
 /// 著者の新規作成 / 更新時に受け取る入力型。
-/// `get_or_create_author` / `update_author` の引数として使う（M3 以降）。
-#[allow(dead_code)] // M3 で配線
+/// `get_or_create_author`（M3 で配線済み） / `update_author`（M7） の引数として使う。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct AuthorInput {
     pub name: String,

@@ -1,6 +1,10 @@
 use std::collections::HashMap;
 
-use crate::models::{Attachment, Author, Collection, EntryDetail, EntryRelation, EntrySummary, EntryInput, SidebarCounts, Tag};
+use crate::db::authors::get_or_create_author;
+use crate::models::{
+    Attachment, Author, AuthorInput, Collection, EntryDetail, EntryInput, EntryRelation,
+    EntrySummary, SidebarCounts, Tag,
+};
 use sqlx::{Row, SqlitePool};
 
 #[derive(sqlx::FromRow)]
@@ -256,7 +260,16 @@ pub async fn create_entry(
     let entry_id = result.last_insert_rowid();
 
     for (pos, name) in input.author_names.iter().enumerate() {
-        let author = get_or_create_author(&mut tx, name).await?;
+        // EntryInput.author_names は文字列のみなので AuthorInput.name に詰めて渡す。
+        // ORCID 付きで渡すルートは M6（metadata.rs 経由）で追加する。
+        let author = get_or_create_author(
+            &mut tx,
+            &AuthorInput {
+                name: name.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO entry_authors (entry_id, author_id, position) VALUES (?, ?, ?)",
         )
@@ -712,7 +725,16 @@ pub async fn update_entry(
         .await?;
 
     for (pos, name) in input.author_names.iter().enumerate() {
-        let author = get_or_create_author(&mut tx, name).await?;
+        // EntryInput.author_names は文字列のみなので AuthorInput.name に詰めて渡す。
+        // ORCID 付きで渡すルートは M6（metadata.rs 経由）で追加する。
+        let author = get_or_create_author(
+            &mut tx,
+            &AuthorInput {
+                name: name.clone(),
+                ..Default::default()
+            },
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO entry_authors (entry_id, author_id, position) VALUES (?, ?, ?)",
         )
@@ -1095,56 +1117,6 @@ pub async fn delete_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error>
     tx.commit().await?;
     Ok(())
 }
-
-async fn get_or_create_author(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    name: &str,
-) -> Result<Author, sqlx::Error> {
-    // M2 では従来どおり `name` 完全一致のみで照合する（ORCID / NFKC 正規化照合は M3）。
-    let existing: Option<Author> = sqlx::query_as(AUTHOR_SELECT_BY_NAME)
-        .bind(name)
-        .fetch_optional(&mut **tx)
-        .await?;
-
-    if let Some(author) = existing {
-        return Ok(author);
-    }
-
-    let result = sqlx::query("INSERT INTO authors (name) VALUES (?)")
-        .bind(name)
-        .execute(&mut **tx)
-        .await?;
-
-    // 列 DEFAULT（is_organization=0 など）を取り違えないよう、挿入後に同一行を再フェッチする。
-    let inserted: Author = sqlx::query_as(AUTHOR_SELECT_BY_ID)
-        .bind(result.last_insert_rowid())
-        .fetch_one(&mut **tx)
-        .await?;
-    Ok(inserted)
-}
-
-// `authors` 1 行の全カラムを Author 構造体の field 名で SELECT する SQL。
-// FromRow が field 名でマッチングするため、SELECT する列名と Author 構造体の field 名を揃える。
-// `identifiers` は別テーブル JOIN で詰めるため対象外（M3 で db/authors.rs ヘルパーに切り出す）。
-const AUTHOR_SELECT_BY_NAME: &str =
-    "SELECT id, name,
-            given_name, middle_name, family_name, suffix, name_particle,
-            name_original, given_name_original, family_name_original, original_script,
-            reading_family, reading_given,
-            is_organization,
-            email, homepage_url, notes,
-            orcid, updated_at
-       FROM authors WHERE name = ?";
-
-const AUTHOR_SELECT_BY_ID: &str =
-    "SELECT id, name,
-            given_name, middle_name, family_name, suffix, name_particle,
-            name_original, given_name_original, family_name_original, original_script,
-            reading_family, reading_given,
-            is_organization,
-            email, homepage_url, notes,
-            orcid, updated_at
-       FROM authors WHERE id = ?";
 
 #[cfg(test)]
 mod tests {
