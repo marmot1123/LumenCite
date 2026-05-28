@@ -8,8 +8,8 @@ mod metadata;
 mod models;
 
 use models::{
-    Attachment, Collection, EntryDetail, EntryInput, EntrySummary, FulltextHit, ImportResult,
-    SidebarCounts, Tag,
+    Attachment, Author, AuthorIdentifierInput, AuthorInput, Collection, EntryDetail, EntryInput,
+    EntrySummary, FulltextHit, ImportResult, SidebarCounts, Tag,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode},
@@ -270,6 +270,75 @@ async fn search_entries(
     tag_id: Option<i64>,
 ) -> Result<Vec<EntrySummary>, String> {
     db::entries::search_entries(&state.db, &query, collection_id, tag_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ── authors (v0.3.0 M7) ───────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn search_authors(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<Author>, String> {
+    db::authors::search_authors(&state.db, &query, limit.unwrap_or(20))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_author(state: State<'_, AppState>, id: i64) -> Result<Option<Author>, String> {
+    db::authors::get_author(&state.db, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_author(
+    state: State<'_, AppState>,
+    id: i64,
+    input: AuthorInput,
+) -> Result<Author, String> {
+    let updated = db::authors::update_author(&state.db, id, &input)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 著者表記が変われば bib export 内容にも波及するので同期キックを送る
+    request_sync(&state);
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn merge_authors(
+    state: State<'_, AppState>,
+    from_id: i64,
+    into_id: i64,
+) -> Result<(), String> {
+    db::authors::merge_authors(&state.db, from_id, into_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    request_sync(&state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn add_author_identifier(
+    state: State<'_, AppState>,
+    author_id: i64,
+    input: AuthorIdentifierInput,
+) -> Result<(), String> {
+    db::authors::add_author_identifier(&state.db, author_id, &input)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_author_identifier(
+    state: State<'_, AppState>,
+    author_id: i64,
+    scheme: String,
+) -> Result<(), String> {
+    db::authors::delete_author_identifier(&state.db, author_id, &scheme)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2039,6 +2108,12 @@ pub fn run() {
             bulk_add_to_collection,
             bulk_add_tag,
             search_entries,
+            search_authors,
+            get_author,
+            update_author,
+            merge_authors,
+            add_author_identifier,
+            delete_author_identifier,
             get_tags,
             create_tag,
             delete_tag,

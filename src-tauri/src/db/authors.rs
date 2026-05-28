@@ -11,7 +11,8 @@
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::models::{Author, AuthorIdentifier, AuthorInput, EntryInput};
+use crate::db::entries::sync_entries_fts;
+use crate::models::{Author, AuthorIdentifier, AuthorIdentifierInput, AuthorInput, EntryInput};
 
 /// `EntryInput` から create/update に渡す著者リストを取り出す。
 ///
@@ -288,6 +289,301 @@ async fn insert_author(
     Ok(inserted)
 }
 
+// ── M7: 編集系 API ──────────────────────────────────────────────────────
+
+/// 著者の全フィールドを `input` で差し替え、関連 entry の `entries_fts` を再同期する。
+///
+/// - `authors` の全列を UPDATE（`updated_at = datetime('now')`）
+/// - `author_identifiers` は **DELETE → INSERT で総差し替え**（1 著者 10 件程度の前提で素朴）
+/// - `input.orcid` が指定されているのに `input.identifiers` に scheme='orcid' が無ければ
+///   暗黙で補う（authors.orcid 列との二重書き運用を維持）
+/// - 当該著者を含む全 entry に対して `sync_entries_fts` を実行（authors_text 反映）
+///
+/// 同一 (scheme, value) が他著者で使われている identifier を渡すと UNIQUE 制約で失敗する。
+pub async fn update_author(
+    pool: &SqlitePool,
+    id: i64,
+    input: &AuthorInput,
+) -> Result<Author, sqlx::Error> {
+    let orcid = trimmed(&input.orcid);
+
+    let mut tx = pool.begin().await?;
+
+    let rows_affected = sqlx::query(
+        "UPDATE authors SET
+            name = ?,
+            given_name = ?, middle_name = ?, family_name = ?, suffix = ?, name_particle = ?,
+            name_original = ?, given_name_original = ?, family_name_original = ?, original_script = ?,
+            reading_family = ?, reading_given = ?,
+            is_organization = ?,
+            email = ?, homepage_url = ?, notes = ?,
+            orcid = ?,
+            updated_at = datetime('now')
+         WHERE id = ?",
+    )
+    .bind(&input.name)
+    .bind(&input.given_name)
+    .bind(&input.middle_name)
+    .bind(&input.family_name)
+    .bind(&input.suffix)
+    .bind(&input.name_particle)
+    .bind(&input.name_original)
+    .bind(&input.given_name_original)
+    .bind(&input.family_name_original)
+    .bind(&input.original_script)
+    .bind(&input.reading_family)
+    .bind(&input.reading_given)
+    .bind(input.is_organization)
+    .bind(&input.email)
+    .bind(&input.homepage_url)
+    .bind(&input.notes)
+    .bind(&orcid)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    if rows_affected == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    // identifiers を DELETE → INSERT で差し替え
+    sqlx::query("DELETE FROM author_identifiers WHERE author_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    // input.identifiers をそのまま投入
+    let mut wrote_orcid_via_identifiers = false;
+    for ident in &input.identifiers {
+        let scheme = ident.scheme.trim();
+        let value = ident.value.trim();
+        if scheme.is_empty() || value.is_empty() {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO author_identifiers (author_id, scheme, value, url)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(scheme)
+        .bind(value)
+        .bind(ident.url.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .execute(&mut *tx)
+        .await?;
+        if scheme == "orcid" {
+            wrote_orcid_via_identifiers = true;
+        }
+    }
+
+    // authors.orcid が立っているのに identifiers に 'orcid' が無いケースを暗黙補完
+    if !wrote_orcid_via_identifiers {
+        if let Some(o) = orcid.as_deref() {
+            sqlx::query(
+                "INSERT INTO author_identifiers (author_id, scheme, value)
+                 VALUES (?, 'orcid', ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .bind(o)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
+    // 関連 entry の FTS を再構築
+    let entry_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT DISTINCT entry_id FROM entry_authors WHERE author_id = ?")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+    for eid in entry_ids {
+        sync_entries_fts(&mut tx, eid).await?;
+    }
+
+    // 再フェッチして返す
+    let mut updated: Author = sqlx::query_as(&format!(
+        "SELECT {AUTHOR_COLUMNS} FROM authors WHERE id = ?"
+    ))
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    updated.identifiers = load_identifiers_in_tx(&mut tx, id).await?;
+
+    tx.commit().await?;
+    Ok(updated)
+}
+
+/// 2 著者を統合する。`from_id` を `into_id` に集約し、`from_id` を削除する。
+///
+/// - `entry_authors`: `from_id` の行を `into_id` へ付け替え。
+///   両者が同じ entry に既にぶら下がっている場合は付け替え不能（PRIMARY KEY 衝突）なので
+///   `from_id` 側の行を素直に削除（into の position は維持）
+/// - `author_identifiers`: `from_id` の identifier を `into_id` へ移す。
+///   `(author_id, scheme)` PRIMARY KEY は ON CONFLICT DO NOTHING で **into 側を優先**。
+///   `(scheme, value)` UNIQUE は from→into 移動先で衝突する可能性があるが、
+///   その場合も DO NOTHING で skip（from のみが持つ identifier だけが残る）
+/// - 関連 entry すべての `entries_fts` を再構築（into の author 表記が反映される）
+/// - 最後に `from_id` を DELETE
+pub async fn merge_authors(
+    pool: &SqlitePool,
+    from_id: i64,
+    into_id: i64,
+) -> Result<(), sqlx::Error> {
+    if from_id == into_id {
+        return Ok(()); // no-op
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // 影響を受ける entry を先に把握しておく（DELETE 後だと from 経由では辿れない）
+    let entry_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT entry_id FROM entry_authors WHERE author_id IN (?, ?)",
+    )
+    .bind(from_id)
+    .bind(into_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    // entry_authors 付け替え（into が既にいる行は from を捨てる）
+    sqlx::query(
+        "DELETE FROM entry_authors
+         WHERE author_id = ?
+           AND entry_id IN (SELECT entry_id FROM entry_authors WHERE author_id = ?)",
+    )
+    .bind(from_id)
+    .bind(into_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE entry_authors SET author_id = ? WHERE author_id = ?")
+        .bind(into_id)
+        .bind(from_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // identifiers を移動。INSERT…SELECT 方式は (scheme, value) UNIQUE INDEX が
+    // 「from にも into にも同じ値が無い限り保たれている」前提を活かせず、from の
+    // 既存行と (scheme, value) で衝突して全行 skip されてしまう。代わりに:
+    //   ① into 側で既に持っている scheme は from 側から DELETE（into を優先）
+    //   ② 残りは UPDATE で from → into に付け替え（PK 衝突解消済み、
+    //      (scheme, value) UNIQUE は同値が別著者にあり得ないので無事）
+    sqlx::query(
+        "DELETE FROM author_identifiers
+          WHERE author_id = ?
+            AND scheme IN (SELECT scheme FROM author_identifiers WHERE author_id = ?)",
+    )
+    .bind(from_id)
+    .bind(into_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE author_identifiers SET author_id = ? WHERE author_id = ?")
+        .bind(into_id)
+        .bind(from_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // from を削除（この時点で entry_authors / author_identifiers が空なので RESTRICT に触れない）
+    let deleted = sqlx::query("DELETE FROM authors WHERE id = ?")
+        .bind(from_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if deleted == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    // 関連 entry の FTS を再構築（into の表記が authors_text へ反映される）
+    for eid in entry_ids {
+        sync_entries_fts(&mut tx, eid).await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 著者に identifier を 1 件追加する（scheme='orcid' の場合は authors.orcid も同期する）。
+/// `(author_id, scheme)` PRIMARY KEY 衝突時は **既存値を上書き** する upsert 動作。
+pub async fn add_author_identifier(
+    pool: &SqlitePool,
+    author_id: i64,
+    input: &AuthorIdentifierInput,
+) -> Result<(), sqlx::Error> {
+    let scheme = input.scheme.trim();
+    let value = input.value.trim();
+    if scheme.is_empty() || value.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "scheme と value は必須".to_string(),
+        ));
+    }
+    let url = input
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        "INSERT INTO author_identifiers (author_id, scheme, value, url)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(author_id, scheme) DO UPDATE SET
+            value = excluded.value,
+            url   = excluded.url",
+    )
+    .bind(author_id)
+    .bind(scheme)
+    .bind(value)
+    .bind(url)
+    .execute(&mut *tx)
+    .await?;
+
+    if scheme == "orcid" {
+        // authors.orcid 列とも同期する（v0.3.0 互換運用）
+        sqlx::query(
+            "UPDATE authors SET orcid = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(value)
+        .bind(author_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 著者から identifier を削除する（scheme='orcid' の削除は authors.orcid もクリアする）。
+pub async fn delete_author_identifier(
+    pool: &SqlitePool,
+    author_id: i64,
+    scheme: &str,
+) -> Result<(), sqlx::Error> {
+    let scheme = scheme.trim();
+    if scheme.is_empty() {
+        return Err(sqlx::Error::Protocol("scheme は必須".to_string()));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM author_identifiers WHERE author_id = ? AND scheme = ?")
+        .bind(author_id)
+        .bind(scheme)
+        .execute(&mut *tx)
+        .await?;
+
+    if scheme == "orcid" {
+        sqlx::query(
+            "UPDATE authors SET orcid = NULL, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(author_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +794,449 @@ mod tests {
         let hits = search_authors(&pool, "Alice", 10).await.unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|a| a.name.contains("Alice")));
+    }
+
+    // ── M7: update_author / merge_authors / *_identifier (§8.5 含む) ─────────
+
+    use crate::db::entries::{create_entry, search_entries};
+    use crate::models::{AuthorIdentifierInput, EntryInput};
+
+    async fn make_author(pool: &SqlitePool, name: &str) -> i64 {
+        let mut tx = pool.begin().await.unwrap();
+        let a = get_or_create_author(&mut tx, &input(name)).await.unwrap();
+        tx.commit().await.unwrap();
+        a.id
+    }
+
+    fn full_input(name: &str) -> AuthorInput {
+        AuthorInput {
+            name: name.to_string(),
+            given_name: Some("Given".to_string()),
+            family_name: Some("Family".to_string()),
+            name_original: Some("関 茂樹".to_string()),
+            original_script: Some("Hani".to_string()),
+            reading_family: Some("せき".to_string()),
+            reading_given: Some("もとき".to_string()),
+            email: Some("x@example.com".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_author_replaces_fields_and_sets_updated_at(pool: SqlitePool) {
+        let id = make_author(&pool, "Original Name").await;
+
+        let updated = update_author(&pool, id, &full_input("New Name")).await.unwrap();
+        assert_eq!(updated.id, id);
+        assert_eq!(updated.name, "New Name");
+        assert_eq!(updated.given_name.as_deref(), Some("Given"));
+        assert_eq!(updated.family_name.as_deref(), Some("Family"));
+        assert_eq!(updated.name_original.as_deref(), Some("関 茂樹"));
+        assert_eq!(updated.reading_family.as_deref(), Some("せき"));
+        assert_eq!(updated.email.as_deref(), Some("x@example.com"));
+        assert!(updated.updated_at.is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_author_returns_row_not_found_for_missing_id(pool: SqlitePool) {
+        let err = update_author(&pool, 9999, &input("X")).await.unwrap_err();
+        assert!(matches!(err, sqlx::Error::RowNotFound));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_author_replaces_identifiers_diff_style(pool: SqlitePool) {
+        let id = make_author(&pool, "X").await;
+        // 先に 3 件
+        let mut start = AuthorInput {
+            name: "X".to_string(),
+            identifiers: vec![
+                AuthorIdentifierInput {
+                    scheme: "dblp".to_string(),
+                    value: "12/1".to_string(),
+                    url: None,
+                },
+                AuthorIdentifierInput {
+                    scheme: "scopus".to_string(),
+                    value: "55".to_string(),
+                    url: None,
+                },
+                AuthorIdentifierInput {
+                    scheme: "wikidata".to_string(),
+                    value: "Q1".to_string(),
+                    url: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let after_first = update_author(&pool, id, &start).await.unwrap();
+        assert_eq!(after_first.identifiers.len(), 3);
+
+        // 1 件残し、2 件入れ替え（dblp は更新、scopus は削除、新規 viaf を追加）
+        start.identifiers = vec![
+            AuthorIdentifierInput {
+                scheme: "dblp".to_string(),
+                value: "12/9".to_string(),
+                url: Some("https://dblp.org/x".to_string()),
+            },
+            AuthorIdentifierInput {
+                scheme: "viaf".to_string(),
+                value: "12345".to_string(),
+                url: None,
+            },
+        ];
+        let after_second = update_author(&pool, id, &start).await.unwrap();
+        let by_scheme: std::collections::HashMap<&str, &AuthorIdentifier> =
+            after_second.identifiers.iter().map(|i| (i.scheme.as_str(), i)).collect();
+        assert_eq!(by_scheme.len(), 2);
+        assert_eq!(by_scheme.get("dblp").unwrap().value, "12/9");
+        assert_eq!(
+            by_scheme.get("dblp").unwrap().url.as_deref(),
+            Some("https://dblp.org/x")
+        );
+        assert_eq!(by_scheme.get("viaf").unwrap().value, "12345");
+        assert!(!by_scheme.contains_key("scopus"));
+        assert!(!by_scheme.contains_key("wikidata"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_author_orcid_writes_both_column_and_identifiers(pool: SqlitePool) {
+        let id = make_author(&pool, "Cited").await;
+        let inp = AuthorInput {
+            name: "Cited".to_string(),
+            orcid: Some("0000-0001-2345-6789".to_string()),
+            // identifiers にも明示せず、暗黙補完を検証
+            ..Default::default()
+        };
+        let updated = update_author(&pool, id, &inp).await.unwrap();
+        assert_eq!(updated.orcid.as_deref(), Some("0000-0001-2345-6789"));
+        let orcid_row = updated
+            .identifiers
+            .iter()
+            .find(|i| i.scheme == "orcid")
+            .expect("scheme='orcid' が identifiers にも入っていること");
+        assert_eq!(orcid_row.value, "0000-0001-2345-6789");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_author_resyncs_fts_for_linked_entries(pool: SqlitePool) {
+        // §8.4 で延期した 2 つ目のテスト
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Random Title".to_string(),
+                entry_type: "article".to_string(),
+                author_names: vec!["Seki".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let author_id: i64 = sqlx::query_scalar("SELECT id FROM authors WHERE name = 'Seki'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // 漢字 / かなを update_author で付与（FTS 再同期込み）
+        let updated = AuthorInput {
+            name: "Seki".to_string(),
+            name_original: Some("関 茂樹".to_string()),
+            reading_family: Some("せき".to_string()),
+            reading_given: Some("もとき".to_string()),
+            ..Default::default()
+        };
+        update_author(&pool, author_id, &updated).await.unwrap();
+
+        // rebuild なしで漢字 / かながヒットする（=update_author が FTS を再同期した）
+        for q in ["関", "せき"] {
+            let hits = search_entries(&pool, q, None, None).await.unwrap();
+            assert_eq!(hits.len(), 1, "{q} should hit after update_author");
+            assert_eq!(hits[0].id, entry.id);
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn merge_authors_moves_entry_links(pool: SqlitePool) {
+        // 2 entry を別々の author にぶら下げる
+        let e1 = create_entry(
+            &pool,
+            &EntryInput {
+                title: "E1".to_string(),
+                entry_type: "article".to_string(),
+                author_names: vec!["From Name".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let e2 = create_entry(
+            &pool,
+            &EntryInput {
+                title: "E2".to_string(),
+                entry_type: "article".to_string(),
+                author_names: vec!["Into Name".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let from_id: i64 = sqlx::query_scalar("SELECT id FROM authors WHERE name = 'From Name'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let into_id: i64 = sqlx::query_scalar("SELECT id FROM authors WHERE name = 'Into Name'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        merge_authors(&pool, from_id, into_id).await.unwrap();
+
+        // from は削除
+        let from_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM authors WHERE id = ?")
+                .bind(from_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(from_count, 0);
+
+        // 2 entry とも into に紐付くようになっている
+        for eid in [e1.id, e2.id] {
+            let aid: i64 = sqlx::query_scalar(
+                "SELECT author_id FROM entry_authors WHERE entry_id = ?",
+            )
+            .bind(eid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(aid, into_id);
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn merge_authors_dedups_when_both_on_same_entry(pool: SqlitePool) {
+        // 同じ entry に from と into 両方が co-author としているケース
+        let e = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Co-authored".to_string(),
+                entry_type: "article".to_string(),
+                author_names: vec!["A".to_string(), "B".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let from_id: i64 = sqlx::query_scalar("SELECT id FROM authors WHERE name = 'A'")
+            .fetch_one(&pool).await.unwrap();
+        let into_id: i64 = sqlx::query_scalar("SELECT id FROM authors WHERE name = 'B'")
+            .fetch_one(&pool).await.unwrap();
+
+        merge_authors(&pool, from_id, into_id).await.unwrap();
+
+        // entry には into 1 行のみ残る
+        let rows: Vec<i64> = sqlx::query_scalar(
+            "SELECT author_id FROM entry_authors WHERE entry_id = ?",
+        )
+        .bind(e.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![into_id]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn merge_authors_resolves_identifier_conflict(pool: SqlitePool) {
+        // 両者に同 scheme の identifier があったら into 側を残す
+        let from_id = make_author(&pool, "From").await;
+        let into_id = make_author(&pool, "Into").await;
+        sqlx::query(
+            "INSERT INTO author_identifiers (author_id, scheme, value)
+             VALUES (?, 'dblp', 'from/123'), (?, 'dblp', 'into/456')",
+        )
+        .bind(from_id)
+        .bind(into_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // from にだけ別 scheme も持たせる（こちらは into に移動する）
+        sqlx::query(
+            "INSERT INTO author_identifiers (author_id, scheme, value) VALUES (?, 'wikidata', 'Q1')",
+        )
+        .bind(from_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        merge_authors(&pool, from_id, into_id).await.unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT scheme, value FROM author_identifiers WHERE author_id = ? ORDER BY scheme",
+        )
+        .bind(into_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("dblp".to_string(), "into/456".to_string()),    // into 側を保持
+                ("wikidata".to_string(), "Q1".to_string()),       // from 由来は移動
+            ]
+        );
+        // from の identifiers は空
+        let from_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM author_identifiers WHERE author_id = ?",
+        )
+        .bind(from_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(from_count, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn merge_authors_into_self_is_noop(pool: SqlitePool) {
+        let id = make_author(&pool, "Solo").await;
+        merge_authors(&pool, id, id).await.unwrap(); // panic しない
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM authors WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn merge_authors_not_found_for_unknown_from(pool: SqlitePool) {
+        let into_id = make_author(&pool, "Into").await;
+        let err = merge_authors(&pool, 9999, into_id).await.unwrap_err();
+        assert!(matches!(err, sqlx::Error::RowNotFound));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_author_identifier_inserts_then_upserts(pool: SqlitePool) {
+        let id = make_author(&pool, "X").await;
+        add_author_identifier(
+            &pool,
+            id,
+            &AuthorIdentifierInput {
+                scheme: "dblp".to_string(),
+                value: "v1".to_string(),
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
+        // 上書き
+        add_author_identifier(
+            &pool,
+            id,
+            &AuthorIdentifierInput {
+                scheme: "dblp".to_string(),
+                value: "v2".to_string(),
+                url: Some("https://dblp.org/x".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT value, url FROM author_identifiers WHERE author_id = ? AND scheme = 'dblp'",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "v2");
+        assert_eq!(row.1.as_deref(), Some("https://dblp.org/x"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_author_identifier_orcid_syncs_authors_column(pool: SqlitePool) {
+        let id = make_author(&pool, "X").await;
+        add_author_identifier(
+            &pool,
+            id,
+            &AuthorIdentifierInput {
+                scheme: "orcid".to_string(),
+                value: "0000-1111-2222-3333".to_string(),
+                url: None,
+            },
+        )
+        .await
+        .unwrap();
+        let orcid: Option<String> =
+            sqlx::query_scalar("SELECT orcid FROM authors WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orcid.as_deref(), Some("0000-1111-2222-3333"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_author_identifier_rejects_empty(pool: SqlitePool) {
+        let id = make_author(&pool, "X").await;
+        let err = add_author_identifier(
+            &pool,
+            id,
+            &AuthorIdentifierInput {
+                scheme: "".to_string(),
+                value: "x".to_string(),
+                url: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, sqlx::Error::Protocol(_)));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_author_identifier_removes_only_that_scheme(pool: SqlitePool) {
+        let id = make_author(&pool, "X").await;
+        sqlx::query(
+            "INSERT INTO author_identifiers (author_id, scheme, value)
+             VALUES (?, 'dblp', 'a'), (?, 'scopus', 'b')",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        delete_author_identifier(&pool, id, "dblp").await.unwrap();
+
+        let remaining: Vec<String> = sqlx::query_scalar(
+            "SELECT scheme FROM author_identifiers WHERE author_id = ? ORDER BY scheme",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec!["scopus".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_author_identifier_orcid_clears_authors_column(pool: SqlitePool) {
+        let id = make_author(&pool, "X").await;
+        sqlx::query("UPDATE authors SET orcid = '0000-X' WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO author_identifiers (author_id, scheme, value) VALUES (?, 'orcid', '0000-X')")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        delete_author_identifier(&pool, id, "orcid").await.unwrap();
+
+        let orcid: Option<String> =
+            sqlx::query_scalar("SELECT orcid FROM authors WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(orcid.is_none(), "authors.orcid もクリアされること");
     }
 }
