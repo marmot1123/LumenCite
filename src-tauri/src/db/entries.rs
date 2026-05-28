@@ -174,7 +174,13 @@ async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::
     .await?;
 
     let authors: Vec<Author> = sqlx::query_as(
-        "SELECT a.id, a.name, a.given_name, a.family_name, a.orcid
+        "SELECT a.id, a.name,
+                a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
+                a.name_original, a.given_name_original, a.family_name_original, a.original_script,
+                a.reading_family, a.reading_given,
+                a.is_organization,
+                a.email, a.homepage_url, a.notes,
+                a.orcid, a.updated_at
          FROM authors a
          JOIN entry_authors ea ON ea.author_id = a.id
          WHERE ea.entry_id = ?
@@ -299,7 +305,13 @@ async fn load_entry_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, 
     .await?;
 
     let authors: Vec<Author> = sqlx::query_as(
-        "SELECT a.id, a.name, a.given_name, a.family_name, a.orcid
+        "SELECT a.id, a.name,
+                a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
+                a.name_original, a.given_name_original, a.family_name_original, a.original_script,
+                a.reading_family, a.reading_given,
+                a.is_organization,
+                a.email, a.homepage_url, a.notes,
+                a.orcid, a.updated_at
          FROM authors a
          JOIN entry_authors ea ON ea.author_id = a.id
          WHERE ea.entry_id = ?
@@ -361,7 +373,13 @@ pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::
     .ok_or(sqlx::Error::RowNotFound)?;
 
     let authors: Vec<Author> = sqlx::query_as(
-        "SELECT a.id, a.name, a.given_name, a.family_name, a.orcid
+        "SELECT a.id, a.name,
+                a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
+                a.name_original, a.given_name_original, a.family_name_original, a.original_script,
+                a.reading_family, a.reading_given,
+                a.is_organization,
+                a.email, a.homepage_url, a.notes,
+                a.orcid, a.updated_at
          FROM authors a
          JOIN entry_authors ea ON ea.author_id = a.id
          WHERE ea.entry_id = ?
@@ -597,7 +615,13 @@ pub async fn get_entries(
         .await?;
 
         let authors: Vec<Author> = sqlx::query_as(
-            "SELECT a.id, a.name, a.given_name, a.family_name, a.orcid
+            "SELECT a.id, a.name,
+                    a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
+                    a.name_original, a.given_name_original, a.family_name_original, a.original_script,
+                    a.reading_family, a.reading_given,
+                    a.is_organization,
+                    a.email, a.homepage_url, a.notes,
+                    a.orcid, a.updated_at
              FROM authors a
              JOIN entry_authors ea ON ea.author_id = a.id
              WHERE ea.entry_id = ?
@@ -1076,12 +1100,11 @@ async fn get_or_create_author(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     name: &str,
 ) -> Result<Author, sqlx::Error> {
-    let existing: Option<Author> = sqlx::query_as(
-        "SELECT id, name, given_name, family_name, orcid FROM authors WHERE name = ?",
-    )
-    .bind(name)
-    .fetch_optional(&mut **tx)
-    .await?;
+    // M2 では従来どおり `name` 完全一致のみで照合する（ORCID / NFKC 正規化照合は M3）。
+    let existing: Option<Author> = sqlx::query_as(AUTHOR_SELECT_BY_NAME)
+        .bind(name)
+        .fetch_optional(&mut **tx)
+        .await?;
 
     if let Some(author) = existing {
         return Ok(author);
@@ -1092,14 +1115,36 @@ async fn get_or_create_author(
         .execute(&mut **tx)
         .await?;
 
-    Ok(Author {
-        id: result.last_insert_rowid(),
-        name: name.to_string(),
-        given_name: None,
-        family_name: None,
-        orcid: None,
-    })
+    // 列 DEFAULT（is_organization=0 など）を取り違えないよう、挿入後に同一行を再フェッチする。
+    let inserted: Author = sqlx::query_as(AUTHOR_SELECT_BY_ID)
+        .bind(result.last_insert_rowid())
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(inserted)
 }
+
+// `authors` 1 行の全カラムを Author 構造体の field 名で SELECT する SQL。
+// FromRow が field 名でマッチングするため、SELECT する列名と Author 構造体の field 名を揃える。
+// `identifiers` は別テーブル JOIN で詰めるため対象外（M3 で db/authors.rs ヘルパーに切り出す）。
+const AUTHOR_SELECT_BY_NAME: &str =
+    "SELECT id, name,
+            given_name, middle_name, family_name, suffix, name_particle,
+            name_original, given_name_original, family_name_original, original_script,
+            reading_family, reading_given,
+            is_organization,
+            email, homepage_url, notes,
+            orcid, updated_at
+       FROM authors WHERE name = ?";
+
+const AUTHOR_SELECT_BY_ID: &str =
+    "SELECT id, name,
+            given_name, middle_name, family_name, suffix, name_particle,
+            name_original, given_name_original, family_name_original, original_script,
+            reading_family, reading_given,
+            is_organization,
+            email, homepage_url, notes,
+            orcid, updated_at
+       FROM authors WHERE id = ?";
 
 #[cfg(test)]
 mod tests {

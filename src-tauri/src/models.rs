@@ -1,12 +1,105 @@
 use std::collections::HashMap;
 
+/// 著者マスタ。v0.3.0 で多言語名・読み仮名・団体著者・CSL 互換フィールドへ拡張。
+/// `identifiers` は別テーブル `author_identifiers` を JOIN して詰める用の付属フィールドで、
+/// 列としては存在しないため `#[sqlx(default)]` で FromRow から除外する（M3 で組み立て）。
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
 pub struct Author {
     pub id: i64,
     pub name: String,
     pub given_name: Option<String>,
+    pub middle_name: Option<String>,
     pub family_name: Option<String>,
+    pub suffix: Option<String>,
+    pub name_particle: Option<String>,
+
+    pub name_original: Option<String>,
+    pub given_name_original: Option<String>,
+    pub family_name_original: Option<String>,
+    pub original_script: Option<String>,
+
+    pub reading_family: Option<String>,
+    pub reading_given: Option<String>,
+
+    pub is_organization: bool,
+
+    pub email: Option<String>,
+    pub homepage_url: Option<String>,
+    pub notes: Option<String>,
+
     pub orcid: Option<String>,
+    pub updated_at: Option<String>,
+
+    #[sqlx(skip)]
+    pub identifiers: Vec<AuthorIdentifier>,
+}
+
+/// 著者の外部識別子（ORCID 以外は `author_identifiers` に正規化保持）。
+/// scheme は 'orcid' / 'scopus' / 'dblp' / 'semantic_scholar' / 'wikidata' /
+/// 'isni' / 'viaf' / 'researcher_id' / 'google_scholar' 等。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone, PartialEq, Eq)]
+pub struct AuthorIdentifier {
+    pub author_id: i64,
+    pub scheme: String,
+    pub value: String,
+    pub url: Option<String>,
+}
+
+/// 著者の新規作成 / 更新時に受け取る入力型。
+/// `get_or_create_author` / `update_author` の引数として使う（M3 以降）。
+#[allow(dead_code)] // M3 で配線
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AuthorInput {
+    pub name: String,
+    #[serde(default)]
+    pub given_name: Option<String>,
+    #[serde(default)]
+    pub middle_name: Option<String>,
+    #[serde(default)]
+    pub family_name: Option<String>,
+    #[serde(default)]
+    pub suffix: Option<String>,
+    #[serde(default)]
+    pub name_particle: Option<String>,
+
+    #[serde(default)]
+    pub name_original: Option<String>,
+    #[serde(default)]
+    pub given_name_original: Option<String>,
+    #[serde(default)]
+    pub family_name_original: Option<String>,
+    #[serde(default)]
+    pub original_script: Option<String>,
+
+    #[serde(default)]
+    pub reading_family: Option<String>,
+    #[serde(default)]
+    pub reading_given: Option<String>,
+
+    #[serde(default)]
+    pub is_organization: bool,
+
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub homepage_url: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+
+    #[serde(default)]
+    pub orcid: Option<String>,
+
+    #[serde(default)]
+    pub identifiers: Vec<AuthorIdentifierInput>,
+}
+
+#[allow(dead_code)] // M3 で配線
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuthorIdentifierInput {
+    pub scheme: String,
+    pub value: String,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]

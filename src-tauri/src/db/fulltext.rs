@@ -172,7 +172,13 @@ async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::
     .await?;
 
     let authors: Vec<Author> = sqlx::query_as(
-        "SELECT a.id, a.name, a.given_name, a.family_name, a.orcid
+        "SELECT a.id, a.name,
+                a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
+                a.name_original, a.given_name_original, a.family_name_original, a.original_script,
+                a.reading_family, a.reading_given,
+                a.is_organization,
+                a.email, a.homepage_url, a.notes,
+                a.orcid, a.updated_at
          FROM authors a
          JOIN entry_authors ea ON ea.author_id = a.id
          WHERE ea.entry_id = ?
