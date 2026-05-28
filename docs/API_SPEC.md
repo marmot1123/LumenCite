@@ -356,6 +356,7 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 | `merge_authors` | `from_id: i64, into_id: i64` | `Result<()>` — entry_authors を `into` に集約、`from` を削除。identifiers は `into` 優先。関連 entry の FTS を再同期 |
 | `add_author_identifier` | `author_id: i64, input: AuthorIdentifierInput` | `Result<()>` — (author_id, scheme) で upsert。scheme='orcid' のときは `authors.orcid` 列も同期 |
 | `delete_author_identifier` | `author_id: i64, scheme: String` | `Result<()>` — scheme='orcid' のときは `authors.orcid` 列もクリア |
+| `fetch_author_from_orcid` | `orcid: String` | `Result<AuthorInput>` — ORCID Public API (`https://pub.orcid.org/v3.0/{id}/person`) から given/family/credit-name / public email / researcher-urls / external-identifiers を取得して AuthorInput に詰めて返す。DB には書かない pure fetcher（呼び出し側が `update_author` で保存する想定）。other-names に CJK / Hangul / Cyrillic が含まれていれば best-effort で `name_original` / `original_script` を推定する |
 
 `update_author` と `merge_authors` は `.bib` 同期キックを送るため、エクスポート先ファイルにも自動反映される。
 

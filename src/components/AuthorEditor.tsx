@@ -71,6 +71,8 @@ export function AuthorEditor({ authorId, onClose, onSaved }: AuthorEditorProps) 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [merging, setMerging] = useState(false);
+  const [fetching, setFetching] = useState(false);
+  const [fetchSummary, setFetchSummary] = useState<string | null>(null);
   const [form, setForm] = useState<AuthorInput | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [mergeQuery, setMergeQuery] = useState("");
@@ -154,6 +156,37 @@ export function AuthorEditor({ authorId, onClose, onSaved }: AuthorEditorProps) 
       setError(String(e));
     } finally {
       setSaving(false);
+    }
+  };
+
+  // ORCID Public API から不足フィールドを引いてくる。既存入力は温存。
+  const handleFetchFromOrcid = async () => {
+    if (!form) return;
+    const orcid = (form.orcid ?? "").trim();
+    if (!ORCID_PATTERN.test(orcid)) {
+      setFetchSummary(null);
+      setError(t("authorEditor.fetch.invalidOrcid"));
+      return;
+    }
+    setFetching(true);
+    setError(null);
+    setFetchSummary(null);
+    try {
+      const fetched = await invoke<AuthorInput>("fetch_author_from_orcid", { orcid });
+      const merged = mergeFetchedIntoForm(form, fetched);
+      setForm(merged.next);
+      setFetchSummary(
+        merged.fieldsFilled === 0 && merged.identifiersAdded === 0
+          ? t("authorEditor.fetch.noChanges")
+          : t("authorEditor.fetch.summary", {
+              fields: merged.fieldsFilled,
+              identifiers: merged.identifiersAdded,
+            }),
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setFetching(false);
     }
   };
 
@@ -355,14 +388,50 @@ export function AuthorEditor({ authorId, onClose, onSaved }: AuthorEditorProps) 
               <Section title={t("authorEditor.section.identifiers")}>
                 <Row>
                   <Field label={t("authorEditor.field.orcid")}>
-                    <input
-                      value={form.orcid ?? ""}
-                      onChange={e => setForm({ ...form, orcid: e.target.value })}
-                      style={inputStyle}
-                      placeholder="0000-0000-0000-0000"
-                    />
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <input
+                        value={form.orcid ?? ""}
+                        onChange={e => {
+                          setForm({ ...form, orcid: e.target.value });
+                          setFetchSummary(null);
+                        }}
+                        style={{ ...inputStyle, flex: "1 1 auto" }}
+                        placeholder="0000-0000-0000-0000"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleFetchFromOrcid}
+                        disabled={fetching || !ORCID_PATTERN.test((form.orcid ?? "").trim())}
+                        title={t("authorEditor.fetch.button")}
+                        style={{
+                          ...secondaryButtonStyle,
+                          padding: "5px 10px",
+                          whiteSpace: "nowrap",
+                          opacity:
+                            fetching || !ORCID_PATTERN.test((form.orcid ?? "").trim())
+                              ? 0.5
+                              : 1,
+                          cursor:
+                            fetching || !ORCID_PATTERN.test((form.orcid ?? "").trim())
+                              ? "default"
+                              : "pointer",
+                        }}
+                      >
+                        {fetching
+                          ? t("authorEditor.fetch.fetching")
+                          : t("authorEditor.fetch.button")}
+                      </button>
+                    </div>
                   </Field>
                 </Row>
+                {fetchSummary && (
+                  <div style={{
+                    marginTop: 4, fontSize: 11, color: "var(--text-mute)",
+                    background: "var(--surface-2)", padding: "5px 8px", borderRadius: 4,
+                  }}>
+                    {fetchSummary}
+                  </div>
+                )}
                 <IdentifiersEditor
                   rows={form.identifiers ?? []}
                   onChange={rows => setForm({ ...form, identifiers: rows })}
@@ -623,6 +692,55 @@ function IdentifiersEditor({
 }
 
 // ── バリデーション ────────────────────────────────────────────────────────────
+
+/**
+ * ORCID から取得した AuthorInput を現在のフォームに**非破壊的に**マージする。
+ *
+ * 設計方針:
+ * - 個別スカラーフィールド: 既存が空/未入力のときだけ fetched の値で埋める。
+ *   ユーザーが既に手入力していたものは温存（混乱を避ける）。
+ * - identifiers: 既存と scheme で diff を取り、未登録の scheme だけを追加。
+ *   ORCID の scheme は別フィールドに専用入力があるので identifiers 側からは除外。
+ * - is_organization: ORCID は個人専用なので触らない。
+ */
+function mergeFetchedIntoForm(
+  current: AuthorInput,
+  fetched: AuthorInput,
+): { next: AuthorInput; fieldsFilled: number; identifiersAdded: number } {
+  let fieldsFilled = 0;
+  const fillScalar = (cur: string | null | undefined, nxt: string | null | undefined) => {
+    const c = (cur ?? "").trim();
+    const n = (nxt ?? "").trim();
+    if (c === "" && n !== "") {
+      fieldsFilled += 1;
+      return n;
+    }
+    return cur ?? null;
+  };
+
+  const next: AuthorInput = {
+    ...current,
+    name: current.name.trim() === "" && fetched.name.trim() !== "" ? (fieldsFilled++, fetched.name) : current.name,
+    given_name: fillScalar(current.given_name, fetched.given_name),
+    middle_name: fillScalar(current.middle_name, fetched.middle_name),
+    family_name: fillScalar(current.family_name, fetched.family_name),
+    name_original: fillScalar(current.name_original, fetched.name_original),
+    original_script: fillScalar(current.original_script, fetched.original_script),
+    email: fillScalar(current.email, fetched.email),
+    homepage_url: fillScalar(current.homepage_url, fetched.homepage_url),
+  };
+
+  // identifiers: scheme で重複排除（既存優先 + orcid は専用フィールドにあるので捨てる）
+  const existingSchemes = new Set((current.identifiers ?? []).map(i => i.scheme));
+  const incoming = (fetched.identifiers ?? []).filter(
+    i => i.scheme !== "orcid" && !existingSchemes.has(i.scheme) && i.scheme.trim() !== "" && i.value.trim() !== "",
+  );
+  if (incoming.length > 0) {
+    next.identifiers = [...(current.identifiers ?? []), ...incoming];
+  }
+
+  return { next, fieldsFilled, identifiersAdded: incoming.length };
+}
 
 /**
  * バリデーション失敗時は i18n キーを返し、成功時は null。

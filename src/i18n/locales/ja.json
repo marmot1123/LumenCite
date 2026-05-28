@@ -789,6 +789,13 @@
       "submit": "この著者に統合",
       "submitting": "統合中…",
       "success": "統合しました。"
+    },
+    "fetch": {
+      "button": "ORCID から取得",
+      "fetching": "取得中…",
+      "summary": "{{fields}} 件のフィールドと {{identifiers}} 件の識別子を取得しました（既存の値は上書きしません）。",
+      "noChanges": "新しく取得できる情報はありませんでした。",
+      "invalidOrcid": "ORCID を 0000-0000-0000-0000 形式で入力してください。"
     }
   }
 }

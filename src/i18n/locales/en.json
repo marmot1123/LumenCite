@@ -789,6 +789,13 @@
       "submit": "Merge into this author",
       "submitting": "Merging…",
       "success": "Merged."
+    },
+    "fetch": {
+      "button": "Fetch from ORCID",
+      "fetching": "Fetching…",
+      "summary": "Filled {{fields}} field(s) and added {{identifiers}} identifier(s). Existing values were preserved.",
+      "noChanges": "No new information to import.",
+      "invalidOrcid": "Enter ORCID as 0000-0000-0000-0000."
     }
   }
 }

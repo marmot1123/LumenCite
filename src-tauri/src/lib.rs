@@ -6,6 +6,7 @@ mod llm;
 mod mcp;
 mod metadata;
 mod models;
+mod orcid;
 
 use models::{
     Attachment, Author, AuthorIdentifierInput, AuthorInput, Collection, EntryDetail, EntryInput,
@@ -341,6 +342,13 @@ async fn delete_author_identifier(
     db::authors::delete_author_identifier(&state.db, author_id, &scheme)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// ORCID Public API から著者情報を取得して AuthorInput を返す（M12）。
+/// state を取らないのは DB に触らない pure fetcher だから。
+#[tauri::command]
+async fn fetch_author_from_orcid(orcid: String) -> Result<AuthorInput, String> {
+    orcid::fetch_by_orcid(&orcid).await
 }
 
 // ── tags ──────────────────────────────────────────────────────────────────────
@@ -2114,6 +2122,7 @@ pub fn run() {
             merge_authors,
             add_author_identifier,
             delete_author_identifier,
+            fetch_author_from_orcid,
             get_tags,
             create_tag,
             delete_tag,

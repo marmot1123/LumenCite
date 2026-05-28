@@ -20,6 +20,7 @@ Expands the `authors` table for multilingual names (kanji, kana readings, Hangul
 - **Author editor modal** (`src/components/AuthorEditor.tsx`) — Edit every author field, manage identifiers, and merge same-name duplicates into one record. Reachable from the detail view and side panel by clicking an author chip, and from the edit sheet via the `…` button next to each saved author.
 - **New Tauri commands** — `get_author`, `update_author`, `add_author_identifier`, `delete_author_identifier`. `search_authors` and `merge_authors` are also fully wired up (the former existed but is now richer; the latter is new).
 - **Author chip with metadata hover** — The detail view and side panel render authors as chips that show the original-script name, kana reading, and ORCID on hover, and use a building icon for organizational authors.
+- **ORCID auto-fill** — The author editor now has a "Fetch from ORCID" button next to the ORCID field. It calls the ORCID Public API (no auth required) and fills in `given_name` / `family_name` / `middle_name` / `email` / `homepage_url` plus any external identifiers (Scopus / ResearcherID / Wikidata / ISNI / VIAF / Loop / …). Existing user-entered values are preserved (only empty fields are filled). For records with non-Latin `other-names`, `name_original` / `original_script` are estimated heuristically (Han / Hangul / Hiragana / Katakana / Cyrillic / Arabic). Reading-kana fields are still entered manually since ORCID has no schema for them.
 
 ### Changed
 
