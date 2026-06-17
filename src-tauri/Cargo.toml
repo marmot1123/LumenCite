@@ -32,8 +32,11 @@ tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-dialog = "2"
 # 起動時 DB 初期化失敗を Tauri イベントループ起動前に表示するためのネイティブダイアログ。
 # tauri-plugin-dialog の blocking_show は run_on_main_thread 経由で setup 中はデッドロックするため、
-# setup ではイベントループ非依存の rfd を直接使う（tauri-plugin-dialog が依存する版と統一）。
-rfd = "0.16"
+# setup ではイベントループ非依存の rfd を直接使う。
+# Linux backend は tauri-plugin-dialog と同じ gtk3 に固定する（default の xdg-portal と
+# gtk3 が両立すると rfd の build.rs が "can't enable both" で panic するため）。
+# gtk3 機能は mac/win では no-op、Linux は webkit2gtk-4.1-dev 経由で gtk+-3.0 が入る。
+rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
 pdf-extract = "0.9"
 tokio = { version = "1", features = ["sync", "time", "macros", "process", "io-util"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

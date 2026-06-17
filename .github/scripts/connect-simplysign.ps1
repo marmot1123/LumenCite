@@ -94,17 +94,22 @@ $expected = ($expected -replace '[^0-9A-Fa-f]', '').ToUpper()
 $secret = Get-SecretFromOtpUri -Value $otpInput
 
 # --- install SimplySign Desktop --------------------------------------------
-# NOTE: confirm/pin the exact installer URL + silent flags on the first rc run.
-# Certum publishes SimplySign Desktop here: https://www.certum.eu/en/support_download_software/
+# Direct installer (verified to exist on files.certum.eu, 2026-06). Override with
+# the SIMPLYSIGN_INSTALLER_URL repo variable if Certum bumps the version.
+# Listing: https://files.certum.eu/software/SimplySignDesktop/Windows/
 $installerUrl = $env:SIMPLYSIGN_INSTALLER_URL
 if ([string]::IsNullOrWhiteSpace($installerUrl)) {
-    $installerUrl = 'https://files.certum.eu/software/SimplySign_Desktop/Windows/SimplySignDesktop-setup.exe'
+    $installerUrl = 'https://files.certum.eu/software/SimplySignDesktop/Windows/9.4.3.90/SimplySignDesktop-9.4.3.90-64-bit-en.msi'
 }
-$installer = Join-Path $env:RUNNER_TEMP 'SimplySignDesktop-setup.exe'
+$installer = Join-Path $env:RUNNER_TEMP 'SimplySignDesktop.msi'
 Write-Host "Downloading SimplySign Desktop from $installerUrl"
 Invoke-WebRequest -Uri $installerUrl -OutFile $installer -UseBasicParsing
-Write-Host 'Installing SimplySign Desktop silently...'
-Start-Process -FilePath $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+Write-Host 'Installing SimplySign Desktop silently (msiexec /qn)...'
+$msi = Start-Process -FilePath 'msiexec.exe' `
+    -ArgumentList '/i', "`"$installer`"", '/qn', '/norestart' -Wait -PassThru
+if ($msi.ExitCode -ne 0 -and $msi.ExitCode -ne 3010) {
+    throw "msiexec failed with exit code $($msi.ExitCode)"
+}
 
 # Locate the SimplySign Desktop executable.
 $exeCandidates = @(
@@ -119,17 +124,48 @@ if (-not $exe) {
 if (-not $exe) { throw 'SimplySignDesktop.exe not found after install. Verify the installer URL/flags.' }
 Write-Host "SimplySign Desktop: $exe"
 
+# Diagnostic: enumerate visible top-level window titles (tells us what to focus).
+Add-Type @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class Win {
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    public static List<string> Titles() {
+        var r = new List<string>();
+        EnumWindows((h, l) => {
+            if (IsWindowVisible(h)) {
+                var sb = new StringBuilder(256);
+                if (GetWindowText(h, sb, 256) > 0) r.Add(sb.ToString());
+            }
+            return true;
+        }, IntPtr.Zero);
+        return r;
+    }
+}
+'@
+function Show-Windows([string] $tag) {
+    Write-Host "--- visible windows ($tag) ---"
+    [Win]::Titles() | ForEach-Object { Write-Host "  [$_]" }
+}
+
 # --- log in -----------------------------------------------------------------
 # SimplySign Desktop is a GUI app; drive its login dialog via SendKeys. The
 # field order (user id -> TAB -> password -> TAB -> OTP -> ENTER) is the working
-# assumption and the most likely thing to need adjustment on the first rc.
+# assumption and the most likely thing to need adjustment on the next rc.
 Add-Type -AssemblyName System.Windows.Forms
 Start-Process -FilePath $exe | Out-Null
-Start-Sleep -Seconds 20
+Start-Sleep -Seconds 25
+Show-Windows 'after launch'
 
 $otp = Get-Totp -Base32Secret $secret
 $wshell = New-Object -ComObject WScript.Shell
-$null = $wshell.AppActivate('SimplySign')
+$activated = $wshell.AppActivate('SimplySign')
+Write-Host "AppActivate('SimplySign') => $activated"
 Start-Sleep -Seconds 2
 [System.Windows.Forms.SendKeys]::SendWait($userId)
 [System.Windows.Forms.SendKeys]::SendWait('{TAB}')
@@ -150,6 +186,7 @@ while ((Get-Date) -lt $deadline) {
 }
 
 if (-not $found) {
+    Show-Windows 'after login attempt'
     Write-Host '--- DIAGNOSTICS: certificates currently in CurrentUser\My ---'
     Get-ChildItem -Path Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
         Format-Table Thumbprint, Subject -AutoSize | Out-String | Write-Host
