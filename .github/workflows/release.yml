@@ -26,11 +26,11 @@ jobs:
           - platform: ubuntu-22.04
             args: ""
             label: linux-x64
-          - platform: windows-latest
-            # Windows コード署名のオーバーレイ（Certum 拇印 + タイムスタンプ）をマージ。
-            # base の tauri.conf.json は certificateThumbprint:null のままにして dev/local を壊さない。
-            args: "--config src-tauri/tauri.release-windows.conf.json"
-            label: windows-x64
+          # Windows は CI に含めない。Certum SimplySign(クラウド HSM) はトレイ GUI への
+          # 対話ログインが必須で、GitHub ホストランナーの非対話セッションでは GUI が
+          # 描画されず無人署名できない（公式にヘッドレス手段なし）。署名済み Windows
+          # インストーラはリリース担当が一時 Windows VM 上で `tauri build` して生成し、
+          # ドラフトリリースへ手動添付する。手順は docs/RELEASE.md §2 を参照。
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -94,21 +94,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           rm certificate.p12
 
-      # ── Windows 署名: Certum SimplySign(クラウド HSM) にログイン ────────
-      # 秘密鍵は Certum クラウドにあり、SimplySign Desktop にログインすると
-      # 証明書が証明書ストアに現れて signtool /sha1 で使える（PIN キャッシュで
-      # この run の残りは無人署名）。OTP は otpauth シークレットから生成。
-      - name: Set up Certum SimplySign signing (Windows)
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        env:
-          CERTUM_SIMPLYSIGN_USERID: ${{ secrets.CERTUM_SIMPLYSIGN_USERID }}
-          CERTUM_SIMPLYSIGN_PASSWORD: ${{ secrets.CERTUM_SIMPLYSIGN_PASSWORD }}
-          CERTUM_OTP_SECRET: ${{ secrets.CERTUM_OTP_SECRET }}
-          CERTUM_CERT_SHA1: ${{ secrets.CERTUM_CERT_SHA1 }}
-        run: ./.github/scripts/connect-simplysign.ps1
-
-      # Linux はコード署名なしで配布。
+      # Linux はコード署名なしで配布。Windows は CI 対象外（上のマトリクス注記参照）。
 
       - name: Build & sign with tauri-action
         uses: tauri-apps/tauri-action@v0
@@ -132,20 +118,17 @@ jobs:
             ## Downloads
 
             - **macOS (Universal — Apple Silicon + Intel)** — `.dmg` (signed + notarized)
-            - **Windows** — `.msi` / `.exe` installer (signed; first downloads may still show a SmartScreen prompt until reputation builds)
+            - **Windows** — `.msi` / `.exe` installer (signed with Certum; added at release time)
             - **Linux** — `.AppImage`, `.deb`, `.rpm`
 
             ## Notes
 
-            - The auto-updater is **enabled on macOS and Windows** (signed updates). **Linux** still updates by manual download from this page.
+            - The auto-updater is **enabled on macOS** (signed updates). **Windows and Linux** update by manual download from this page.
           releaseDraft: true
           prerelease: false
-          # latest.json は macOS と Windows ジョブが生成する。tauri-action は既存の
-          # latest.json を取得して platforms をマージするため、両方のエントリが残る
-          # （macOS は notarize で最も遅く終わるので Windows のエントリを取り込んでから
-          # 書き出す）。Linux は updater 非対象。
-          # ⚠️ rc ドライランで latest.json に darwin-* と windows-* が両方あるか必ず確認。
-          includeUpdaterJson: ${{ startsWith(matrix.platform, 'macos') || startsWith(matrix.platform, 'windows') }}
+          # latest.json は macOS ジョブのみ生成（macOS のみ auto-updater 有効）。
+          # Windows は VM 手動署名のため CI 非対象。
+          includeUpdaterJson: ${{ startsWith(matrix.platform, 'macos') }}
           args: ${{ matrix.args }}
 
       - name: Cleanup macOS keychain
