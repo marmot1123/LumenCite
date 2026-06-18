@@ -16,13 +16,13 @@ v0.1.0 配布対象: **macOS (Apple Silicon + Intel)** / **Windows** / **Linux (
 | ターゲット | 必要なもの | 必要な GitHub Secret |
 |---|---|---|
 | macOS | Apple Developer ID Application 証明書 + notarytool | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `KEYCHAIN_PASSWORD` |
-| Windows | **v0.1.0 は未署名配布**（SmartScreen は「詳細情報→実行」で回避）。**v0.2.1 で Certum 個人名義の署名を導入予定**（§2） | （取得後）コード署名用の Secret を追加 |
+| Windows | **v0.2.1 で Certum Open Source Code Signing（クラウド HSM/SimplySign）を導入**（§2）。CI 無人署名は SimplySign の GUI ログイン必須により不可と判明 → **一時 Windows VM で手動署名**。専用の常時起動マシンは不要 | （CI Secret なし。VM の SimplySign ログインで署名） |
 | Linux | 不要（署名は使わない） | — |
-| Tauri Updater (macOS) | **v0.2.0 で有効化（macOS のみ）**。ed25519 鍵で `latest.json` を検証 | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
-| Tauri Updater (Windows) | **v0.2.1 へ送り**（コード署名と同時に導入） | — |
+| Tauri Updater (macOS) | **v0.2.0 で有効化**。ed25519 鍵で `latest.json` を検証 | `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
+| Tauri Updater (Windows) | **v0.2.1 では見送り**（手動 latest.json マージが macOS updater を壊すリスク）。Windows は手動 DL 更新 | — |
 | 全 OS | リリース作成権限 | `GITHUB_TOKEN`（GitHub Actions が自動付与） |
 
-> v0.2.0 で必要な GitHub Secrets は **macOS 関連 7 個 + Tauri Updater 署名鍵 2 個** の計 9 個。Windows 署名鍵は v0.2.1 で導入する。
+> v0.2.0 で必要な GitHub Secrets は **macOS 関連 7 個 + Tauri Updater 署名鍵 2 個** の計 9 個。v0.2.1 では **CI 用の追加 Secret は不要**（Windows 署名は VM 手動）。
 
 ---
 
@@ -67,72 +67,88 @@ GitHub の Settings > Secrets and variables > Actions > **New repository secret*
 
 ---
 
-## 2. Windows 側準備（v0.1.0 スキップ → v0.2.1 で Certum 個人名義を導入）
+## 2. Windows 側準備（v0.1.0 スキップ → v0.2.1 で Certum Open Source を導入）
 
-### 2-0. 経緯と CA 選定（2026-05-27 決定）
+### 2-0. 経緯と CA 選定（2026-05-27 → 2026-06-11 更新）
 
-v0.1.0 では Windows コード署名は **未署名で配布**（SmartScreen は「詳細情報 → 実行」で回避案内）。v0.2.1 で署名を導入する。CA は調査の結果 **Certum を「個人名義」で取得**する方針に決定した。
+v0.1.0 では Windows コード署名は **未署名で配布**（SmartScreen は「詳細情報 → 実行」で回避案内）。v0.2.1 で署名を導入する。CA は調査の結果 **Certum**（ポーランドの CA）を個人で取得する方針に決定した。当初 Standard Code Signing（€189〜209）を想定していたが、**LumenCite は MIT ライセンスで GitHub に公開済みの OSS のため、より安価な Certum Open Source Code Signing（€49 前後・クラウド版）を採用**することにした（2026-06-11 決定）。
 
 - **DigiCert 等の OV は見送り**: 2023-06 の CA/Browser Forum 要件で秘密鍵は HSM 格納必須（`.pfx` DL 署名不可）。さらに OV は「組織」実在確認が必要で、**法人登記のない個人事業主だと検証が難航**（実際に DigiCert OV 申請が停滞）。
 - **Azure Trusted Signing（現 Artifact Signing）も不可**: 安価（~$10/月・クラウド HSM）だが、公式 FAQ（2026-05 時点）で個人開発者は **米国・カナダのみ**対象。**日本の個人は対象外**。EV も発行しない。
-- **Certum 個人名義が現実解**: 個人として申請でき、本人確認はパスポート + 英語の住所証明のみ。**D-U-N-S 番号不要**、**SimplySign（クラウド）でトークン輸入も不要**。費用 **€189/年**（概ね 3〜3.5 万円・為替次第）。証明書サブジェクトに本名が出る点だけ許容が必要。
-  - 屋号を載せたい場合は D-U-N-S 番号（東京商工リサーチ、¥3,300、約 1 週間）が追加で必要。
-  - 公開リポジトリなら Certum Open Source Code Signing（年 €30 前後）も候補（サブジェクト表記に制約）。
-- SmartScreen は個人/OV 証明書では当初警告が出るが、DL 実績で評価が育つ（即時評価は EV のみ）。
+- **Certum Open Source Code Signing（クラウド / SimplySign）を採用**:
+  - 本人確認は **パスポート + 英語の住所証明のみ**（Standard と同じ）。加えて **OSS プロジェクトの証明**（リポジトリ URL + ライセンス）の提出が必要 → MIT 公開済みの本リポジトリで満たせる。
+  - **D-U-N-S 番号不要**、**SimplySign（クラウド）でトークン輸入も不要**。費用 **€49 前後/年**（Standard の €189〜209 より大幅に安い）。
+  - ⚠️ **証明書のサブジェクト名 (CN) は `Open Source Developer` + 本名**（例 `Open Source Developer, Motoki Seki`）になる。本名は載るので個人名義方針と整合。機能面（Authenticode 検証・SmartScreen 評価育成）は Standard と同等。
+  - ⚠️ 購入時は必ず **「Open Source Code Signing — in the Cloud / SimplySign」** を選ぶ。検索で出る「€69 のセット」は**物理スマートカード+リーダー版**なので選ばない。
+  - ⚠️ **用途は OSS に限定**される。将来 LumenCite をクローズドソース化・商用ライセンス化する場合は Standard への切り替えが必要。
+  - 署名回数制限 5,000 回/月（実質無関係）。鍵長は RSA 3072-bit 以上。有効期間は 2026-02-27 以降 最大 459 日。
+- SmartScreen は Open Source/OV 証明書では当初警告が出るが、DL 実績で評価が育つ（即時評価は EV のみ）。
 
-参考: [Certum 必要書類](https://support.certum.eu/en/code-signing-required-documents/) ／ [blog.craftz.dog（個人名義実例）](https://blog.craftz.dog/6b64c9ec806b/) ／ [Tauri v2 Windows 署名](https://v2.tauri.app/distribute/sign/windows/) ／ [defguard: Certum HSM + Tauri CI](https://defguard.net/blog/windows-codesign-certum-hsm/)
+参考: [Certum Open Source CS in the Cloud（商品）](https://certum.store/open-source-code-signing-on-simplysign.html) ／ [Certum 必要書類](https://support.certum.eu/en/code-signing-required-documents/) ／ [piers.rocks（Open Source 証明書 実体験・CN 表記）](https://piers.rocks/2025/10/30/certum-open-source-code-sign.html) ／ [Tauri v2 Windows 署名](https://v2.tauri.app/distribute/sign/windows/) ／ [defguard: Certum HSM + Tauri CI](https://defguard.net/blog/windows-codesign-certum-hsm/)
 
-### 2-1. 取得・導入チェックリスト（Certum 個人名義）
+### 2-1. 取得・導入チェックリスト（Certum Open Source・クラウド）
 
 クリティカルパスは Phase 2 の承認待ち（実日数 数日）。Phase 3〜6 は半日〜1 日程度。
 
-**Phase 0 — 事前準備（手元作業）**
-- [ ] パスポート（有効期限内）の顔写真ページを撮影
-- [ ] 英語の住所証明書（印字・ラテン文字・発行 13 ヶ月以内）を 1 つ。いずれか:
+**Phase 0 — 事前準備（手元作業）✅ 2026-06 取得済み**
+- [x] パスポート（有効期限内）の顔写真ページを撮影
+- [x] 英語の住所証明書（印字・ラテン文字・発行 13 ヶ月以内）を 1 つ。いずれか:
   - ゆうちょ銀行の英語版残高証明書（窓口で「英語・住所表記付き」を依頼）※**残高金額は審査に無関係**
   - 英語で出せる公共料金請求書（残高を見せたくない場合）
-- [ ] 証明書に載せる氏名のローマ字を**パスポート表記と一致**させる（例 `Motoki Seki`）。この氏名・住所が配布バイナリに埋まる点を最終確認
-- [ ] クレジットカード（€189 支払い用）
+- [ ] **OSS プロジェクトの証明**を用意: 公開リポジトリ URL（<https://github.com/marmot1123/LumenCite>）と `LICENSE`（MIT）。申請者本人が関与していることが分かる状態にしておく
+- [ ] 証明書に載せる氏名のローマ字を**パスポート表記と一致**させる（例 `Motoki Seki`）。CN は `Open Source Developer, <氏名>` になる点・この氏名が配布バイナリに埋まる点を最終確認
+- [ ] クレジットカード（€49 前後の支払い用）
 
 **Phase 1 — 購入（Certum）**
 - [ ] [certum.eu / shop.certum.eu](https://shop.certum.eu/) でアカウント作成
-- [ ] 「Standard Code Signing — in the Cloud（SimplySign）」1 年（€189）を選択（USB トークン版でなくクラウド版）
+- [ ] **「Open Source Code Signing — in the Cloud（SimplySign）」**1 年（€49 前後）を選択（USB トークン/スマートカード版でなくクラウド版）
 - [ ] **個人（individual）**として申請（corporation を選ばない＝VAT ID 不要）→ カード支払い
 
 **Phase 2 — 本人確認・アクティベーション**
-- [ ] 証明書アクティベーション開始 → 鍵長 **4096-bit** を選択
+- [ ] 証明書アクティベーション開始 → 鍵長 **RSA 3072-bit 以上**（4096-bit 可）を選択
 - [ ] 本人確認方法 **Automatic Identity Verification（推奨）**
 - [ ] スマホでパスポートのライブ確認（顔＋パスポート）
-- [ ] パスポート画像＋英語住所証明をアップロード（指示によりパスワード付き zip をメール送付の場合あり）
+- [ ] パスポート画像＋英語住所証明をアップロード（指示によりパスワード付き zip をメール送付／`ccp@certum.pl` 宛の場合あり）
+- [ ] **OSS プロジェクトの URL（GitHub）とライセンスを提出**（Open Source 版固有の追加要件）
 - [ ] 申請者情報・証明書情報（氏名＝パスポート表記）を入力 → **承認待ち**（不備があると往復）
 
-**Phase 3 — SimplySign セットアップ**
-- [ ] SimplySign モバイルアプリを導入・登録（署名時の OTP/認証用）
-- [ ] SimplySign Desktop を Windows にインストール（証明書を Windows 証明書ストア / `signtool` から見えるようにする）
-- [ ] 発行済み証明書がクラウドプロファイルに見えることを確認
+**Phase 3 — アクティベーション + シークレット取得（Mac＋スマホで完結）✅ 2026-06-17 完了**
+- [x] SimplySign モバイルアプリ登録 / 証明書アクティベート（RSA 3072-bit 以上）
+- [x] `otpauth://` シークレット取り出し（QR をデコード。`zbarimg` 等でオフライン）
+- [x] 証明書(公開部分)を入手し拇印を算出: `openssl x509 -in cert.pem -noout -fingerprint -sha1` → `B4415786DBCFEEEFF9ECDEEB4FD3193F2EB7A9C9`（PEM は `~/Dropbox/secrets/Certum/`）
 
-**Phase 4 — ローカル署名テスト（Windows 実機 / VM）**
-- [ ] `signtool sign /tr http://time.certum.pl/ /td sha256 /fd sha256 /a test.exe`
-- [ ] `signtool verify /pa /v test.exe` が成功
-- [ ] 証明書ストアの**拇印（thumbprint）**を控える（`certmgr.msc` / `Cert:\CurrentUser\My`）
+### 2-2. 署名アーキテクチャ: 一時 Windows VM で手動署名（2026-06-17 決定）
 
-**Phase 5 — LumenCite ビルドへ組み込み**
-- [ ] ローカルビルド署名（最短）: `src-tauri/tauri.conf.json` の `bundle.windows` に
-  ```json
-  "windows": {
-    "certificateThumbprint": "<Phase4の拇印>",
-    "digestAlgorithm": "sha256",
-    "timestampUrl": "http://time.certum.pl/"
-  }
-  ```
-  （SimplySign Desktop で認証済みのマシンならストア経由で署名される）
-- [ ] CI（GitHub Actions）で自動署名する場合は `bundle.windows.signCommand`（`%1` が対象ファイル）でカスタム署名コマンドを指定。クラウド HSM を CI で回すのは難所なので defguard の記事を参照
-- [ ] **Windows updater 同時有効化**: `release.yml` の `includeUpdaterJson` を Windows ジョブでも `true`（現状 macOS のみ）→ `latest.json` に windows エントリ追加。updater 署名は**既存の ed25519 鍵を流用**（Authenticode とは別物、両方必要。§3 参照）
+**CI 自動署名は断念した。** Certum SimplySign はクラウド HSM の鍵を呼び出すのに **SimplySign Desktop（トレイ常駐 GUI）への対話ログインが必須**で、ヘッドレス/CLI ログイン手段が公式に存在しない。GitHub ホストランナーの非対話セッションでは GUI が描画されず（`rc.2` で実証：プロセスは起動するがウィンドウ列挙に出ず、SendKeys 不発・証明書がストアに現れない）、**無人 CI 署名は構造的に不可**。SSL.com eSigner CKA や Azure Trusted Signing のような CI 向け無人署名アダプタを Certum は提供していない。
 
-**Phase 6 — 配布・確認**
-- [ ] 署名済み `.msi`/`.exe` を Release に添付し `signtool verify` で再確認
-- [ ] SmartScreen 警告が出る場合は DL 実績で評価が育つ。必要なら [Microsoft へ file submission](https://www.microsoft.com/en-us/wdsi/filesubmission)
-- [ ] 本ドキュメント §6 と README/CHANGELOG の「Windows 未署名」記述を更新
+→ **macOS（署名+notarize）と Linux は CI、Windows は一時 VM で手動署名**する分担にした。専用の常時起動マシンは不要で、VM はリリース時だけ起動すればよい。
+
+**Phase 4 — Windows VM の用意（初回のみ）**
+- [ ] Apple Silicon なら [UTM](https://mac.getutm.app/)（無料）＋ Windows 11 ARM、または Parallels 等
+- [ ] VM に SimplySign Desktop（[files.certum.eu](https://files.certum.eu/software/SimplySignDesktop/Windows/) の 64-bit `.msi`）、Rust + Node + pnpm + Tauri ビルド前提一式、Git をインストール
+- [ ] SimplySign モバイルアプリは手元のスマホで OK（VM 側には不要。ログイン時に OTP を入力）
+
+**Phase 5 — リリースごとの Windows 署名手順（VM 上）**
+1. [ ] CI（タグ push）が **macOS + Linux のドラフトリリース**を生成するのを待つ（§5 参照）
+2. [ ] VM で対象タグを `git checkout` し、`~/.tauri/lumencite-updater.key` 相当の **updater 秘密鍵を環境変数で渡せる**ようにする（`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`(空)）
+3. [ ] **SimplySign Desktop を起動しログイン**（ユーザーID + スマホ OTP）。証明書がストアに載る（PIN キャッシュ 3h・セッション 2h）
+4. [ ] 署名込みでビルド:
+   ```pwsh
+   pnpm install --frozen-lockfile
+   pnpm tauri build --config src-tauri/tauri.release-windows.conf.json
+   ```
+   `tauri.release-windows.conf.json` の `certificateThumbprint`（拇印）でバンドル時に `signtool` 署名され、`createUpdaterArtifacts` で updater 成果物（`*-setup.exe` + `.sig` 等）も生成される
+5. [ ] `signtool verify /pa /v <生成された .exe/.msi>` で署名を確認
+6. [ ] 生成された **署名済み `.msi`/`.exe`** をドラフトリリースへアップロード（`gh release upload <tag> <files> --clobber`）
+
+**Phase 6 — Windows auto-updater（v0.2.1 では見送り）**
+- v0.2.1 は **署名済みインストーラの配布まで**とし、**Windows auto-updater は見送る**。理由: updater を有効化するには VM 生成物の windows エントリ（url + `.sig` の中身 + version + pub_date）を CI 生成の `latest.json` に手動マージする必要があり、誤ると**稼働中の macOS updater を壊すリスク**がある。Windows は当面「このページから手動 DL で更新」。
+- 将来 Windows updater を入れる場合は、CI 向け無人署名できる CA（例: Azure Trusted Signing / SSL.com eSigner）への移行か、セルフホスト Windows runner の常設とセットで検討する。
+
+**Phase 7 — 配布・確認**
+- [ ] 署名済み `.msi`/`.exe` を別マシンで `signtool verify /pa /v` 再確認
+- [ ] SmartScreen 警告は DL 実績で評価が育つ。必要なら [Microsoft へ file submission](https://www.microsoft.com/en-us/wdsi/filesubmission)
+- [ ] README の「Windows 未署名」記述を更新（CHANGELOG は対応済み）
 
 ---
 

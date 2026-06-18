@@ -5,7 +5,21 @@ All notable changes to LumenCite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v0.2.0 (in progress)
+## [Unreleased] — v0.2.1
+
+### Added
+
+- **Windows code signing** — Windows installers (`.msi` / `.exe`) are now Authenticode-signed with a Certum Open Source Code Signing certificate (cloud HSM via SimplySign). SmartScreen reputation builds over download history. (Signed at release time from a local Windows build; SimplySign's interactive login prevents unattended CI signing.)
+
+### Changed
+
+- Editable BibTeX cite keys, graceful DB-init failure handling, MCP server `env` input, and MCP startup-status UI (carried over from the v0.2.1 development line).
+
+### Notes
+
+- The auto-updater remains **macOS-only** for now. Windows updates by manual download from GitHub Releases (Windows auto-updater deferred to avoid risky manual `latest.json` edits that could break the macOS updater).
+
+## [0.2.0] - 2026-05-27
 
 Turns LumenCite into a research sparring partner. See `docs/SPEC.md` (v0.2.0 section) and the implementation plan for details.
 

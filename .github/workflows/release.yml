@@ -26,9 +26,11 @@ jobs:
           - platform: ubuntu-22.04
             args: ""
             label: linux-x64
-          - platform: windows-latest
-            args: ""
-            label: windows-x64
+          # Windows は CI に含めない。Certum SimplySign(クラウド HSM) はトレイ GUI への
+          # 対話ログインが必須で、GitHub ホストランナーの非対話セッションでは GUI が
+          # 描画されず無人署名できない（公式にヘッドレス手段なし）。署名済み Windows
+          # インストーラはリリース担当が一時 Windows VM 上で `tauri build` して生成し、
+          # ドラフトリリースへ手動添付する。手順は docs/RELEASE.md §2 を参照。
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -92,9 +94,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           rm certificate.p12
 
-      # Windows / Linux はコード署名なしで配布 (v0.1.0)。
-      # 将来 Windows コード署名証明書を導入する場合は、ここで pfx を書き出して
-      # TAURI_WINDOWS_CERTIFICATE / TAURI_WINDOWS_CERTIFICATE_PASSWORD を渡す。
+      # Linux はコード署名なしで配布。Windows は CI 対象外（上のマトリクス注記参照）。
 
       - name: Build & sign with tauri-action
         uses: tauri-apps/tauri-action@v0
@@ -118,15 +118,16 @@ jobs:
             ## Downloads
 
             - **macOS (Universal — Apple Silicon + Intel)** — `.dmg` (signed + notarized)
-            - **Windows** — `.msi` installer (unsigned; SmartScreen will warn — click "More info" → "Run anyway")
+            - **Windows** — `.msi` / `.exe` installer (signed with Certum; added at release time)
             - **Linux** — `.AppImage`, `.deb`, `.rpm`
 
             ## Notes
 
-            - The auto-updater is **enabled on macOS** (signed updates). **Windows and Linux** still update by manual download from this page; Windows signing + updater are planned for a later release.
+            - The auto-updater is **enabled on macOS** (signed updates). **Windows and Linux** update by manual download from this page.
           releaseDraft: true
           prerelease: false
           # latest.json は macOS ジョブのみ生成（macOS のみ auto-updater 有効）。
+          # Windows は VM 手動署名のため CI 非対象。
           includeUpdaterJson: ${{ startsWith(matrix.platform, 'macos') }}
           args: ${{ matrix.args }}
 
