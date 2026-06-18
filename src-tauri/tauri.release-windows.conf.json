@@ -1,6 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
+    "createUpdaterArtifacts": false,
     "windows": {
       "certificateThumbprint": "B4415786DBCFEEEFF9ECDEEB4FD3193F2EB7A9C9",
       "digestAlgorithm": "sha256",
