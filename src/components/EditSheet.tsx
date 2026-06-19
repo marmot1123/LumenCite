@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { ExtraFieldInputs } from "./ExtraFieldInputs";
+import { AuthorEditor } from "./AuthorEditor";
 import type { EntryDetail, EntryInput, EntryType } from "../types";
 
 interface EditSheetProps {
@@ -32,6 +33,20 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [keyAvailable, setKeyAvailable] = useState(true);
+
+  // 著者詳細編集モーダル (AuthorEditor) を開く対象。null なら閉じている。
+  // `index` は author_names のどの行に対応するかで、AuthorEditor 保存時に
+  // 名前変更を反映する。
+  const [editingAuthor, setEditingAuthor] = useState<{ id: number; index: number } | null>(null);
+  // 編集モーダルから既存著者を引くには id が必要。EditSheet は entry.authors を
+  // 持っているので、入力行 i の現在の入力テキストが entry.authors[i].name に一致するなら
+  // その id を渡せる、というシンプルな対応を取る。
+  const authorIdFor = (i: number): number | null => {
+    const name = (form.author_names ?? [])[i]?.trim();
+    if (!name) return null;
+    const matched = entry.authors.find(a => a.name === name);
+    return matched?.id ?? null;
+  };
 
   const set = <K extends keyof EntryInput>(key: K, value: EntryInput[K]) =>
     setForm(f => ({ ...f, [key]: value }));
@@ -157,20 +172,39 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
 
           <div style={{ marginBottom: 12 }}>
             <label style={labelStyle}>{t("addSheet.field.authors")}</label>
-            {(form.author_names ?? [""]).map((name, i) => (
-              <div key={i} style={{ display: "flex", gap: 6, marginBottom: 5 }}>
-                <input value={name} onChange={e => setAuthor(i, e.target.value)}
-                  placeholder={t("addSheet.field.authorPlaceholder", { index: i + 1 })}
-                  style={{ ...fieldStyle, flex: 1 }} />
-                {(form.author_names ?? []).length > 1 && (
-                  <button onClick={() => removeAuthor(i)} style={{
-                    padding: "0 8px", border: "1px solid var(--border-strong)",
-                    borderRadius: 5, background: "var(--surface)", color: "var(--text-mute)",
-                    cursor: "pointer", fontSize: 13,
-                  }}>×</button>
-                )}
-              </div>
-            ))}
+            {(form.author_names ?? [""]).map((name, i) => {
+              const aid = authorIdFor(i);
+              return (
+                <div key={i} style={{ display: "flex", gap: 6, marginBottom: 5 }}>
+                  <input value={name} onChange={e => setAuthor(i, e.target.value)}
+                    placeholder={t("addSheet.field.authorPlaceholder", { index: i + 1 })}
+                    style={{ ...fieldStyle, flex: 1 }} />
+                  {/* 既存著者として DB に存在している行だけ詳細編集ボタンを出す。
+                      テキストを変更中だったり、新規に追加した行 (= entry.authors に未登録)
+                      では aid が null になり、ボタンは無効化される。 */}
+                  <button
+                    onClick={() => aid != null && setEditingAuthor({ id: aid, index: i })}
+                    disabled={aid == null}
+                    title={aid == null ? "" : t("authorEditor.title")}
+                    style={{
+                      padding: "0 8px", border: "1px solid var(--border-strong)",
+                      borderRadius: 5,
+                      background: "var(--surface)",
+                      color: aid == null ? "var(--text-faint)" : "var(--text-mute)",
+                      cursor: aid == null ? "default" : "pointer", fontSize: 13,
+                      opacity: aid == null ? 0.4 : 1,
+                    }}
+                  >…</button>
+                  {(form.author_names ?? []).length > 1 && (
+                    <button onClick={() => removeAuthor(i)} style={{
+                      padding: "0 8px", border: "1px solid var(--border-strong)",
+                      borderRadius: 5, background: "var(--surface)", color: "var(--text-mute)",
+                      cursor: "pointer", fontSize: 13,
+                    }}>×</button>
+                  )}
+                </div>
+              );
+            })}
             <button onClick={addAuthor} style={{
               fontSize: 11.5, color: "var(--accent-strong)", border: "none",
               background: "transparent", cursor: "pointer", padding: "2px 0",
@@ -269,6 +303,24 @@ export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
           }}>{saving ? t("editSheet.submitting") : t("editSheet.submit")}</button>
         </div>
       </div>
+
+      {editingAuthor && (
+        <AuthorEditor
+          authorId={editingAuthor.id}
+          onClose={() => setEditingAuthor(null)}
+          onSaved={(updated) => {
+            // 著者の表示名が変わった場合だけ、対応する author_names[i] を書き換える。
+            // merge 経由（updated === null）では当該 entry の著者紐付け自体は変わらない
+            // ので何もしない（次回 entry 再フェッチで反映）。
+            if (updated && editingAuthor) {
+              const i = editingAuthor.index;
+              const next = [...(form.author_names ?? [])];
+              next[i] = updated.name;
+              set("author_names", next);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

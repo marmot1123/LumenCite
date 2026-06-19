@@ -48,6 +48,11 @@ pub const MCP_SERVERS_KEY: &str = "mcp.servers";
 pub const LLM_OCR_PROVIDER_KEY: &str = "llm.ocr_provider";
 pub const LLM_OCR_MODEL_KEY: &str = "llm.ocr_model";
 
+/// v0.3.0 で entries_fts.authors_text の合成 SQL が name_original / reading_* も
+/// 含む形に変わったため、既存ライブラリの FTS を 1 回だけ起動時に再構築するフラグ。
+/// 値は "1"（再構築済み）のみで、未設定なら未実施扱い。
+pub const FTS_AUTHORS_V030_REBUILT_KEY: &str = "fts.authors_v030_rebuilt";
+
 #[cfg(test)]
 mod tests {
     use super::*;

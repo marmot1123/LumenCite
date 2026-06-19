@@ -4,7 +4,7 @@ use nom_bibtex::Bibtex;
 use sqlx::{Row, SqlitePool};
 
 use crate::db::entries::{create_entry, get_entry};
-use crate::models::{EntryDetail, EntryInput, ImportResult};
+use crate::models::{AuthorInput, EntryDetail, EntryInput, ImportResult};
 
 pub async fn import_bibtex(pool: &SqlitePool, content: &str) -> Result<ImportResult, String> {
     let bib = Bibtex::parse(content).map_err(|e| format!("BibTeX 解析エラー: {:?}", e))?;
@@ -59,7 +59,10 @@ fn bibliography_to_input(entry: &nom_bibtex::Bibliography) -> Option<EntryInput>
     }
 
     let entry_type = map_entry_type(entry.entry_type());
-    let author_names = tags.get("author").map(|a| parse_authors(a)).unwrap_or_default();
+    let authors: Vec<AuthorInput> = tags
+        .get("author")
+        .map(|a| parse_authors(a))
+        .unwrap_or_default();
 
     let year = tags
         .get("year")
@@ -101,7 +104,7 @@ fn bibliography_to_input(entry: &nom_bibtex::Bibliography) -> Option<EntryInput>
     Some(EntryInput {
         title,
         entry_type,
-        author_names,
+        authors: if authors.is_empty() { None } else { Some(authors) },
         year,
         doi,
         arxiv_id,
@@ -129,26 +132,112 @@ fn map_entry_type(bib_type: &str) -> String {
     .to_string()
 }
 
-fn parse_authors(author_str: &str) -> Vec<String> {
-    author_str
-        .split(" and ")
-        .map(|name| {
-            let name = name.trim();
-            // "Last, First Middle" → "First Middle Last"
-            if let Some(comma) = name.find(',') {
-                let last = name[..comma].trim();
-                let first = name[comma + 1..].trim();
+/// BibTeX の `author = {...}` 値を `AuthorInput` のリストに分解する。
+///
+/// v0.3.0 で `is_organization` 検出と family/given 分解を追加。
+/// 区切り " and " は **波括弧の外側でのみ** 効くようにし、団体名内の "and"
+/// （例: `{Smith and Jones Inc}`）を保護する。各トークンに対し:
+///
+/// - `{...}` で完全に囲まれていれば団体著者として `is_organization=true`、
+///   内側のテキストを `name` に格納（CSL の literal 相当）
+/// - "Last, First" 形式ならカンマで分割し `family_name`/`given_name` を埋めつつ
+///   `name` は "First Last" の表示順で組み立てる
+/// - "First Last" 形式は分割せず `name` のみに入れる（誤判定を避ける）
+fn parse_authors(author_str: &str) -> Vec<AuthorInput> {
+    split_authors(author_str)
+        .into_iter()
+        .filter_map(|raw| {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return None;
+            }
+
+            // 団体著者リテラル: `{...}` で完全に囲まれている
+            if raw.starts_with('{') && raw.ends_with('}') {
+                let inner = raw[1..raw.len() - 1].trim();
+                if inner.is_empty() {
+                    return None;
+                }
+                return Some(AuthorInput {
+                    name: inner.to_string(),
+                    is_organization: true,
+                    ..Default::default()
+                });
+            }
+
+            // 個人著者
+            if let Some(comma) = raw.find(',') {
+                let last = raw[..comma].trim();
+                let first = raw[comma + 1..].trim();
                 if first.is_empty() {
-                    last.to_string()
+                    Some(AuthorInput {
+                        name: last.to_string(),
+                        family_name: Some(last.to_string()),
+                        ..Default::default()
+                    })
                 } else {
-                    format!("{} {}", first, last)
+                    Some(AuthorInput {
+                        name: format!("{} {}", first, last),
+                        given_name: Some(first.to_string()),
+                        family_name: Some(last.to_string()),
+                        ..Default::default()
+                    })
                 }
             } else {
-                name.to_string()
+                Some(AuthorInput {
+                    name: raw.to_string(),
+                    ..Default::default()
+                })
             }
         })
-        .filter(|n| !n.is_empty())
         .collect()
+}
+
+/// `" and "` で著者を分割する。ただし波括弧の中の "and" は無視する
+/// （`{Smith and Jones Inc}` を 1 トークン扱いする）。
+fn split_authors(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+            }
+            b' ' if depth == 0 && bytes.get(i..i + 5) == Some(b" and ") => {
+                parts.push(&s[start..i]);
+                start = i + 5;
+                i += 5;
+            }
+            _ => {
+                // UTF-8 連続バイトを安全に飛ばす
+                i += utf8_char_len(bytes[i]);
+            }
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn utf8_char_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first < 0xC0 {
+        1 // 連続バイト単独は不正だがループを進めるため 1 にする
+    } else if first < 0xE0 {
+        2
+    } else if first < 0xF0 {
+        3
+    } else {
+        4
+    }
 }
 
 fn non_empty(opt: Option<&String>) -> Option<String> {
@@ -408,13 +497,61 @@ mod tests {
     #[test]
     fn parse_author_last_first() {
         let authors = parse_authors("Einstein, Albert and Bohr, Niels");
-        assert_eq!(authors, vec!["Albert Einstein", "Niels Bohr"]);
+        let names: Vec<&str> = authors.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["Albert Einstein", "Niels Bohr"]);
+        // "Last, First" は family/given を分割できる
+        assert_eq!(authors[0].family_name.as_deref(), Some("Einstein"));
+        assert_eq!(authors[0].given_name.as_deref(), Some("Albert"));
+        assert!(!authors[0].is_organization);
     }
 
     #[test]
     fn parse_author_first_last() {
         let authors = parse_authors("Alan Turing and John McCarthy");
-        assert_eq!(authors, vec!["Alan Turing", "John McCarthy"]);
+        let names: Vec<&str> = authors.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["Alan Turing", "John McCarthy"]);
+        // "First Last" 形式は分割しない（誤判定回避のため name のみ）
+        assert!(authors[0].family_name.is_none());
+        assert!(authors[0].given_name.is_none());
+    }
+
+    // ── v0.3.0 §8.3 BibTeX 団体著者 ──────────────────────────────────────
+
+    #[test]
+    fn parse_author_literal_organization() {
+        // `author = {{IEEE}}` の中身（nom-bibtex が outer {} を剥がした後）= "{IEEE}"
+        let authors = parse_authors("{IEEE}");
+        assert_eq!(authors.len(), 1);
+        assert_eq!(authors[0].name, "IEEE");
+        assert!(authors[0].is_organization);
+        assert!(authors[0].family_name.is_none());
+        assert!(authors[0].given_name.is_none());
+    }
+
+    #[test]
+    fn parse_author_mixed_organization_and_person() {
+        // 団体と個人が混在
+        let authors = parse_authors("{IEEE} and Alan Turing and {ACM}");
+        assert_eq!(authors.len(), 3);
+        assert!(authors[0].is_organization && authors[0].name == "IEEE");
+        assert!(!authors[1].is_organization && authors[1].name == "Alan Turing");
+        assert!(authors[2].is_organization && authors[2].name == "ACM");
+    }
+
+    #[test]
+    fn parse_author_literal_with_inner_and_is_one_token() {
+        // 波括弧内の "and" は区切りとして扱わない（団体名を保護）
+        let authors = parse_authors("{Smith and Jones Inc}");
+        assert_eq!(authors.len(), 1);
+        assert!(authors[0].is_organization);
+        assert_eq!(authors[0].name, "Smith and Jones Inc");
+    }
+
+    #[test]
+    fn parse_author_empty_literal_is_dropped() {
+        let authors = parse_authors("{} and Real Person");
+        assert_eq!(authors.len(), 1);
+        assert_eq!(authors[0].name, "Real Person");
     }
 
     #[test]
@@ -467,6 +604,67 @@ mod tests {
         assert_eq!(entries[0].title, "Attention Is All You Need");
         assert_eq!(entries[0].authors.len(), 3);
         assert_eq!(entries[0].authors[0].name, "Ashish Vaswani");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn import_marks_literal_authors_as_organization(pool: sqlx::SqlitePool) {
+        let bib = r#"
+@misc{ieeestd2008,
+  title  = {IEEE Standard for Floating-Point Arithmetic},
+  author = {{IEEE}},
+  year   = {2008}
+}
+"#;
+        let result = import_bibtex(&pool, bib).await.unwrap();
+        assert_eq!(result.imported, 1);
+
+        let (count, is_org): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), MAX(is_organization) FROM authors WHERE name = 'IEEE'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "団体著者 IEEE は 1 行のみ");
+        assert_eq!(is_org, 1, "is_organization=1 が立つこと");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn import_keeps_existing_org_author(pool: sqlx::SqlitePool) {
+        // 同じ団体著者を含む 2 つの entry を import しても authors 行は 1 つ。
+        // is_organization は両方とも 1 として扱われる。
+        let bib = r#"
+@misc{a,
+  title  = {Standard A},
+  author = {{IEEE}},
+  year   = {2008}
+}
+@misc{b,
+  title  = {Standard B},
+  author = {{IEEE}},
+  year   = {2019}
+}
+"#;
+        let result = import_bibtex(&pool, bib).await.unwrap();
+        assert_eq!(result.imported, 2);
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM authors WHERE name = 'IEEE'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "name 一致で名寄せされ 1 行に集約されること");
+
+        // 両 entry に同じ author_id がぶら下がっていること
+        let author_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT ea.author_id
+             FROM entry_authors ea
+             JOIN authors a ON a.id = ea.author_id
+             WHERE a.name = 'IEEE'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(author_ids.len(), 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -16,6 +16,8 @@ interface MetaPanelProps {
   onDeleteHighlight: (id: number) => void;
   onUpdateNotes: (notes: string) => void;
   onSelectEntry: (id: number) => void;
+  /** info タブの著者チップから AuthorEditor で保存された後、entry の再フェッチ依頼を上に流す。 */
+  onAuthorEdited?: () => void;
 }
 
 type TabLabelKey =
@@ -34,7 +36,7 @@ const TABS: { id: MetaTabId; labelKey: TabLabelKey }[] = [
 export function MetaPanel({
   entry, tab, onTabChange,
   highlights, onJumpToPage, onDeleteHighlight,
-  onUpdateNotes, onSelectEntry,
+  onUpdateNotes, onSelectEntry, onAuthorEdited,
 }: MetaPanelProps) {
   const { t } = useTranslation();
   return (
@@ -66,7 +68,7 @@ export function MetaPanel({
         })}
       </div>
       <div style={{ flex: 1, overflow: "auto", padding: "16px 18px" }}>
-        {tab === "info" && <InfoTab entry={entry} />}
+        {tab === "info" && <InfoTab entry={entry} onAuthorEdited={onAuthorEdited} />}
         {tab === "highlights" && (
           <HighlightsTab
             highlights={highlights}

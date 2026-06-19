@@ -5,7 +5,29 @@ All notable changes to LumenCite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v0.2.1
+## [0.3.0] - 2026-06-20
+
+Expands the `authors` table for multilingual names (kanji, kana readings, Hangul, Cyrillic), international identifiers beyond ORCID, organizational authors, and a full author editor in the UI. See `docs/SPEC.md` (v0.3.0 section) and `~/.claude/plans/v0-3-0-authors-radiant-kana.md` for details.
+
+### Added
+
+- **Multilingual author fields** (migration 0009) — `middle_name` / `suffix` / `name_particle` for CSL parity, `name_original` + `given_name_original` / `family_name_original` + `original_script` (ISO 15924) for kanji / Hangul / Cyrillic representations, `reading_family` / `reading_given` for kana sort and search, plus `email` / `homepage_url` / `notes` / `updated_at`.
+- **`author_identifiers` table** — Normalized storage for non-ORCID identifiers (`scopus`, `dblp`, `semantic_scholar`, `wikidata`, `isni`, `viaf`, `researcher_id`, `google_scholar`, …). `(scheme, value)` is globally unique to prevent the same identifier from being attached to two different authors. ORCID is dual-written to both `authors.orcid` (compat) and `author_identifiers`.
+- **Smarter name deduplication** — `get_or_create_author` now matches by ORCID first (across both `authors.orcid` and `author_identifiers (scheme='orcid')`), then by NFKC-normalized lowercase name (so `関 茂樹` / `ＳＥＫＩ` / `seki` / `  Seki  ` collapse to one author), and only inserts if no match is found.
+- **Organization authors from BibTeX** — `author = {{IEEE}}` style literals are detected at import and stored with `is_organization=1`. The depth-aware `" and "` splitter protects names like `{Smith and Jones Inc}`.
+- **CrossRef ORCID ingestion** — DOI lookups now populate `AuthorInput.orcid` (and `given_name` / `family_name` when available), so authors imported by DOI are correctly merged with existing ORCID entries.
+- **FTS now indexes kanji + kana** — `entries_fts.authors_text` concatenates `name`, `name_original`, `reading_family`, and `reading_given`. Searching for `関` / `せき` / `Seki` all hit the same entry. On first launch after upgrade, every entry's FTS is rebuilt once (tracked by `settings.fts.authors_v030_rebuilt`).
+- **Author editor modal** (`src/components/AuthorEditor.tsx`) — Edit every author field, manage identifiers, and merge same-name duplicates into one record. Reachable from the detail view and side panel by clicking an author chip, and from the edit sheet via the `…` button next to each saved author.
+- **New Tauri commands** — `get_author`, `update_author`, `add_author_identifier`, `delete_author_identifier`. `search_authors` and `merge_authors` are also fully wired up (the former existed but is now richer; the latter is new).
+- **Author chip with metadata hover** — The detail view and side panel render authors as chips that show the original-script name, kana reading, and ORCID on hover, and use a building icon for organizational authors.
+- **ORCID auto-fill** — The author editor now has a "Fetch from ORCID" button next to the ORCID field. It calls the ORCID Public API (no auth required) and fills in `given_name` / `family_name` / `middle_name` / `email` / `homepage_url` plus any external identifiers (Scopus / ResearcherID / Wikidata / ISNI / VIAF / Loop / …). Existing user-entered values are preserved (only empty fields are filled). For records with non-Latin `other-names`, `name_original` / `original_script` are estimated heuristically (Han / Hangul / Hiragana / Katakana / Cyrillic / Arabic). Reading-kana fields are still entered manually since ORCID has no schema for them.
+
+### Changed
+
+- **`Author` (Rust + TS types) gained 13 fields and an `identifiers: AuthorIdentifier[]`** — Field-by-field deserialization is preserved; the new fields default to `null` for existing entries until the user edits them through the AuthorEditor.
+- **`EntryInput` gained `authors?: AuthorInput[]`** — When set (by BibTeX import / CrossRef ingestion / AuthorEditor), it takes precedence over `author_names` and lets ORCIDs and organization flags flow through the create/update path.
+
+## [0.2.1] - 2026-06-18
 
 ### Added
 
@@ -59,5 +81,6 @@ Initial public release.
 - **Windows installer is unsigned**: SmartScreen will warn on first launch. Click "More info" → "Run anyway". Code signing is planned for a future release once download volume warrants it.
 - **macOS** builds are signed with a Developer ID certificate and notarized by Apple.
 
-[Unreleased]: https://github.com/marmot1123/lumencite/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/marmot1123/lumencite/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/marmot1123/lumencite/releases/tag/v0.2.0
 [0.1.0]: https://github.com/marmot1123/lumencite/releases/tag/v0.1.0

@@ -42,16 +42,44 @@ LaTeX の `\cite{...}` で参照されるキー。LaTeX 連携が安定するよ
 
 ### `authors` — 著者マスタ
 
-同一著者を複数文献にまたがって管理する。ORCID で名寄せを補助する。
+同一著者を複数文献にまたがって管理する。ORCID で名寄せを補助する。v0.3.0 で多言語名（漢字名等）・読み仮名・団体著者・CSL 互換フィールドに対応。
 
 | カラム | 型 | 備考 |
 |--------|-----|------|
 | `id` | INTEGER PK | |
 | `name` | TEXT NOT NULL | 表示用フルネーム |
 | `given_name` | TEXT | 名（任意） |
+| `middle_name` | TEXT | ミドルネーム / "John F. Kennedy" の `F.`（v0.3.0 / migration 0009） |
 | `family_name` | TEXT | 姓（任意） |
-| `orcid` | TEXT UNIQUE | ORCID識別子（任意） |
+| `suffix` | TEXT | `Jr.` / `Sr.` / `III` 等。CSL の suffix に対応（v0.3.0 / migration 0009） |
+| `name_particle` | TEXT | `von` / `van der` / `de la` 等。CSL の non-dropping-particle に対応。`family_name` に混ぜない（v0.3.0 / migration 0009） |
+| `name_original` | TEXT | オリジナル言語表記のフルネーム（例 `関 元樹` / `毛沢东`）。区切りが曖昧な言語向け（v0.3.0 / migration 0009） |
+| `given_name_original` | TEXT | オリジナル言語の名（例 `元樹`）。分割できる場合のみ（v0.3.0 / migration 0009） |
+| `family_name_original` | TEXT | オリジナル言語の姓（例 `関`）。分割できる場合のみ（v0.3.0 / migration 0009） |
+| `original_script` | TEXT | ISO 15924 文字種コード（例 `Hani` 漢字 / `Hang` ハングル / `Cyrl` キリル）。正規化・ソート判定に利用（v0.3.0 / migration 0009） |
+| `reading_family` | TEXT | 姓の読み仮名（例 `せき`）。五十音ソート・かな検索用（v0.3.0 / migration 0009） |
+| `reading_given` | TEXT | 名の読み仮名（例 `もとき`）（v0.3.0 / migration 0009） |
+| `is_organization` | INTEGER | 団体著者フラグ（0/1）。`1` のとき given/family を無視し `name` を literal として扱う（CSL の literal 相当）。BibTeX の `{IEEE}` 等から自動検出。DEFAULT 0（v0.3.0 / migration 0009） |
+| `email` | TEXT | corresponding author 追跡用（任意・v0.3.0 / migration 0009） |
+| `homepage_url` | TEXT | 著者プロフィールページ URL（任意・v0.3.0 / migration 0009） |
+| `notes` | TEXT | 「同名別人」「2024 改姓」等の自由メモ（v0.3.0 / migration 0009） |
+| `orcid` | TEXT UNIQUE | ORCID識別子（任意）。互換維持のため専用カラムを残しつつ、新規取得時は `author_identifiers` にも併記する |
 | `created_at` | TEXT | |
+| `updated_at` | TEXT | `datetime('now')`。編集機能で更新（v0.3.0 / migration 0009） |
+
+#### 名寄せロジック（v0.3.0 で改善）
+
+`get_or_create_author`（`db/authors.rs`）は v0.3.0 で 3 段照合に拡張:
+
+1. ORCID があれば ORCID で照合（`authors.orcid` 列を優先し、無ければ `author_identifiers (scheme='orcid')` も見る）→ ヒットすれば既存を返す
+2. ORCID なし or 未ヒットなら 正規化済み `name`（trim + Unicode NFKC + lowercase、`unicode-normalization` クレート使用）で照合。SQLite は NFKC 関数を持たないので、authors を全件 SELECT → Rust 側で比較する素朴実装（個人ライブラリ規模で十分。将来は `authors.normalized_name` 列で O(1) 化する余地）
+3. それでもなければ INSERT。`orcid` が入力されていれば `authors.orcid` 列と `author_identifiers(scheme='orcid')` の両方に書く（互換維持運用）
+
+#### 編集・統合（v0.3.0 新規）
+
+- `update_author(id, AuthorInput)` — 全列 UPDATE + `author_identifiers` を **DELETE → INSERT で総差し替え**。`input.orcid` がセットされているのに `input.identifiers` に scheme='orcid' が含まれていなければ暗黙で `author_identifiers` にも書く。完了後、当該著者が紐づく全 entry の `entries_fts` を再構築する
+- `merge_authors(from_id, into_id)` — `entry_authors` を `into` に集約（同 entry に両方ぶら下がっている衝突行は `from` を削除して `into` を残す）。`author_identifiers` は `into` を優先 — まず `from` 側の同一 scheme 行を DELETE してから `UPDATE` で `from→into` に付け替える（`INSERT…SELECT ON CONFLICT` 方式は `(scheme, value)` UNIQUE INDEX に短絡されるため不採用）。最後に関連 entry の FTS を再同期
+- `add_author_identifier` / `delete_author_identifier` — scheme='orcid' のときは `authors.orcid` 列も同期 (set / clear)
 
 ### `entry_authors` — 文献↔著者（多対多・順序付き）
 
@@ -60,6 +88,22 @@ LaTeX の `\cite{...}` で参照されるキー。LaTeX 連携が安定するよ
 | `entry_id` | INTEGER FK → entries | ON DELETE CASCADE |
 | `author_id` | INTEGER FK → authors | ON DELETE RESTRICT |
 | `position` | INTEGER | 著者順（0始まり） |
+
+### `author_identifiers` — 著者の外部識別子（v0.3.0 / migration 0009）
+
+ORCID 以外の識別子（Scopus / DBLP / Semantic Scholar / Wikidata / ISNI / VIAF / ResearcherID / Google Scholar 等）を正規化して保持する。追加のたびに `authors` テーブルへ migration するのを避けるため別テーブル化。
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `author_id` | INTEGER FK → authors | ON DELETE CASCADE |
+| `scheme` | TEXT NOT NULL | `orcid` / `scopus` / `dblp` / `semantic_scholar` / `wikidata` / `isni` / `viaf` / `researcher_id` / `google_scholar` 等 |
+| `value` | TEXT NOT NULL | 識別子の値（例 ORCID `0000-0002-1825-0097`、Wikidata `Q937`） |
+| `url` | TEXT | 任意。`scheme` から導出できる場合は省略可 |
+
+- `PRIMARY KEY (author_id, scheme)` — 1 著者 1 scheme につき 1 行
+- `UNIQUE INDEX idx_author_identifiers_scheme_value ON author_identifiers(scheme, value)` — 同じ識別子が複数著者に紐づかないようにする
+
+ORCID は `authors.orcid` 専用カラムと併記する運用（v0.3.0 時点）。v0.4.0 以降で `authors.orcid` を廃止し、本テーブルに一本化する余地は残す。
 
 ---
 
@@ -151,7 +195,7 @@ arXivプレプリントと出版版など、別エントリとして管理しつ
 | カラム | 型 | 備考 |
 |--------|-----|------|
 | `title` | TEXT | エントリのタイトル |
-| `authors_text` | TEXT | 著者名をスペース区切りで結合 |
+| `authors_text` | TEXT | 著者名をスペース区切りで結合。v0.3.0 で `name_original`（漢字名等）と `reading_family || ' ' || reading_given`（読み仮名）も同じセルへ追記し、「せき」「関」「Seki」のどれでもヒットさせる |
 | `tags_text` | TEXT | タグ名をスペース区切りで結合 |
 | `abstract_text` | TEXT | abstract（NULL は空文字） |
 | `identifiers` | TEXT | DOI・ISBN・arXiv ID・year をスペース区切り |
@@ -263,6 +307,12 @@ LLM APIキー等の機密情報は **OS キーチェーン**（macOS Keychain / 
 | `llm.ocr_model` | モデル識別子（未設定可） | OCR 用モデル。未設定なら `llm.model` にフォールバック |
 | `chat.tool_whitelist` | JSON | ツール別自動承認のデフォルト上書き。`delete_*` / MCP write 系は上書き不可 |
 | `mcp.servers` | JSON | 外部 MCP サーバー設定。Claude Desktop の `mcpServers` 互換形式 |
+
+#### キー追加（v0.3.0）
+
+| キー | 値 | 用途 |
+|------|------|------|
+| `fts.authors_v030_rebuilt` | `"1"`（または未設定） | v0.3.0 で `entries_fts.authors_text` の合成式が変わったため、起動時に 1 回だけ全 entry の FTS を再構築する。完了したらこのキーが立つ。失敗時は立てずに次回起動でリトライ |
 
 OS キーチェーン側のサービス名: `com.lumencite.LumenCite`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。MCP サーバーに渡す秘匿情報（API キー等）が必要な場合も、平文を `settings` に置かず環境変数 or キーチェーン経由とする。
 

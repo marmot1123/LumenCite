@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::models::EntryInput;
+use crate::models::{AuthorInput, EntryInput};
 
 // ── DOI（CrossRef API）────────────────────────────────────────────────────────
 
@@ -39,22 +39,16 @@ fn crossref_to_input(msg: &serde_json::Value, doi: &str) -> EntryInput {
         .unwrap_or("(タイトルなし)")
         .to_string();
 
-    let author_names: Vec<String> = msg["author"]
+    // v0.3.0: CrossRef の著者配列を AuthorInput に変換し、ORCID / given / family を拾う。
+    // `name` フィールド単独（団体名や分離不能な表記）は is_organization=false で literal 扱い。
+    let crossref_authors: Vec<AuthorInput> = msg["author"]
         .as_array()
         .unwrap_or(&vec![])
         .iter()
-        .filter_map(|a| {
-            let given = a["given"].as_str().unwrap_or("");
-            let family = a["family"].as_str().unwrap_or("");
-            if family.is_empty() {
-                a["name"].as_str().map(|s| s.to_string())
-            } else if given.is_empty() {
-                Some(family.to_string())
-            } else {
-                Some(format!("{} {}", given, family))
-            }
-        })
+        .filter_map(crossref_author_to_input)
         .collect();
+    // 互換: フロント側がまだ author_names だけ見るルートにも値が残るよう、表示名を併設する。
+    let author_names: Vec<String> = crossref_authors.iter().map(|a| a.name.clone()).collect();
 
     let year = msg["published"]["date-parts"]
         .as_array()
@@ -121,10 +115,66 @@ fn crossref_to_input(msg: &serde_json::Value, doi: &str) -> EntryInput {
         doi: Some(doi.to_string()),
         url: url_val,
         author_names,
+        authors: if crossref_authors.is_empty() { None } else { Some(crossref_authors) },
         abstract_,
         extra_fields,
         ..Default::default()
     }
+}
+
+/// CrossRef の author 1 件を `AuthorInput` に変換する。
+///
+/// CrossRef の author 要素は以下の形を想定:
+///   { "given": "Albert", "family": "Einstein",
+///     "ORCID": "https://orcid.org/0000-0002-1825-0097",
+///     "name": "..." (個人名が given/family に分割できないとき、または団体名) }
+///
+/// 仕様メモ:
+/// - ORCID は URL 形式 (`https://orcid.org/<id>`) で返ることが多い。`<id>` だけ取り出して
+///   `AuthorInput.orcid` に詰める（`db/authors.rs::get_or_create_author` 側が両形式を吸収する）。
+/// - given/family が両方欠けて `name` のみのケースは個人/団体の判別が付かないため
+///   v0.3.0 では **is_organization=false（個人扱い）** で literal name を返す。BibTeX の
+///   `{IEEE}` 検出のような明示マーカーが無いため、団体判定は将来の TODO。
+fn crossref_author_to_input(a: &serde_json::Value) -> Option<AuthorInput> {
+    let given = a["given"].as_str().map(str::trim).unwrap_or("");
+    let family = a["family"].as_str().map(str::trim).unwrap_or("");
+    let name_only = a["name"].as_str().map(str::trim).unwrap_or("");
+
+    let (name, given_opt, family_opt) = if !family.is_empty() && !given.is_empty() {
+        (format!("{} {}", given, family), Some(given.to_string()), Some(family.to_string()))
+    } else if !family.is_empty() {
+        (family.to_string(), None, Some(family.to_string()))
+    } else if !name_only.is_empty() {
+        (name_only.to_string(), None, None)
+    } else {
+        return None;
+    };
+
+    let orcid = a["ORCID"]
+        .as_str()
+        .map(normalize_orcid)
+        .filter(|s| !s.is_empty());
+
+    Some(AuthorInput {
+        name,
+        given_name: given_opt,
+        family_name: family_opt,
+        orcid,
+        ..Default::default()
+    })
+}
+
+/// ORCID 値を「ハイフン込みの素の ID」に正規化する。
+/// `https://orcid.org/0000-...` / `http://orcid.org/0000-...` / 末尾スラッシュ /
+/// 余分な空白を吸収。形式チェックはここでは行わず、呼び出し側で必要なら追加検証する。
+fn normalize_orcid(raw: &str) -> String {
+    raw.trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 // ── arXiv API ─────────────────────────────────────────────────────────────────
@@ -374,6 +424,109 @@ mod tests {
 
         assert!(input.extra_fields.is_empty());
         assert_eq!(input.title, "Bare Bones");
+    }
+
+    // ── v0.3.0 § CrossRef 著者 (ORCID / given / family) ──────────────────────
+
+    #[test]
+    fn crossref_extracts_orcid_and_splits_name() {
+        let msg = json!({
+            "type": "journal-article",
+            "title": ["With ORCID"],
+            "author": [
+                {
+                    "given": "Albert",
+                    "family": "Einstein",
+                    "ORCID": "https://orcid.org/0000-0002-1825-0097",
+                },
+                { "given": "Niels", "family": "Bohr" }
+            ],
+        });
+
+        let input = crossref_to_input(&msg, "10.0/orcid");
+        // 互換ルート: author_names も併設
+        assert_eq!(input.author_names, vec!["Albert Einstein", "Niels Bohr"]);
+
+        let authors = input.authors.as_ref().expect("authors を詰めるべき");
+        assert_eq!(authors.len(), 2);
+
+        // 1 人目: ORCID + given/family すべて埋まる
+        assert_eq!(authors[0].name, "Albert Einstein");
+        assert_eq!(authors[0].given_name.as_deref(), Some("Albert"));
+        assert_eq!(authors[0].family_name.as_deref(), Some("Einstein"));
+        assert_eq!(
+            authors[0].orcid.as_deref(),
+            Some("0000-0002-1825-0097"),
+            "ORCID URL の末尾 ID 部分だけが入ること"
+        );
+
+        // 2 人目: ORCID 無し
+        assert_eq!(authors[1].name, "Niels Bohr");
+        assert!(authors[1].orcid.is_none());
+    }
+
+    #[test]
+    fn crossref_orcid_bare_id_is_kept_as_is() {
+        // CrossRef は通常 URL 形式だが、裸 ID で返ってきても壊れない
+        let msg = json!({
+            "type": "journal-article",
+            "title": ["t"],
+            "author": [{ "given": "G", "family": "F", "ORCID": "0000-0001-2345-6789" }],
+        });
+        let input = crossref_to_input(&msg, "10.0/x");
+        let authors = input.authors.unwrap();
+        assert_eq!(authors[0].orcid.as_deref(), Some("0000-0001-2345-6789"));
+    }
+
+    #[test]
+    fn crossref_name_only_author_keeps_literal_name() {
+        // given/family が無く name のみのケース（団体名 or 分離不能な表記）
+        let msg = json!({
+            "type": "journal-article",
+            "title": ["t"],
+            "author": [{ "name": "World Health Organization" }],
+        });
+        let input = crossref_to_input(&msg, "10.0/x");
+        let authors = input.authors.unwrap();
+        assert_eq!(authors.len(), 1);
+        assert_eq!(authors[0].name, "World Health Organization");
+        assert!(authors[0].given_name.is_none());
+        assert!(authors[0].family_name.is_none());
+        // v0.3.0 では CrossRef レスポンスからは団体判定できないので false のまま
+        assert!(!authors[0].is_organization);
+    }
+
+    #[test]
+    fn crossref_no_authors_yields_none_in_authors_field() {
+        let msg = json!({ "type": "journal-article", "title": ["t"] });
+        let input = crossref_to_input(&msg, "10.0/x");
+        assert!(input.authors.is_none(), "著者ゼロなら None（互換: author_names は空 Vec）");
+        assert!(input.author_names.is_empty());
+    }
+
+    #[test]
+    fn crossref_drops_authors_with_no_usable_field() {
+        // given も family も name も無い空の author 要素は捨てる
+        let msg = json!({
+            "type": "journal-article",
+            "title": ["t"],
+            "author": [
+                {},
+                { "given": "A", "family": "B" }
+            ],
+        });
+        let input = crossref_to_input(&msg, "10.0/x");
+        let authors = input.authors.unwrap();
+        assert_eq!(authors.len(), 1);
+        assert_eq!(authors[0].name, "A B");
+    }
+
+    #[test]
+    fn normalize_orcid_strips_url_prefix_and_trailing_slash() {
+        assert_eq!(normalize_orcid("https://orcid.org/0000-0002-1825-0097"), "0000-0002-1825-0097");
+        assert_eq!(normalize_orcid("http://orcid.org/0000-0002-1825-0097"), "0000-0002-1825-0097");
+        assert_eq!(normalize_orcid("https://orcid.org/0000-0002-1825-0097/"), "0000-0002-1825-0097");
+        assert_eq!(normalize_orcid("  0000-0002-1825-0097  "), "0000-0002-1825-0097");
     }
 
     #[test]
