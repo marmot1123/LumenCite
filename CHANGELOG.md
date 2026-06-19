@@ -5,7 +5,7 @@ All notable changes to LumenCite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v0.3.0 (in progress)
+## [0.3.0] - 2026-06-20
 
 Expands the `authors` table for multilingual names (kanji, kana readings, Hangul, Cyrillic), international identifiers beyond ORCID, organizational authors, and a full author editor in the UI. See `docs/SPEC.md` (v0.3.0 section) and `~/.claude/plans/v0-3-0-authors-radiant-kana.md` for details.
 
