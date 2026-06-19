@@ -27,7 +27,21 @@ Expands the `authors` table for multilingual names (kanji, kana readings, Hangul
 - **`Author` (Rust + TS types) gained 13 fields and an `identifiers: AuthorIdentifier[]`** — Field-by-field deserialization is preserved; the new fields default to `null` for existing entries until the user edits them through the AuthorEditor.
 - **`EntryInput` gained `authors?: AuthorInput[]`** — When set (by BibTeX import / CrossRef ingestion / AuthorEditor), it takes precedence over `author_names` and lets ORCIDs and organization flags flow through the create/update path.
 
-## [0.2.0]
+## [0.2.1] - 2026-06-18
+
+### Added
+
+- **Windows code signing** — Windows installers (`.msi` / `.exe`) are now Authenticode-signed with a Certum Open Source Code Signing certificate (cloud HSM via SimplySign). SmartScreen reputation builds over download history. (Signed at release time from a local Windows build; SimplySign's interactive login prevents unattended CI signing.)
+
+### Changed
+
+- Editable BibTeX cite keys, graceful DB-init failure handling, MCP server `env` input, and MCP startup-status UI (carried over from the v0.2.1 development line).
+
+### Notes
+
+- The auto-updater remains **macOS-only** for now. Windows updates by manual download from GitHub Releases (Windows auto-updater deferred to avoid risky manual `latest.json` edits that could break the macOS updater).
+
+## [0.2.0] - 2026-05-27
 
 Turns LumenCite into a research sparring partner. See `docs/SPEC.md` (v0.2.0 section) and the implementation plan for details.
 
