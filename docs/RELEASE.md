@@ -239,6 +239,32 @@ git push origin main --tags
 
 ---
 
+## 8. v0.3.0 リリースの固有事項（multilingual authors）
+
+v0.3.0 は authors テーブルを多言語名・読み仮名・国際識別子・団体著者対応に拡張する（migration 0009 + `author_identifiers` テーブル）。リリース時に注意すべき運用差分:
+
+### 8-1. 初回起動時の FTS ワンショット再構築
+
+- v0.3.0 では `entries_fts.authors_text` に `name_original`（漢字 / ハングル / キリル）と読み仮名（`reading_family` / `reading_given`）を合成するよう変更した。**既存ライブラリの FTS は古い合成のままなので、アップグレード後の初回起動で全 entry の FTS を一度だけ再構築する**（`src-tauri/src/lib.rs` の setup で `rebuild_authors_fts_once` を呼ぶ。`settings` テーブルの `fts.authors_v030_rebuilt` フラグで冪等化 — 2 回目以降は no-op）。
+- 大規模ライブラリでは初回起動が数秒ブロックしうる。クラッシュではないので進捗が気になる場合のみ将来スプラッシュ表示を検討（v0.3.0 では未実装）。
+
+### 8-2. アップグレード検証（必須）
+
+クリーンインストールに加え、**v0.2.x の既存ライブラリを引き継いだ状態**で必ず確認する:
+
+- [ ] v0.2.1 で作成した DB を残したまま v0.3.0 を起動 → migration 0009 が通り、起動時に FTS 再構築ログ（`entries_fts: rebuilt for v0.3.0 authors schema`）が一度だけ出る
+- [ ] 日本語著者を含む entry を `関` / `せき` / `Seki` のいずれで検索してもヒットする
+- [ ] AuthorEditor で著者フィールド編集・identifier 追加・同名著者マージが動く
+- [ ] ORCID 「Fetch from ORCID」で given/family/identifier が埋まる
+- [ ] 2 回目の起動では FTS 再構築が走らない（フラグ機能の確認）
+
+### 8-3. auto-updater の配信順
+
+- v0.2.1 は既に Latest として公開済み。v0.3.0 タグを publish すると `latest.json` が v0.3.0 を指すようになり、macOS の v0.2.x ユーザーへ自動配信される（通常の進行で問題なし）。
+- updater 公開鍵 `98449F75…` は v0.1.0 以降の全リリースで不変。**鍵を変えると旧版ユーザーが署名検証に失敗して更新できなくなる**ため、`tauri.conf.json` の `pubkey` は絶対に変更しない。
+
+---
+
 ## 関連
 
 - `tauri.conf.json` — bundle / updater 設定
