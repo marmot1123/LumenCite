@@ -22,6 +22,12 @@ A desktop reference management application for researchers, built with **Tauri 2
 - 💾 **Backup & export** — SQLite を `VACUUM INTO` で日次自動バックアップ (14 世代保持) + JSON / BibTeX / Markdown 手動エクスポート
 - ⬆️ **Auto-updater** — Tauri Updater プラグインで署名検証付きアップデート
 
+## Download & install
+
+最新版は [GitHub Releases](https://github.com/marmot1123/LumenCite/releases/latest) から入手できます（macOS: `.dmg` / Windows: `.msi`・`.exe` / Linux: `.AppImage`・`.deb`・`.rpm`）。macOS は署名＋notarize 済みで、アプリ内 **設定 → アップデート**から自動更新できます。
+
+> ⚠️ **v0.1.0 をお使いの方へ:** v0.1.0 は updater 鍵の設定漏れにより**自動更新が動作しません**（「アップデートを確認」で `Invalid symbol 95, offset 7.` というエラーになります）。お手数ですが、上記 Releases から**最新版を一度だけ手動でダウンロードして入れ直して**ください。以降は自動更新が有効になります。v0.2.0 以降のバージョンはこの問題の影響を受けません。
+
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 18+ と [pnpm](https://pnpm.io/) 9+
