@@ -36,6 +36,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # v0.1.0 はプレースホルダ pubkey (REPLACE_WITH_TAURI_SIGNER_PUBKEY) のままタグされ、
+      # updater が base64 デコードで `Invalid symbol 95, offset 7.` を出して壊れた。再発防止に、
+      # 署名ビルド前に updater 設定が本物の鍵かを検証してタグ build を即座に止める。
+      - name: Guard against placeholder updater pubkey
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          cfg = json.load(open("src-tauri/tauri.conf.json"))
+          up = cfg.get("plugins", {}).get("updater", {})
+          pubkey = up.get("pubkey", "")
+          if (not pubkey) or pubkey.startswith("REPLACE") or "PUBKEY" in pubkey.upper():
+              print(f"::error::updater pubkey looks like a placeholder: {pubkey!r}. "
+                    "Set the real key before tagging a release.")
+              sys.exit(1)
+          print("updater pubkey OK (not a placeholder)")
+          PY
+
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
