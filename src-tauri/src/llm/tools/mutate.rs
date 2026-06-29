@@ -397,6 +397,10 @@ async fn execute_update_entry(
         abstract_: current.abstract_.clone(),
         notes: current.notes.clone(),
         author_names: current.authors.iter().map(|a| a.name.clone()).collect(),
+        // タグも update_entry が「全削除 → tag_ids から再挿入」で全置換するため、
+        // 引き継がないと tag_ids=[] で既存タグが丸ごと消える（citation_key と同じクラスのバグ）。
+        // LLM ツールにはタグ編集口を設けていないので、ここで常に現状維持する（タグ操作は add_tag）。
+        tag_ids: current.tags.iter().map(|t| t.id).collect(),
         extra_fields: current.extra_fields.clone(),
         ..Default::default()
     };
@@ -973,6 +977,35 @@ mod tests {
 
         let entry = crate::db::entries::get_entry(&pool, id).await.unwrap();
         assert_eq!(entry.citation_key.as_deref(), Some("self2020"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_preserves_existing_tags(pool: SqlitePool) {
+        // タグの付いたエントリ。
+        let entry_id = make_entry(&pool, "Tagged Paper").await;
+        let tag = crate::db::tags::create_tag(&pool, "ml").await.unwrap();
+        crate::db::tags::add_tag_to_entry(&pool, entry_id, tag.id)
+            .await
+            .unwrap();
+
+        let ctx = make_ctx(&pool);
+        // タグには一切触れない update（notes だけ変更）。
+        let c = call(
+            "update_entry",
+            json!({ "entry_id": entry_id, "notes": "updated via chat" }),
+        );
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        // 既存タグが消えずに残っていること。
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_tags WHERE entry_id = ? AND tag_id = ?",
+        )
+        .bind(entry_id)
+        .bind(tag.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "existing tags must survive update_entry");
     }
 
     #[sqlx::test(migrations = "./migrations")]
