@@ -10,7 +10,7 @@
 | `citation_key` | TEXT | BibTeX エントリキー（cite key）。NULL = 自動生成、値あり = ユーザーがピン留めした固定キー。`migrations/0008` で追加 |
 | `title` | TEXT NOT NULL | |
 | `year` | INTEGER | |
-| `entry_type` | TEXT NOT NULL | `article` `book` `inproceedings` `thesis` `webpage` `misc` 等（BibTeX型に対応） |
+| `entry_type` | TEXT NOT NULL | 種別キー（制約なしの自由 TEXT）。既存 6 種 `article` `book` `inproceedings` `thesis` `webpage` `misc` は BibTeX 由来。v0.4.0 で Zotero アイテムタイプを追加: `preprint` `bookSection` `report` `magazineArticle` `newspaperArticle` `encyclopediaArticle` `dictionaryEntry` `manuscript` `presentation` `patent` `standard` `dataset` `computerProgram`。一覧は `src/types.ts` の `EntryType` が正 |
 | `doi` | TEXT | |
 | `isbn` | TEXT | |
 | `arxiv_id` | TEXT | `2301.00001` 形式 |

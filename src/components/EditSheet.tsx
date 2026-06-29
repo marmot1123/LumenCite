@@ -4,14 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { ExtraFieldInputs } from "./ExtraFieldInputs";
 import { AuthorEditor } from "./AuthorEditor";
 import type { EntryDetail, EntryInput, EntryType } from "../types";
+import { ENTRY_TYPES } from "../types";
 
 interface EditSheetProps {
   entry: EntryDetail;
   onClose: () => void;
   onSaved: (entry: EntryDetail) => void;
 }
-
-const ENTRY_TYPES: EntryType[] = ["article", "book", "inproceedings", "thesis", "webpage", "misc"];
 
 export function EditSheet({ entry, onClose, onSaved }: EditSheetProps) {
   const { t } = useTranslation();

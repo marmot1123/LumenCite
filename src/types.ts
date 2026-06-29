@@ -1,4 +1,49 @@
-export type EntryType = "article" | "book" | "inproceedings" | "thesis" | "webpage" | "misc";
+// 文献種別。既存の 6 種（article 等）は BibTeX 由来のキーのまま据え置き、v0.4.0 で
+// 追加した種別は Zotero のアイテムタイプ名（camelCase）をそのままキーに使う。
+// entry_type は DB 上は自由 TEXT（制約なし）なので、値の追加にマイグレーションは不要。
+export type EntryType =
+  | "article"
+  | "inproceedings"
+  | "preprint"
+  | "book"
+  | "bookSection"
+  | "thesis"
+  | "report"
+  | "magazineArticle"
+  | "newspaperArticle"
+  | "encyclopediaArticle"
+  | "dictionaryEntry"
+  | "manuscript"
+  | "presentation"
+  | "patent"
+  | "standard"
+  | "dataset"
+  | "computerProgram"
+  | "webpage"
+  | "misc";
+
+/** Add/Edit シートのプルダウンに出す順序。関連する種別を近くに並べてある。 */
+export const ENTRY_TYPES: EntryType[] = [
+  "article",
+  "inproceedings",
+  "preprint",
+  "book",
+  "bookSection",
+  "thesis",
+  "report",
+  "magazineArticle",
+  "newspaperArticle",
+  "encyclopediaArticle",
+  "dictionaryEntry",
+  "manuscript",
+  "presentation",
+  "patent",
+  "standard",
+  "dataset",
+  "computerProgram",
+  "webpage",
+  "misc",
+];
 export type ViewMode = "table" | "covers" | "timeline" | "graph";
 export type Density = "compact" | "default" | "comfortable";
 export type ThemeMode = "light" | "dark" | "auto";
@@ -391,6 +436,82 @@ export const EXTRA_FIELDS_BY_TYPE: Record<EntryType, ExtraFieldDef[]> = {
     { key: "howpublished", labelKey: "extraField.howpublishedMisc", placeholderKey: "extraFieldPlaceholder.howpublishedMisc" },
     { key: "publisher",    labelKey: "extraField.publisherMisc" },
   ],
+  // ── v0.4.0 で追加した Zotero 由来の種別 ───────────────────────────────────
+  preprint: [
+    { key: "repository", labelKey: "extraField.repository", placeholderKey: "extraFieldPlaceholder.repository" },
+    { key: "version",    labelKey: "extraField.version",    placeholderKey: "extraFieldPlaceholder.version" },
+  ],
+  bookSection: [
+    { key: "booktitle", labelKey: "extraField.bookTitle", placeholderKey: "extraFieldPlaceholder.bookTitle" },
+    { key: "publisher", labelKey: "extraField.publisher", placeholderKey: "extraFieldPlaceholder.publisherBook" },
+    { key: "address",   labelKey: "extraField.address",   placeholderKey: "extraFieldPlaceholder.address" },
+    { key: "edition",   labelKey: "extraField.edition",   placeholderKey: "extraFieldPlaceholder.edition" },
+    { key: "series",    labelKey: "extraField.series" },
+    { key: "pages",     labelKey: "extraField.pages",     placeholderKey: "extraFieldPlaceholder.pages" },
+  ],
+  report: [
+    { key: "institution",  labelKey: "extraField.institution",  placeholderKey: "extraFieldPlaceholder.institutionReport" },
+    { key: "reportNumber", labelKey: "extraField.reportNumber", placeholderKey: "extraFieldPlaceholder.reportNumber" },
+    { key: "reportType",   labelKey: "extraField.reportType",   placeholderKey: "extraFieldPlaceholder.reportType" },
+    { key: "address",      labelKey: "extraField.addressLocation" },
+    { key: "pages",        labelKey: "extraField.pages" },
+  ],
+  magazineArticle: [
+    { key: "journal", labelKey: "extraField.publication", placeholderKey: "extraFieldPlaceholder.publicationMag" },
+    { key: "volume",  labelKey: "extraField.volume" },
+    { key: "issue",   labelKey: "extraField.issue" },
+    { key: "pages",   labelKey: "extraField.pages" },
+  ],
+  newspaperArticle: [
+    { key: "journal", labelKey: "extraField.publication", placeholderKey: "extraFieldPlaceholder.publicationNews" },
+    { key: "edition", labelKey: "extraField.edition" },
+    { key: "section", labelKey: "extraField.section", placeholderKey: "extraFieldPlaceholder.section" },
+    { key: "pages",   labelKey: "extraField.pages" },
+    { key: "address", labelKey: "extraField.addressLocation" },
+  ],
+  encyclopediaArticle: [
+    { key: "booktitle", labelKey: "extraField.encyclopediaTitle", placeholderKey: "extraFieldPlaceholder.encyclopediaTitle" },
+    { key: "publisher", labelKey: "extraField.publisher" },
+    { key: "volume",    labelKey: "extraField.volume" },
+    { key: "pages",     labelKey: "extraField.pages" },
+    { key: "edition",   labelKey: "extraField.edition" },
+  ],
+  dictionaryEntry: [
+    { key: "booktitle", labelKey: "extraField.dictionaryTitle", placeholderKey: "extraFieldPlaceholder.dictionaryTitle" },
+    { key: "publisher", labelKey: "extraField.publisher" },
+    { key: "volume",    labelKey: "extraField.volume" },
+    { key: "pages",     labelKey: "extraField.pages" },
+    { key: "edition",   labelKey: "extraField.edition" },
+  ],
+  manuscript: [
+    { key: "manuscriptType", labelKey: "extraField.manuscriptType", placeholderKey: "extraFieldPlaceholder.manuscriptType" },
+    { key: "address",        labelKey: "extraField.addressLocation", placeholderKey: "extraFieldPlaceholder.addressLocation" },
+  ],
+  presentation: [
+    { key: "meetingName",      labelKey: "extraField.meetingName",      placeholderKey: "extraFieldPlaceholder.meetingName" },
+    { key: "presentationType", labelKey: "extraField.presentationType", placeholderKey: "extraFieldPlaceholder.presentationType" },
+    { key: "address",          labelKey: "extraField.addressEvent",     placeholderKey: "extraFieldPlaceholder.addressProc" },
+  ],
+  patent: [
+    { key: "patentNumber", labelKey: "extraField.patentNumber", placeholderKey: "extraFieldPlaceholder.patentNumber" },
+    { key: "applicant",    labelKey: "extraField.applicant",    placeholderKey: "extraFieldPlaceholder.applicant" },
+    { key: "address",      labelKey: "extraField.addressLocation" },
+  ],
+  standard: [
+    { key: "standardNumber", labelKey: "extraField.standardNumber", placeholderKey: "extraFieldPlaceholder.standardNumber" },
+    { key: "organization",   labelKey: "extraField.organization",   placeholderKey: "extraFieldPlaceholder.organizationStd" },
+    { key: "address",        labelKey: "extraField.addressLocation" },
+  ],
+  dataset: [
+    { key: "repository", labelKey: "extraField.repository", placeholderKey: "extraFieldPlaceholder.repositoryData" },
+    { key: "version",    labelKey: "extraField.version",    placeholderKey: "extraFieldPlaceholder.version" },
+    { key: "publisher",  labelKey: "extraField.publisher" },
+  ],
+  computerProgram: [
+    { key: "version",   labelKey: "extraField.version",   placeholderKey: "extraFieldPlaceholder.versionSw" },
+    { key: "publisher", labelKey: "extraField.publisher", placeholderKey: "extraFieldPlaceholder.publisherSw" },
+    { key: "address",   labelKey: "extraField.addressLocation" },
+  ],
 };
 
 /** 既知の extra_field キー → i18n キー（DetailPanel 等での表示用） */
@@ -411,4 +532,15 @@ export const EXTRA_FIELD_LABEL_KEYS: Record<string, string> = {
   chapter:      "extraField.chapter",
   month:        "extraField.month",
   howpublished: "extraField.howpublished",
+  repository:       "extraField.repository",
+  version:          "extraField.version",
+  reportNumber:     "extraField.reportNumber",
+  reportType:       "extraField.reportType",
+  section:          "extraField.section",
+  manuscriptType:   "extraField.manuscriptType",
+  patentNumber:     "extraField.patentNumber",
+  applicant:        "extraField.applicant",
+  standardNumber:   "extraField.standardNumber",
+  meetingName:      "extraField.meetingName",
+  presentationType: "extraField.presentationType",
 };

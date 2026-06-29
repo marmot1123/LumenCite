@@ -70,7 +70,12 @@ fn crossref_to_input(msg: &serde_json::Value, doi: &str) -> EntryInput {
     let entry_type = match msg["type"].as_str().unwrap_or("") {
         "journal-article" | "article" => "article",
         "book" | "monograph" | "reference-book" | "edited-book" => "book",
+        "book-chapter" | "book-section" | "book-part" => "bookSection",
         "proceedings-article" => "inproceedings",
+        "posted-content" => "preprint",
+        "report" | "report-component" => "report",
+        "dataset" => "dataset",
+        "standard" => "standard",
         "dissertation" => "thesis",
         _ => "misc",
     }
@@ -88,7 +93,11 @@ fn crossref_to_input(msg: &serde_json::Value, doi: &str) -> EntryInput {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     if let Some(c) = container {
-        let key = if entry_type == "inproceedings" { "booktitle" } else { "journal" };
+        let key = if entry_type == "inproceedings" || entry_type == "bookSection" {
+            "booktitle"
+        } else {
+            "journal"
+        };
         extra_fields.insert(key.to_string(), c);
     }
 

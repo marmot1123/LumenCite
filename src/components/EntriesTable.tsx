@@ -245,7 +245,7 @@ function Row({ entry, selected, onClick, onDoubleClick, onStartDrag, isDragging,
         fontSize: 12, color: "var(--text-mute)",
         overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
         fontStyle: "italic",
-      }}>{entry.entry_type}</div>
+      }}>{t(`entryType.${entry.entry_type}`, { defaultValue: entry.entry_type })}</div>
 
       {/* tags */}
       <div style={{

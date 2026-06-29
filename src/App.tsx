@@ -268,6 +268,16 @@ export default function App() {
   // load entries when view, debounced search, or scope changes
   useEffect(() => { loadEntries(); }, [selectedView, debouncedSearch, searchScope]);
 
+  // チャット中に LLM が書き込みツールを実行すると dataVersion が進む。
+  // チャット画面でも App 本体は mount されたままなので、ここで一覧を再読込しておけば
+  // ライブラリへ戻る前からリアルタイムに最新化される。初期値 0 のときは何もしない。
+  const chatDataVersion = useChatStore((s) => s.dataVersion);
+  useEffect(() => {
+    if (chatDataVersion > 0) loadEntries();
+    // loadEntries は毎レンダー再生成されるが、ここは dataVersion の変化時のみ走らせたい
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatDataVersion]);
+
   // entries が変わったら、表示されていない id を選択集合から外す。
   // これにより view/search 切替で「見えない選択」が残らない。
   useEffect(() => {
@@ -770,7 +780,12 @@ export default function App() {
     return (
       <>
         <ChatScreen
-          onBack={() => setScreen("library")}
+          onBack={() => {
+            // LLM がツール経由で DB を更新している可能性があるため、
+            // ライブラリへ戻るタイミングで一覧を再読込して表示を最新化する。
+            loadEntries();
+            setScreen("library");
+          }}
           onOpenSettings={() => setShowSettings(true)}
         />
         {globalOverlays}

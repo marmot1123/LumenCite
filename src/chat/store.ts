@@ -10,6 +10,7 @@ import type {
   ScopeMode,
   SessionWithMessages,
   UiChatMessage,
+  UiToolCall,
 } from "../types";
 import {
   applyApproval,
@@ -34,6 +35,9 @@ interface ChatStore extends ChatMessagesState {
   loadingSessions: boolean;
   /** 直近にアーカイブしたセッション（取り消しトースト表示用）。 */
   archiveToast: { sessionId: number; title: string } | null;
+  /** ライブラリ DB を変更し得るツールが実行されるたびに増えるカウンタ。
+   *  App 側がこれを購読し、チャット中でも一覧をリアルタイム再読込する。 */
+  dataVersion: number;
 
   loadSessions: () => Promise<void>;
   openSession: (id: number) => Promise<void>;
@@ -65,6 +69,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   entryIds: [],
   loadingSessions: false,
   archiveToast: null,
+  dataVersion: 0,
 
   loadSessions: async () => {
     set({ loadingSessions: true });
@@ -119,7 +124,18 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     set((s) => ({ messages: [...s.messages, userMessage], streaming: true, error: null }));
 
     const channel = new Channel<ChatStreamEvent>();
-    channel.onmessage = (ev) => set((s) => applyStreamEvent(s, ev));
+    channel.onmessage = (ev) => {
+      set((s) => applyStreamEvent(s, ev));
+      // 書き込みツールが実行された瞬間に dataVersion を進め、一覧の再読込を促す。
+      // set は同期なので、ここで get() すれば適用済みの messages を参照できる。
+      if (ev.kind === "tool_call_executed") {
+        const tc = findToolCallByCallId(get().messages, ev.call_id);
+        // 拒否されたカード（state="rejected"）は DB を変更していないので除外する。
+        if (tc && tc.state === "done" && isLibraryMutatingTool(tc.tool_name)) {
+          set((s) => ({ dataVersion: s.dataVersion + 1 }));
+        }
+      }
+    };
 
     try {
       await invoke("chat_send_message", { sessionId: sid, userText: text, channel });
@@ -238,4 +254,32 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 function isDefaultTitle(title: string): boolean {
   const t = title.trim().toLowerCase();
   return t === "" || t === "new chat" || t === "untitled" || t === "新しい chat";
+}
+
+/** call_id に対応するツールカードを messages から探す（新しい順）。 */
+function findToolCallByCallId(
+  messages: UiChatMessage[],
+  callId: string,
+): UiToolCall | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const tc = messages[i].tool_calls.find((c) => c.call_id === callId);
+    if (tc) return tc;
+  }
+  return undefined;
+}
+
+/** ライブラリ一覧（entries）の表示に影響し得る書き込みツールか。
+ *  read 系（get_entry / fulltext_search / list_*）と、ローカル DB を変えない
+ *  外部連携 mcp_* は除外する。それ以外（create/update/delete/add_tag 等）は
+ *  一覧へ反映すべき書き込みとみなす。承認ポリシーの分類（approval.rs）と対応。 */
+export function isLibraryMutatingTool(toolName: string): boolean {
+  if (
+    toolName === "get_entry" ||
+    toolName === "fulltext_search" ||
+    toolName.startsWith("list_") ||
+    toolName.startsWith("mcp_")
+  ) {
+    return false;
+  }
+  return true;
 }

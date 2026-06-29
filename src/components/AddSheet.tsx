@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Icon } from "./icons";
 import { ExtraFieldInputs } from "./ExtraFieldInputs";
 import type { EntryDetail, EntryInput, EntryType } from "../types";
+import { ENTRY_TYPES } from "../types";
 
 interface AddSheetProps {
   onClose: () => void;
@@ -14,8 +15,6 @@ interface AddSheetProps {
 
 type AddTab = "doi" | "arxiv" | "isbn" | "bibtex" | "manual";
 type Phase = "input" | "loading" | "preview" | "error" | "saving";
-
-const ENTRY_TYPES: EntryType[] = ["article", "book", "inproceedings", "thesis", "webpage", "misc"];
 
 const FETCH_COMMANDS: Record<string, string> = {
   doi:   "fetch_metadata_by_doi",

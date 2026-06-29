@@ -122,10 +122,16 @@ fn map_entry_type(bib_type: &str) -> String {
         "article" | "periodical" | "suppperiodical" => "article",
         "book" | "booklet" | "collection" | "mvbook" | "mvcollection"
         | "reference" | "mvreference" => "book",
-        "inproceedings" | "conference" | "inbook" | "incollection"
-        | "inreference" | "suppbook" | "suppcollection" | "proceedings"
-        | "mvproceedings" => "inproceedings",
+        "incollection" | "inbook" | "suppbook" | "suppcollection"
+        | "inreference" => "bookSection",
+        "inproceedings" | "conference" | "proceedings" | "mvproceedings" => "inproceedings",
         "phdthesis" | "mastersthesis" | "thesis" => "thesis",
+        "techreport" | "report" => "report",
+        "unpublished" => "manuscript",
+        "patent" => "patent",
+        "standard" => "standard",
+        "dataset" => "dataset",
+        "software" => "computerProgram",
         "online" | "electronic" | "www" | "webpage" => "webpage",
         _ => "misc",
     }
@@ -410,13 +416,25 @@ pub async fn sync_bibtex(pool: &SqlitePool, path: &std::path::Path) -> Result<()
 }
 
 fn entry_to_bibtex(entry: &EntryDetail, key: &str) -> String {
+    // 内部の種別キー → BibTeX(biblatex) のエントリ型。biblatex 前提（@online 等を使う）。
+    // 対応する標準型が無いもの（preprint/presentation/standard 等）は @misc に丸める。
     let bib_type = match entry.entry_type.as_str() {
-        "article"        => "article",
-        "book"           => "book",
-        "inproceedings"  => "inproceedings",
-        "thesis"         => "phdthesis",
-        "webpage"        => "online",
-        _                => "misc",
+        "article"             => "article",
+        "magazineArticle"     => "article",
+        "newspaperArticle"    => "article",
+        "book"                => "book",
+        "bookSection"         => "incollection",
+        "encyclopediaArticle" => "incollection",
+        "dictionaryEntry"     => "incollection",
+        "inproceedings"       => "inproceedings",
+        "thesis"              => "phdthesis",
+        "report"              => "report",
+        "manuscript"          => "unpublished",
+        "patent"              => "patent",
+        "dataset"             => "dataset",
+        "computerProgram"     => "software",
+        "webpage"             => "online",
+        _                     => "misc",
     };
 
     let mut fields: Vec<String> = Vec::new();
@@ -562,7 +580,16 @@ mod tests {
         assert_eq!(map_entry_type("conference"),    "inproceedings");
         assert_eq!(map_entry_type("phdthesis"),     "thesis");
         assert_eq!(map_entry_type("online"),        "webpage");
-        assert_eq!(map_entry_type("techreport"),    "misc");
+        // v0.4.0: 新種別へのマッピング
+        assert_eq!(map_entry_type("incollection"),  "bookSection");
+        assert_eq!(map_entry_type("inbook"),        "bookSection");
+        assert_eq!(map_entry_type("techreport"),    "report");
+        assert_eq!(map_entry_type("report"),        "report");
+        assert_eq!(map_entry_type("unpublished"),   "manuscript");
+        assert_eq!(map_entry_type("patent"),        "patent");
+        assert_eq!(map_entry_type("dataset"),       "dataset");
+        assert_eq!(map_entry_type("software"),      "computerProgram");
+        assert_eq!(map_entry_type("unknowntype"),   "misc");
     }
 
     #[test]

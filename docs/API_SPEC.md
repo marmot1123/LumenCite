@@ -10,7 +10,14 @@ const entry = await invoke("get_entry", { id: 1 });
 ## データ型
 
 ```ts
-type EntryType = "article" | "book" | "inproceedings" | "thesis" | "webpage" | "misc";
+// 既存 6 種は BibTeX 由来のキー、v0.4.0 追加分は Zotero のアイテムタイプ名（camelCase）。
+type EntryType =
+  | "article" | "inproceedings" | "preprint"
+  | "book" | "bookSection"
+  | "thesis" | "report"
+  | "magazineArticle" | "newspaperArticle" | "encyclopediaArticle" | "dictionaryEntry"
+  | "manuscript" | "presentation" | "patent" | "standard" | "dataset" | "computerProgram"
+  | "webpage" | "misc";
 type RelationType = "preprint_of" | "version_of" | "supplement_of";
 
 type Author = {
