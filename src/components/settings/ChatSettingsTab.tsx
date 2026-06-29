@@ -186,9 +186,11 @@ function McpServerPublic() {
   const { t } = useTranslation();
   const [status, setStatus] = useState<McpServerStatusInfo | null>(null);
   const [snippet, setSnippet] = useState("");
+  const [desktopSnippet, setDesktopSnippet] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedDesktop, setCopiedDesktop] = useState(false);
 
   const reload = () => {
     invoke<McpServerStatusInfo>("get_mcp_server_status").then(setStatus).catch(() => setStatus(null));
@@ -201,13 +203,18 @@ function McpServerPublic() {
   const port = status?.port;
 
   // 起動中はクライアント設定スニペット（token 込み）を取得する。
+  // Claude Code = リモート HTTP 直結コマンド / Claude Desktop = stdio shim 用 mcpServers JSON。
   useEffect(() => {
     if (enabled && running) {
       invoke<string>("get_mcp_server_config_snippet", { client: "claude_code" })
         .then(setSnippet)
         .catch(() => setSnippet(""));
+      invoke<string>("get_mcp_server_config_snippet", { client: "claude_desktop" })
+        .then(setDesktopSnippet)
+        .catch(() => setDesktopSnippet(""));
     } else {
       setSnippet("");
+      setDesktopSnippet("");
     }
   }, [enabled, running, port]);
 
@@ -231,6 +238,7 @@ function McpServerPublic() {
       await invoke<string>("regenerate_mcp_server_token");
       if (enabled && running) {
         setSnippet(await invoke<string>("get_mcp_server_config_snippet", { client: "claude_code" }));
+        setDesktopSnippet(await invoke<string>("get_mcp_server_config_snippet", { client: "claude_desktop" }));
       }
     } catch (e) {
       setError(typeof e === "string" ? e : String(e));
@@ -253,12 +261,12 @@ function McpServerPublic() {
     }
   };
 
-  const copy = async () => {
-    if (!snippet) return;
+  const copyTo = async (text: string, setFlag: (v: boolean) => void) => {
+    if (!text) return;
     try {
-      await writeText(snippet);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      await writeText(text);
+      setFlag(true);
+      setTimeout(() => setFlag(false), 1500);
     } catch { /* clipboard 失敗は無視 */ }
   };
 
@@ -292,6 +300,8 @@ function McpServerPublic() {
       )}
       {enabled && running && (
         <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+          {/* Claude Code: リモート HTTP MCP に直結するコマンド */}
+          <div style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text)" }}>{t("settings.chat.mcpServerCodeLabel")}</div>
           <div style={{ fontSize: 11, color: "var(--text-mute)", lineHeight: 1.5 }}>{t("settings.chat.mcpServerSnippetNote")}</div>
           <textarea
             readOnly
@@ -302,12 +312,29 @@ function McpServerPublic() {
             style={{ ...field, resize: "vertical", lineHeight: 1.5, fontSize: 11 }}
           />
           <div style={{ display: "flex", gap: 6 }}>
-            <button onClick={() => void copy()} disabled={!snippet} style={{ ...primaryBtn, opacity: snippet ? 1 : 0.5 }}>
+            <button onClick={() => void copyTo(snippet, setCopied)} disabled={!snippet} style={{ ...primaryBtn, opacity: snippet ? 1 : 0.5 }}>
               {copied ? t("settings.chat.mcpServerCopied") : t("settings.chat.mcpServerCopy")}
             </button>
             <button onClick={() => void regenerate()} disabled={busy} title={t("settings.chat.mcpServerRegenNote")} style={{ ...iconBtn, width: "auto", padding: "0 10px", gap: 6, fontSize: 11.5, color: "var(--text-mute)" }}>
               <Icon name="sync" size={12} color="var(--text-mute)" />
               {t("settings.chat.mcpServerRegen")}
+            </button>
+          </div>
+
+          {/* Claude Desktop: stdio のみ対応 → 本体を --mcp-stdio shim として起動する mcpServers JSON */}
+          <div style={{ marginTop: 8, fontSize: 11.5, fontWeight: 600, color: "var(--text)" }}>{t("settings.chat.mcpServerDesktopLabel")}</div>
+          <div style={{ fontSize: 11, color: "var(--text-mute)", lineHeight: 1.5 }}>{t("settings.chat.mcpServerDesktopNote")}</div>
+          <textarea
+            readOnly
+            value={desktopSnippet}
+            rows={10}
+            spellCheck={false}
+            onFocus={(e) => e.currentTarget.select()}
+            style={{ ...field, resize: "vertical", lineHeight: 1.5, fontSize: 11, fontFamily: "var(--font-mono, monospace)" }}
+          />
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={() => void copyTo(desktopSnippet, setCopiedDesktop)} disabled={!desktopSnippet} style={{ ...primaryBtn, opacity: desktopSnippet ? 1 : 0.5 }}>
+              {copiedDesktop ? t("settings.chat.mcpServerCopied") : t("settings.chat.mcpServerDesktopCopy")}
             </button>
           </div>
         </div>

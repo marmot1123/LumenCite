@@ -584,11 +584,14 @@ type McpAuditEntry = {
 | `set_mcp_server_write_enabled` | `enabled: bool` | `Result<McpServerStatusInfo>` — **Phase 2**: write 系の公開可否を切替。サーバーはリクエスト毎に設定を読むため再起動不要 |
 | `get_mcp_audit_log` | `limit?: i64` | `Result<Vec<McpAuditEntry>>` — **Phase 2**: MCP 経由 write の監査ログ（新しい順。limit 既定 100） |
 | `regenerate_mcp_server_token` | — | `Result<String>` — token を再生成しキーチェーンへ保存。起動中なら新 token で再起動し、生成した token を返す（表示用） |
-| `get_mcp_server_config_snippet` | `client: String` | `Result<String>` — クライアント別の貼り付け設定。`"claude_code"` は `claude mcp add --transport http ...` コマンド、それ以外は URL + ヘッダ |
+| `get_mcp_server_config_snippet` | `client: String` | `Result<String>` — クライアント別の貼り付け設定。`"claude_code"` は `claude mcp add --transport http ...` コマンド、`"claude_desktop"` は本体を `--mcp-stdio` shim として起動する `mcpServers` JSON（**Phase 3**）、それ以外は URL + ヘッダ |
+
+**Phase 3（stdio shim）:** Claude Desktop は stdio トランスポートのみ対応しリモート HTTP MCP に直結できない。本体バイナリを `--mcp-stdio` 付きで起動すると（`main.rs` が GUI 起動前に検出）、Tauri を立ち上げず `mcp_shim::run_stdio_proxy` が「stdio ↔ localhost HTTP」プロキシとして動作し、`LUMENCITE_MCP_URL` / `LUMENCITE_MCP_TOKEN`（Claude Desktop 設定の `env`）を使って内蔵 MCP サーバーへ橋渡しする。別 sidecar バイナリにしないことで追加の署名・notarize 対象を増やさない。`claude_desktop` スニペットの `command` は `std::env::current_exe()` の絶対パス。
 
 **公開ツール（MCP `tools/list`）:**
 - **read 系（常時）**: `fulltext_search` / `get_entry` / `list_collections` / `list_tags`（チャットの read ツール定義を流用）＋ `search_entries`（メタデータ FTS）/ `resolve_citation_key`（実 cite key）/ `export_bibtex`（.bib テキスト）。
 - **write 系（`mcp_server.write_enabled` 有効時のみ）**: `add_tag` / `update_notes` / `add_to_collection` / `create_entry` / `update_entry`（`mutate` の定義を流用）。**破壊系 `delete_entry` は常に非公開**で、`tools/call` でも許可リスト外として `isError` で拒否する。write 無効時に write ツールを呼ぶと `isError` で拒否。
+  - **バルク対応**: `add_tag` / `add_to_collection` は単一 `entry_id` に加えて **`entry_ids`（整数配列）**を受け付け、1 回の呼び出しで複数エントリへ適用する（両者は併用可・重複は順序保持で除去）。ベストエフォートで、存在しないエントリはスキップして成功分を適用し、結果サマリ（適用件数＋スキップ件数）を返す。1 件も成功しなければ `isError`。タグは get-or-create をバッチで 1 回だけ行う。
 - write 成功時はサーバーが監査ログ記録＋ `.bib` 同期キック＋ `entries-changed` イベント（一覧ライブ反映）を発火する。
 
 ### OCR（v0.2.0 追加）

@@ -15,22 +15,28 @@ pub fn specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "add_tag".to_string(),
-            description: "Add a tag to an entry. The tag is created if it does not already exist. \
-                          This is idempotent — calling it again with the same tag has no effect."
+            description: "Add a tag to one or more entries in a single call. The tag is created if it \
+                          does not already exist. This is idempotent — re-tagging an entry has no effect. \
+                          Use \"entry_ids\" to tag many entries at once instead of calling this repeatedly."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "entry_id": {
                         "type": "integer",
-                        "description": "The ID of the entry to tag."
+                        "description": "The ID of a single entry to tag. Provide this or \"entry_ids\"."
+                    },
+                    "entry_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "IDs of multiple entries to tag in one call. Provide this or \"entry_id\"."
                     },
                     "tag_name": {
                         "type": "string",
                         "description": "The name of the tag to attach (e.g. \"machine-learning\")."
                     }
                 },
-                "required": ["entry_id", "tag_name"]
+                "required": ["tag_name"]
             }),
             needs_approval: false,
         },
@@ -57,22 +63,28 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "add_to_collection".to_string(),
-            description: "Add an entry to a collection. \
-                          This is idempotent — if the entry is already in the collection, nothing changes."
+            description: "Add one or more entries to a collection in a single call. \
+                          This is idempotent — entries already in the collection are unchanged. \
+                          Use \"entry_ids\" to add many entries at once instead of calling this repeatedly."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "entry_id": {
                         "type": "integer",
-                        "description": "The ID of the entry to add."
+                        "description": "The ID of a single entry to add. Provide this or \"entry_ids\"."
+                    },
+                    "entry_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "IDs of multiple entries to add in one call. Provide this or \"entry_id\"."
                     },
                     "collection_id": {
                         "type": "integer",
                         "description": "The ID of the target collection."
                     }
                 },
-                "required": ["entry_id", "collection_id"]
+                "required": ["collection_id"]
             }),
             needs_approval: false,
         },
@@ -263,10 +275,19 @@ async fn execute_add_tag(
     ctx: &ToolContext<'_>,
     call: &ToolCallSpec,
 ) -> Result<String, ToolError> {
-    let entry_id = parse_i64(&call.arguments, "entry_id")?;
+    let entry_ids = parse_entry_ids(&call.arguments)?;
     let tag_name = parse_str(&call.arguments, "tag_name")?;
 
-    // Get-or-create the tag by name
+    // 存在しない ID は先に切り分け、実在 ID にのみ適用する。
+    let present = existing_entry_ids(ctx.pool, &entry_ids).await?;
+    let (found, missing) = partition_existing(entry_ids, &present);
+    if found.is_empty() {
+        return Err(ToolError::InvalidArguments(format!(
+            "no matching entries to tag (not found: {missing:?})"
+        )));
+    }
+
+    // Get-or-create the tag by name (once for the whole batch)
     let all_tags = crate::db::tags::get_tags(ctx.pool).await?;
     let tag = if let Some(existing) = all_tags.into_iter().find(|t| t.name == tag_name) {
         existing
@@ -274,9 +295,12 @@ async fn execute_add_tag(
         crate::db::tags::create_tag(ctx.pool, &tag_name).await?
     };
 
-    crate::db::tags::add_tag_to_entry(ctx.pool, entry_id, tag.id).await?;
+    // 実在エントリにのみ適用。ここでの失敗は真の DB エラーなので伝播させる。
+    for id in &found {
+        crate::db::tags::add_tag_to_entry(ctx.pool, *id, tag.id).await?;
+    }
 
-    Ok(format!("Tag \"{}\" (id={}) added to entry {}.", tag.name, tag.id, entry_id))
+    Ok(bulk_summary(&format!("Tag \"{}\" (id={})", tag.name, tag.id), &found, &missing))
 }
 
 async fn execute_update_notes(
@@ -306,12 +330,35 @@ async fn execute_add_to_collection(
     ctx: &ToolContext<'_>,
     call: &ToolCallSpec,
 ) -> Result<String, ToolError> {
-    let entry_id = parse_i64(&call.arguments, "entry_id")?;
+    let entry_ids = parse_entry_ids(&call.arguments)?;
     let collection_id = parse_i64(&call.arguments, "collection_id")?;
 
-    crate::db::collections::add_entry_to_collection(ctx.pool, entry_id, collection_id).await?;
+    // コレクション不在を「エントリが見つからない」と誤報しないよう先に検証する。
+    let collection_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM collections WHERE id = ?)")
+            .bind(collection_id)
+            .fetch_one(ctx.pool)
+            .await?;
+    if !collection_exists {
+        return Err(ToolError::InvalidArguments(format!(
+            "collection {collection_id} not found"
+        )));
+    }
 
-    Ok(format!("Entry {} added to collection {}.", entry_id, collection_id))
+    let present = existing_entry_ids(ctx.pool, &entry_ids).await?;
+    let (found, missing) = partition_existing(entry_ids, &present);
+    if found.is_empty() {
+        return Err(ToolError::InvalidArguments(format!(
+            "no matching entries to add (not found: {missing:?})"
+        )));
+    }
+
+    // 実在エントリにのみ適用。ここでの失敗は真の DB エラーなので伝播させる。
+    for id in &found {
+        crate::db::collections::add_entry_to_collection(ctx.pool, *id, collection_id).await?;
+    }
+
+    Ok(bulk_summary(&format!("Added to collection {collection_id}"), &found, &missing))
 }
 
 async fn execute_create_entry(
@@ -478,6 +525,68 @@ fn parse_str(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| ToolError::InvalidArguments(format!("missing or invalid string field \"{}\"", key)))
+}
+
+/// `entry_id`（単一）または `entry_ids`（整数配列）から対象エントリ ID を取り出す。
+/// 両方与えられたら結合し、重複は順序を保って除去する。どちらも無ければ／配列に
+/// 非整数が混じればエラー（バルク系ツール add_tag / add_to_collection で共用）。
+fn parse_entry_ids(args: &serde_json::Value) -> Result<Vec<i64>, ToolError> {
+    let mut ids: Vec<i64> = Vec::new();
+    if let Some(v) = args.get("entry_id").and_then(|v| v.as_i64()) {
+        ids.push(v);
+    }
+    if let Some(arr) = args.get("entry_ids").and_then(|v| v.as_array()) {
+        for item in arr {
+            let id = item.as_i64().ok_or_else(|| {
+                ToolError::InvalidArguments("\"entry_ids\" must be an array of integers".to_string())
+            })?;
+            ids.push(id);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(*id));
+    if ids.is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "provide \"entry_id\" (integer) or \"entry_ids\" (array of integers)".to_string(),
+        ));
+    }
+    Ok(ids)
+}
+
+/// `ids` のうち実在するエントリ ID の集合を返す。存在判定を FK 違反の有無に頼らず
+/// 明示クエリで行うことで、「存在しない ID（スキップ対象）」と「実在 ID への真の DB
+/// エラー（伝播対象）」を確実に切り分けられる（テストでも FK pragma に依存しない）。
+async fn existing_entry_ids(
+    pool: &sqlx::SqlitePool,
+    ids: &[i64],
+) -> Result<std::collections::HashSet<i64>, ToolError> {
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT id FROM entries WHERE id IN (");
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(*id);
+    }
+    qb.push(")");
+    let rows: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// 対象 ID を実在（`found`）と不在（`missing`）に分ける。順序は入力に従う。
+fn partition_existing(entry_ids: Vec<i64>, present: &std::collections::HashSet<i64>) -> (Vec<i64>, Vec<i64>) {
+    entry_ids.into_iter().partition(|id| present.contains(id))
+}
+
+/// バルク write の結果サマリ（純粋なフォーマッタ）。`applied` は実在し適用済みの ID、
+/// `skipped` は存在せずスキップした ID。呼び出し側が `applied` 非空を保証する。
+fn bulk_summary(subject: &str, applied: &[i64], skipped: &[i64]) -> String {
+    let mut msg = if applied.len() == 1 {
+        format!("{subject} applied to entry {}.", applied[0])
+    } else {
+        format!("{subject} applied to {} entries: {applied:?}.", applied.len())
+    };
+    if !skipped.is_empty() {
+        msg.push_str(&format!(" Skipped {} not found: {skipped:?}.", skipped.len()));
+    }
+    msg
 }
 
 /// `extra_fields` 引数を `{string: string}` の対として取り出す。
@@ -706,6 +815,175 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── bulk: entry_ids ────────────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_tag_bulk_tags_multiple_entries(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "P1").await;
+        let e2 = make_entry(&pool, "P2").await;
+        let e3 = make_entry(&pool, "P3").await;
+        let ctx = make_ctx(&pool);
+        let c = call("add_tag", json!({"entry_ids": [e1, e2, e3], "tag_name": "ml"}));
+
+        let msg = try_execute(&ctx, &c).await.unwrap().unwrap();
+        assert!(msg.contains("3 entries"), "summary was: {msg}");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_tags et JOIN tags t ON t.id = et.tag_id WHERE t.name = 'ml'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 3);
+
+        // タグは1度だけ作成される（バッチで使い回す）。
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE name = 'ml'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tags, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_tag_combines_entry_id_and_entry_ids_and_dedups(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "P1").await;
+        let e2 = make_entry(&pool, "P2").await;
+        let ctx = make_ctx(&pool);
+        // entry_id と entry_ids 併用、e1 は重複 → 2 件に畳まれる。
+        let c = call("add_tag", json!({"entry_id": e1, "entry_ids": [e1, e2], "tag_name": "z"}));
+
+        let msg = try_execute(&ctx, &c).await.unwrap().unwrap();
+        assert!(msg.contains("2 entries"), "summary was: {msg}");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_tags et JOIN tags t ON t.id = et.tag_id WHERE t.name = 'z'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_to_collection_bulk_links_multiple_entries(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "P1").await;
+        let e2 = make_entry(&pool, "P2").await;
+        let col_id = sqlx::query("INSERT INTO collections (name) VALUES ('Reading')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let ctx = make_ctx(&pool);
+        let c = call(
+            "add_to_collection",
+            json!({"entry_ids": [e1, e2], "collection_id": col_id}),
+        );
+
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_collections WHERE collection_id = ?",
+        )
+        .bind(col_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ── bulk helpers (pure) ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_entry_ids_combines_and_dedups() {
+        let ids = parse_entry_ids(&json!({"entry_id": 1, "entry_ids": [1, 2, 3]})).unwrap();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_entry_ids_requires_at_least_one_id() {
+        assert!(matches!(
+            parse_entry_ids(&json!({})),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn parse_entry_ids_rejects_non_integer_array() {
+        assert!(matches!(
+            parse_entry_ids(&json!({"entry_ids": ["a", "b"]})),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn bulk_summary_reports_skipped() {
+        let m = bulk_summary("Tag x", &[1, 2], &[9]);
+        assert!(m.contains("2 entries"));
+        assert!(m.contains("Skipped 1"));
+    }
+
+    #[test]
+    fn bulk_summary_no_skips_omits_skipped_clause() {
+        let m = bulk_summary("Tag x", &[1], &[]);
+        assert!(m.contains("entry 1"));
+        assert!(!m.contains("Skipped"));
+    }
+
+    // 存在判定は明示クエリなので FK pragma に依存せずテストできる（add_tag の skip 系）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_tag_skips_missing_entries_and_tags_present(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "P1").await;
+        let ctx = make_ctx(&pool);
+        let c = call("add_tag", json!({"entry_ids": [e1, 99999], "tag_name": "x"}));
+
+        let msg = try_execute(&ctx, &c).await.unwrap().unwrap();
+        assert!(msg.contains("Skipped"), "summary was: {msg}");
+        assert!(msg.contains("99999"), "summary was: {msg}");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_tags et JOIN tags t ON t.id = et.tag_id WHERE t.name = 'x'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "only the existing entry should be tagged");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_tag_all_missing_returns_error_and_creates_no_tag(pool: SqlitePool) {
+        let ctx = make_ctx(&pool);
+        let c = call("add_tag", json!({"entry_ids": [99998, 99999], "tag_name": "ghost"}));
+
+        let result = try_execute(&ctx, &c).await.unwrap();
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+
+        // 1件も該当しなければタグも作らない。
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE name = 'ghost'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tags, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_to_collection_unknown_collection_reports_collection_not_entries(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "P1").await;
+        let ctx = make_ctx(&pool);
+        // 実在エントリ + 存在しない collection_id → エントリではなくコレクションのエラー。
+        let c = call(
+            "add_to_collection",
+            json!({"entry_ids": [e1], "collection_id": 4242}),
+        );
+
+        let result = try_execute(&ctx, &c).await.unwrap();
+        match result {
+            Err(ToolError::InvalidArguments(m)) => {
+                assert!(m.contains("collection 4242"), "message was: {m}");
+            }
+            other => panic!("expected InvalidArguments about the collection, got {other:?}"),
+        }
     }
 
     // ── create_entry ───────────────────────────────────────────────────────
