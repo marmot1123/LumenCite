@@ -88,9 +88,14 @@ fn error_response(request_line: &str, code: i64, message: &str) -> Option<String
 pub fn run_stdio_proxy() -> i32 {
     let url = std::env::var("LUMENCITE_MCP_URL").unwrap_or_default();
     let token = std::env::var("LUMENCITE_MCP_TOKEN").unwrap_or_default();
-    if url.is_empty() {
+    if url.is_empty() || token.is_empty() {
+        let missing = if url.is_empty() {
+            "LUMENCITE_MCP_URL"
+        } else {
+            "LUMENCITE_MCP_TOKEN"
+        };
         eprintln!(
-            "lumencite-mcp: LUMENCITE_MCP_URL is not set. \
+            "lumencite-mcp: {missing} is not set. \
              Copy the Claude Desktop config snippet from LumenCite settings."
         );
         return 2;
