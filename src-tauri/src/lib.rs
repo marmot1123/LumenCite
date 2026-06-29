@@ -5,6 +5,7 @@ mod keychain;
 mod llm;
 mod mcp;
 mod mcp_server;
+pub mod mcp_shim;
 mod metadata;
 mod models;
 mod orcid;
@@ -2149,8 +2150,27 @@ async fn get_mcp_server_config_snippet(
         "claude_code" => format!(
             "claude mcp add --transport http lumencite {url} --header \"Authorization: Bearer {token}\""
         ),
-        // それ以外（Claude Desktop 等の汎用リモート MCP）向けには素の URL とヘッダを返す。
-        // stdio しか使えないクライアント用の lumencite-mcp shim は Phase 3。
+        // Claude Desktop は stdio のみ対応のため、本体バイナリ自身を `--mcp-stdio` shim として
+        // 起動させる `mcpServers` JSON を生成する（Phase 3）。`command` は現在の実行ファイル絶対パス。
+        "claude_desktop" => {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("failed to resolve executable path: {e}"))?;
+            let config = serde_json::json!({
+                "mcpServers": {
+                    "lumencite": {
+                        "command": exe.to_string_lossy(),
+                        "args": ["--mcp-stdio"],
+                        "env": {
+                            "LUMENCITE_MCP_URL": url,
+                            "LUMENCITE_MCP_TOKEN": token,
+                        }
+                    }
+                }
+            });
+            serde_json::to_string_pretty(&config)
+                .map_err(|e| format!("failed to serialize config: {e}"))?
+        }
+        // その他の汎用リモート MCP クライアント向けには素の URL とヘッダを返す。
         _ => format!("URL: {url}\nHeader: Authorization: Bearer {token}"),
     };
     Ok(snippet)
