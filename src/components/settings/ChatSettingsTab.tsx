@@ -179,8 +179,9 @@ function McpServers() {
   );
 }
 
-// LumenCite 自身を MCP サーバーとして公開する設定。read-only (Phase 1)。
+// LumenCite 自身を MCP サーバーとして公開する設定。
 // 有効化するとアプリ内に localhost HTTP サーバーが立ち、Claude Code 等から接続できる。
+// 既定は read-only。write 系ツールは別トグル（Phase 2）で明示的に許可する。
 function McpServerPublic() {
   const { t } = useTranslation();
   const [status, setStatus] = useState<McpServerStatusInfo | null>(null);
@@ -196,6 +197,7 @@ function McpServerPublic() {
 
   const enabled = status?.enabled ?? false;
   const running = status?.running ?? false;
+  const writeEnabled = status?.write_enabled ?? false;
   const port = status?.port;
 
   // 起動中はクライアント設定スニペット（token 込み）を取得する。
@@ -237,6 +239,20 @@ function McpServerPublic() {
     }
   };
 
+  // write 系ツールの公開可否（Phase 2）。サーバー再起動は不要（backend がリクエスト毎に評価）。
+  const toggleWrite = async (next: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await invoke<McpServerStatusInfo>("set_mcp_server_write_enabled", { enabled: next }));
+    } catch (e) {
+      setError(typeof e === "string" ? e : String(e));
+      reload();
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const copy = async () => {
     if (!snippet) return;
     try {
@@ -263,6 +279,17 @@ function McpServerPublic() {
         ))}
       </label>
       {error && <div style={{ fontSize: 11.5, color: "var(--danger-strong)", marginTop: 6 }}>{error}</div>}
+      {enabled && (
+        <div style={{ marginTop: 6 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", borderRadius: 6, cursor: busy ? "default" : "pointer" }}>
+            <input type="checkbox" checked={writeEnabled} disabled={busy} onChange={(e) => void toggleWrite(e.target.checked)} />
+            <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.chat.mcpServerWriteEnable")}</span>
+          </label>
+          <div style={{ fontSize: 10.5, color: "var(--text-faint)", lineHeight: 1.5, padding: "0 8px" }}>
+            {t("settings.chat.mcpServerWriteWarn")}
+          </div>
+        </div>
+      )}
       {enabled && running && (
         <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
           <div style={{ fontSize: 11, color: "var(--text-mute)", lineHeight: 1.5 }}>{t("settings.chat.mcpServerSnippetNote")}</div>

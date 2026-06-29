@@ -315,8 +315,24 @@ LLM APIキー等の機密情報は **OS キーチェーン**（macOS Keychain / 
 | `fts.authors_v030_rebuilt` | `"1"`（または未設定） | v0.3.0 で `entries_fts.authors_text` の合成式が変わったため、起動時に 1 回だけ全 entry の FTS を再構築する。完了したらこのキーが立つ。失敗時は立てずに次回起動でリトライ |
 | `mcp_server.enabled` | `"1"` \| `"0"`（または未設定） | LumenCite 自身を MCP サーバーとして公開するかのフラグ。`"1"` で起動時に自動起動 |
 | `mcp_server.port` | 文字列の数値（未設定なら既定 `3917`） | MCP サーバーのバインドポート。`port=0` で起動した場合は OS 割り当ての実ポートをここに保存する |
+| `mcp_server.write_enabled` | `"1"` \| `"0"`（または未設定） | **Phase 2**: MCP サーバー公開で write 系ツールを許可するフラグ（既定 false）。承認 UI が無いためサーバー側でこのゲートを enforce する。サーバーはリクエスト毎に評価するので変更は再起動不要 |
 
 OS キーチェーン側のサービス名: `com.lumencite.app`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。MCP **サーバー公開**の Bearer 認可トークンも同サービスのアカウント名 `mcp_server.token` に保管する（`settings` には置かない）。MCP サーバーに渡す秘匿情報（API キー等）が必要な場合も、平文を `settings` に置かず環境変数 or キーチェーン経由とする。
+
+### `mcp_audit_log` — MCP 経由 write の監査ログ（Phase 2 / migration 0010）
+
+外部 MCP クライアント（Claude Desktop/Code 等）からの書き込みは承認 UI を介さないため、何が・いつ・成否を後から追えるよう append-only で記録する。read 系は記録しない。
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `id` | INTEGER PK | |
+| `tool_name` | TEXT NOT NULL | 実行された write ツール名（例 `create_entry`） |
+| `arguments` | TEXT NOT NULL | ツール引数（JSON 文字列） |
+| `result` | TEXT | 成功サマリ or エラーメッセージ |
+| `is_error` | INTEGER NOT NULL | 0/1。実行が論理的に失敗したか |
+| `created_at` | TEXT NOT NULL | `datetime('now')` 既定 |
+
+`get_mcp_audit_log` コマンドで新しい順に取得する。閲覧 UI は未実装（Phase 4 候補）。
 
 ---
 

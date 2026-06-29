@@ -326,6 +326,8 @@ export interface McpServerStatusInfo {
   running: boolean;
   port: number;
   has_token: boolean;
+  /** Phase 2: write 系ツールを公開しているか（mcp_server.write_enabled）。 */
+  write_enabled: boolean;
 }
 
 /** backend の chat_sessions 行（entry_count を投影）。 */

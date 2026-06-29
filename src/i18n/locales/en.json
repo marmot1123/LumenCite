@@ -673,6 +673,8 @@
       "mcpServerCopied": "Copied ✓",
       "mcpServerRegen": "Regenerate token",
       "mcpServerRegenNote": "Generate a new token and invalidate the old one.",
+      "mcpServerWriteEnable": "Allow write tools (create / edit / tag)",
+      "mcpServerWriteWarn": "Lets the connected client modify your library (add/edit entries, tags, notes, collections). Deleting entries is never exposed. Every write is recorded in an audit log.",
       "whitelistTitle": "Tool auto-approval",
       "whitelistDesc": "Which write tools run automatically vs. ask each time. Reads are always automatic; delete and MCP writes always ask and can't be changed here.",
       "auto": "Automatic",

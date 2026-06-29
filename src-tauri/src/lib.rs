@@ -1994,6 +1994,18 @@ struct McpServerStatusInfo {
     running: bool,
     port: u16,
     has_token: bool,
+    /// Phase 2: write 系ツールを公開しているか（`mcp_server.write_enabled`）。
+    write_enabled: bool,
+}
+
+/// AppState + AppHandle から MCP サーバー起動用の依存をまとめる。
+fn mcp_server_deps(state: &AppState, app: &AppHandle) -> mcp_server::ServerDeps {
+    mcp_server::ServerDeps {
+        pool: state.db.clone(),
+        app_data_dir: state.app_data_dir.clone(),
+        sync_tx: state.sync_tx.clone(),
+        app: Some(app.clone()),
+    }
 }
 
 /// 設定済みポート（未設定なら既定値）。
@@ -2020,11 +2032,17 @@ async fn build_mcp_server_status(
     let has_token = keychain::get(&keychain::account_for_mcp_token())
         .map_err(|e| e.to_string())?
         .is_some();
+    let write_enabled = db::settings::get_setting(pool, db::settings::MCP_SERVER_WRITE_ENABLED_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        == Some("1");
     Ok(McpServerStatusInfo {
         enabled,
         running: running_port.is_some(),
         port: running_port.unwrap_or(configured_port),
         has_token,
+        write_enabled,
     })
 }
 
@@ -2038,6 +2056,7 @@ async fn get_mcp_server_status(
 #[tauri::command]
 async fn set_mcp_server_enabled(
     state: State<'_, AppState>,
+    app: AppHandle,
     enabled: bool,
 ) -> Result<McpServerStatusInfo, String> {
     db::settings::set_setting(
@@ -2053,7 +2072,7 @@ async fn set_mcp_server_enabled(
         let port = mcp_server_configured_port(&state.db).await?;
         let bound = state
             .mcp_server
-            .start(state.db.clone(), state.app_data_dir.clone(), port, token)?;
+            .start(mcp_server_deps(&state, &app), port, token)?;
         // OS が別ポートを割り当てた場合に追従できるよう、実バインドポートを保存。
         db::settings::set_setting(
             &state.db,
@@ -2069,8 +2088,39 @@ async fn set_mcp_server_enabled(
     build_mcp_server_status(&state.db, &state.mcp_server).await
 }
 
+/// Phase 2: write 系ツールの公開可否を切り替える。サーバーはリクエスト毎に設定を
+/// 読むため、再起動は不要（起動中ならそのまま反映される）。
 #[tauri::command]
-async fn regenerate_mcp_server_token(state: State<'_, AppState>) -> Result<String, String> {
+async fn set_mcp_server_write_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<McpServerStatusInfo, String> {
+    db::settings::set_setting(
+        &state.db,
+        db::settings::MCP_SERVER_WRITE_ENABLED_KEY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    build_mcp_server_status(&state.db, &state.mcp_server).await
+}
+
+/// Phase 2: MCP 経由の write 監査ログを新しい順で返す。
+#[tauri::command]
+async fn get_mcp_audit_log(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<db::mcp_audit::McpAuditEntry>, String> {
+    db::mcp_audit::recent(&state.db, limit.unwrap_or(100))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn regenerate_mcp_server_token(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
     let token = mcp_server::generate_token(&state.db).await?;
     keychain::set(&keychain::account_for_mcp_token(), &token).map_err(|e| e.to_string())?;
     // 起動中なら新トークンで再起動する。
@@ -2078,7 +2128,7 @@ async fn regenerate_mcp_server_token(state: State<'_, AppState>) -> Result<Strin
         let port = mcp_server_configured_port(&state.db).await?;
         state
             .mcp_server
-            .start(state.db.clone(), state.app_data_dir.clone(), port, token.clone())?;
+            .start(mcp_server_deps(&state, &app), port, token.clone())?;
     }
     Ok(token)
 }
@@ -2178,6 +2228,9 @@ pub fn run() {
 
             let mcp = Arc::new(mcp::McpManager::default());
             let mcp_server = Arc::new(mcp_server::McpServerManager::default());
+            // AppState に move する前に、MCP サーバー自動起動用のクローンを取る。
+            let srv_sync_tx = sync_tx.clone();
+            let srv_app = app.handle().clone();
             app.manage(AppState {
                 db: pool.clone(),
                 sync_tx,
@@ -2208,7 +2261,13 @@ pub fn run() {
                             .flatten()
                             .and_then(|s| s.parse::<u16>().ok())
                             .unwrap_or(mcp_server::DEFAULT_PORT);
-                        if let Err(e) = mcp_server.start(srv_pool.clone(), srv_dir, port, token) {
+                        let deps = mcp_server::ServerDeps {
+                            pool: srv_pool.clone(),
+                            app_data_dir: srv_dir,
+                            sync_tx: srv_sync_tx,
+                            app: Some(srv_app),
+                        };
+                        if let Err(e) = mcp_server.start(deps, port, token) {
                             eprintln!("MCP server start failed: {e}");
                         }
                     }
@@ -2343,6 +2402,8 @@ pub fn run() {
             remove_mcp_server,
             get_mcp_server_status,
             set_mcp_server_enabled,
+            set_mcp_server_write_enabled,
+            get_mcp_audit_log,
             regenerate_mcp_server_token,
             get_mcp_server_config_snippet,
             ocr_pdf,

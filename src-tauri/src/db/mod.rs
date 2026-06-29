@@ -5,6 +5,7 @@ pub mod collections;
 pub mod entries;
 pub mod fulltext;
 pub mod highlights;
+pub mod mcp_audit;
 pub mod settings;
 pub mod tags;
 

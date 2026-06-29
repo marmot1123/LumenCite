@@ -48,6 +48,9 @@ pub const MCP_SERVERS_KEY: &str = "mcp.servers";
 pub const MCP_SERVER_ENABLED_KEY: &str = "mcp_server.enabled";
 /// MCP サーバーのバインドポート（未設定なら `mcp_server::DEFAULT_PORT`）。
 pub const MCP_SERVER_PORT_KEY: &str = "mcp_server.port";
+/// MCP サーバー公開で write 系ツールを許可するフラグ（"1" で許可、既定 false）。
+/// Phase 2。承認 UI が無いためサーバー側でこのゲートを enforce する。
+pub const MCP_SERVER_WRITE_ENABLED_KEY: &str = "mcp_server.write_enabled";
 
 /// OCR 用 LLM プロバイダ / モデル（未設定なら chat の provider / model にフォールバック）。
 pub const LLM_OCR_PROVIDER_KEY: &str = "llm.ocr_provider";

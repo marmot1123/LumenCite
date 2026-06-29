@@ -553,16 +553,27 @@ agentic LLM Chat のセッション管理と会話ループ。`chat_send_message
 
 設定は `settings` の `mcp.servers` キーに JSON（Claude Desktop の `mcpServers` 互換）で保存する。
 
-### MCP サーバー公開（v0.3.0 追加 — Phase 1: read-only）
+### MCP サーバー公開（v0.3.0 追加 — Phase 1: read-only / Phase 2: write ゲート）
 
-LumenCite 自身を MCP サーバーとして公開し、Claude Desktop / Claude Code からライブラリを参照できるようにする。起動中アプリ内に localhost HTTP（JSON-RPC 2.0）でサーバーを立て、`Authorization: Bearer <token>` で認可する。token は OS キーチェーン（アカウント名 `mcp_server.token`）に保管。サーバー側で LLM は呼ばない（推論は接続元のサブスク認証側）。詳細は `SPEC.md` の「MCP サーバー公開」節を参照。
+LumenCite 自身を MCP サーバーとして公開し、Claude Desktop / Claude Code からライブラリを参照・操作できるようにする。起動中アプリ内に localhost HTTP（JSON-RPC 2.0）でサーバーを立て、`Authorization: Bearer <token>` で認可する。token は OS キーチェーン（アカウント名 `mcp_server.token`）に保管。サーバー側で LLM は呼ばない（推論は接続元のサブスク認証側）。詳細は `SPEC.md` の「MCP サーバー公開」節を参照。
 
 ```ts
 type McpServerStatusInfo = {
-  enabled: boolean;  // mcp_server.enabled == "1"
-  running: boolean;  // サーバースレッドが起動中か
-  port: number;      // 起動中なら実バインドポート、未起動なら設定値（既定 3917）
-  has_token: boolean; // キーチェーンに token があるか
+  enabled: boolean;       // mcp_server.enabled == "1"
+  running: boolean;       // サーバースレッドが起動中か
+  port: number;           // 起動中なら実バインドポート、未起動なら設定値（既定 3917）
+  has_token: boolean;     // キーチェーンに token があるか
+  write_enabled: boolean; // Phase 2: write 系ツールを公開しているか（mcp_server.write_enabled）
+};
+
+// get_mcp_audit_log の戻り値（Phase 2）。MCP 経由の write を新しい順で返す。
+type McpAuditEntry = {
+  id: number;
+  tool_name: string;
+  arguments: string;   // JSON 文字列
+  result: string | null;
+  is_error: boolean;
+  created_at: string;
 };
 ```
 
@@ -570,10 +581,15 @@ type McpServerStatusInfo = {
 |---------|------|--------|
 | `get_mcp_server_status` | — | `Result<McpServerStatusInfo>` |
 | `set_mcp_server_enabled` | `enabled: bool` | `Result<McpServerStatusInfo>` — 有効化時は token を用意してサーバー起動＋実バインドポートを `mcp_server.port` に保存。無効化時は停止 |
+| `set_mcp_server_write_enabled` | `enabled: bool` | `Result<McpServerStatusInfo>` — **Phase 2**: write 系の公開可否を切替。サーバーはリクエスト毎に設定を読むため再起動不要 |
+| `get_mcp_audit_log` | `limit?: i64` | `Result<Vec<McpAuditEntry>>` — **Phase 2**: MCP 経由 write の監査ログ（新しい順。limit 既定 100） |
 | `regenerate_mcp_server_token` | — | `Result<String>` — token を再生成しキーチェーンへ保存。起動中なら新 token で再起動し、生成した token を返す（表示用） |
 | `get_mcp_server_config_snippet` | `client: String` | `Result<String>` — クライアント別の貼り付け設定。`"claude_code"` は `claude mcp add --transport http ...` コマンド、それ以外は URL + ヘッダ |
 
-公開ツール（MCP `tools/list`）は **read 系のみ**: `fulltext_search` / `get_entry` / `list_collections` / `list_tags`（チャットの read ツール定義を流用）＋ `search_entries`（メタデータ FTS）/ `resolve_citation_key`（実 cite key）/ `export_bibtex`（.bib テキスト）。write/mutate/ocr は Phase 1 では非公開で、`tools/call` でも許可リスト外として `isError` で拒否する。
+**公開ツール（MCP `tools/list`）:**
+- **read 系（常時）**: `fulltext_search` / `get_entry` / `list_collections` / `list_tags`（チャットの read ツール定義を流用）＋ `search_entries`（メタデータ FTS）/ `resolve_citation_key`（実 cite key）/ `export_bibtex`（.bib テキスト）。
+- **write 系（`mcp_server.write_enabled` 有効時のみ）**: `add_tag` / `update_notes` / `add_to_collection` / `create_entry` / `update_entry`（`mutate` の定義を流用）。**破壊系 `delete_entry` は常に非公開**で、`tools/call` でも許可リスト外として `isError` で拒否する。write 無効時に write ツールを呼ぶと `isError` で拒否。
+- write 成功時はサーバーが監査ログ記録＋ `.bib` 同期キック＋ `entries-changed` イベント（一覧ライブ反映）を発火する。
 
 ### OCR（v0.2.0 追加）
 
