@@ -2,8 +2,9 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Icon } from "../icons";
-import type { McpServerInfo, McpServerStatus } from "../../types";
+import type { McpServerInfo, McpServerStatus, McpServerStatusInfo } from "../../types";
 
 // ホワイトリストで上書き可能なツールと既定の自動承認可否（backend approval.rs と一致）。
 const OVERRIDABLE_TOOLS: { name: string; defaultAuto: boolean }[] = [
@@ -24,6 +25,7 @@ export function ChatSettingsTab() {
         {t("settings.chat.description")}
       </div>
       <McpServers />
+      <McpServerPublic />
       <ToolWhitelist />
     </>
   );
@@ -177,6 +179,143 @@ function McpServers() {
   );
 }
 
+// LumenCite 自身を MCP サーバーとして公開する設定。
+// 有効化するとアプリ内に localhost HTTP サーバーが立ち、Claude Code 等から接続できる。
+// 既定は read-only。write 系ツールは別トグル（Phase 2）で明示的に許可する。
+function McpServerPublic() {
+  const { t } = useTranslation();
+  const [status, setStatus] = useState<McpServerStatusInfo | null>(null);
+  const [snippet, setSnippet] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const reload = () => {
+    invoke<McpServerStatusInfo>("get_mcp_server_status").then(setStatus).catch(() => setStatus(null));
+  };
+  useEffect(reload, []);
+
+  const enabled = status?.enabled ?? false;
+  const running = status?.running ?? false;
+  const writeEnabled = status?.write_enabled ?? false;
+  const port = status?.port;
+
+  // 起動中はクライアント設定スニペット（token 込み）を取得する。
+  useEffect(() => {
+    if (enabled && running) {
+      invoke<string>("get_mcp_server_config_snippet", { client: "claude_code" })
+        .then(setSnippet)
+        .catch(() => setSnippet(""));
+    } else {
+      setSnippet("");
+    }
+  }, [enabled, running, port]);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await invoke<McpServerStatusInfo>("set_mcp_server_enabled", { enabled: next }));
+    } catch (e) {
+      setError(typeof e === "string" ? e : String(e));
+      reload();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const regenerate = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke<string>("regenerate_mcp_server_token");
+      if (enabled && running) {
+        setSnippet(await invoke<string>("get_mcp_server_config_snippet", { client: "claude_code" }));
+      }
+    } catch (e) {
+      setError(typeof e === "string" ? e : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // write 系ツールの公開可否（Phase 2）。サーバー再起動は不要（backend がリクエスト毎に評価）。
+  const toggleWrite = async (next: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await invoke<McpServerStatusInfo>("set_mcp_server_write_enabled", { enabled: next }));
+    } catch (e) {
+      setError(typeof e === "string" ? e : String(e));
+      reload();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async () => {
+    if (!snippet) return;
+    try {
+      await writeText(snippet);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard 失敗は無視 */ }
+  };
+
+  return (
+    <Section title={t("settings.chat.mcpServerTitle")} description={t("settings.chat.mcpServerDesc")}>
+      <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", borderRadius: 6, cursor: busy ? "default" : "pointer" }}>
+        <input type="checkbox" checked={enabled} disabled={busy} onChange={(e) => void toggle(e.target.checked)} />
+        <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.chat.mcpServerEnable")}</span>
+        <span style={{ flex: 1 }} />
+        {enabled && (running ? (
+          <span style={{ ...badge, color: "#15803d", background: "rgba(34,197,94,0.14)" }}>
+            ● {t("settings.chat.mcpServerRunning", { port })}
+          </span>
+        ) : (
+          <span style={{ ...badge, color: "var(--danger-strong)", background: "var(--danger-bg)" }}>
+            ● {t("settings.chat.mcpServerStopped")}
+          </span>
+        ))}
+      </label>
+      {error && <div style={{ fontSize: 11.5, color: "var(--danger-strong)", marginTop: 6 }}>{error}</div>}
+      {enabled && (
+        <div style={{ marginTop: 6 }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", borderRadius: 6, cursor: busy ? "default" : "pointer" }}>
+            <input type="checkbox" checked={writeEnabled} disabled={busy} onChange={(e) => void toggleWrite(e.target.checked)} />
+            <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.chat.mcpServerWriteEnable")}</span>
+          </label>
+          <div style={{ fontSize: 10.5, color: "var(--text-faint)", lineHeight: 1.5, padding: "0 8px" }}>
+            {t("settings.chat.mcpServerWriteWarn")}
+          </div>
+        </div>
+      )}
+      {enabled && running && (
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ fontSize: 11, color: "var(--text-mute)", lineHeight: 1.5 }}>{t("settings.chat.mcpServerSnippetNote")}</div>
+          <textarea
+            readOnly
+            value={snippet}
+            rows={3}
+            spellCheck={false}
+            onFocus={(e) => e.currentTarget.select()}
+            style={{ ...field, resize: "vertical", lineHeight: 1.5, fontSize: 11 }}
+          />
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={() => void copy()} disabled={!snippet} style={{ ...primaryBtn, opacity: snippet ? 1 : 0.5 }}>
+              {copied ? t("settings.chat.mcpServerCopied") : t("settings.chat.mcpServerCopy")}
+            </button>
+            <button onClick={() => void regenerate()} disabled={busy} title={t("settings.chat.mcpServerRegenNote")} style={{ ...iconBtn, width: "auto", padding: "0 10px", gap: 6, fontSize: 11.5, color: "var(--text-mute)" }}>
+              <Icon name="sync" size={12} color="var(--text-mute)" />
+              {t("settings.chat.mcpServerRegen")}
+            </button>
+          </div>
+        </div>
+      )}
+    </Section>
+  );
+}
+
 function ToolWhitelist() {
   const { t } = useTranslation();
   const [overrides, setOverrides] = useState<Record<string, boolean>>({});
@@ -242,4 +381,7 @@ const primaryBtn: React.CSSProperties = {
 const iconBtn: React.CSSProperties = {
   width: 28, height: 28, padding: 0, border: "1px solid var(--border)", borderRadius: 6,
   background: "var(--surface)", cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+};
+const badge: React.CSSProperties = {
+  fontSize: 10, fontWeight: 600, padding: "1px 6px", borderRadius: 999, whiteSpace: "nowrap", flexShrink: 0,
 };

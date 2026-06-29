@@ -320,6 +320,16 @@ export interface McpServerInfo extends McpServerConfig {
   status: McpServerStatus | null;
 }
 
+/** 公開 MCP サーバー（LumenCite 自身）の状態（get_mcp_server_status の戻り値）。 */
+export interface McpServerStatusInfo {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  has_token: boolean;
+  /** Phase 2: write 系ツールを公開しているか（mcp_server.write_enabled）。 */
+  write_enabled: boolean;
+}
+
 /** backend の chat_sessions 行（entry_count を投影）。 */
 export interface ChatSession {
   id: number;

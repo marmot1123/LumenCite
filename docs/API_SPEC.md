@@ -532,7 +532,12 @@ agentic LLM Chat のセッション管理と会話ループ。`chat_send_message
 - `create_entry` / `update_entry`: 都度承認
 - `delete_*` / MCP の write 系: 常時確認（ホワイトリストで上書き不可）
 
-`create_entry` / `update_entry` は基本フィールド（`title` / `entry_type` / `year` / `abstract` / `doi` / `isbn` / `arxiv_id` / `url` / `notes` / `author_names`）に加え、型固有フィールドを `extra_fields`（`{string: string}`）で受け付ける（`journal` / `volume` / `issue` / `number` / `pages` / `publisher` / `booktitle` / `address` / `edition` / `series` / `school` / `institution` / `organization` / `howpublished` など、`DATA_MODEL.md` の `entries.extra_fields` 参照）。`update_entry` では指定したキーのみ上書き/追加し、未指定の既存 `extra_fields` は保持する。
+`create_entry` / `update_entry` は基本フィールド（`title` / `entry_type` / `year` / `abstract` / `doi` / `isbn` / `arxiv_id` / `url` / `notes` / `author_names` / `citation_key`）に加え、型固有フィールドを `extra_fields`（`{string: string}`）で受け付ける（`journal` / `volume` / `issue` / `number` / `pages` / `publisher` / `booktitle` / `address` / `edition` / `series` / `school` / `institution` / `organization` / `howpublished` など、`DATA_MODEL.md` の `entries.extra_fields` 参照）。`update_entry` では指定したキーのみ上書き/追加し、未指定の既存 `extra_fields` は保持する。
+
+`citation_key`（固定 cite key）の扱い:
+- `create_entry`: 省略/空文字なら自動生成（NULL 保存）。サニタイズ後に他エントリと重複する場合は実行前に検証で弾き、ツールはエラーを返す（LLM が別キーを選び直せるようメッセージを返す）。
+- `update_entry`: **引数を省略すると現在のキーを保持**する（指定しない限り変更しない）。値を渡すとピン留めキーを差し替え、空文字を渡すと unpin（自動生成へ戻す）。重複は同上で弾く。
+- `get_entry` ツールは戻り値に `citation_key`（ピン留めキー。未設定なら null）と `resolved_citation_key`（`.bib` / `\cite{}` で実際に使われるキー。未ピン留め時は自動生成値）を含む。
 
 ホワイトリストの上書きは `get_setting("chat.tool_whitelist")` / `set_setting` で読み書きする（専用コマンドは設けない）。
 
@@ -547,6 +552,44 @@ agentic LLM Chat のセッション管理と会話ループ。`chat_send_message
 | `remove_mcp_server` | `id: String` | `Result<()>` — プロセス停止 + 設定削除 |
 
 設定は `settings` の `mcp.servers` キーに JSON（Claude Desktop の `mcpServers` 互換）で保存する。
+
+### MCP サーバー公開（v0.3.0 追加 — Phase 1: read-only / Phase 2: write ゲート）
+
+LumenCite 自身を MCP サーバーとして公開し、Claude Desktop / Claude Code からライブラリを参照・操作できるようにする。起動中アプリ内に localhost HTTP（JSON-RPC 2.0）でサーバーを立て、`Authorization: Bearer <token>` で認可する。token は OS キーチェーン（アカウント名 `mcp_server.token`）に保管。サーバー側で LLM は呼ばない（推論は接続元のサブスク認証側）。詳細は `SPEC.md` の「MCP サーバー公開」節を参照。
+
+```ts
+type McpServerStatusInfo = {
+  enabled: boolean;       // mcp_server.enabled == "1"
+  running: boolean;       // サーバースレッドが起動中か
+  port: number;           // 起動中なら実バインドポート、未起動なら設定値（既定 3917）
+  has_token: boolean;     // キーチェーンに token があるか
+  write_enabled: boolean; // Phase 2: write 系ツールを公開しているか（mcp_server.write_enabled）
+};
+
+// get_mcp_audit_log の戻り値（Phase 2）。MCP 経由の write を新しい順で返す。
+type McpAuditEntry = {
+  id: number;
+  tool_name: string;
+  arguments: string;   // JSON 文字列
+  result: string | null;
+  is_error: boolean;
+  created_at: string;
+};
+```
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `get_mcp_server_status` | — | `Result<McpServerStatusInfo>` |
+| `set_mcp_server_enabled` | `enabled: bool` | `Result<McpServerStatusInfo>` — 有効化時は token を用意してサーバー起動＋実バインドポートを `mcp_server.port` に保存。無効化時は停止 |
+| `set_mcp_server_write_enabled` | `enabled: bool` | `Result<McpServerStatusInfo>` — **Phase 2**: write 系の公開可否を切替。サーバーはリクエスト毎に設定を読むため再起動不要 |
+| `get_mcp_audit_log` | `limit?: i64` | `Result<Vec<McpAuditEntry>>` — **Phase 2**: MCP 経由 write の監査ログ（新しい順。limit 既定 100） |
+| `regenerate_mcp_server_token` | — | `Result<String>` — token を再生成しキーチェーンへ保存。起動中なら新 token で再起動し、生成した token を返す（表示用） |
+| `get_mcp_server_config_snippet` | `client: String` | `Result<String>` — クライアント別の貼り付け設定。`"claude_code"` は `claude mcp add --transport http ...` コマンド、それ以外は URL + ヘッダ |
+
+**公開ツール（MCP `tools/list`）:**
+- **read 系（常時）**: `fulltext_search` / `get_entry` / `list_collections` / `list_tags`（チャットの read ツール定義を流用）＋ `search_entries`（メタデータ FTS）/ `resolve_citation_key`（実 cite key）/ `export_bibtex`（.bib テキスト）。
+- **write 系（`mcp_server.write_enabled` 有効時のみ）**: `add_tag` / `update_notes` / `add_to_collection` / `create_entry` / `update_entry`（`mutate` の定義を流用）。**破壊系 `delete_entry` は常に非公開**で、`tools/call` でも許可リスト外として `isError` で拒否する。write 無効時に write ツールを呼ぶと `isError` で拒否。
+- write 成功時はサーバーが監査ログ記録＋ `.bib` 同期キック＋ `entries-changed` イベント（一覧ライブ反映）を発火する。
 
 ### OCR（v0.2.0 追加）
 

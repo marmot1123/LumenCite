@@ -117,6 +117,13 @@ pub fn specs() -> Vec<ToolSpec> {
                         "type": "string",
                         "description": "URL to the work."
                     },
+                    "citation_key": {
+                        "type": "string",
+                        "description": "Pinned BibTeX citation key (the key used in LaTeX \\cite{...}). \
+                            Optional and must be globally unique; if omitted, the key is auto-generated \
+                            from first author + year at export time. Allowed characters: alphanumerics \
+                            and _ : - . / + (others are stripped)."
+                    },
                     "notes": {
                         "type": "string",
                         "description": "Personal notes."
@@ -182,6 +189,13 @@ pub fn specs() -> Vec<ToolSpec> {
                     "url": {
                         "type": "string",
                         "description": "New URL."
+                    },
+                    "citation_key": {
+                        "type": "string",
+                        "description": "New pinned BibTeX citation key (used in LaTeX \\cite{...}). \
+                            Must be globally unique. Omit to keep the current key unchanged; pass an \
+                            empty string to unpin and revert to an auto-generated key. Allowed \
+                            characters: alphanumerics and _ : - . / + (others are stripped)."
                     },
                     "notes": {
                         "type": "string",
@@ -333,10 +347,14 @@ async fn execute_create_entry(
 
     let extra_fields = parse_extra_fields(args).unwrap_or_default();
 
+    // 省略時・空文字時は None（自動生成）。重複は事前検証で弾く。
+    let citation_key = validate_citation_key_arg(ctx, args, None).await?.flatten();
+
     let input = EntryInput {
         title,
         entry_type,
         year,
+        citation_key,
         abstract_,
         doi,
         isbn,
@@ -368,6 +386,10 @@ async fn execute_update_entry(
         title: current.title.clone(),
         entry_type: current.entry_type.clone(),
         year: current.year,
+        // ピン留め済みの固定 cite key を引き継ぐ。引き継がないと update_entry が
+        // citation_key = NULL で上書きし、ユーザーが固定したキーが自動生成に戻ってしまう。
+        // LLM ツールには citation_key の上書き口を設けていないため、ここで常に現状維持する。
+        citation_key: current.citation_key.clone(),
         doi: current.doi.clone(),
         isbn: current.isbn.clone(),
         arxiv_id: current.arxiv_id.clone(),
@@ -375,6 +397,10 @@ async fn execute_update_entry(
         abstract_: current.abstract_.clone(),
         notes: current.notes.clone(),
         author_names: current.authors.iter().map(|a| a.name.clone()).collect(),
+        // タグも update_entry が「全削除 → tag_ids から再挿入」で全置換するため、
+        // 引き継がないと tag_ids=[] で既存タグが丸ごと消える（citation_key と同じクラスのバグ）。
+        // LLM ツールにはタグ編集口を設けていないので、ここで常に現状維持する（タグ操作は add_tag）。
+        tag_ids: current.tags.iter().map(|t| t.id).collect(),
         extra_fields: current.extra_fields.clone(),
         ..Default::default()
     };
@@ -416,6 +442,11 @@ async fn execute_update_entry(
     // 既存の extra_fields に対し、指定されたキーだけを上書き/追加する（指定外は保持）。
     if let Some(provided) = parse_extra_fields(args) {
         input.extra_fields.extend(provided);
+    }
+    // citation_key は引数があるときだけ上書き。Some(key)=ピン留め、None=自動に戻す。
+    // 引数が無ければ上で引き継いだ現状値を保持する。
+    if let Some(new_key) = validate_citation_key_arg(ctx, args, Some(entry_id)).await? {
+        input.citation_key = new_key;
     }
 
     crate::db::entries::update_entry(ctx.pool, entry_id, &input).await?;
@@ -459,6 +490,33 @@ fn parse_extra_fields(args: &serde_json::Value) -> Option<HashMap<String, String
                 .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
                 .collect()
         })
+}
+
+/// `citation_key` 引数を取り出してサニタイズ・衝突検証する。戻り値の意味:
+/// - `None`            … 引数が無い（呼び出し側は「変更なし」として扱う）
+/// - `Some(None)`      … 値が空 / サニタイズ後に空（= 自動生成にフォールバック）
+/// - `Some(Some(key))` … 有効なピン留めキー（他エントリと重複しないことを確認済み）
+///
+/// `exclude_id` には更新中エントリ自身の id を渡し、自分との衝突を除外する。
+/// 重複時は `InvalidArguments` を返し、LLM が別キーを選び直せるようにする
+/// （DB 側の UNIQUE 制約も最終防衛として効くが、ここで分かりやすく弾く）。
+async fn validate_citation_key_arg(
+    ctx: &ToolContext<'_>,
+    args: &serde_json::Value,
+    exclude_id: Option<i64>,
+) -> Result<Option<Option<String>>, ToolError> {
+    let Some(raw) = args.get("citation_key").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let sanitized = crate::db::entries::sanitize_citation_key(raw);
+    if let Some(ref key) = sanitized {
+        if !crate::db::entries::is_citation_key_available(ctx.pool, key, exclude_id).await? {
+            return Err(ToolError::InvalidArguments(format!(
+                "citation key \"{key}\" is already in use by another entry; choose a different key"
+            )));
+        }
+    }
+    Ok(Some(sanitized))
 }
 
 #[cfg(test)]
@@ -804,6 +862,180 @@ mod tests {
         assert_eq!(entry.extra_fields.get("issue").map(String::as_str), Some("3"));
         // 指定しなかった volume は保持される。
         assert_eq!(entry.extra_fields.get("volume").map(String::as_str), Some("1"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_pins_citation_key(pool: SqlitePool) {
+        let ctx = make_ctx(&pool);
+        let c = call(
+            "create_entry",
+            json!({ "title": "Paper", "entry_type": "article", "citation_key": "lovelace1843" }),
+        );
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        let key: Option<String> =
+            sqlx::query_scalar("SELECT citation_key FROM entries WHERE title = ?")
+                .bind("Paper")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(key.as_deref(), Some("lovelace1843"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_duplicate_citation_key_is_invalid(pool: SqlitePool) {
+        // 既に同じキーをピン留めしたエントリがある状態。
+        create_entry(
+            &pool,
+            &EntryInput {
+                title: "First".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("dup2020".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ctx = make_ctx(&pool);
+        let c = call(
+            "create_entry",
+            json!({ "title": "Second", "citation_key": "dup2020" }),
+        );
+        let result = try_execute(&ctx, &c).await.unwrap();
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_sets_and_unpins_citation_key(pool: SqlitePool) {
+        let id = make_entry(&pool, "Paper").await;
+        let ctx = make_ctx(&pool);
+
+        // ピン留めする。
+        let c = call("update_entry", json!({ "entry_id": id, "citation_key": "pinned2024" }));
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+        let key: Option<String> =
+            sqlx::query_scalar("SELECT citation_key FROM entries WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(key.as_deref(), Some("pinned2024"));
+
+        // 空文字で unpin → NULL（自動生成）に戻る。
+        let c = call("update_entry", json!({ "entry_id": id, "citation_key": "" }));
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+        let key: Option<String> =
+            sqlx::query_scalar("SELECT citation_key FROM entries WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(key, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_duplicate_citation_key_is_invalid(pool: SqlitePool) {
+        create_entry(
+            &pool,
+            &EntryInput {
+                title: "Owner".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("taken2020".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let other = make_entry(&pool, "Other").await;
+
+        let ctx = make_ctx(&pool);
+        let c = call("update_entry", json!({ "entry_id": other, "citation_key": "taken2020" }));
+        let result = try_execute(&ctx, &c).await.unwrap();
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_repins_same_key_succeeds(pool: SqlitePool) {
+        // 自分が既に持つキーを再指定しても自己衝突で弾かれないこと。
+        let id = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Self".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("self2020".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        let ctx = make_ctx(&pool);
+        let c = call("update_entry", json!({ "entry_id": id, "citation_key": "self2020" }));
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        let entry = crate::db::entries::get_entry(&pool, id).await.unwrap();
+        assert_eq!(entry.citation_key.as_deref(), Some("self2020"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_preserves_existing_tags(pool: SqlitePool) {
+        // タグの付いたエントリ。
+        let entry_id = make_entry(&pool, "Tagged Paper").await;
+        let tag = crate::db::tags::create_tag(&pool, "ml").await.unwrap();
+        crate::db::tags::add_tag_to_entry(&pool, entry_id, tag.id)
+            .await
+            .unwrap();
+
+        let ctx = make_ctx(&pool);
+        // タグには一切触れない update（notes だけ変更）。
+        let c = call(
+            "update_entry",
+            json!({ "entry_id": entry_id, "notes": "updated via chat" }),
+        );
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        // 既存タグが消えずに残っていること。
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_tags WHERE entry_id = ? AND tag_id = ?",
+        )
+        .bind(entry_id)
+        .bind(tag.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "existing tags must survive update_entry");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_preserves_pinned_citation_key(pool: SqlitePool) {
+        // ユーザーがピン留めした固定 cite key を持つエントリ。
+        let id = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Paper".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("smith2020".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        let ctx = make_ctx(&pool);
+        // citation_key には一切触れない update（notes だけ変更）。
+        let c = call(
+            "update_entry",
+            json!({ "entry_id": id, "notes": "updated via chat" }),
+        );
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        // ピン留めキーが NULL に巻き戻されず保持されていること。
+        let entry = crate::db::entries::get_entry(&pool, id).await.unwrap();
+        assert_eq!(entry.citation_key.as_deref(), Some("smith2020"));
+        assert_eq!(entry.notes.as_deref(), Some("updated via chat"));
     }
 
     #[sqlx::test(migrations = "./migrations")]

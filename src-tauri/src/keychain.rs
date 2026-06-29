@@ -56,3 +56,8 @@ pub fn delete(account: &str) -> Result<(), KeychainError> {
 pub fn account_for_api_key(provider: &str) -> String {
     format!("llm.api_key.{}", provider)
 }
+
+/// MCP サーバー（公開）の Bearer 認可トークンのキーチェーンアカウント名。
+pub fn account_for_mcp_token() -> String {
+    "mcp_server.token".to_string()
+}

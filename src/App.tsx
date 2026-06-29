@@ -278,6 +278,16 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatDataVersion]);
 
+  // MCP サーバー公開（Phase 2）経由で外部クライアント（Claude Code 等）が DB を
+  // 書き換えると backend が "entries-changed" を emit する。常に最新の loadEntries を
+  // 呼べるよう ref 経由にし、リスナー自体は mount 時に 1 回だけ張る。
+  const loadEntriesRef = useRef(loadEntries);
+  loadEntriesRef.current = loadEntries;
+  useEffect(() => {
+    const un = listen("entries-changed", () => { loadEntriesRef.current(); });
+    return () => { un.then((u) => u()); };
+  }, []);
+
   // entries が変わったら、表示されていない id を選択集合から外す。
   // これにより view/search 切替で「見えない選択」が残らない。
   useEffect(() => {

@@ -52,4 +52,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
 # v0.3.0: 著者名寄せの NFKC 正規化（漢字・全角・半角・合成済み/分解済み等価化）
 unicode-normalization = "0.1"
+# MCP サーバー（Phase 1）: localhost にバインドする軽量 HTTP サーバー。
+# async DB 呼び出しは tauri::async_runtime::block_on で橋渡しするため、tokio の
+# net/rt 機能追加や axum/hyper の重い依存は不要。
+tiny_http = "0.12"
 
