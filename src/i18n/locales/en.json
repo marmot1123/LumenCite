@@ -672,6 +672,7 @@
       "mcpServerSnippetNote": "Run this in your terminal to connect Claude Code. It contains a secret token — keep it private.",
       "mcpServerDesktopLabel": "Claude Desktop",
       "mcpServerDesktopNote": "Claude Desktop only speaks stdio, so add this to its claude_desktop_config.json (Settings → Developer → Edit Config). It launches LumenCite as a stdio bridge and contains a secret token — keep it private.",
+      "mcpServerDesktopPathWarn": "The config embeds this app's current path. Install LumenCite to your Applications folder and reopen it before copying — if the app is moved, rebuilt, or run from a temporary location, the path breaks and you must re-copy this JSON.",
       "mcpServerDesktopCopy": "Copy JSON",
       "mcpServerCopy": "Copy command",
       "mcpServerCopied": "Copied ✓",

@@ -324,6 +324,8 @@ function McpServerPublic() {
           {/* Claude Desktop: stdio のみ対応 → 本体を --mcp-stdio shim として起動する mcpServers JSON */}
           <div style={{ marginTop: 8, fontSize: 11.5, fontWeight: 600, color: "var(--text)" }}>{t("settings.chat.mcpServerDesktopLabel")}</div>
           <div style={{ fontSize: 11, color: "var(--text-mute)", lineHeight: 1.5 }}>{t("settings.chat.mcpServerDesktopNote")}</div>
+          {/* command にこのアプリの絶対パスを埋め込むため、移動/translocation で壊れる旨を警告 */}
+          <div style={{ fontSize: 10.5, color: "var(--text-faint)", lineHeight: 1.5 }}>⚠️ {t("settings.chat.mcpServerDesktopPathWarn")}</div>
           <textarea
             readOnly
             value={desktopSnippet}
