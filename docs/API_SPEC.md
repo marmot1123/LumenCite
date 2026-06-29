@@ -591,6 +591,7 @@ type McpAuditEntry = {
 **公開ツール（MCP `tools/list`）:**
 - **read 系（常時）**: `fulltext_search` / `get_entry` / `list_collections` / `list_tags`（チャットの read ツール定義を流用）＋ `search_entries`（メタデータ FTS）/ `resolve_citation_key`（実 cite key）/ `export_bibtex`（.bib テキスト）。
 - **write 系（`mcp_server.write_enabled` 有効時のみ）**: `add_tag` / `update_notes` / `add_to_collection` / `create_entry` / `update_entry`（`mutate` の定義を流用）。**破壊系 `delete_entry` は常に非公開**で、`tools/call` でも許可リスト外として `isError` で拒否する。write 無効時に write ツールを呼ぶと `isError` で拒否。
+  - **バルク対応**: `add_tag` / `add_to_collection` は単一 `entry_id` に加えて **`entry_ids`（整数配列）**を受け付け、1 回の呼び出しで複数エントリへ適用する（両者は併用可・重複は順序保持で除去）。ベストエフォートで、存在しないエントリはスキップして成功分を適用し、結果サマリ（適用件数＋スキップ件数）を返す。1 件も成功しなければ `isError`。タグは get-or-create をバッチで 1 回だけ行う。
 - write 成功時はサーバーが監査ログ記録＋ `.bib` 同期キック＋ `entries-changed` イベント（一覧ライブ反映）を発火する。
 
 ### OCR（v0.2.0 追加）

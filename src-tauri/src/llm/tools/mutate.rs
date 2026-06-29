@@ -15,22 +15,28 @@ pub fn specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "add_tag".to_string(),
-            description: "Add a tag to an entry. The tag is created if it does not already exist. \
-                          This is idempotent — calling it again with the same tag has no effect."
+            description: "Add a tag to one or more entries in a single call. The tag is created if it \
+                          does not already exist. This is idempotent — re-tagging an entry has no effect. \
+                          Use \"entry_ids\" to tag many entries at once instead of calling this repeatedly."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "entry_id": {
                         "type": "integer",
-                        "description": "The ID of the entry to tag."
+                        "description": "The ID of a single entry to tag. Provide this or \"entry_ids\"."
+                    },
+                    "entry_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "IDs of multiple entries to tag in one call. Provide this or \"entry_id\"."
                     },
                     "tag_name": {
                         "type": "string",
                         "description": "The name of the tag to attach (e.g. \"machine-learning\")."
                     }
                 },
-                "required": ["entry_id", "tag_name"]
+                "required": ["tag_name"]
             }),
             needs_approval: false,
         },
@@ -57,22 +63,28 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "add_to_collection".to_string(),
-            description: "Add an entry to a collection. \
-                          This is idempotent — if the entry is already in the collection, nothing changes."
+            description: "Add one or more entries to a collection in a single call. \
+                          This is idempotent — entries already in the collection are unchanged. \
+                          Use \"entry_ids\" to add many entries at once instead of calling this repeatedly."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "entry_id": {
                         "type": "integer",
-                        "description": "The ID of the entry to add."
+                        "description": "The ID of a single entry to add. Provide this or \"entry_ids\"."
+                    },
+                    "entry_ids": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "IDs of multiple entries to add in one call. Provide this or \"entry_id\"."
                     },
                     "collection_id": {
                         "type": "integer",
                         "description": "The ID of the target collection."
                     }
                 },
-                "required": ["entry_id", "collection_id"]
+                "required": ["collection_id"]
             }),
             needs_approval: false,
         },
@@ -263,10 +275,10 @@ async fn execute_add_tag(
     ctx: &ToolContext<'_>,
     call: &ToolCallSpec,
 ) -> Result<String, ToolError> {
-    let entry_id = parse_i64(&call.arguments, "entry_id")?;
+    let entry_ids = parse_entry_ids(&call.arguments)?;
     let tag_name = parse_str(&call.arguments, "tag_name")?;
 
-    // Get-or-create the tag by name
+    // Get-or-create the tag by name (once for the whole batch)
     let all_tags = crate::db::tags::get_tags(ctx.pool).await?;
     let tag = if let Some(existing) = all_tags.into_iter().find(|t| t.name == tag_name) {
         existing
@@ -274,9 +286,13 @@ async fn execute_add_tag(
         crate::db::tags::create_tag(ctx.pool, &tag_name).await?
     };
 
-    crate::db::tags::add_tag_to_entry(ctx.pool, entry_id, tag.id).await?;
+    // ベストエフォート: 不正な ID（存在しないエントリ）はスキップして残りを処理する。
+    let (ok, failed) = apply_per_entry(&entry_ids, |id| {
+        crate::db::tags::add_tag_to_entry(ctx.pool, id, tag.id)
+    })
+    .await;
 
-    Ok(format!("Tag \"{}\" (id={}) added to entry {}.", tag.name, tag.id, entry_id))
+    bulk_summary(&format!("Tag \"{}\" (id={})", tag.name, tag.id), &ok, &failed)
 }
 
 async fn execute_update_notes(
@@ -306,12 +322,15 @@ async fn execute_add_to_collection(
     ctx: &ToolContext<'_>,
     call: &ToolCallSpec,
 ) -> Result<String, ToolError> {
-    let entry_id = parse_i64(&call.arguments, "entry_id")?;
+    let entry_ids = parse_entry_ids(&call.arguments)?;
     let collection_id = parse_i64(&call.arguments, "collection_id")?;
 
-    crate::db::collections::add_entry_to_collection(ctx.pool, entry_id, collection_id).await?;
+    let (ok, failed) = apply_per_entry(&entry_ids, |id| {
+        crate::db::collections::add_entry_to_collection(ctx.pool, id, collection_id)
+    })
+    .await;
 
-    Ok(format!("Entry {} added to collection {}.", entry_id, collection_id))
+    bulk_summary(&format!("Added to collection {collection_id}"), &ok, &failed)
 }
 
 async fn execute_create_entry(
@@ -478,6 +497,68 @@ fn parse_str(args: &serde_json::Value, key: &str) -> Result<String, ToolError> {
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .ok_or_else(|| ToolError::InvalidArguments(format!("missing or invalid string field \"{}\"", key)))
+}
+
+/// `entry_id`（単一）または `entry_ids`（整数配列）から対象エントリ ID を取り出す。
+/// 両方与えられたら結合し、重複は順序を保って除去する。どちらも無ければ／配列に
+/// 非整数が混じればエラー（バルク系ツール add_tag / add_to_collection で共用）。
+fn parse_entry_ids(args: &serde_json::Value) -> Result<Vec<i64>, ToolError> {
+    let mut ids: Vec<i64> = Vec::new();
+    if let Some(v) = args.get("entry_id").and_then(|v| v.as_i64()) {
+        ids.push(v);
+    }
+    if let Some(arr) = args.get("entry_ids").and_then(|v| v.as_array()) {
+        for item in arr {
+            let id = item.as_i64().ok_or_else(|| {
+                ToolError::InvalidArguments("\"entry_ids\" must be an array of integers".to_string())
+            })?;
+            ids.push(id);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(*id));
+    if ids.is_empty() {
+        return Err(ToolError::InvalidArguments(
+            "provide \"entry_id\" (integer) or \"entry_ids\" (array of integers)".to_string(),
+        ));
+    }
+    Ok(ids)
+}
+
+/// 各エントリ ID に非同期処理を順に適用し、(成功した ID, 失敗した ID) を返す。
+/// 失敗（存在しないエントリ等）でも中断せず残りを処理する（ベストエフォート）。
+async fn apply_per_entry<F, Fut>(ids: &[i64], mut op: F) -> (Vec<i64>, Vec<i64>)
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<(), sqlx::Error>>,
+{
+    let mut ok = Vec::new();
+    let mut failed = Vec::new();
+    for &id in ids {
+        match op(id).await {
+            Ok(()) => ok.push(id),
+            Err(_) => failed.push(id),
+        }
+    }
+    (ok, failed)
+}
+
+/// バルク write の結果サマリを作る。1 件も成功しなければ Err（呼び出し側で isError 化）。
+fn bulk_summary(subject: &str, ok: &[i64], failed: &[i64]) -> Result<String, ToolError> {
+    if ok.is_empty() {
+        return Err(ToolError::InvalidArguments(format!(
+            "{subject}: no entries were updated (not found: {failed:?})"
+        )));
+    }
+    let mut msg = if ok.len() == 1 {
+        format!("{subject} applied to entry {}.", ok[0])
+    } else {
+        format!("{subject} applied to {} entries: {ok:?}.", ok.len())
+    };
+    if !failed.is_empty() {
+        msg.push_str(&format!(" Skipped {} not found: {failed:?}.", failed.len()));
+    }
+    Ok(msg)
 }
 
 /// `extra_fields` 引数を `{string: string}` の対として取り出す。
@@ -706,6 +787,121 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── bulk: entry_ids ────────────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_tag_bulk_tags_multiple_entries(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "P1").await;
+        let e2 = make_entry(&pool, "P2").await;
+        let e3 = make_entry(&pool, "P3").await;
+        let ctx = make_ctx(&pool);
+        let c = call("add_tag", json!({"entry_ids": [e1, e2, e3], "tag_name": "ml"}));
+
+        let msg = try_execute(&ctx, &c).await.unwrap().unwrap();
+        assert!(msg.contains("3 entries"), "summary was: {msg}");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_tags et JOIN tags t ON t.id = et.tag_id WHERE t.name = 'ml'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 3);
+
+        // タグは1度だけ作成される（バッチで使い回す）。
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE name = 'ml'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tags, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_tag_combines_entry_id_and_entry_ids_and_dedups(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "P1").await;
+        let e2 = make_entry(&pool, "P2").await;
+        let ctx = make_ctx(&pool);
+        // entry_id と entry_ids 併用、e1 は重複 → 2 件に畳まれる。
+        let c = call("add_tag", json!({"entry_id": e1, "entry_ids": [e1, e2], "tag_name": "z"}));
+
+        let msg = try_execute(&ctx, &c).await.unwrap().unwrap();
+        assert!(msg.contains("2 entries"), "summary was: {msg}");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_tags et JOIN tags t ON t.id = et.tag_id WHERE t.name = 'z'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_to_collection_bulk_links_multiple_entries(pool: SqlitePool) {
+        let e1 = make_entry(&pool, "P1").await;
+        let e2 = make_entry(&pool, "P2").await;
+        let col_id = sqlx::query("INSERT INTO collections (name) VALUES ('Reading')")
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid();
+        let ctx = make_ctx(&pool);
+        let c = call(
+            "add_to_collection",
+            json!({"entry_ids": [e1, e2], "collection_id": col_id}),
+        );
+
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM entry_collections WHERE collection_id = ?",
+        )
+        .bind(col_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ── bulk helpers (pure) ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_entry_ids_combines_and_dedups() {
+        let ids = parse_entry_ids(&json!({"entry_id": 1, "entry_ids": [1, 2, 3]})).unwrap();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn parse_entry_ids_requires_at_least_one_id() {
+        assert!(matches!(
+            parse_entry_ids(&json!({})),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn parse_entry_ids_rejects_non_integer_array() {
+        assert!(matches!(
+            parse_entry_ids(&json!({"entry_ids": ["a", "b"]})),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn bulk_summary_reports_skipped_failures() {
+        let m = bulk_summary("Tag x", &[1, 2], &[9]).unwrap();
+        assert!(m.contains("2 entries"));
+        assert!(m.contains("Skipped 1"));
+    }
+
+    #[test]
+    fn bulk_summary_errors_when_nothing_succeeded() {
+        assert!(matches!(
+            bulk_summary("Tag x", &[], &[9]),
+            Err(ToolError::InvalidArguments(_))
+        ));
     }
 
     // ── create_entry ───────────────────────────────────────────────────────
