@@ -44,6 +44,11 @@ pub const CHAT_TOOL_WHITELIST_KEY: &str = "chat.tool_whitelist";
 /// 外部 MCP サーバー設定（Claude Desktop の mcpServers 互換 JSON）。
 pub const MCP_SERVERS_KEY: &str = "mcp.servers";
 
+/// LumenCite 自身を MCP サーバーとして公開する機能の有効フラグ（"1" で有効）。
+pub const MCP_SERVER_ENABLED_KEY: &str = "mcp_server.enabled";
+/// MCP サーバーのバインドポート（未設定なら `mcp_server::DEFAULT_PORT`）。
+pub const MCP_SERVER_PORT_KEY: &str = "mcp_server.port";
+
 /// OCR 用 LLM プロバイダ / モデル（未設定なら chat の provider / model にフォールバック）。
 pub const LLM_OCR_PROVIDER_KEY: &str = "llm.ocr_provider";
 pub const LLM_OCR_MODEL_KEY: &str = "llm.ocr_model";

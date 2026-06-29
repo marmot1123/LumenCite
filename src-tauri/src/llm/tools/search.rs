@@ -35,7 +35,10 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "get_entry".to_string(),
             description: "Retrieve full metadata for a single library entry by its numeric id. \
-                Returns title, year, authors, abstract, tags, DOI/arXiv id, and notes. \
+                Returns title, year, authors, abstract, tags, DOI/arXiv id, notes, and the BibTeX \
+                citation key. The `citation_key` field is the user-pinned key (null when none is \
+                pinned), while `resolved_citation_key` is the key actually used in LaTeX \\cite{} / \
+                .bib exports (auto-generated from first author + year when not pinned). \
                 Use this after fulltext_search to fetch details about a specific result.".to_string(),
             parameters: json!({
                 "type": "object",
@@ -153,6 +156,10 @@ async fn get_entry_tool(
     let author_names: Vec<&str> = detail.authors.iter().map(|a| a.name.as_str()).collect();
     let tag_names: Vec<&str> = detail.tags.iter().map(|t| t.name.as_str()).collect();
 
+    // 実際に .bib / \cite{} で使われるキー（ピン留めが無ければ自動生成）。
+    // 失敗しても get_entry 全体は落とさず null として返す。
+    let resolved_key = crate::bibtex::resolve_citation_key(ctx.pool, entry_id).await.ok();
+
     let obj = json!({
         "id": detail.id,
         "title": detail.title,
@@ -163,7 +170,9 @@ async fn get_entry_tool(
         "doi": detail.doi,
         "arxiv_id": detail.arxiv_id,
         "abstract": detail.abstract_,
-        "notes": detail.notes
+        "notes": detail.notes,
+        "citation_key": detail.citation_key,
+        "resolved_citation_key": resolved_key
     });
 
     Ok(serde_json::to_string(&obj).unwrap_or_default())
@@ -372,6 +381,56 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["title"], "Test Paper");
         assert_eq!(parsed["year"], 2024);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_entry_includes_pinned_citation_key(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Pinned Paper".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("smith2020".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ctx = ctx_all(&pool);
+        let call = make_call("get_entry", json!({ "entry_id": entry.id }));
+
+        let s = try_execute(&ctx, &call).await.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["citation_key"], "smith2020");
+        // ピン留め時は resolved も同じキー。
+        assert_eq!(parsed["resolved_citation_key"], "smith2020");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_entry_auto_key_is_null_but_resolved_present(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Auto Paper".to_string(),
+                entry_type: "article".to_string(),
+                year: Some(2021),
+                author_names: vec!["Ada Lovelace".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ctx = ctx_all(&pool);
+        let call = make_call("get_entry", json!({ "entry_id": entry.id }));
+
+        let s = try_execute(&ctx, &call).await.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // 未ピン留めなら citation_key は null、resolved は自動生成された非空キー。
+        assert!(parsed["citation_key"].is_null());
+        let resolved = parsed["resolved_citation_key"].as_str().unwrap();
+        assert!(!resolved.is_empty(), "resolved key should be auto-generated");
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -306,15 +306,17 @@ LLM APIキー等の機密情報は **OS キーチェーン**（macOS Keychain / 
 | `llm.ocr_provider` | `openai` \| `anthropic`（未設定可） | OCR 用 LLM プロバイダ。未設定なら `llm.provider` にフォールバック |
 | `llm.ocr_model` | モデル識別子（未設定可） | OCR 用モデル。未設定なら `llm.model` にフォールバック |
 | `chat.tool_whitelist` | JSON | ツール別自動承認のデフォルト上書き。`delete_*` / MCP write 系は上書き不可 |
-| `mcp.servers` | JSON | 外部 MCP サーバー設定。Claude Desktop の `mcpServers` 互換形式 |
+| `mcp.servers` | JSON | 外部 MCP サーバー設定（クライアント側）。Claude Desktop の `mcpServers` 互換形式 |
 
 #### キー追加（v0.3.0）
 
 | キー | 値 | 用途 |
 |------|------|------|
 | `fts.authors_v030_rebuilt` | `"1"`（または未設定） | v0.3.0 で `entries_fts.authors_text` の合成式が変わったため、起動時に 1 回だけ全 entry の FTS を再構築する。完了したらこのキーが立つ。失敗時は立てずに次回起動でリトライ |
+| `mcp_server.enabled` | `"1"` \| `"0"`（または未設定） | LumenCite 自身を MCP サーバーとして公開するかのフラグ。`"1"` で起動時に自動起動 |
+| `mcp_server.port` | 文字列の数値（未設定なら既定 `3917`） | MCP サーバーのバインドポート。`port=0` で起動した場合は OS 割り当ての実ポートをここに保存する |
 
-OS キーチェーン側のサービス名: `com.lumencite.LumenCite`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。MCP サーバーに渡す秘匿情報（API キー等）が必要な場合も、平文を `settings` に置かず環境変数 or キーチェーン経由とする。
+OS キーチェーン側のサービス名: `com.lumencite.app`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。MCP **サーバー公開**の Bearer 認可トークンも同サービスのアカウント名 `mcp_server.token` に保管する（`settings` には置かない）。MCP サーバーに渡す秘匿情報（API キー等）が必要な場合も、平文を `settings` に置かず環境変数 or キーチェーン経由とする。
 
 ---
 

@@ -4,6 +4,7 @@ mod db;
 mod keychain;
 mod llm;
 mod mcp;
+mod mcp_server;
 mod metadata;
 mod models;
 mod orcid;
@@ -37,6 +38,8 @@ pub struct AppState {
     pub chat: Arc<ChatRuntime>,
     /// 外部 MCP サーバーのクライアント（Chat ツールへマージ）。
     pub mcp: Arc<mcp::McpManager>,
+    /// LumenCite 自身を MCP サーバーとして公開する際の起動/停止マネージャ。
+    pub mcp_server: Arc<mcp_server::McpServerManager>,
     /// アプリデータディレクトリ（添付ファイルの相対パス解決用）。
     pub app_data_dir: PathBuf,
 }
@@ -1982,6 +1985,127 @@ fn db_init_dialog_text(failure: &DbInitFailure) -> (String, String) {
     }
 }
 
+// ─── MCP サーバー公開（Phase 1） ─────────────────────────────────────────────
+
+/// MCP サーバーの状態（フロントの設定画面表示用）。
+#[derive(serde::Serialize)]
+struct McpServerStatusInfo {
+    enabled: bool,
+    running: bool,
+    port: u16,
+    has_token: bool,
+}
+
+/// 設定済みポート（未設定なら既定値）。
+async fn mcp_server_configured_port(pool: &SqlitePool) -> Result<u16, String> {
+    Ok(db::settings::get_setting(pool, db::settings::MCP_SERVER_PORT_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(mcp_server::DEFAULT_PORT))
+}
+
+/// 状態を組み立てる内部ヘルパ（複数コマンドから共有）。
+async fn build_mcp_server_status(
+    pool: &SqlitePool,
+    manager: &mcp_server::McpServerManager,
+) -> Result<McpServerStatusInfo, String> {
+    let enabled = db::settings::get_setting(pool, db::settings::MCP_SERVER_ENABLED_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        == Some("1");
+    let configured_port = mcp_server_configured_port(pool).await?;
+    let running_port = manager.running_port();
+    let has_token = keychain::get(&keychain::account_for_mcp_token())
+        .map_err(|e| e.to_string())?
+        .is_some();
+    Ok(McpServerStatusInfo {
+        enabled,
+        running: running_port.is_some(),
+        port: running_port.unwrap_or(configured_port),
+        has_token,
+    })
+}
+
+#[tauri::command]
+async fn get_mcp_server_status(
+    state: State<'_, AppState>,
+) -> Result<McpServerStatusInfo, String> {
+    build_mcp_server_status(&state.db, &state.mcp_server).await
+}
+
+#[tauri::command]
+async fn set_mcp_server_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<McpServerStatusInfo, String> {
+    db::settings::set_setting(
+        &state.db,
+        db::settings::MCP_SERVER_ENABLED_KEY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if enabled {
+        let token = mcp_server::get_or_create_token(&state.db).await?;
+        let port = mcp_server_configured_port(&state.db).await?;
+        let bound = state
+            .mcp_server
+            .start(state.db.clone(), state.app_data_dir.clone(), port, token)?;
+        // OS が別ポートを割り当てた場合に追従できるよう、実バインドポートを保存。
+        db::settings::set_setting(
+            &state.db,
+            db::settings::MCP_SERVER_PORT_KEY,
+            &bound.to_string(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    } else {
+        state.mcp_server.stop();
+    }
+
+    build_mcp_server_status(&state.db, &state.mcp_server).await
+}
+
+#[tauri::command]
+async fn regenerate_mcp_server_token(state: State<'_, AppState>) -> Result<String, String> {
+    let token = mcp_server::generate_token(&state.db).await?;
+    keychain::set(&keychain::account_for_mcp_token(), &token).map_err(|e| e.to_string())?;
+    // 起動中なら新トークンで再起動する。
+    if state.mcp_server.running_port().is_some() {
+        let port = mcp_server_configured_port(&state.db).await?;
+        state
+            .mcp_server
+            .start(state.db.clone(), state.app_data_dir.clone(), port, token.clone())?;
+    }
+    Ok(token)
+}
+
+#[tauri::command]
+async fn get_mcp_server_config_snippet(
+    state: State<'_, AppState>,
+    client: String,
+) -> Result<String, String> {
+    let port = state
+        .mcp_server
+        .running_port()
+        .unwrap_or(mcp_server_configured_port(&state.db).await?);
+    let token = mcp_server::get_or_create_token(&state.db).await?;
+    let url = format!("http://127.0.0.1:{port}/mcp");
+
+    let snippet = match client.as_str() {
+        "claude_code" => format!(
+            "claude mcp add --transport http lumencite {url} --header \"Authorization: Bearer {token}\""
+        ),
+        // それ以外（Claude Desktop 等の汎用リモート MCP）向けには素の URL とヘッダを返す。
+        // stdio しか使えないクライアント用の lumencite-mcp shim は Phase 3。
+        _ => format!("URL: {url}\nHeader: Authorization: Bearer {token}"),
+    };
+    Ok(snippet)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2053,12 +2177,43 @@ pub fn run() {
             });
 
             let mcp = Arc::new(mcp::McpManager::default());
+            let mcp_server = Arc::new(mcp_server::McpServerManager::default());
             app.manage(AppState {
                 db: pool.clone(),
                 sync_tx,
                 chat: Arc::new(ChatRuntime::default()),
                 mcp: mcp.clone(),
+                mcp_server: mcp_server.clone(),
                 app_data_dir: data_dir.clone(),
+            });
+
+            // LumenCite を MCP サーバーとして公開する設定が有効なら起動する。
+            let srv_pool = pool.clone();
+            let srv_dir = data_dir.clone();
+            tauri::async_runtime::spawn(async move {
+                let enabled = db::settings::get_setting(&srv_pool, db::settings::MCP_SERVER_ENABLED_KEY)
+                    .await
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("1");
+                if !enabled {
+                    return;
+                }
+                match mcp_server::get_or_create_token(&srv_pool).await {
+                    Ok(token) => {
+                        let port = db::settings::get_setting(&srv_pool, db::settings::MCP_SERVER_PORT_KEY)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .unwrap_or(mcp_server::DEFAULT_PORT);
+                        if let Err(e) = mcp_server.start(srv_pool.clone(), srv_dir, port, token) {
+                            eprintln!("MCP server start failed: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("MCP server token error: {e}"),
+                }
             });
 
             // 設定済みの MCP サーバーをバックグラウンドで起動する。
@@ -2186,6 +2341,10 @@ pub fn run() {
             list_mcp_servers,
             add_mcp_server,
             remove_mcp_server,
+            get_mcp_server_status,
+            set_mcp_server_enabled,
+            regenerate_mcp_server_token,
+            get_mcp_server_config_snippet,
             ocr_pdf,
             run_backup_now,
             list_backups,
