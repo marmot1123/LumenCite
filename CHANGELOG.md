@@ -5,6 +5,23 @@ All notable changes to LumenCite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-29
+
+Two headline features. The entry-type set expands from 6 to 19 (Zotero-aligned), and LumenCite can now act as an **MCP server**, so Claude Desktop / Claude Code can read and (optionally) write your library using your Claude subscription instead of API tokens — LumenCite never calls an LLM itself, so no API key is needed. See `docs/SPEC.md` (「MCP サーバー公開」section) and `docs/API_SPEC.md`.
+
+### Added
+
+- **Entry types 6 → 19 (Zotero-aligned)** — adds `book`, `bookSection`, `thesis`, `report`, `webpage`, `software`, `dataset`, `preprint`, and more. Existing BibTeX type keys are preserved and new types use camelCase; **no migration is needed**. Database changes made by the chat assistant now refresh the entry list in real time.
+- **MCP server — read-only (Phase 1)** — LumenCite publishes itself as a localhost HTTP MCP server (JSON-RPC 2.0, `Authorization: Bearer <token>` with the token stored in the OS keychain). Read tools: `fulltext_search` / `get_entry` / `list_collections` / `list_tags` / `search_entries` / `resolve_citation_key` / `export_bibtex`. The settings panel can enable the server, show a running badge, copy the Claude Code connect command, and regenerate the token.
+- **MCP server — gated writes + audit log (Phase 2)** — opt-in write tools (**default off**): `add_tag` / `update_notes` / `add_to_collection` / `create_entry` / `update_entry`. `delete_entry` is never exposed. Every write is recorded in an audit log (`mcp_audit_log`, migration 0010) and triggers `.bib` auto-sync plus a live entry-list refresh.
+- **MCP server — Claude Desktop bridge (Phase 3)** — Claude Desktop speaks only stdio, so running the app as `lumencite --mcp-stdio` turns it into a stdio↔localhost-HTTP bridge to the in-app server. The settings panel generates the ready-to-paste `mcpServers` JSON. No separate binary is shipped, so there is no extra code-signing surface.
+- **Bulk tagging / collections over MCP** — `add_tag` and `add_to_collection` accept an `entry_ids` array to apply to many entries in a single call (best-effort: non-existent entries are skipped and reported in the result).
+- **LLM `citation_key` support** — the chat and MCP tools now read and write the pinned BibTeX citation key: `get_entry` returns `citation_key` (and the resolved key), and `create_entry` / `update_entry` accept `citation_key` with uniqueness validation.
+
+### Fixed
+
+- **`update_entry` no longer wipes a pinned `citation_key` or an entry's tags** — the LLM `update_entry` tool previously reset a pinned citation key to `NULL` and could drop existing tags when updating other fields; both are now preserved.
+
 ## [0.3.0] - 2026-06-20
 
 Expands the `authors` table for multilingual names (kanji, kana readings, Hangul, Cyrillic), international identifiers beyond ORCID, organizational authors, and a full author editor in the UI. See `docs/SPEC.md` (v0.3.0 section) and `~/.claude/plans/v0-3-0-authors-radiant-kana.md` for details.
