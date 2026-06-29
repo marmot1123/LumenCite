@@ -672,6 +672,7 @@
       "mcpServerSnippetNote": "Claude Code に接続するにはこのコマンドをターミナルで実行します。秘密トークンを含むため取り扱いに注意してください。",
       "mcpServerDesktopLabel": "Claude Desktop",
       "mcpServerDesktopNote": "Claude Desktop は stdio のみ対応のため、この JSON を claude_desktop_config.json（設定 → 開発者 → 構成を編集）に追加します。LumenCite を stdio ブリッジとして起動します。秘密トークンを含むため取り扱いに注意してください。",
+      "mcpServerDesktopPathWarn": "この設定にはアプリの現在のパスが埋め込まれます。コピー前に LumenCite をアプリケーションフォルダへ移してから開き直してください。アプリを移動・再ビルド・一時的な場所から起動するとパスが無効になり、この JSON を貼り直す必要があります。",
       "mcpServerDesktopCopy": "JSON をコピー",
       "mcpServerCopy": "コマンドをコピー",
       "mcpServerCopied": "コピーしました ✓",

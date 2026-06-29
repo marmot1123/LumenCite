@@ -42,9 +42,15 @@ pub fn proxy_line(
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
             if status.is_success() {
-                // 通知応答（202 / 空ボディ）は stdout へ何も書かない。
                 if text.trim().is_empty() {
-                    None
+                    // 通知（id 無し / 202）は正常に無出力。ただし id 付きリクエストへ
+                    // 空ボディが返るのは異常なので、クライアントを無限待機させないよう
+                    // エラー応答へ変換する（error_response は id 無しなら None を返す）。
+                    error_response(
+                        trimmed,
+                        -32000,
+                        "empty response body from LumenCite MCP server",
+                    )
                 } else {
                     Some(text)
                 }
@@ -117,7 +123,13 @@ pub fn run_stdio_proxy() -> i32 {
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break, // EOF / 切断
+            // 非 UTF-8 の行は読み飛ばしてセッションを継続する（lines() は当該行を
+            // 消費済みなのでスピンしない）。それ以外（EOF / パイプ切断）は終了。
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                eprintln!("lumencite-mcp: skipping a non-UTF8 line: {e}");
+                continue;
+            }
+            Err(_) => break,
         };
         if let Some(resp) = proxy_line(&client, &url, &token, &line) {
             if writeln!(stdout, "{resp}").is_err() {
