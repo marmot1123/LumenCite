@@ -18,6 +18,8 @@
 //! プロトコルのディスパッチ（[`handle_rpc`]）はトランスポート非依存で、HTTP を介さず
 //! 単体テストできる（副作用＝`.bib` 同期/UI イベントは HTTP 層が `RpcOutcome.mutated` を見て行う）。
 
+pub mod clipper;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -459,10 +461,78 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// リクエストの行き先。`route()` は pure なので単体テストできる。
+#[derive(Debug, PartialEq)]
+enum Route {
+    /// `OPTIONS /clipper` — CORS preflight（**認証不要**: preflight は Authorization を持たない）
+    ClipperPreflight,
+    /// `GET /clipper` — ペアリング疎通確認（認証必須）
+    ClipperPing,
+    /// `POST /clipper` — クリップ本体（認証必須 + `clipper.enabled`）
+    Clip,
+    /// `POST <その他>` — 既存の JSON-RPC（`/mcp` ほかパス不問。後方互換）
+    Rpc,
+    /// それ以外のメソッド → 405
+    MethodNotAllowed,
+}
+
+fn route(method: &tiny_http::Method, path: &str) -> Route {
+    use tiny_http::Method;
+    // クエリ・末尾スラッシュを無視してパスを正規化する
+    let path = path.split('?').next().unwrap_or(path);
+    let path = if path.len() > 1 { path.trim_end_matches('/') } else { path };
+    let is_clipper = path == "/clipper";
+    match (method, is_clipper) {
+        (Method::Options, true) => Route::ClipperPreflight,
+        (Method::Get, true) => Route::ClipperPing,
+        (Method::Post, true) => Route::Clip,
+        (Method::Post, false) => Route::Rpc,
+        _ => Route::MethodNotAllowed,
+    }
+}
+
+/// `Origin` が Chrome 拡張のときだけ返す CORS ヘッダ群。
+/// Web ページ由来の Origin（https:// 等）には返さない。
+fn cors_headers(origin: Option<&str>) -> Vec<tiny_http::Header> {
+    let Some(origin) = origin.filter(|o| o.starts_with("chrome-extension://")) else {
+        return vec![];
+    };
+    let h = |k: &[u8], v: &[u8]| tiny_http::Header::from_bytes(k, v).expect("static header");
+    vec![
+        h(b"Access-Control-Allow-Origin", origin.as_bytes()),
+        h(b"Access-Control-Allow-Methods", b"GET, POST, OPTIONS"),
+        h(b"Access-Control-Allow-Headers", b"Authorization, Content-Type"),
+        h(b"Access-Control-Max-Age", b"600"),
+    ]
+}
+
 fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &str) {
-    use std::io::Read;
     use tauri::Emitter;
     use tiny_http::{Header, Response};
+
+    let json_ct = || {
+        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header")
+    };
+    let origin: Option<String> = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Origin"))
+        .map(|h| h.value.as_str().to_string());
+    let cors = cors_headers(origin.as_deref());
+    let with_cors = |mut resp: Response<std::io::Cursor<Vec<u8>>>| {
+        for h in &cors {
+            resp = resp.with_header(h.clone());
+        }
+        resp
+    };
+
+    let routed = route(req.method(), req.url());
+
+    // preflight は Authorization ヘッダを持たないため、認証より先に処理する
+    if routed == Route::ClipperPreflight {
+        let _ = req.respond(with_cors(Response::from_string("").with_status_code(204)));
+        return;
+    }
 
     // 認可: Authorization: Bearer <token>
     let authorized = req.headers().iter().any(|h| {
@@ -474,57 +544,134 @@ fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &s
                 .unwrap_or(false)
     });
     if !authorized {
-        let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
+        let _ = req.respond(with_cors(
+            Response::from_string("unauthorized").with_status_code(401),
+        ));
         return;
     }
 
-    if *req.method() != tiny_http::Method::Post {
-        let _ = req.respond(Response::from_string("method not allowed").with_status_code(405));
-        return;
-    }
+    match routed {
+        Route::ClipperPreflight => unreachable!("handled before auth"),
+        Route::MethodNotAllowed => {
+            let _ = req.respond(Response::from_string("method not allowed").with_status_code(405));
+        }
+        Route::ClipperPing => {
+            let body = json!({ "ok": true, "app": "LumenCite", "version": env!("CARGO_PKG_VERSION") });
+            let _ = req.respond(with_cors(
+                Response::from_string(body.to_string()).with_header(json_ct()),
+            ));
+        }
+        Route::Clip => {
+            if !tauri::async_runtime::block_on(clipper::clipper_enabled(&deps.pool)) {
+                let body = json!({ "status": "error", "code": "clipper_disabled" });
+                let _ = req.respond(with_cors(
+                    Response::from_string(body.to_string())
+                        .with_status_code(403)
+                        .with_header(json_ct()),
+                ));
+                return;
+            }
+            let body = match read_body(&mut req) {
+                Ok(b) => b,
+                Err((code, msg)) => {
+                    let _ = req.respond(with_cors(
+                        Response::from_string(msg).with_status_code(code),
+                    ));
+                    return;
+                }
+            };
+            let clip_req: clipper::ClipRequest = match serde_json::from_str(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    let body =
+                        json!({ "status": "error", "code": "bad_request", "message": e.to_string() });
+                    let _ = req.respond(with_cors(
+                        Response::from_string(body.to_string())
+                            .with_status_code(400)
+                            .with_header(json_ct()),
+                    ));
+                    return;
+                }
+            };
+            let outcome = tauri::async_runtime::block_on(clipper::handle_clip(&deps.pool, &clip_req));
+            if outcome.mutated {
+                let _ = deps.sync_tx.send(());
+                if let Some(app) = &deps.app {
+                    let _ = app.emit("entries-changed", ());
+                }
+            }
+            let pdf_job = outcome.pdf_job.clone();
+            let _ = req.respond(with_cors(
+                Response::from_string(outcome.response.to_string())
+                    .with_status_code(outcome.status)
+                    .with_header(json_ct()),
+            ));
+            // PDF ダウンロードは応答後に非同期実行（serve loop を塞がない）
+            if let Some(job) = pdf_job {
+                spawn_pdf_job(deps, job);
+            }
+        }
+        Route::Rpc => {
+            let body = match read_body(&mut req) {
+                Ok(b) => b,
+                Err((code, msg)) => {
+                    let _ = req.respond(Response::from_string(msg).with_status_code(code));
+                    return;
+                }
+            };
+            let outcome: RpcOutcome = match serde_json::from_str::<Value>(&body) {
+                Ok(v) => {
+                    tauri::async_runtime::block_on(handle_rpc(&deps.pool, &deps.app_data_dir, &v))
+                }
+                Err(e) => RpcOutcome {
+                    response: Some(json!({
+                        "jsonrpc": "2.0", "id": null,
+                        "error": { "code": -32700, "message": format!("parse error: {e}") }
+                    })),
+                    mutated: false,
+                },
+            };
 
+            // write 成功の副作用: `.bib` 自動同期キック + 一覧へのライブ反映イベント。
+            if outcome.mutated {
+                let _ = deps.sync_tx.send(());
+                if let Some(app) = &deps.app {
+                    let _ = app.emit("entries-changed", ());
+                }
+            }
+
+            match outcome.response {
+                Some(v) => {
+                    let _ = req
+                        .respond(Response::from_string(v.to_string()).with_header(json_ct()));
+                }
+                // 通知のみ（応答不要）→ 202 Accepted
+                None => {
+                    let _ = req.respond(Response::from_string("").with_status_code(202));
+                }
+            }
+        }
+    }
+}
+
+/// ボディを上限付きで読む（Content-Length は詐称できるため実読で判定）。
+fn read_body(req: &mut tiny_http::Request) -> Result<String, (u16, &'static str)> {
+    use std::io::Read;
     let mut body = String::new();
-    // 上限+1 まで読んで超過を検出する（Content-Length は詐称できるため実読で判定）
     let mut limited = std::io::Read::take(req.as_reader(), MAX_BODY_BYTES + 1);
     if limited.read_to_string(&mut body).is_err() {
-        let _ = req.respond(Response::from_string("bad request body").with_status_code(400));
-        return;
+        return Err((400, "bad request body"));
     }
     if body.len() as u64 > MAX_BODY_BYTES {
-        let _ = req.respond(Response::from_string("payload too large").with_status_code(413));
-        return;
+        return Err((413, "payload too large"));
     }
+    Ok(body)
+}
 
-    let outcome: RpcOutcome = match serde_json::from_str::<Value>(&body) {
-        Ok(v) => tauri::async_runtime::block_on(handle_rpc(&deps.pool, &deps.app_data_dir, &v)),
-        Err(e) => RpcOutcome {
-            response: Some(json!({
-                "jsonrpc": "2.0", "id": null,
-                "error": { "code": -32700, "message": format!("parse error: {e}") }
-            })),
-            mutated: false,
-        },
-    };
-
-    // write 成功の副作用: `.bib` 自動同期キック + 一覧へのライブ反映イベント。
-    if outcome.mutated {
-        let _ = deps.sync_tx.send(());
-        if let Some(app) = &deps.app {
-            let _ = app.emit("entries-changed", ());
-        }
-    }
-
-    match outcome.response {
-        Some(v) => {
-            let ct = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                .expect("static header");
-            let _ = req.respond(Response::from_string(v.to_string()).with_header(ct));
-        }
-        // 通知のみ（応答不要）→ 202 Accepted
-        None => {
-            let _ = req.respond(Response::from_string("").with_status_code(202));
-        }
-    }
+/// PDF ダウンロードジョブを応答後に spawn する（実体は M3 で実装）。
+fn spawn_pdf_job(_deps: &ServerDeps, _job: clipper::PdfJob) {
+    // M3: download_and_attach を tauri::async_runtime::spawn で実行し、
+    // 成功時に sync_tx + entries-changed を発火する。
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -552,6 +699,125 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn route_dispatch_table() {
+        use tiny_http::Method;
+        assert_eq!(route(&Method::Options, "/clipper"), Route::ClipperPreflight);
+        assert_eq!(route(&Method::Get, "/clipper"), Route::ClipperPing);
+        assert_eq!(route(&Method::Post, "/clipper"), Route::Clip);
+        // 末尾スラッシュ・クエリは無視する
+        assert_eq!(route(&Method::Post, "/clipper/"), Route::Clip);
+        assert_eq!(route(&Method::Get, "/clipper?x=1"), Route::ClipperPing);
+        // 既存 JSON-RPC: POST は任意パスで従来どおり
+        assert_eq!(route(&Method::Post, "/mcp"), Route::Rpc);
+        assert_eq!(route(&Method::Post, "/"), Route::Rpc);
+        // その他メソッドは 405（従来挙動の維持）
+        assert_eq!(route(&Method::Get, "/mcp"), Route::MethodNotAllowed);
+        assert_eq!(route(&Method::Options, "/mcp"), Route::MethodNotAllowed);
+        assert_eq!(route(&Method::Delete, "/clipper"), Route::MethodNotAllowed);
+    }
+
+    #[test]
+    fn cors_headers_only_for_chrome_extension_origin() {
+        assert!(cors_headers(None).is_empty());
+        assert!(cors_headers(Some("https://evil.example")).is_empty());
+        let hs = cors_headers(Some("chrome-extension://abcdef"));
+        assert!(hs.iter().any(|h| {
+            h.field.equiv("Access-Control-Allow-Origin")
+                && h.value.as_str() == "chrome-extension://abcdef"
+        }));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn http_clipper_routes_auth_cors_and_gating(pool: SqlitePool) {
+        let manager = McpServerManager::default();
+        let token = "test-token-clipper".to_string();
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        let deps = ServerDeps {
+            pool: pool.clone(),
+            app_data_dir: PathBuf::from(""),
+            sync_tx,
+            app: None,
+        };
+        let port = manager.start(deps, 0, token.clone()).expect("server should bind");
+        let url = format!("http://127.0.0.1:{port}/clipper");
+        let client = reqwest::Client::new();
+
+        // OPTIONS preflight は認証なしで 204。chrome-extension Origin にだけ CORS を返す
+        let resp = client
+            .request(reqwest::Method::OPTIONS, &url)
+            .header("Origin", "chrome-extension://abc")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap()),
+            Some("chrome-extension://abc")
+        );
+        let resp = client
+            .request(reqwest::Method::OPTIONS, &url)
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+
+        // 認証なしの GET/POST は 401
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+        assert_eq!(client.post(&url).body("{}").send().await.unwrap().status(), 401);
+
+        // GET /clipper（ペアリング疎通確認）
+        let resp = client.get(&url).bearer_auth(&token).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let ping: Value = resp.json().await.unwrap();
+        assert_eq!(ping["ok"], true);
+        assert_eq!(ping["app"], "LumenCite");
+
+        // clipper.enabled 未設定 → POST は 403
+        let resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&json!({ "url": "https://example.com/a" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "clipper_disabled");
+
+        // 有効化 → 作成成功 + sync キック
+        crate::db::settings::set_setting(&pool, crate::db::settings::CLIPPER_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let resp = client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&json!({ "url": "https://example.com/a", "title": "Clipped Page" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "created");
+        assert_eq!(body["title"], "Clipped Page");
+        assert!(sync_rx.try_recv().is_ok(), "作成成功で .bib 同期がキックされる");
+
+        // 既存 JSON-RPC ルートは従来どおり動く（後方互換）
+        let rpc_url = format!("http://127.0.0.1:{port}/mcp");
+        let resp = client
+            .post(&rpc_url)
+            .bearer_auth(&token)
+            .json(&req("tools/list", json!({})))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        manager.stop();
     }
 
     #[sqlx::test(migrations = "./migrations")]

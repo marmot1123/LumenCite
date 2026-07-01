@@ -288,12 +288,7 @@ async fn execute_add_tag(
     }
 
     // Get-or-create the tag by name (once for the whole batch)
-    let all_tags = crate::db::tags::get_tags(ctx.pool).await?;
-    let tag = if let Some(existing) = all_tags.into_iter().find(|t| t.name == tag_name) {
-        existing
-    } else {
-        crate::db::tags::create_tag(ctx.pool, &tag_name).await?
-    };
+    let tag = crate::db::tags::get_or_create_tag(ctx.pool, &tag_name).await?;
 
     // 実在エントリにのみ適用。ここでの失敗は真の DB エラーなので伝播させる。
     for id in &found {

@@ -56,6 +56,10 @@ pub const MCP_SERVER_PORT_KEY: &str = "mcp_server.port";
 /// Phase 2。承認 UI が無いためサーバー側でこのゲートを enforce する。
 pub const MCP_SERVER_WRITE_ENABLED_KEY: &str = "mcp_server.write_enabled";
 
+/// Web クリッパー（ブラウザ拡張 → `POST /clipper`）の有効フラグ（"1" で有効、既定 off）。
+/// `mcp_server.write_enabled` とは独立の同意面としてリクエスト毎に評価する。
+pub const CLIPPER_ENABLED_KEY: &str = "clipper.enabled";
+
 /// OCR 用 LLM プロバイダ / モデル（未設定なら chat の provider / model にフォールバック）。
 pub const LLM_OCR_PROVIDER_KEY: &str = "llm.ocr_provider";
 pub const LLM_OCR_MODEL_KEY: &str = "llm.ocr_model";

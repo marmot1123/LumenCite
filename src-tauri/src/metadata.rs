@@ -335,7 +335,7 @@ fn strip_html_tags(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn normalize_arxiv_id(id: &str) -> String {
+pub(crate) fn normalize_arxiv_id(id: &str) -> String {
     let id = id.trim();
     if let Some(pos) = id.rfind('/') {
         let rest = &id[pos + 1..];
