@@ -31,6 +31,36 @@ pub async fn index_attachment(
     Ok(())
 }
 
+/// 指定ページのみを差し替える（他ページの行は保持）。部分 OCR の保存用。
+/// 空文字列のページは削除のみ行う（再処理の結果テキストが無かった場合）。
+pub async fn update_attachment_pages(
+    pool: &SqlitePool,
+    attachment_id: i64,
+    pages: &[(i64, String)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    for (page, content) in pages {
+        sqlx::query("DELETE FROM fulltext WHERE attachment_id = ? AND page = ?")
+            .bind(attachment_id)
+            .bind(page)
+            .execute(&mut *tx)
+            .await?;
+        if content.trim().is_empty() {
+            continue;
+        }
+        sqlx::query("INSERT INTO fulltext (content, attachment_id, page) VALUES (?, ?, ?)")
+            .bind(content)
+            .bind(attachment_id)
+            .bind(page)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn unindex_attachment(
     pool: &SqlitePool,
     attachment_id: i64,
@@ -307,6 +337,41 @@ mod tests {
         let fresh = search_fulltext(&pool, "fresh", None, None).await.unwrap();
         assert!(stale.is_empty());
         assert_eq!(fresh.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_attachment_pages_replaces_only_given_pages(pool: SqlitePool) {
+        let (_, att_id) = setup_attachment(&pool, "Paper").await;
+        index_attachment(
+            &pool,
+            att_id,
+            &[
+                (1, "page one original".to_string()),
+                (2, "page two original".to_string()),
+                (3, "page three original".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // ページ 2 だけ差し替える。1 と 3 は保持される。
+        update_attachment_pages(&pool, att_id, &[(2, "page two replaced".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(search_fulltext(&pool, "original", None, None).await.unwrap().len(), 2);
+        assert_eq!(search_fulltext(&pool, "replaced", None, None).await.unwrap().len(), 1);
+        assert!(search_fulltext(&pool, "two original", None, None).await.unwrap().is_empty());
+
+        // 空文字列に差し替えた場合はそのページの行が消える（再OCRで空だったケース）
+        update_attachment_pages(&pool, att_id, &[(3, "".to_string())]).await.unwrap();
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
+                .bind(att_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row_count, 2); // page 1 original + page 2 replaced
     }
 
     #[sqlx::test(migrations = "./migrations")]
