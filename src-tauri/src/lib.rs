@@ -178,10 +178,17 @@ async fn bulk_restore(state: State<'_, AppState>, ids: Vec<i64>) -> Result<(), S
 }
 
 #[tauri::command]
-async fn bulk_purge(state: State<'_, AppState>, ids: Vec<i64>) -> Result<(), String> {
+async fn bulk_purge(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<(), String> {
     db::entries::bulk_purge(&state.db, &ids)
         .await
         .map_err(|e| e.to_string())?;
+    for id in &ids {
+        remove_entry_attachment_dir(&app, *id);
+    }
     request_sync(&state);
     Ok(())
 }
@@ -257,14 +264,26 @@ async fn is_citation_key_available(
 }
 
 #[tauri::command]
-async fn delete_entry(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    // attachments の cascade では fulltext は消えないので先に消す
-    let _ = db::fulltext::unindex_entry(&state.db, id).await;
+async fn delete_entry(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<(), String> {
+    // fulltext のクリーンアップは db::entries::delete_entry 内で行われる
     db::entries::delete_entry(&state.db, id)
         .await
         .map_err(|e| e.to_string())?;
+    remove_entry_attachment_dir(&app, id);
     request_sync(&state);
     Ok(())
+}
+
+/// hard delete 後に添付の実ファイル（attachments/<entry_id>/）を削除する。
+/// DB 削除成功後に呼ぶ。ファイル側の失敗は無視する。
+fn remove_entry_attachment_dir(app: &tauri::AppHandle, entry_id: i64) {
+    if let Ok(root) = attachments_root(app) {
+        let _ = std::fs::remove_dir_all(root.join(entry_id.to_string()));
+    }
 }
 
 #[tauri::command]

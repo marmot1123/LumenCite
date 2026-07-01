@@ -509,6 +509,14 @@ async fn execute_delete_entry(
 
     crate::db::entries::delete_entry(ctx.pool, entry_id).await?;
 
+    // 添付の実ファイル（attachments/<entry_id>/）も削除する。DB 削除は成功して
+    // いるので、ファイル削除の失敗は致命的でない（無視）。
+    let dir = ctx
+        .app_data_dir
+        .join("attachments")
+        .join(entry_id.to_string());
+    let _ = std::fs::remove_dir_all(dir);
+
     Ok(format!("Entry {} permanently deleted.", entry_id))
 }
 
@@ -696,6 +704,48 @@ mod tests {
     }
 
     // ── unknown tool → None ───────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_entry_removes_attachment_dir_and_fulltext(pool: SqlitePool) {
+        let entry_id = make_entry(&pool, "Doomed").await;
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry_id,
+            &format!("attachments/{entry_id}/a.pdf"),
+            "a.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap();
+        crate::db::fulltext::index_attachment(&pool, att.id, &[(1, "needle".to_string())])
+            .await
+            .unwrap();
+
+        // 一時 app_data_dir に添付の実ファイルを用意する
+        let base = std::env::temp_dir().join(format!(
+            "lumencite-test-{}-{}",
+            std::process::id(),
+            entry_id
+        ));
+        let dir = base.join("attachments").join(entry_id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.pdf"), b"pdf").unwrap();
+
+        let ctx = ToolContext { app_data_dir: &base, ..make_ctx(&pool) };
+        let c = call("delete_entry", json!({"entry_id": entry_id}));
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        assert!(!dir.exists(), "attachment dir must be removed from disk");
+        let orphans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
+                .bind(att.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphans, 0, "fulltext rows must be cleaned up");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn unknown_tool_returns_none(pool: SqlitePool) {

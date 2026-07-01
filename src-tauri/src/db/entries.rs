@@ -1133,6 +1133,17 @@ pub async fn delete_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error>
         .execute(&mut *tx)
         .await?;
 
+    // fulltext は attachments への FK が無く cascade では消えないため、ここで消す。
+    // 呼び出し元（Tauri コマンド / チャットツール / MCP）すべてで漏れなく効く。
+    sqlx::query(
+        "DELETE FROM fulltext WHERE attachment_id IN (
+            SELECT id FROM attachments WHERE entry_id = ?
+        )",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
     let rows_affected = sqlx::query("DELETE FROM entries WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)

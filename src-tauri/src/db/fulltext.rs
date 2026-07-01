@@ -72,19 +72,6 @@ pub async fn unindex_attachment(
     Ok(())
 }
 
-/// 指定 entry に紐づくすべての添付の fulltext を消す。entry 削除前に呼ぶ想定。
-pub async fn unindex_entry(pool: &SqlitePool, entry_id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM fulltext WHERE attachment_id IN (
-            SELECT id FROM attachments WHERE entry_id = ?
-        )",
-    )
-    .bind(entry_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 pub async fn is_indexed(pool: &SqlitePool, attachment_id: i64) -> Result<bool, sqlx::Error> {
     let row =
         sqlx::query("SELECT COUNT(*) AS cnt FROM fulltext WHERE attachment_id = ?")
@@ -375,6 +362,24 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn delete_entry_removes_fulltext_rows(pool: SqlitePool) {
+        let (entry_id, att_id) = setup_attachment(&pool, "Paper").await;
+        index_attachment(&pool, att_id, &[(1, "needle".to_string())])
+            .await
+            .unwrap();
+
+        crate::db::entries::delete_entry(&pool, entry_id).await.unwrap();
+
+        let orphans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
+                .bind(att_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphans, 0, "hard delete must not orphan fulltext rows");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn unindex_removes_rows(pool: SqlitePool) {
         let (_, att_id) = setup_attachment(&pool, "Paper").await;
         index_attachment(&pool, att_id, &[(1, "needle".to_string())])
@@ -466,7 +471,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn unindex_entry_removes_all_attachments(pool: SqlitePool) {
+    async fn delete_entry_removes_fulltext_of_all_attachments(pool: SqlitePool) {
         let (entry_id, att1) = setup_attachment(&pool, "Paper").await;
         let att2 = add_attachment(
             &pool,
@@ -486,7 +491,7 @@ mod tests {
             .await
             .unwrap();
 
-        unindex_entry(&pool, entry_id).await.unwrap();
+        crate::db::entries::delete_entry(&pool, entry_id).await.unwrap();
 
         let hits_a = search_fulltext(&pool, "alpha", None, None).await.unwrap();
         let hits_b = search_fulltext(&pool, "beta", None, None).await.unwrap();
