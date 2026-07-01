@@ -1,6 +1,7 @@
 mod backup;
 mod bibtex;
 mod db;
+mod download;
 mod keychain;
 mod llm;
 mod mcp;
@@ -589,29 +590,7 @@ fn attachments_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("attachments"))
 }
 
-fn unique_dest(dir: &std::path::Path, file_name: &str) -> PathBuf {
-    let candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let (stem, ext) = match file_name.rsplit_once('.') {
-        Some((s, e)) => (s.to_string(), format!(".{e}")),
-        None => (file_name.to_string(), String::new()),
-    };
-    for i in 1..1000 {
-        let next = dir.join(format!("{stem}_{i}{ext}"));
-        if !next.exists() {
-            return next;
-        }
-    }
-    dir.join(format!(
-        "{stem}_{}{ext}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ))
-}
+use download::unique_dest;
 
 #[tauri::command]
 async fn pick_pdf_file(app: tauri::AppHandle) -> Result<Option<String>, String> {

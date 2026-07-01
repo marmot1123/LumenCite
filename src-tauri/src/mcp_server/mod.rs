@@ -668,10 +668,35 @@ fn read_body(req: &mut tiny_http::Request) -> Result<String, (u16, &'static str)
     Ok(body)
 }
 
-/// PDF ダウンロードジョブを応答後に spawn する（実体は M3 で実装）。
-fn spawn_pdf_job(_deps: &ServerDeps, _job: clipper::PdfJob) {
-    // M3: download_and_attach を tauri::async_runtime::spawn で実行し、
-    // 成功時に sync_tx + entries-changed を発火する。
+/// PDF ダウンロードジョブを応答後に非同期実行する。成功したら `entries-changed` で
+/// UI に反映する（添付は .bib の内容に影響しないため sync はキックしない）。
+/// 失敗（ペイウォール・サイズ超過等）はログのみ — エントリ作成は既に成功している。
+fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
+    let pool = deps.pool.clone();
+    let app_data_dir = deps.app_data_dir.clone();
+    let app = deps.app.clone();
+    tauri::async_runtime::spawn(async move {
+        use tauri::Emitter;
+        match crate::download::download_and_attach(
+            &pool,
+            &app_data_dir,
+            job.entry_id,
+            &job.url,
+            crate::download::DownloadCaps::default(),
+        )
+        .await
+        {
+            Ok(att) => {
+                eprintln!("clipper: attached {} to entry {}", att.file_name, job.entry_id);
+                if let Some(app) = &app {
+                    let _ = app.emit("entries-changed", ());
+                }
+            }
+            Err(e) => {
+                eprintln!("clipper: PDF download failed for entry {}: {e}", job.entry_id);
+            }
+        }
+    });
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
