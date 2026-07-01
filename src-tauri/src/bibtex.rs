@@ -276,14 +276,39 @@ pub async fn export_bibtex(
         entries.push(get_entry(pool, id).await.map_err(|e| e.to_string())?);
     }
 
+    // 出力オプションは pool から直接読む。これにより export / save / sync / MCP の
+    // 全経路がシグネチャ変更なしで同じ設定を反映する。
+    let opts = ExportOptions::load(pool).await?;
+
     let keys = assign_keys(&entries);
     let parts: Vec<String> = entries
         .iter()
         .zip(keys.iter())
-        .map(|(entry, key)| entry_to_bibtex(entry, key))
+        .map(|(entry, key)| entry_to_bibtex(entry, key, &opts))
         .collect();
 
     Ok(parts.join("\n"))
+}
+
+/// BibTeX 出力時のオプション。settings テーブルから読み込む。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExportOptions {
+    /// abstract / note フィールドを出力しない。
+    pub exclude_abstract_note: bool,
+}
+
+impl ExportOptions {
+    async fn load(pool: &SqlitePool) -> Result<Self, String> {
+        let exclude_abstract_note = crate::db::settings::get_setting(
+            pool,
+            crate::db::settings::BIBTEX_EXCLUDE_ABSTRACT_NOTE_KEY,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .as_deref()
+            == Some("1");
+        Ok(ExportOptions { exclude_abstract_note })
+    }
 }
 
 /// `(ピン留めキー, 自動 base)` の列に、export と同じ規則で最終的な cite key を割り当てる。
@@ -415,7 +440,72 @@ pub async fn sync_bibtex(pool: &SqlitePool, path: &std::path::Path) -> Result<()
     Ok(())
 }
 
-fn entry_to_bibtex(entry: &EntryDetail, key: &str) -> String {
+/// BibTeX/LaTeX のフィールド値に含まれる TeX 特殊文字をエスケープする。
+/// `_` `&` `%` `#` `$` `{` `}` `~` `^` `\` を 1 パスで置換するため二重エスケープしない
+/// （`\` → `\textbackslash{}` が生む `{}` を再走査しない）。
+/// `$…$` / `$$…$$` の数式区間は意図的な LaTeX とみなし、そのまま出力する
+/// （タイトルや抄録中の数式を壊さないため）。誤検出（金額表記など）を防ぐため、
+/// 開き delimiter の直後・閉じ delimiter の直前が空白の組は数式とみなさない
+/// （例: "between $5 and $10" は両方エスケープされる）。
+/// biblatex の verbatim フィールド（url/doi/eprint）には適用しないこと
+/// （URL/DOI 内の `_` 等を壊すため）。
+fn escape_bibtex(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            if let Some(end) = math_segment_end(&chars, i) {
+                out.extend(&chars[i..=end]);
+                i = end + 1;
+                continue;
+            }
+        }
+        match chars[i] {
+            '\\' => out.push_str("\\textbackslash{}"),
+            '&'  => out.push_str("\\&"),
+            '%'  => out.push_str("\\%"),
+            '$'  => out.push_str("\\$"),
+            '#'  => out.push_str("\\#"),
+            '_'  => out.push_str("\\_"),
+            '{'  => out.push_str("\\{"),
+            '}'  => out.push_str("\\}"),
+            '~'  => out.push_str("\\textasciitilde{}"),
+            '^'  => out.push_str("\\textasciicircum{}"),
+            c    => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `chars[start]` が `$` のとき、そこから始まる有効な数式区間の終端 index
+/// （閉じ delimiter の最後の `$` の位置）を返す。有効な区間がなければ `None`。
+/// `$$` で開いた区間は `$$` でのみ閉じる。
+fn math_segment_end(chars: &[char], start: usize) -> Option<usize> {
+    let delim = if chars.get(start + 1) == Some(&'$') { 2 } else { 1 };
+    let content_start = start + delim;
+    // 開き delimiter の直後が空白・`$`・末尾なら数式とみなさない
+    match chars.get(content_start) {
+        Some(c) if !c.is_whitespace() && *c != '$' => {}
+        _ => return None,
+    }
+    let mut j = content_start;
+    while j < chars.len() {
+        if chars[j] == '$' && !chars[j - 1].is_whitespace() {
+            if delim == 1 {
+                return Some(j);
+            }
+            if chars.get(j + 1) == Some(&'$') {
+                return Some(j + 1);
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+fn entry_to_bibtex(entry: &EntryDetail, key: &str, opts: &ExportOptions) -> String {
     // 内部の種別キー → BibTeX(biblatex) のエントリ型。biblatex 前提（@online 等を使う）。
     // 対応する標準型が無いもの（preprint/presentation/standard 等）は @misc に丸める。
     let bib_type = match entry.entry_type.as_str() {
@@ -439,11 +529,13 @@ fn entry_to_bibtex(entry: &EntryDetail, key: &str) -> String {
 
     let mut fields: Vec<String> = Vec::new();
 
-    fields.push(format!("  title      = {{{}}}", entry.title));
+    fields.push(format!("  title      = {{{}}}", escape_bibtex(&entry.title)));
 
     if !entry.authors.is_empty() {
+        // 各著者名を個別にエスケープしてから " and " で連結する
+        // （区切りの " and " 自体はエスケープ対象に含まれない）。
         let author_str = entry.authors.iter()
-            .map(|a| a.name.as_str())
+            .map(|a| escape_bibtex(&a.name))
             .collect::<Vec<_>>()
             .join(" and ");
         fields.push(format!("  author     = {{{}}}", author_str));
@@ -465,17 +557,20 @@ fn entry_to_bibtex(entry: &EntryDetail, key: &str) -> String {
     if let Some(url) = &entry.url {
         fields.push(format!("  url        = {{{}}}", url));
     }
-    if let Some(abs) = &entry.abstract_ {
-        fields.push(format!("  abstract   = {{{}}}", abs));
-    }
-    if let Some(notes) = &entry.notes {
-        fields.push(format!("  note       = {{{}}}", notes));
+    // abstract / note は普段使わず不正文字や別言語が混入しがちなため、設定で除外できる。
+    if !opts.exclude_abstract_note {
+        if let Some(abs) = &entry.abstract_ {
+            fields.push(format!("  abstract   = {{{}}}", escape_bibtex(abs)));
+        }
+        if let Some(notes) = &entry.notes {
+            fields.push(format!("  note       = {{{}}}", escape_bibtex(notes)));
+        }
     }
 
     let mut extra: Vec<_> = entry.extra_fields.iter().collect();
     extra.sort_by_key(|(k, _)| k.as_str());
     for (k, v) in extra {
-        fields.push(format!("  {:<10} = {{{}}}", k, v));
+        fields.push(format!("  {:<10} = {{{}}}", k, escape_bibtex(v)));
     }
 
     format!("@{}{{{},\n{}\n}}", bib_type, key, fields.join(",\n"))
@@ -705,6 +800,126 @@ mod tests {
         let result = import_bibtex(&pool, bib).await.unwrap();
         assert_eq!(result.imported, 0);
         assert_eq!(result.skipped, 1);
+    }
+
+    // ── escaping ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn escape_bibtex_specials() {
+        // TeX 特殊文字はすべてエスケープされる
+        assert_eq!(escape_bibtex("a_b"), "a\\_b");
+        assert_eq!(escape_bibtex("Tom & Jerry"), "Tom \\& Jerry");
+        assert_eq!(escape_bibtex("100%"), "100\\%");
+        assert_eq!(escape_bibtex("C#"), "C\\#");
+        assert_eq!(escape_bibtex("$5"), "\\$5");
+        assert_eq!(escape_bibtex("a{b}c"), "a\\{b\\}c");
+        assert_eq!(escape_bibtex("a~b"), "a\\textasciitilde{}b");
+        assert_eq!(escape_bibtex("a^b"), "a\\textasciicircum{}b");
+        // バックスラッシュは 1 パスで処理し二重エスケープしない
+        assert_eq!(escape_bibtex("a\\b"), "a\\textbackslash{}b");
+        // 通常文字・ユニコードはそのまま
+        assert_eq!(escape_bibtex("université 日本語"), "université 日本語");
+    }
+
+    #[test]
+    fn escape_bibtex_preserves_math_segments() {
+        // $…$ 区間は数式としてそのまま出力する（\ ^ _ { } もエスケープしない）
+        assert_eq!(escape_bibtex("$\\phi^4$ theory"), "$\\phi^4$ theory");
+        assert_eq!(escape_bibtex("On $O(n \\log n)$ time"), "On $O(n \\log n)$ time");
+        assert_eq!(escape_bibtex("$x_i$ and $y^{2}$"), "$x_i$ and $y^{2}$");
+        // $$…$$（ディスプレイ数式）も保護する
+        assert_eq!(escape_bibtex("$$E=mc^2$$"), "$$E=mc^2$$");
+        // 数式区間の外は従来どおりエスケープする
+        assert_eq!(escape_bibtex("A & B: $x_1$"), "A \\& B: $x_1$");
+        assert_eq!(escape_bibtex("$\\alpha$-decay 100%"), "$\\alpha$-decay 100\\%");
+    }
+
+    #[test]
+    fn escape_bibtex_escapes_non_math_dollars() {
+        // 対応する閉じ $ がない場合は数式とみなさずエスケープする
+        assert_eq!(escape_bibtex("costs 100$"), "costs 100\\$");
+        assert_eq!(escape_bibtex("$5 off"), "\\$5 off");
+        // 開き直後・閉じ直前が空白の組は数式とみなさない（金額などの誤検出防止）
+        assert_eq!(
+            escape_bibtex("between $5 and $10"),
+            "between \\$5 and \\$10"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_escapes_special_chars_in_fields(pool: sqlx::SqlitePool) {
+        let input = EntryInput {
+            title: "Deep_Learning & AI: 100% #1".to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["A_B Smith".to_string()],
+            year: Some(2020),
+            abstract_: Some("uses x_i and y_j".to_string()),
+            extra_fields: [("journal".to_string(), "J_Phys & Chem".to_string())].into(),
+            ..Default::default()
+        };
+        let entry = create_entry(&pool, &input).await.unwrap();
+
+        let bib = export_bibtex(&pool, Some(vec![entry.id])).await.unwrap();
+
+        assert!(bib.contains("Deep\\_Learning \\& AI: 100\\% \\#1"), "title escaped: {bib}");
+        assert!(bib.contains("A\\_B Smith"), "author escaped: {bib}");
+        assert!(bib.contains("uses x\\_i and y\\_j"), "abstract escaped: {bib}");
+        assert!(bib.contains("J\\_Phys \\& Chem"), "extra field escaped: {bib}");
+        // 生の特殊文字（エスケープ漏れ）が残っていないこと
+        assert!(!bib.contains("Deep_Learning"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_does_not_escape_verbatim_fields(pool: sqlx::SqlitePool) {
+        // biblatex の url/doi/eprint は verbatim フィールド。アンダースコア等を
+        // エスケープすると URL/DOI が壊れるため、そのまま出力する。
+        let input = EntryInput {
+            title: "T".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1007/s00211-019-01077_8".to_string()),
+            url: Some("https://ex.com/a_b?x=1&y=2#frag".to_string()),
+            arxiv_id: Some("2017_v1".to_string()),
+            ..Default::default()
+        };
+        let entry = create_entry(&pool, &input).await.unwrap();
+
+        let bib = export_bibtex(&pool, Some(vec![entry.id])).await.unwrap();
+
+        assert!(bib.contains("10.1007/s00211-019-01077_8"), "doi verbatim: {bib}");
+        assert!(bib.contains("https://ex.com/a_b?x=1&y=2#frag"), "url verbatim: {bib}");
+        assert!(bib.contains("2017_v1"), "eprint verbatim: {bib}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_excludes_abstract_and_note_when_enabled(pool: sqlx::SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "T".to_string(),
+            entry_type: "article".to_string(),
+            abstract_: Some("some abstract text".to_string()),
+            notes: Some("a private note".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        // 既定（未設定）では出力される
+        let bib_default = export_bibtex(&pool, Some(vec![entry.id])).await.unwrap();
+        assert!(bib_default.contains("abstract"), "default keeps abstract: {bib_default}");
+        assert!(bib_default.contains("some abstract text"));
+        assert!(bib_default.contains("a private note"));
+
+        // フラグを立てると abstract / note は出力されない
+        crate::db::settings::set_setting(
+            &pool,
+            crate::db::settings::BIBTEX_EXCLUDE_ABSTRACT_NOTE_KEY,
+            "1",
+        ).await.unwrap();
+
+        let bib_excluded = export_bibtex(&pool, Some(vec![entry.id])).await.unwrap();
+        assert!(!bib_excluded.contains("abstract"), "excluded drops abstract: {bib_excluded}");
+        assert!(!bib_excluded.contains("some abstract text"));
+        assert!(!bib_excluded.contains("note"), "excluded drops note: {bib_excluded}");
+        assert!(!bib_excluded.contains("a private note"));
+        // 他フィールドは維持される
+        assert!(bib_excluded.contains("title"));
     }
 
     // ── export tests ──────────────────────────────────────────────────────────

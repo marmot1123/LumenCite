@@ -375,7 +375,10 @@
     "syncError": "同期エラー: {{error}}",
     "lastSynced": "最終同期: {{time}}",
     "neverSynced": "まだ同期されていません",
-    "disabled": "同期は無効です"
+    "disabled": "同期は無効です",
+    "optionsLabel": "出力オプション",
+    "excludeAbstractNote": "abstract / note を出力しない",
+    "excludeAbstractNoteHint": "概要やノートを BibTeX に書き出しません（不正な文字や別言語が混入しがちなため）。エクスポート・MCP 出力にも適用されます。"
   },
   "entriesTable": {
     "colTitle": "タイトル",

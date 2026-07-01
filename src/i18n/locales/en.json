@@ -375,7 +375,10 @@
     "syncError": "Sync error: {{error}}",
     "lastSynced": "Last synced: {{time}}",
     "neverSynced": "Not synced yet",
-    "disabled": "Sync is disabled"
+    "disabled": "Sync is disabled",
+    "optionsLabel": "Export options",
+    "excludeAbstractNote": "Exclude abstract / note",
+    "excludeAbstractNoteHint": "Do not write abstract or note fields to BibTeX (they often contain invalid characters or other languages). Also applies to manual export and MCP output."
   },
   "entriesTable": {
     "colTitle": "Title",

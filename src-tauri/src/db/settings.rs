@@ -33,6 +33,10 @@ pub async fn delete_setting(pool: &SqlitePool, key: &str) -> Result<(), sqlx::Er
 /// BibTeX 同期先パスの設定キー。
 pub const BIBTEX_SYNC_PATH_KEY: &str = "bibtex_sync_path";
 
+/// BibTeX 出力（同期・エクスポート）で abstract / note フィールドを除外するフラグ
+/// （"1" で除外）。普段使わない上に不正文字や別言語が混入しがちなため。
+pub const BIBTEX_EXCLUDE_ABSTRACT_NOTE_KEY: &str = "bibtex.exclude_abstract_note";
+
 pub const LLM_PROVIDER_KEY: &str = "llm.provider";
 pub const LLM_MODEL_KEY: &str = "llm.model";
 pub const LLM_SUMMARY_SOURCE_KEY: &str = "llm.summary_source";

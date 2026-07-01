@@ -303,8 +303,12 @@ type McpServerInfo = McpServerConfig & {
 | `get_bibtex_sync_path` | — | `Option<String>` — `settings.bibtex_sync_path` の値 |
 | `set_bibtex_sync_path` | `path: String` | `Result<()>` — 設定後に即同期リクエストを送る |
 | `clear_bibtex_sync_path` | — | `Result<()>` — 同期を無効化 |
+| `get_bibtex_exclude_abstract_note` | — | `Result<bool>` — `settings.bibtex.exclude_abstract_note`（`"1"` で true） |
+| `set_bibtex_exclude_abstract_note` | `exclude: bool` | `Result<()>` — 設定後に即同期リクエストを送る。BibTeX 出力（同期・エクスポート・MCP）から abstract / note を除外する |
 | `pick_bibtex_sync_path` | `default_name?: String` | `Result<Option<String>>` — 保存ダイアログを開き選択パスを返す（キャンセル時 None） |
 | `sync_bibtex_now` | — | `Result<()>` — debounce をバイパスして即時書き出し |
+
+BibTeX 出力時はフィールド値の TeX 特殊文字（`_ & % # $ { } ~ ^ \`）を自動エスケープする（biber/biblatex のパースエラー防止）。ただし biblatex の verbatim フィールド（`url` / `doi` / `eprint`）と数値・ISBN は URL/DOI を壊さないようエスケープしない。また `$…$` / `$$…$$` の数式区間は意図的な LaTeX とみなし保護する（区間内はエスケープしない）。誤検出防止のため、開き `$` の直後・閉じ `$` の直前が空白の組（例: `between $5 and $10`）は数式とみなさない。
 
 ミューテーション系コマンド（`create_entry` / `update_entry` / `delete_entry` / `trash_entry` / `restore_entry` / `bulk_*` / `import_bibtex`）が呼ばれると、内部の `sync_tx` 経由でコーディネーターに通知される。コーディネーターは 800ms の trailing-edge デバウンスで `bibtex::sync_bibtex` を呼び出し、書き込み完了/失敗を `bibtex-synced` イベントで UI に通知する。
 
