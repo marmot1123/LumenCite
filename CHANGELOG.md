@@ -5,6 +5,17 @@ All notable changes to LumenCite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Web Clipper (Chrome extension)** — a toolbar button that saves the paper on the current page to LumenCite. The extension extracts identifiers (DOI / arXiv / ISBN from `citation_*` meta tags, URL patterns and `doi.org` canonical links); the app resolves metadata (CrossRef / arXiv / OpenLibrary), skips duplicates, and creates the entry. Pages without an identifier are saved as `webpage` entries. arXiv PDFs (and `citation_pdf_url`) are downloaded and attached automatically (50 MB cap, `%PDF-` validation). Served by the existing localhost HTTP server on a new `/clipper` route, gated by its own opt-in toggle (`clipper.enabled`, default off) independent of MCP write access. Pairing uses a copyable connect code from Settings → Chat → Web Clipper. The repository is now a pnpm workspace with the extension under `extension/`.
+- **BibTeX export hardening** — TeX special characters are escaped on export (with `$…$` math protection so formulas in titles/abstracts survive), and a new option excludes abstract/note fields from all BibTeX outputs.
+
+### Fixed
+
+- Data-loss and race fixes from the 2026-07 code review: OCR no longer destroys the fulltext index on failure, hard-deleting entries removes attachment files from disk, chat write tools trigger `.bib` auto-sync, per-entry PDF page state no longer leaks across entries, shared theme/language state, real app version in Settings, and more (PRs #18 / #19).
+
 ## [0.4.0] - 2026-06-29
 
 Two headline features. The entry-type set expands from 6 to 19 (Zotero-aligned), and LumenCite can now act as an **MCP server**, so Claude Desktop / Claude Code can read and (optionally) write your library using your Claude subscription instead of API tokens — LumenCite never calls an LLM itself, so no API key is needed. See `docs/SPEC.md` (「MCP サーバー公開」section) and `docs/API_SPEC.md`.

@@ -59,7 +59,22 @@ cd src-tauri && cargo test
 
 # Frontend (型 + ビルド)
 pnpm build
+
+# ブラウザ拡張
+pnpm --filter lumencite-clipper test
 ```
+
+## Browser extension (Web Clipper)
+
+`extension/` に Chrome 拡張（Manifest V3）があります。論文ページでツールバーボタンをクリックすると、起動中の LumenCite にエントリを作成します（DOI / arXiv / ISBN を自動抽出、arXiv は PDF も自動添付）。
+
+```bash
+pnpm --filter lumencite-clipper build   # extension/dist を生成
+```
+
+1. `chrome://extensions` → デベロッパーモード → 「パッケージ化されていない拡張機能を読み込む」で `extension/dist` を選択
+2. LumenCite の 設定 → Chat → **Web クリッパー** を有効化し、接続コードをコピー
+3. 拡張のオプションページに接続コードを貼り付けて保存
 
 ## Documentation
 
