@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import type { ThemeMode, AccentName, Density, ResolvedTheme } from "../types";
 
 const ACCENTS: Record<AccentName, { strong: string; soft: string; ring: string }> = {
@@ -68,27 +68,78 @@ function ls<T>(key: string, fallback: T): T {
   catch { return fallback; }
 }
 
+// テーマ状態はモジュールレベルの単一ストアで共有する。
+// フックごとに独立 useState を持つと、設定モーダルでの変更が他のコンポーネント
+// （App の density、サイドバー等）に伝播せず、App 側に残った古い "auto" が
+// OS のライト/ダーク切替時にユーザーの明示的な選択を上書きしてしまう。
+type ThemeState = {
+  theme: ThemeMode;
+  accent: AccentName;
+  density: Density;
+  systemTheme: ResolvedTheme;
+};
+
+let state: ThemeState = {
+  theme: ls("lc-theme", "auto"),
+  accent: ls("lc-accent", "amber"),
+  density: ls("lc-density", "default"),
+  systemTheme: readSystemTheme(),
+};
+
+const listeners = new Set<() => void>();
+
+function resolvedOf(s: ThemeState): ResolvedTheme {
+  return s.theme === "auto" ? s.systemTheme : s.theme;
+}
+
+function setState(patch: Partial<ThemeState>) {
+  state = { ...state, ...patch };
+  applyTheme(resolvedOf(state), state.accent);
+  listeners.forEach((l) => l());
+}
+
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+if (typeof window !== "undefined" && window.matchMedia) {
+  // OS のライト/ダーク切替に追従（モジュールで一度だけ購読）
+  window
+    .matchMedia("(prefers-color-scheme: dark)")
+    .addEventListener("change", (e) => setState({ systemTheme: e.matches ? "dark" : "light" }));
+  // 別ウィンドウ（PDF ビューワー）からの変更にも追従する
+  window.addEventListener("storage", (e) => {
+    if (e.key === "lc-theme") setState({ theme: ls("lc-theme", "auto") });
+    if (e.key === "lc-accent") setState({ accent: ls("lc-accent", "amber") });
+    if (e.key === "lc-density") setState({ density: ls("lc-density", "default") });
+  });
+  // 初期適用（従来はマウント時 effect で行っていた）
+  applyTheme(resolvedOf(state), state.accent);
+}
+
+const setTheme = (t: ThemeMode) => {
+  localStorage.setItem("lc-theme", JSON.stringify(t));
+  setState({ theme: t });
+};
+const setAccent = (a: AccentName) => {
+  localStorage.setItem("lc-accent", JSON.stringify(a));
+  setState({ accent: a });
+};
+const setDensity = (d: Density) => {
+  localStorage.setItem("lc-density", JSON.stringify(d));
+  setState({ density: d });
+};
+
 export function useTheme() {
-  const [theme, setThemeState] = useState<ThemeMode>(() => ls("lc-theme", "auto"));
-  const [accent, setAccentState] = useState<AccentName>(() => ls("lc-accent", "amber"));
-  const [density, setDensityState] = useState<Density>(() => ls("lc-density", "default"));
-  const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() => readSystemTheme());
-
-  useEffect(() => {
-    if (typeof window === "undefined" || !window.matchMedia) return;
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = (e: MediaQueryListEvent) => setSystemTheme(e.matches ? "dark" : "light");
-    mq.addEventListener("change", handler);
-    return () => mq.removeEventListener("change", handler);
-  }, []);
-
-  const resolved: ResolvedTheme = theme === "auto" ? systemTheme : theme;
-
-  useEffect(() => { applyTheme(resolved, accent); }, [resolved, accent]);
-
-  const setTheme = (t: ThemeMode) => { setThemeState(t); localStorage.setItem("lc-theme", JSON.stringify(t)); };
-  const setAccent = (a: AccentName) => { setAccentState(a); localStorage.setItem("lc-accent", JSON.stringify(a)); };
-  const setDensity = (d: Density) => { setDensityState(d); localStorage.setItem("lc-density", JSON.stringify(d)); };
-
-  return { theme, accent, density, resolved, setTheme, setAccent, setDensity };
+  const s = useSyncExternalStore(subscribe, () => state);
+  return {
+    theme: s.theme,
+    accent: s.accent,
+    density: s.density,
+    resolved: resolvedOf(s),
+    setTheme,
+    setAccent,
+    setDensity,
+  };
 }

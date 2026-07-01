@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
+import i18n from "../i18n";
 import type { AppLanguage } from "../i18n";
 
 const STORAGE_KEY = "lc-language";
@@ -21,29 +22,44 @@ function readStored(): LanguageSetting {
   return "auto";
 }
 
+// 言語設定はモジュールレベルで共有する（useTheme と同じ理由：フックごとの
+// useState だと、コマンドパレットで切り替えても設定モーダルの表示が古いまま残る）。
+let setting: LanguageSetting = readStored();
+const listeners = new Set<() => void>();
+
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function apply(s: LanguageSetting) {
+  const effective = s === "auto" ? resolveAuto() : s;
+  if (i18n.language !== effective) {
+    void i18n.changeLanguage(effective);
+  }
+}
+
+// 起動時に保存済み設定を反映（従来は最初のフックのマウント時に行っていた）
+apply(setting);
+
+const setLanguage = (value: LanguageSetting) => {
+  setting = value;
+  try {
+    localStorage.setItem(STORAGE_KEY, value);
+  } catch {
+    /* noop */
+  }
+  apply(value);
+  listeners.forEach((l) => l());
+};
+
 export function useLanguage() {
-  const { i18n } = useTranslation();
-  const [setting, setSetting] = useState<LanguageSetting>(() => readStored());
-
-  useEffect(() => {
-    const effective = setting === "auto" ? resolveAuto() : setting;
-    if (i18n.language !== effective) {
-      void i18n.changeLanguage(effective);
-    }
-  }, [setting, i18n]);
-
-  const setLanguage = useCallback((value: LanguageSetting) => {
-    setSetting(value);
-    try {
-      localStorage.setItem(STORAGE_KEY, value);
-    } catch {
-      /* noop */
-    }
-  }, []);
-
+  // useTranslation を挟むことで言語変更時に再レンダーされ、effective が追従する
+  const { i18n: i18nHook } = useTranslation();
+  const s = useSyncExternalStore(subscribe, () => setting);
   return {
-    setting,
-    effective: i18n.language as AppLanguage,
+    setting: s,
+    effective: i18nHook.language as AppLanguage,
     setLanguage,
   };
 }
