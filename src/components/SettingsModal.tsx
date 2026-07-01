@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTheme } from "../hooks/useTheme";
 import { useLanguage } from "../hooks/useLanguage";
@@ -24,7 +25,18 @@ interface SettingsModalProps {
   initialTab?: TabId;
 }
 
-const APP_VERSION = "0.2.0";
+// tauri.conf.json の version を実行時に取得する（ハードコードすると更新漏れする）
+let cachedAppVersion = "";
+function useAppVersion(): string {
+  const [version, setVersion] = useState(cachedAppVersion);
+  useEffect(() => {
+    if (cachedAppVersion) return;
+    getVersion()
+      .then((v) => { cachedAppVersion = v; setVersion(v); })
+      .catch(() => { /* noop */ });
+  }, []);
+  return version;
+}
 
 const TABS: { id: TabId; iconName: Parameters<typeof Icon>[0]["name"] }[] = [
   { id: "appearance", iconName: "sparkle" },
@@ -499,6 +511,7 @@ function BibtexTab({ onOpenBibtexSync }: { onOpenBibtexSync: () => void }) {
 
 function UpdatesTab() {
   const { t } = useTranslation();
+  const appVersion = useAppVersion();
   const [channel, setChannel] = useState<"stable" | "beta">("stable");
   const [status, setStatus] = useState<
     "idle" | "checking" | "up_to_date" | "available" | "downloading" | "installing" | "error"
@@ -545,7 +558,7 @@ function UpdatesTab() {
     <>
       <Section title={t("settings.updates.title")}>
         <div style={{ fontSize: 12.5, color: "var(--text)", marginBottom: 10 }}>
-          {t("settings.updates.currentVersion", { version: APP_VERSION })}
+          {t("settings.updates.currentVersion", { version: appVersion })}
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           <SecondaryBtn onClick={handleCheck} disabled={status === "checking" || status === "downloading" || status === "installing"}>
@@ -716,6 +729,7 @@ function DataTab() {
 
 function AboutTab() {
   const { t } = useTranslation();
+  const appVersion = useAppVersion();
   const open = (url: string) => { void openUrl(url); };
   return (
     <>
@@ -735,7 +749,7 @@ function AboutTab() {
 
       <Section title={t("settings.about.appTitle")}>
         <div style={{ fontSize: 12.5, color: "var(--text)", marginBottom: 4 }}>
-          {t("settings.about.version", { version: APP_VERSION })}
+          {t("settings.about.version", { version: appVersion })}
         </div>
         <div style={{ fontSize: 12.5, color: "var(--text)", marginBottom: 10 }}>
           {t("settings.about.license")}
