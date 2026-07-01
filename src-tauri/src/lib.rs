@@ -1152,6 +1152,8 @@ struct ChannelHost {
     runtime: Arc<ChatRuntime>,
     session_id: i64,
     cancel: Arc<AtomicBool>,
+    /// `.bib` 自動同期コーディネーターへの通知用（write ツール成功時にキック）。
+    sync_tx: UnboundedSender<()>,
 }
 
 fn role_label(role: llm::Role) -> String {
@@ -1211,6 +1213,12 @@ impl llm::chat::ChatLoopHost for ChannelHost {
 
     fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
+    }
+
+    fn on_db_mutated(&mut self) {
+        // write ツール成功のたびにキック（800ms デバウンスされるので回数は問題ない）。
+        // ループがエラーで終わっても実行済みの書き換えは同期される。
+        let _ = self.sync_tx.send(());
     }
 }
 
@@ -1517,6 +1525,7 @@ async fn chat_send_message(
         runtime: state.chat.clone(),
         session_id,
         cancel,
+        sync_tx: state.sync_tx.clone(),
     };
 
     let ctx = llm::tools::ToolContext {

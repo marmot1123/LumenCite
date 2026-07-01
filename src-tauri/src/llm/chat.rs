@@ -51,6 +51,9 @@ pub trait ChatLoopHost: Send {
     async fn on_message_persisted(&mut self, message_id: i64, role: Role);
     /// 中断要求が来ているか（毎ターン頭で確認）。
     fn is_cancelled(&self) -> bool;
+    /// ローカル DB を書き換えるツールが成功した（`.bib` 同期などの副作用用）。
+    /// ループがエラーで終わっても、それまでの書き換え分は通知済みになる。
+    fn on_db_mutated(&mut self) {}
 }
 
 /// assistant の各 `tool_use` には、直後に対応する `tool_result` が必要（OpenAI / Anthropic とも）。
@@ -177,7 +180,12 @@ pub async fn run_chat_loop(
                 format!("The user denied the tool call `{}`.", call.tool_name)
             } else {
                 match tools::execute_tool(ctx, call).await {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        if tools::is_local_write_tool(&call.tool_name) {
+                            host.on_db_mutated();
+                        }
+                        s
+                    }
                     Err(e) => format!("Tool `{}` failed: {e}", call.tool_name),
                 }
             };
@@ -276,6 +284,7 @@ mod tests {
         persisted: Vec<(i64, Role)>,
         approvals: VecDeque<bool>,
         cancelled: bool,
+        db_mutations: usize,
     }
 
     #[async_trait::async_trait]
@@ -298,6 +307,9 @@ mod tests {
         }
         fn is_cancelled(&self) -> bool {
             self.cancelled
+        }
+        fn on_db_mutated(&mut self) {
+            self.db_mutations += 1;
         }
     }
 
@@ -374,6 +386,50 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn write_tool_success_notifies_db_mutated(pool: SqlitePool) {
+        let session_id = make_session(&pool).await;
+        let entry = crate::db::entries::create_entry(
+            &pool,
+            &crate::models::EntryInput {
+                title: "Paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let provider = MockProvider::new(vec![
+            tool_turn(
+                "c1",
+                "add_tag",
+                serde_json::json!({"entry_id": entry.id, "tag_name": "ml"}),
+            ),
+            text_turn("done"),
+        ]);
+        let mut host = RecordingHost::default();
+        run(&pool, session_id, &provider, &mut host, "tag it").await;
+
+        assert_eq!(host.db_mutations, 1, "successful write tool must notify");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn read_or_failed_tool_does_not_notify_db_mutated(pool: SqlitePool) {
+        let session_id = make_session(&pool).await;
+        let provider = MockProvider::new(vec![
+            // read 系ツール → 通知しない
+            tool_turn("c1", "fulltext_search", serde_json::json!({"query": "x"})),
+            // 存在しない entry への write → 実行失敗なので通知しない
+            tool_turn("c2", "add_tag", serde_json::json!({"entry_id": 99999, "tag_name": "ml"})),
+            text_turn("done"),
+        ]);
+        let mut host = RecordingHost::default();
+        run(&pool, session_id, &provider, &mut host, "hi").await;
+
+        assert_eq!(host.db_mutations, 0);
     }
 
     #[test]

@@ -310,7 +310,7 @@ type McpServerInfo = McpServerConfig & {
 
 BibTeX 出力時はフィールド値の TeX 特殊文字（`_ & % # $ { } ~ ^ \`）を自動エスケープする（biber/biblatex のパースエラー防止）。ただし biblatex の verbatim フィールド（`url` / `doi` / `eprint`）と数値・ISBN は URL/DOI を壊さないようエスケープしない。また `$…$` / `$$…$$` の数式区間は意図的な LaTeX とみなし保護する（区間内はエスケープしない）。誤検出防止のため、開き `$` の直後・閉じ `$` の直前が空白の組（例: `between $5 and $10`）は数式とみなさない。
 
-ミューテーション系コマンド（`create_entry` / `update_entry` / `delete_entry` / `trash_entry` / `restore_entry` / `bulk_*` / `import_bibtex`）が呼ばれると、内部の `sync_tx` 経由でコーディネーターに通知される。コーディネーターは 800ms の trailing-edge デバウンスで `bibtex::sync_bibtex` を呼び出し、書き込み完了/失敗を `bibtex-synced` イベントで UI に通知する。
+ミューテーション系コマンド（`create_entry` / `update_entry` / `delete_entry` / `trash_entry` / `restore_entry` / `bulk_*` / `import_bibtex`）が呼ばれると、内部の `sync_tx` 経由でコーディネーターに通知される。チャットの write 系ツール（`llm::tools::is_local_write_tool`）が成功した場合も同様に通知される（MCP サーバー経由の write は従来どおり）。コーディネーターは 800ms の trailing-edge デバウンスで `bibtex::sync_bibtex` を呼び出し、書き込み完了/失敗を `bibtex-synced` イベントで UI に通知する。
 
 ```ts
 // Tauri イベント: "bibtex-synced"
