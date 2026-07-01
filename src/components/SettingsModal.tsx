@@ -779,6 +779,11 @@ export function SettingsModal({ onClose, onOpenBibtexSync, initialTab }: Setting
   const { t } = useTranslation();
   const [active, setActive] = useState<TabId>(initialTab ?? "appearance");
 
+  // モーダルが開いたまま（例: アプリメニューの About）でもタブ指定に追従する
+  useEffect(() => {
+    if (initialTab) setActive(initialTab);
+  }, [initialTab]);
+
   return (
     <div
       onClick={onClose}

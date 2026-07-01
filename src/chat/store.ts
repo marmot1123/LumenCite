@@ -30,6 +30,9 @@ export interface NewSessionArgs {
 interface ChatStore extends ChatMessagesState {
   sessions: ChatSession[];
   activeSessionId: number | null;
+  /** ストリーミング中のセッション。null なら実行中のストリームなし。
+   *  同時ストリームは 1 本に制限し、別セッション表示中のイベント混入を防ぐ。 */
+  streamingSessionId: number | null;
   /** アクティブセッションのスコープ対象 entry 群 */
   entryIds: number[];
   loadingSessions: boolean;
@@ -56,6 +59,9 @@ interface ChatStore extends ChatMessagesState {
   reset: () => void;
 }
 
+/** openSession の応答順序ガード用シーケンス番号。 */
+let openSessionSeq = 0;
+
 export const useChatStore = create<ChatStore>((set, get) => ({
   // ChatMessagesState
   messages: [],
@@ -66,6 +72,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   // ChatStore
   sessions: [],
   activeSessionId: null,
+  streamingSessionId: null,
   entryIds: [],
   loadingSessions: false,
   archiveToast: null,
@@ -82,16 +89,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   openSession: async (id) => {
+    const seq = ++openSessionSeq;
     const swm = await invoke<SessionWithMessages>("get_chat_session", { id });
-    set({
+    // 素早い連続クリックで古い応答が新しい表示を上書きしないようにする
+    if (seq !== openSessionSeq) return;
+    set((s) => ({
       activeSessionId: id,
       messages: rowsToUiMessages(swm.messages),
       entryIds: swm.entry_ids,
-      streaming: false,
+      // ストリーミング中のセッションに戻ってきた場合は Stop ボタン等を復元する
+      streaming: s.streamingSessionId === id,
       blocking: false,
       pendingApprovals: [],
       error: null,
-    });
+    }));
   },
 
   createSession: async ({ title, provider, model, scopeMode, entryIds }) => {
@@ -117,23 +128,41 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   sendMessage: async (text) => {
     const sid = get().activeSessionId;
-    if (sid == null || !text.trim() || get().streaming) return;
+    if (sid == null || !text.trim() || get().streamingSessionId != null) return;
 
     // 楽観的に user メッセージを追加してストリーミング開始
     const userMessage: UiChatMessage = { role: "user", content: text, tool_calls: [] };
-    set((s) => ({ messages: [...s.messages, userMessage], streaming: true, error: null }));
+    set((s) => ({
+      messages: [...s.messages, userMessage],
+      streaming: true,
+      streamingSessionId: sid,
+      error: null,
+    }));
+
+    // 表示中セッションが切り替わっている間に取りこぼしたイベントがあるか
+    let missedEvents = false;
+    // call_id -> tool_name（表示中でなくても dataVersion 判定できるように控える）
+    const toolNames = new Map<string, string>();
 
     const channel = new Channel<ChatStreamEvent>();
     channel.onmessage = (ev) => {
-      set((s) => applyStreamEvent(s, ev));
-      // 書き込みツールが実行された瞬間に dataVersion を進め、一覧の再読込を促す。
-      // set は同期なので、ここで get() すれば適用済みの messages を参照できる。
+      if (ev.kind === "tool_call_proposed") toolNames.set(ev.call_id, ev.tool_name);
+      // 書き込みツールが実行されたら dataVersion を進め、一覧の再読込を促す
+      // （拒否は結果テキストで判別できないため tool_name ベースで判定し、
+      //  拒否済みの実行イベントは backend から state="done" では来ない）。
       if (ev.kind === "tool_call_executed") {
-        const tc = findToolCallByCallId(get().messages, ev.call_id);
-        // 拒否されたカード（state="rejected"）は DB を変更していないので除外する。
-        if (tc && tc.state === "done" && isLibraryMutatingTool(tc.tool_name)) {
+        const name = toolNames.get(ev.call_id);
+        const rejected = findToolCallByCallId(get().messages, ev.call_id)?.state === "rejected";
+        if (name && !rejected && isLibraryMutatingTool(name)) {
           set((s) => ({ dataVersion: s.dataVersion + 1 }));
         }
+      }
+      // メッセージ UI への適用は、このストリームのセッションを表示している間だけ。
+      // 別セッション表示中に適用すると、その会話にテキストが混入してしまう。
+      if (get().activeSessionId === sid) {
+        set((s) => applyStreamEvent(s, ev));
+      } else {
+        missedEvents = true;
       }
     };
 
@@ -141,9 +170,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       await invoke("chat_send_message", { sessionId: sid, userText: text, channel });
     } catch (e) {
       // invoke の reject は Channel の error イベントでも届くが、保険で握る
-      set((s) => (s.error ? s : { streaming: false, error: String(e) }));
+      if (get().activeSessionId === sid) {
+        set((s) => (s.error ? s : { streaming: false, error: String(e) }));
+      }
     } finally {
-      set({ streaming: false });
+      set({ streamingSessionId: null });
+      if (get().activeSessionId === sid) {
+        if (missedEvents) {
+          // 表示を外していた間の分を DB から復元する
+          void get().openSession(sid);
+        } else {
+          set({ streaming: false });
+        }
+      }
       // セッション一覧の更新日時順を反映するため再読込
       void get().loadSessions();
       void get().maybeGenerateTitle(sid);
@@ -160,7 +199,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   cancelStream: async () => {
-    const sid = get().activeSessionId;
+    // 中断対象は表示中セッションではなく、実際にストリーミング中のセッション
+    const sid = get().streamingSessionId ?? get().activeSessionId;
     if (sid == null) return;
     try {
       await invoke("cancel_chat_stream", { sessionId: sid });

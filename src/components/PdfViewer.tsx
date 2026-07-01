@@ -154,6 +154,12 @@ export function PdfViewer({ attachmentId, initialPage }: Props) {
         if (e.key === "-")                   { zoomOut(); e.preventDefault(); }
         if (e.key === "0")                   { setScale(DEFAULT_SCALE); e.preventDefault(); }
       }
+      // 入力欄（ページ番号など）編集中は矢印キーをカーソル移動に譲る
+      const target = e.target as HTMLElement | null;
+      const editing = target && (
+        target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable
+      );
+      if (editing) return;
       if (e.key === "PageDown" || e.key === "ArrowRight") {
         if (currentPage < pages.length) scrollToPage(currentPage + 1);
       }

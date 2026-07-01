@@ -8,6 +8,7 @@ export function Composer() {
   const { t } = useTranslation();
   const streaming = useChatStore((s) => s.streaming);
   const blocking = useChatStore((s) => s.blocking);
+  const streamingSessionId = useChatStore((s) => s.streamingSessionId);
   const sendMessage = useChatStore((s) => s.sendMessage);
   const cancelStream = useChatStore((s) => s.cancelStream);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
@@ -15,9 +16,12 @@ export function Composer() {
   const [draft, setDraft] = useState("");
   const [focused, setFocused] = useState(false);
 
+  // 別セッションがストリーミング中は新規送信不可（同時ストリームは 1 本）
+  const busyElsewhere = streamingSessionId != null && streamingSessionId !== activeSessionId;
+
   const send = () => {
     const text = draft.trim();
-    if (!text || streaming || blocking) return;
+    if (!text || streaming || blocking || busyElsewhere) return;
     setDraft("");
     void sendMessage(text);
   };
@@ -58,7 +62,7 @@ export function Composer() {
                 {t("chat.stop")}
               </button>
             ) : (
-              <button onClick={send} disabled={blocking || !draft.trim()} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 12px 5px 11px", borderRadius: 6, border: "none", background: "var(--accent-strong)", color: "#fff", cursor: blocking || !draft.trim() ? "default" : "pointer", opacity: blocking || !draft.trim() ? 0.5 : 1, fontSize: 12, fontWeight: 600 }}>
+              <button onClick={send} disabled={blocking || busyElsewhere || !draft.trim()} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 12px 5px 11px", borderRadius: 6, border: "none", background: "var(--accent-strong)", color: "#fff", cursor: blocking || busyElsewhere || !draft.trim() ? "default" : "pointer", opacity: blocking || busyElsewhere || !draft.trim() ? 0.5 : 1, fontSize: 12, fontWeight: 600 }}>
                 {t("chat.send")}
                 <ChatIcon name="enter" size={12} color="#fff" strokeWidth={2} />
               </button>
