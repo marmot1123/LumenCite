@@ -446,7 +446,21 @@ fn serve_loop(server: tiny_http::Server, stop: Arc<AtomicBool>, deps: ServerDeps
     }
 }
 
+/// リクエストボディの上限。JSON-RPC には十分大きく、暴走クライアントによる
+/// 無制限読み込みは防ぐ。
+const MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
+
+/// 定数時間の文字列比較（トークン照合用。早期 return によるタイミング差を避ける）。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &str) {
+    use std::io::Read;
     use tauri::Emitter;
     use tiny_http::{Header, Response};
 
@@ -456,7 +470,7 @@ fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &s
             && h.value
                 .as_str()
                 .strip_prefix("Bearer ")
-                .map(|t| t == token)
+                .map(|t| constant_time_eq(t, token))
                 .unwrap_or(false)
     });
     if !authorized {
@@ -470,8 +484,14 @@ fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &s
     }
 
     let mut body = String::new();
-    if req.as_reader().read_to_string(&mut body).is_err() {
+    // 上限+1 まで読んで超過を検出する（Content-Length は詐称できるため実読で判定）
+    let mut limited = std::io::Read::take(req.as_reader(), MAX_BODY_BYTES + 1);
+    if limited.read_to_string(&mut body).is_err() {
         let _ = req.respond(Response::from_string("bad request body").with_status_code(400));
+        return;
+    }
+    if body.len() as u64 > MAX_BODY_BYTES {
+        let _ = req.respond(Response::from_string("payload too large").with_status_code(413));
         return;
     }
 

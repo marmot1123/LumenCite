@@ -8,7 +8,10 @@
 //! JSON-RPC over stdio は公式 SDK に依存せず最小限を自前実装する。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -18,6 +21,27 @@ use tokio::sync::Mutex;
 use crate::llm::ToolSpec;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// `tools/call` の応答待ちタイムアウト。応答しないサーバーが
+/// チャットターンを永遠に塞がないための上限。
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// initialize / tools/list ハンドシェイクのタイムアウト。
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `fut` を `dur` で打ち切り、超過は `McpError::Io` にする。
+async fn with_timeout<T>(
+    dur: Duration,
+    what: &str,
+    fut: impl Future<Output = Result<T, McpError>>,
+) -> Result<T, McpError> {
+    match tokio::time::timeout(dur, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(McpError::Io(format!(
+            "{what} timed out after {}s",
+            dur.as_secs()
+        ))),
+    }
+}
 const TOOL_PREFIX: &str = "mcp_";
 
 /// 外部 MCP サーバー 1 件の設定（Claude Desktop の mcpServers 1 エントリに相当）。
@@ -189,7 +213,10 @@ struct ServerIo {
 struct ServerHandle {
     config: McpServerConfig,
     child: Child,
-    io: Mutex<ServerIo>,
+    /// `Arc` なのは、`call` が `servers` マップのロックを外してから
+    /// リクエストできるようにするため（保持したままだと 1 サーバーの
+    /// 無応答で全 MCP 操作が塞がる）。
+    io: Arc<Mutex<ServerIo>>,
     /// orig tool name -> 提示用 ToolSpec
     tools: Vec<(String, ToolSpec)>,
 }
@@ -298,26 +325,32 @@ impl McpManager {
             next_id: 0,
         };
 
-        // initialize ハンドシェイク
-        io.request(
+        // initialize ハンドシェイク（無応答サーバーで起動が固まらないようタイムアウト付き）
+        with_timeout(
+            STARTUP_TIMEOUT,
             "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": { "name": "LumenCite", "version": env!("CARGO_PKG_VERSION") }
-            }),
+            io.request(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "LumenCite", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            ),
         )
         .await?;
         io.notify("notifications/initialized", json!({})).await?;
 
-        let tools_result = io.request("tools/list", json!({})).await?;
+        let tools_result =
+            with_timeout(STARTUP_TIMEOUT, "tools/list", io.request("tools/list", json!({})))
+                .await?;
         let tools = parse_tools_list(&config.id, &tools_result);
         let count = tools.len();
 
         let handle = ServerHandle {
             config: config.clone(),
             child,
-            io: Mutex::new(io),
+            io: Arc::new(Mutex::new(io)),
             tools,
         };
         self.servers.lock().await.insert(config.id.clone(), handle);
@@ -356,26 +389,31 @@ impl McpManager {
 
     /// `mcp_<id>_<tool>` を解決して tools/call を実行し、結果テキストを返す。
     pub async fn call(&self, prefixed_name: &str, arguments: &Value) -> Result<String, McpError> {
-        let mut servers = self.servers.lock().await;
-        // プレフィックス名に一致するサーバーとオリジナル tool 名を探す
-        for handle in servers.values_mut() {
-            if let Some((orig, _)) = handle
-                .tools
-                .iter()
-                .find(|(_, spec)| spec.name == prefixed_name)
-            {
-                let orig = orig.clone();
-                let mut io = handle.io.lock().await;
-                let result = io
-                    .request(
-                        "tools/call",
-                        json!({ "name": orig, "arguments": arguments }),
-                    )
-                    .await?;
-                return Ok(extract_call_text(&result));
-            }
-        }
-        Err(McpError::NotFound(prefixed_name.to_string()))
+        // servers マップのロックは名前解決だけに使い、リクエスト中は保持しない。
+        // 保持したままだと、1 サーバーの無応答で tool_specs() や他サーバーへの
+        // 呼び出しまで全て塞がってしまう。
+        let target = {
+            let servers = self.servers.lock().await;
+            servers.values().find_map(|handle| {
+                handle
+                    .tools
+                    .iter()
+                    .find(|(_, spec)| spec.name == prefixed_name)
+                    .map(|(orig, _)| (orig.clone(), Arc::clone(&handle.io)))
+            })
+        };
+        let Some((orig, io)) = target else {
+            return Err(McpError::NotFound(prefixed_name.to_string()));
+        };
+
+        let mut io = io.lock().await;
+        let result = with_timeout(
+            CALL_TIMEOUT,
+            "tools/call",
+            io.request("tools/call", json!({ "name": orig, "arguments": arguments })),
+        )
+        .await?;
+        Ok(extract_call_text(&result))
     }
 }
 
@@ -465,6 +503,20 @@ mod tests {
             command: "lumencite-nonexistent-mcp-binary-xyz".to_string(),
             args: vec![],
             env: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_timeout_maps_elapsed_to_io_error() {
+        let r: Result<(), McpError> = with_timeout(
+            Duration::from_millis(10),
+            "tools/call",
+            std::future::pending(),
+        )
+        .await;
+        match r {
+            Err(McpError::Io(msg)) => assert!(msg.contains("timed out"), "{msg}"),
+            other => panic!("expected timeout Io error, got {other:?}"),
         }
     }
 
