@@ -21,8 +21,25 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
   const { t } = useTranslation();
   const [path, setPath] = useState<string | null>(initialPath);
   const [busy, setBusy] = useState(false);
+  const [excludeAbstractNote, setExcludeAbstractNote] = useState(false);
 
   useEffect(() => setPath(initialPath), [initialPath]);
+
+  useEffect(() => {
+    invoke<boolean>("get_bibtex_exclude_abstract_note")
+      .then(setExcludeAbstractNote)
+      .catch((e) => console.error(e));
+  }, []);
+
+  const toggleExcludeAbstractNote = async (next: boolean) => {
+    setExcludeAbstractNote(next); // 楽観更新
+    try {
+      await invoke("set_bibtex_exclude_abstract_note", { exclude: next });
+    } catch (e) {
+      console.error(e);
+      setExcludeAbstractNote(!next); // 失敗したら戻す
+    }
+  };
 
   const pick = async () => {
     setBusy(true);
@@ -152,6 +169,30 @@ export function BibtexSyncSheet({ onClose, initialPath, lastSynced, lastError, o
             <span style={{ color: "var(--text-faint)" }}>{t("bibtexSyncSheet.disabled")}</span>
           )}
         </div>
+
+        <div style={{
+          fontSize: 10.5, fontWeight: 600, color: "var(--text-faint)",
+          textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6,
+        }}>{t("bibtexSyncSheet.optionsLabel")}</div>
+        <label style={{
+          display: "flex", alignItems: "flex-start", gap: 8,
+          cursor: "pointer", marginBottom: 16,
+        }}>
+          <input
+            type="checkbox"
+            checked={excludeAbstractNote}
+            onChange={(e) => toggleExcludeAbstractNote(e.target.checked)}
+            style={{ marginTop: 2, cursor: "pointer" }}
+          />
+          <span>
+            <span style={{ fontSize: 12.5, color: "var(--text)" }}>
+              {t("bibtexSyncSheet.excludeAbstractNote")}
+            </span>
+            <span style={{ display: "block", fontSize: 11, color: "var(--text-mute)", lineHeight: 1.5, marginTop: 2 }}>
+              {t("bibtexSyncSheet.excludeAbstractNoteHint")}
+            </span>
+          </span>
+        </label>
 
         <div style={{ display: "flex", justifyContent: "flex-end" }}>
           <button

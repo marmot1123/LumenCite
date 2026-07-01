@@ -1872,6 +1872,32 @@ async fn clear_bibtex_sync_path(state: State<'_, AppState>) -> Result<(), String
 }
 
 #[tauri::command]
+async fn get_bibtex_exclude_abstract_note(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(db::settings::get_setting(&state.db, db::settings::BIBTEX_EXCLUDE_ABSTRACT_NOTE_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        == Some("1"))
+}
+
+#[tauri::command]
+async fn set_bibtex_exclude_abstract_note(
+    state: State<'_, AppState>,
+    exclude: bool,
+) -> Result<(), String> {
+    db::settings::set_setting(
+        &state.db,
+        db::settings::BIBTEX_EXCLUDE_ABSTRACT_NOTE_KEY,
+        if exclude { "1" } else { "" },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    // 設定変更を同期先 .bib に即反映する。
+    request_sync(&state);
+    Ok(())
+}
+
+#[tauri::command]
 async fn pick_bibtex_sync_path(
     app: tauri::AppHandle,
     default_name: Option<String>,
@@ -2381,6 +2407,8 @@ pub fn run() {
             get_bibtex_sync_path,
             set_bibtex_sync_path,
             clear_bibtex_sync_path,
+            get_bibtex_exclude_abstract_note,
+            set_bibtex_exclude_abstract_note,
             pick_bibtex_sync_path,
             sync_bibtex_now,
             pick_pdf_file,
