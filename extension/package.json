@@ -1,0 +1,17 @@
+{
+  "name": "lumencite-clipper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LumenCite Web Clipper — Chrome extension",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p . && node scripts/copy-static.mjs",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.280",
+    "happy-dom": "^15.11.0",
+    "typescript": "~5.6.2",
+    "vitest": "^2.1.8"
+  }
+}

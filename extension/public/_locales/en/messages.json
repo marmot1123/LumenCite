@@ -1,0 +1,23 @@
+{
+  "extName": { "message": "LumenCite Web Clipper" },
+  "extDescription": { "message": "Save the paper on the current page to LumenCite with one click." },
+  "clipTitle": { "message": "Clip to LumenCite" },
+  "okCreated": { "message": "Saved to LumenCite" },
+  "okDuplicate": { "message": "Already in your library" },
+  "errNotPaired": { "message": "Not paired — paste the connect code in the options page" },
+  "errNoAccess": { "message": "This page cannot be clipped" },
+  "errUnreachable": { "message": "Cannot reach LumenCite — is the app running?" },
+  "errAuth": { "message": "Pairing expired — re-pair in the options page" },
+  "errDisabled": { "message": "Web clipper is disabled in LumenCite settings" },
+  "errServer": { "message": "LumenCite returned an error" },
+  "optionsTitle": { "message": "LumenCite Clipper — Pairing" },
+  "optionsInstructions": { "message": "In LumenCite, open Settings → Chat / MCP → Web Clipper, enable it, copy the connect code, and paste it below." },
+  "optionsSave": { "message": "Test & save" },
+  "optionsTesting": { "message": "Testing connection…" },
+  "optionsBadCode": { "message": "Invalid connect code" },
+  "optionsPingFailed": { "message": "Could not reach LumenCite. Check that the app is running and the clipper is enabled." },
+  "optionsPaired": {
+    "message": "Paired with LumenCite on port $PORT$",
+    "placeholders": { "port": { "content": "$1" } }
+  }
+}
