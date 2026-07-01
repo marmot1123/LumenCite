@@ -123,7 +123,10 @@ pub async fn search_fulltext(
 
     if use_like {
         // 各トークンが content に含まれること（AND）
-        let likes: Vec<&str> = tokens.iter().map(|_| "f.content LIKE ?").collect();
+        let likes: Vec<&str> = tokens
+            .iter()
+            .map(|_| "f.content LIKE ? ESCAPE '\\'")
+            .collect();
         sql.push_str(&likes.join(" AND "));
     } else {
         sql.push_str("fulltext MATCH ?");
@@ -151,7 +154,7 @@ pub async fn search_fulltext(
     let mut q = sqlx::query(&sql);
     if use_like {
         for token in &tokens {
-            q = q.bind(format!("%{}%", token));
+            q = q.bind(crate::db::entries::like_pattern(token));
         }
     } else {
         q = q.bind(build_match_expr(&tokens));
@@ -497,6 +500,26 @@ mod tests {
         let hits_b = search_fulltext(&pool, "beta", None, None).await.unwrap();
         assert!(hits_a.is_empty());
         assert!(hits_b.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn like_fallback_treats_wildcards_literally(pool: SqlitePool) {
+        let (_, att_id) = setup_attachment(&pool, "Paper").await;
+        index_attachment(
+            &pool,
+            att_id,
+            &[
+                (1, "uses a_b indexing".to_string()),
+                (2, "uses acb indexing".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // 短いトークン → LIKE フォールバック。`_` はリテラル扱いであること。
+        let hits = search_fulltext(&pool, "a_", None, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "`_` must not act as a wildcard");
+        assert_eq!(hits[0].page, 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

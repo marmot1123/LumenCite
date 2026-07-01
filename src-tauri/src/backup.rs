@@ -26,8 +26,14 @@ pub async fn run_backup(
     fs::create_dir_all(&backups_dir).map_err(|e| e.to_string())?;
 
     let timestamp = Local::now().format("%Y%m%d-%H%M%S");
-    let file_name = format!("lumencite-{}.db", timestamp);
-    let target = backups_dir.join(&file_name);
+    let mut target = backups_dir.join(format!("lumencite-{}.db", timestamp));
+    // タイムスタンプは秒精度なので、同一秒内の連続実行では VACUUM INTO が
+    // 「already exists」で失敗する。接尾辞で一意化する。
+    let mut n = 1usize;
+    while target.exists() {
+        target = backups_dir.join(format!("lumencite-{}-{}.db", timestamp, n));
+        n += 1;
+    }
 
     // VACUUM INTO は通常のクエリと違ってトランザクション内で実行できないので
     // SQL リテラルとしてパスを直接埋め込む。シングルクォートをエスケープしておく。
@@ -72,6 +78,28 @@ pub fn list_backups(app_dir: &Path) -> Result<Vec<BackupInfo>, String> {
     // 新しい順
     entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn consecutive_backups_in_same_second_all_succeed(pool: SqlitePool) {
+        let dir = std::env::temp_dir().join(format!("lc-backup-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // 3 連続実行はほぼ確実に同一秒に収まる。全て成功し、別ファイルになること。
+        let p1 = run_backup(&pool, &dir, 14).await.unwrap();
+        let p2 = run_backup(&pool, &dir, 14).await.unwrap();
+        let p3 = run_backup(&pool, &dir, 14).await.unwrap();
+
+        assert_ne!(p1, p2);
+        assert_ne!(p2, p3);
+        assert!(p1.exists() && p2.exists() && p3.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 fn prune_old_backups(backups_dir: &Path, keep: usize) -> std::io::Result<()> {

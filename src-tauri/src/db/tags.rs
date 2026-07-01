@@ -18,15 +18,31 @@ pub async fn create_tag(pool: &SqlitePool, name: &str) -> Result<Tag, sqlx::Erro
 }
 
 pub async fn delete_tag(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    // タグ名は entries_fts.tags_text に含まれるため、削除の影響を受ける
+    // エントリを控えておき、削除後に再同期する。
+    let entry_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT entry_id FROM entry_tags WHERE tag_id = ?")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+
     let rows = sqlx::query("DELETE FROM tags WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
 
     if rows == 0 {
         return Err(sqlx::Error::RowNotFound);
     }
+
+    for entry_id in entry_ids {
+        crate::db::entries::sync_entries_fts(&mut tx, entry_id).await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -169,6 +185,23 @@ mod tests {
 
         let hits = search_entries(&pool, "transformer", None, None).await.unwrap();
         assert!(hits.is_empty(), "タグ削除後はタグ名検索でヒットしないべき");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_tag_syncs_fts_of_tagged_entries(pool: SqlitePool) {
+        use crate::db::entries::search_entries;
+        let entry = create_entry(&pool, &EntryInput {
+            title: "Paper".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+        let tag = create_tag(&pool, "obsolete-topic").await.unwrap();
+        add_tag_to_entry(&pool, entry.id, tag.id).await.unwrap();
+
+        delete_tag(&pool, tag.id).await.unwrap();
+
+        let hits = search_entries(&pool, "obsolete", None, None).await.unwrap();
+        assert!(hits.is_empty(), "削除済みタグ名で検索にヒットし続けないこと");
     }
 
     #[sqlx::test(migrations = "./migrations")]

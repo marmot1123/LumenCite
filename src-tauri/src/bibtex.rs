@@ -259,9 +259,11 @@ pub async fn export_bibtex(
     let ids: Vec<i64> = match entry_ids {
         Some(ids) => ids,
         None => sqlx::query(
+            // created_at は秒精度で同時刻がありうるため id でタイブレークして
+            // 並びを決定的にする（resolve_citation_key と一致させること）。
             "SELECT id FROM entries
              WHERE deleted_at IS NULL
-             ORDER BY created_at DESC",
+             ORDER BY created_at DESC, id DESC",
         )
         .fetch_all(pool)
         .await
@@ -356,7 +358,7 @@ pub async fn resolve_citation_key(pool: &SqlitePool, entry_id: i64) -> Result<St
                   WHERE ea.entry_id = e.id ORDER BY ea.position LIMIT 1) AS first_author
          FROM entries e
          WHERE e.deleted_at IS NULL
-         ORDER BY e.created_at DESC",
+         ORDER BY e.created_at DESC, e.id DESC",
     )
     .fetch_all(pool)
     .await
@@ -920,6 +922,37 @@ mod tests {
         assert!(!bib_excluded.contains("a private note"));
         // 他フィールドは維持される
         assert!(bib_excluded.contains("title"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn key_assignment_deterministic_for_same_second_entries(pool: sqlx::SqlitePool) {
+        // created_at は秒精度なので、一括インポートでは同時刻のエントリが多数できる。
+        // タイブレーク（id DESC）が無いと export とプレビューで接尾辞の割り当てが
+        // 食い違い得る。同時刻でも id 降順で決定的に割り当てられることを確認する。
+        let mk = |title: &str| EntryInput {
+            title: title.to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["Alice Smith".to_string()],
+            year: Some(2020),
+            ..Default::default()
+        };
+        let e1 = create_entry(&pool, &mk("Paper One")).await.unwrap();
+        let e2 = create_entry(&pool, &mk("Paper Two")).await.unwrap();
+        sqlx::query("UPDATE entries SET created_at = '2020-01-01 00:00:00'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let k1 = resolve_citation_key(&pool, e1.id).await.unwrap();
+        let k2 = resolve_citation_key(&pool, e2.id).await.unwrap();
+
+        // id DESC なので新しい e2 が base、古い e1 が接尾辞付き
+        assert_eq!(k1, format!("{k2}a"), "suffix assignment must be deterministic");
+
+        // export も同じ割り当てになる
+        let bib = export_bibtex(&pool, None).await.unwrap();
+        assert!(bib.contains(&format!("{{{k1},")), "export uses same key for e1: {bib}");
+        assert!(bib.contains(&format!("{{{k2},")), "export uses same key for e2: {bib}");
     }
 
     // ── export tests ──────────────────────────────────────────────────────────
