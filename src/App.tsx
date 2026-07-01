@@ -807,6 +807,7 @@ export default function App() {
     return (
       <>
         <DetailView
+          key={detail.id} // エントリ切替時に page 等の state を持ち越さないよう再マウント
           entry={detail}
           onBack={() => setScreen("library")}
           onToggleStar={() => handleToggleStar(detail.id, !detail.starred)}

@@ -87,22 +87,26 @@ export function DetailView({
   useEffect(() => { try { localStorage.setItem("lc-detail-metaTab", metaTab); } catch { /* noop */ } }, [metaTab]);
 
   // エントリごとの last_page をロード / 保存
+  const lastPageLoaded = useRef(false);
+  const lastPersistedPage = useRef<number>(-1);
   useEffect(() => {
     invoke<string | null>("get_setting", { key: `pdf.last_page.${entry.id}` })
       .then(v => {
         const n = v ? parseInt(v, 10) : NaN;
         if (Number.isFinite(n) && n > 0) {
+          lastPersistedPage.current = n; // 保存済みの値なので再書き込み不要
           setPage(n);
           setScrollTick(t => t + 1);
         }
       })
-      .catch(() => { /* noop */ });
+      .catch(() => { /* noop */ })
+      .finally(() => { lastPageLoaded.current = true; });
   }, [entry.id]);
 
-  // page が変わったら DB の last_page を更新（簡易デバウンス）
-  const lastPersistedPage = useRef<number>(-1);
+  // page が変わったら DB の last_page を更新（簡易デバウンス）。
+  // 保存値のロード完了前は書き込まない（初期値 1 で保存値を潰さないため）。
   useEffect(() => {
-    if (lastPersistedPage.current === page) return;
+    if (!lastPageLoaded.current || lastPersistedPage.current === page) return;
     const handle = setTimeout(() => {
       lastPersistedPage.current = page;
       invoke("set_setting", { key: `pdf.last_page.${entry.id}`, value: String(page) }).catch(() => { /* noop */ });
