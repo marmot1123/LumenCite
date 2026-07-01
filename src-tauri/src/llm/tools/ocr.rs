@@ -90,21 +90,26 @@ pub async fn run_ocr(
         return Err(ToolError::Execution("no pages to OCR".into()));
     }
 
-    // 4. 既存インデックスを消してからページごとに Vision → 保存
-    crate::db::fulltext::unindex_attachment(pool, attachment_id).await?;
+    // 4. 全ページの Vision 結果を集めてから保存する。途中の API エラーで
+    //    既存インデックスが失われないよう、削除はここでは行わない。
     let page_count = images.len();
     let mut total_chars = 0usize;
+    let mut results: Vec<(i64, String)> = Vec::with_capacity(page_count);
     for (page_no, b64) in images {
         let text = ocr::ocr_image(&provider, &model, &api_key, "image/png", &b64)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         total_chars += text.chars().count();
-        sqlx::query("INSERT INTO fulltext (content, attachment_id, page) VALUES (?, ?, ?)")
-            .bind(&text)
-            .bind(attachment_id)
-            .bind(page_no)
-            .execute(pool)
-            .await?;
+        results.push((page_no, text));
+    }
+
+    // 5. トランザクションで置き換え。全ページ OCR なら丸ごと、部分 OCR なら
+    //    該当ページのみ差し替え（従来は部分 OCR でも全ページ消していた）。
+    match pages {
+        None => crate::db::fulltext::index_attachment(pool, attachment_id, &results).await?,
+        Some(_) => {
+            crate::db::fulltext::update_attachment_pages(pool, attachment_id, &results).await?
+        }
     }
 
     Ok(format!(

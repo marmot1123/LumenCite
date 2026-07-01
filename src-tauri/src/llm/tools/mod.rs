@@ -69,6 +69,21 @@ pub fn all_tool_specs() -> Vec<ToolSpec> {
     specs
 }
 
+/// ローカル DB の文献データを書き換えるツールか。
+/// `.bib` 自動同期など、書き換え成功時の副作用の要否判定に使う
+/// （`ocr_pdf` は fulltext のみ、`mcp_*` は外部サーバーなので含めない）。
+pub fn is_local_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "add_tag"
+            | "update_notes"
+            | "add_to_collection"
+            | "create_entry"
+            | "update_entry"
+            | "delete_entry"
+    )
+}
+
 /// `ToolCallSpec` を実行し、LLM に返すツール結果テキストを得る。
 pub async fn execute_tool(ctx: &ToolContext<'_>, call: &ToolCallSpec) -> Result<String, ToolError> {
     // MCP ツールは外部サーバーへルーティングする。

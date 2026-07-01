@@ -231,10 +231,18 @@ export default function App() {
     document.body.style.userSelect = "none";
   };
 
+  // 応答順序ガード: 遅れて解決した古い検索・一覧応答が新しい表示を上書きしないようにする
+  const loadSeqRef = useRef(0);
+
   const loadEntries = (view = selectedView, query = debouncedSearch, scope = searchScope) => {
     // サイドバー件数は entries とは独立した集計値。loadEntries が呼ばれるたびに
     // refresh しておくことで、view 切替直後にも最新の件数が表示される。
     reloadCounts();
+
+    const seq = ++loadSeqRef.current;
+    const ifCurrent = <T,>(fn: (v: T) => void) => (v: T) => {
+      if (seq === loadSeqRef.current) fn(v);
+    };
 
     const collectionId = view.startsWith("col:") ? Number(view.slice(4)) : null;
     const tagId = view.startsWith("tag:") ? Number(view.slice(4)) : null;
@@ -244,11 +252,11 @@ export default function App() {
     if (scope === "fulltext") {
       // 全文モード時は entries テーブルは現在のビューで埋めておき、結果リストは fulltextHits に持つ
       const args: LoadEntriesArgs = { collectionId, tagId, view: viewName };
-      invoke<EntrySummary[]>("get_entries", args).then(setEntries).catch(console.error);
+      invoke<EntrySummary[]>("get_entries", args).then(ifCurrent(setEntries)).catch(console.error);
       if (trimmed) {
         invoke<FulltextHit[]>("fulltext_search", { query: trimmed, collectionId, tagId })
-          .then(setFulltextHits)
-          .catch((e) => { console.error(e); setFulltextHits([]); });
+          .then(ifCurrent(setFulltextHits))
+          .catch((e) => { console.error(e); ifCurrent(setFulltextHits)([]); });
       } else {
         setFulltextHits([]);
       }
@@ -257,11 +265,11 @@ export default function App() {
 
     if (trimmed) {
       invoke<EntrySummary[]>("search_entries", { query: trimmed, collectionId, tagId })
-        .then(setEntries)
+        .then(ifCurrent(setEntries))
         .catch(console.error);
     } else {
       const args: LoadEntriesArgs = { collectionId, tagId, view: viewName };
-      invoke<EntrySummary[]>("get_entries", args).then(setEntries).catch(console.error);
+      invoke<EntrySummary[]>("get_entries", args).then(ifCurrent(setEntries)).catch(console.error);
     }
   };
 
@@ -319,9 +327,11 @@ export default function App() {
   // load detail when single selection changes (bulk mode shows BulkActionsPanel, no detail needed)
   useEffect(() => {
     if (selectedId == null) { setDetail(null); return; }
+    let cancelled = false; // 素早い選択切替で古い応答が勝たないように
     invoke<EntryDetail>("get_entry", { id: selectedId })
-      .then(setDetail)
-      .catch(() => setDetail(null));
+      .then((d) => { if (!cancelled) setDetail(d); })
+      .catch(() => { if (!cancelled) setDetail(null); });
+    return () => { cancelled = true; };
   }, [selectedId]);
 
   // ── multi-select handler (called from EntriesTable rows) ──────────────────
@@ -807,6 +817,7 @@ export default function App() {
     return (
       <>
         <DetailView
+          key={detail.id} // エントリ切替時に page 等の state を持ち越さないよう再マウント
           entry={detail}
           onBack={() => setScreen("library")}
           onToggleStar={() => handleToggleStar(detail.id, !detail.starred)}

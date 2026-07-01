@@ -172,6 +172,18 @@ async fn search_ids_fts(
     Ok(q.fetch_all(pool).await?.iter().map(|r| r.get("id")).collect())
 }
 
+/// LIKE 検索用の部分一致パターン。`%` `_` `\` をエスケープしてリテラル扱いにする
+/// （クエリ側で `ESCAPE '\'` を併記すること）。
+pub(crate) fn like_pattern(token: &str) -> String {
+    format!(
+        "%{}%",
+        token
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
+}
+
 async fn search_ids_like(
     pool: &SqlitePool,
     tokens: &[&str],
@@ -186,8 +198,9 @@ async fn search_ids_like(
     );
     for _ in tokens {
         sql.push_str(
-            " AND (f.title LIKE ? OR f.authors_text LIKE ? OR f.tags_text LIKE ?
-                   OR f.abstract_text LIKE ? OR f.identifiers LIKE ?)",
+            " AND (f.title LIKE ? ESCAPE '\\' OR f.authors_text LIKE ? ESCAPE '\\'
+                   OR f.tags_text LIKE ? ESCAPE '\\' OR f.abstract_text LIKE ? ESCAPE '\\'
+                   OR f.identifiers LIKE ? ESCAPE '\\')",
         );
     }
     if collection_id.is_some() {
@@ -202,7 +215,7 @@ async fn search_ids_like(
 
     let mut q = sqlx::query(&sql);
     for token in tokens {
-        let pattern = format!("%{}%", token);
+        let pattern = like_pattern(token);
         for _ in 0..5 {
             q = q.bind(pattern.clone());
         }
@@ -1133,6 +1146,17 @@ pub async fn delete_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error>
         .execute(&mut *tx)
         .await?;
 
+    // fulltext は attachments への FK が無く cascade では消えないため、ここで消す。
+    // 呼び出し元（Tauri コマンド / チャットツール / MCP）すべてで漏れなく効く。
+    sqlx::query(
+        "DELETE FROM fulltext WHERE attachment_id IN (
+            SELECT id FROM attachments WHERE entry_id = ?
+        )",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
     let rows_affected = sqlx::query("DELETE FROM entries WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -1151,6 +1175,23 @@ pub async fn delete_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error>
 mod tests {
     use super::*;
     use crate::models::EntryInput;
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn like_fallback_treats_wildcards_literally(pool: SqlitePool) {
+        // 短いトークンは LIKE フォールバックに乗る。`_`/`%` をワイルドカードとして
+        // 解釈すると無関係なエントリがヒットするため、リテラル扱いを確認する。
+        for title in ["x_y notation", "xay notation"] {
+            create_entry(&pool, &EntryInput {
+                title: title.to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            }).await.unwrap();
+        }
+
+        let hits = search_entries(&pool, "x_", None, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "`_` はリテラルとして扱う");
+        assert_eq!(hits[0].title, "x_y notation");
+    }
 
     // ── create_entry ────────────────────────────────────────────────────────
 

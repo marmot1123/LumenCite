@@ -28,6 +28,18 @@ export function ChatScreen({ onBack, onOpenSettings }: ChatScreenProps) {
     void loadSessions();
   }, [loadSessions]);
 
+  // ⌘N で新規チャット（SessionList のボタンに表示しているバッジと対応）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n") {
+        e.preventDefault();
+        setNewSessionOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
 
   return (

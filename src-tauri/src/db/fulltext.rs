@@ -31,6 +31,36 @@ pub async fn index_attachment(
     Ok(())
 }
 
+/// 指定ページのみを差し替える（他ページの行は保持）。部分 OCR の保存用。
+/// 空文字列のページは削除のみ行う（再処理の結果テキストが無かった場合）。
+pub async fn update_attachment_pages(
+    pool: &SqlitePool,
+    attachment_id: i64,
+    pages: &[(i64, String)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    for (page, content) in pages {
+        sqlx::query("DELETE FROM fulltext WHERE attachment_id = ? AND page = ?")
+            .bind(attachment_id)
+            .bind(page)
+            .execute(&mut *tx)
+            .await?;
+        if content.trim().is_empty() {
+            continue;
+        }
+        sqlx::query("INSERT INTO fulltext (content, attachment_id, page) VALUES (?, ?, ?)")
+            .bind(content)
+            .bind(attachment_id)
+            .bind(page)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn unindex_attachment(
     pool: &SqlitePool,
     attachment_id: i64,
@@ -39,19 +69,6 @@ pub async fn unindex_attachment(
         .bind(attachment_id)
         .execute(pool)
         .await?;
-    Ok(())
-}
-
-/// 指定 entry に紐づくすべての添付の fulltext を消す。entry 削除前に呼ぶ想定。
-pub async fn unindex_entry(pool: &SqlitePool, entry_id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM fulltext WHERE attachment_id IN (
-            SELECT id FROM attachments WHERE entry_id = ?
-        )",
-    )
-    .bind(entry_id)
-    .execute(pool)
-    .await?;
     Ok(())
 }
 
@@ -106,7 +123,10 @@ pub async fn search_fulltext(
 
     if use_like {
         // 各トークンが content に含まれること（AND）
-        let likes: Vec<&str> = tokens.iter().map(|_| "f.content LIKE ?").collect();
+        let likes: Vec<&str> = tokens
+            .iter()
+            .map(|_| "f.content LIKE ? ESCAPE '\\'")
+            .collect();
         sql.push_str(&likes.join(" AND "));
     } else {
         sql.push_str("fulltext MATCH ?");
@@ -134,7 +154,7 @@ pub async fn search_fulltext(
     let mut q = sqlx::query(&sql);
     if use_like {
         for token in &tokens {
-            q = q.bind(format!("%{}%", token));
+            q = q.bind(crate::db::entries::like_pattern(token));
         }
     } else {
         q = q.bind(build_match_expr(&tokens));
@@ -310,6 +330,59 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn update_attachment_pages_replaces_only_given_pages(pool: SqlitePool) {
+        let (_, att_id) = setup_attachment(&pool, "Paper").await;
+        index_attachment(
+            &pool,
+            att_id,
+            &[
+                (1, "page one original".to_string()),
+                (2, "page two original".to_string()),
+                (3, "page three original".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // ページ 2 だけ差し替える。1 と 3 は保持される。
+        update_attachment_pages(&pool, att_id, &[(2, "page two replaced".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(search_fulltext(&pool, "original", None, None).await.unwrap().len(), 2);
+        assert_eq!(search_fulltext(&pool, "replaced", None, None).await.unwrap().len(), 1);
+        assert!(search_fulltext(&pool, "two original", None, None).await.unwrap().is_empty());
+
+        // 空文字列に差し替えた場合はそのページの行が消える（再OCRで空だったケース）
+        update_attachment_pages(&pool, att_id, &[(3, "".to_string())]).await.unwrap();
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
+                .bind(att_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row_count, 2); // page 1 original + page 2 replaced
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_entry_removes_fulltext_rows(pool: SqlitePool) {
+        let (entry_id, att_id) = setup_attachment(&pool, "Paper").await;
+        index_attachment(&pool, att_id, &[(1, "needle".to_string())])
+            .await
+            .unwrap();
+
+        crate::db::entries::delete_entry(&pool, entry_id).await.unwrap();
+
+        let orphans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
+                .bind(att_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(orphans, 0, "hard delete must not orphan fulltext rows");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn unindex_removes_rows(pool: SqlitePool) {
         let (_, att_id) = setup_attachment(&pool, "Paper").await;
         index_attachment(&pool, att_id, &[(1, "needle".to_string())])
@@ -401,7 +474,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn unindex_entry_removes_all_attachments(pool: SqlitePool) {
+    async fn delete_entry_removes_fulltext_of_all_attachments(pool: SqlitePool) {
         let (entry_id, att1) = setup_attachment(&pool, "Paper").await;
         let att2 = add_attachment(
             &pool,
@@ -421,12 +494,32 @@ mod tests {
             .await
             .unwrap();
 
-        unindex_entry(&pool, entry_id).await.unwrap();
+        crate::db::entries::delete_entry(&pool, entry_id).await.unwrap();
 
         let hits_a = search_fulltext(&pool, "alpha", None, None).await.unwrap();
         let hits_b = search_fulltext(&pool, "beta", None, None).await.unwrap();
         assert!(hits_a.is_empty());
         assert!(hits_b.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn like_fallback_treats_wildcards_literally(pool: SqlitePool) {
+        let (_, att_id) = setup_attachment(&pool, "Paper").await;
+        index_attachment(
+            &pool,
+            att_id,
+            &[
+                (1, "uses a_b indexing".to_string()),
+                (2, "uses acb indexing".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // 短いトークン → LIKE フォールバック。`_` はリテラル扱いであること。
+        let hits = search_fulltext(&pool, "a_", None, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "`_` must not act as a wildcard");
+        assert_eq!(hits[0].page, 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -333,6 +333,12 @@ function PdfPage({ doc, page, scale, mode, pageHighlights, onTextSelected, regis
     return () => document.removeEventListener("selectionchange", onChange);
   }, [page]);
 
+  // モード切替時は保持中のスナップショットを破棄する。Select モードでの選択が
+  // Highlight モードに残ると、無関係なクリックで古い選択のカラーピッカーが開く。
+  useEffect(() => {
+    selSnapshotRef.current = null;
+  }, [mode]);
+
   // mousedown でスナップショットをクリア（新しい選択操作の開始）
   useEffect(() => {
     const onDown = (e: MouseEvent) => {

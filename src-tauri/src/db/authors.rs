@@ -86,7 +86,7 @@ pub(crate) async fn search_authors(
     query: &str,
     limit: i64,
 ) -> Result<Vec<Author>, sqlx::Error> {
-    let like = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+    let like = crate::db::entries::like_pattern(query);
     let mut rows: Vec<Author> = sqlx::query_as(&format!(
         "SELECT {AUTHOR_COLUMNS}
            FROM authors
