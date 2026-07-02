@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Icon } from "../icons";
-import type { McpServerInfo, McpServerStatus, McpServerStatusInfo } from "../../types";
+import type { ClipperStatusInfo, McpServerInfo, McpServerStatus, McpServerStatusInfo } from "../../types";
 
 // ホワイトリストで上書き可能なツールと既定の自動承認可否（backend approval.rs と一致）。
 const OVERRIDABLE_TOOLS: { name: string; defaultAuto: boolean }[] = [
@@ -26,6 +26,7 @@ export function ChatSettingsTab() {
       </div>
       <McpServers />
       <McpServerPublic />
+      <ClipperSettings />
       <ToolWhitelist />
     </>
   );
@@ -337,6 +338,96 @@ function McpServerPublic() {
           <div style={{ display: "flex", gap: 6 }}>
             <button onClick={() => void copyTo(desktopSnippet, setCopiedDesktop)} disabled={!desktopSnippet} style={{ ...primaryBtn, opacity: desktopSnippet ? 1 : 0.5 }}>
               {copiedDesktop ? t("settings.chat.mcpServerCopied") : t("settings.chat.mcpServerDesktopCopy")}
+            </button>
+          </div>
+        </div>
+      )}
+    </Section>
+  );
+}
+
+/** Web クリッパー（Chrome 拡張）: 有効トグル + 拡張に貼る接続コード。 */
+function ClipperSettings() {
+  const { t } = useTranslation();
+  const [status, setStatus] = useState<ClipperStatusInfo | null>(null);
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const reload = () => {
+    invoke<ClipperStatusInfo>("get_clipper_status").then(setStatus).catch(() => setStatus(null));
+  };
+  useEffect(reload, []);
+
+  const enabled = status?.enabled ?? false;
+  const running = status?.server_running ?? false;
+  const port = status?.port;
+
+  useEffect(() => {
+    if (enabled && running) {
+      invoke<string>("get_clipper_connect_code").then(setCode).catch(() => setCode(""));
+    } else {
+      setCode("");
+    }
+  }, [enabled, running, port]);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await invoke<ClipperStatusInfo>("set_clipper_enabled", { enabled: next }));
+    } catch (e) {
+      setError(typeof e === "string" ? e : String(e));
+      reload();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const copy = async () => {
+    if (!code) return;
+    try {
+      await writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard 失敗は無視 */ }
+  };
+
+  return (
+    <Section title={t("settings.chat.clipperTitle")} description={t("settings.chat.clipperDesc")}>
+      <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 8px", borderRadius: 6, cursor: busy ? "default" : "pointer" }}>
+        <input type="checkbox" checked={enabled} disabled={busy} onChange={(e) => void toggle(e.target.checked)} />
+        <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.chat.clipperEnable")}</span>
+        <span style={{ flex: 1 }} />
+        {enabled && (running ? (
+          <span style={{ ...badge, color: "#15803d", background: "rgba(34,197,94,0.14)" }}>
+            ● {t("settings.chat.clipperRunning", { port })}
+          </span>
+        ) : (
+          <span style={{ ...badge, color: "var(--danger-strong)", background: "var(--danger-bg)" }}>
+            ● {t("settings.chat.clipperStopped")}
+          </span>
+        ))}
+      </label>
+      {error && <div style={{ fontSize: 11.5, color: "var(--danger-strong)", marginTop: 6 }}>{error}</div>}
+      {enabled && running && (
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text)" }}>{t("settings.chat.clipperCodeLabel")}</div>
+          <div style={{ fontSize: 11, color: "var(--text-mute)", lineHeight: 1.5 }}>{t("settings.chat.clipperCodeNote")}</div>
+          {/* トークンは MCP サーバーと共有: 「トークン再生成」で拡張のペアリングも無効になる */}
+          <div style={{ fontSize: 10.5, color: "var(--text-faint)", lineHeight: 1.5 }}>⚠️ {t("settings.chat.clipperRegenWarn")}</div>
+          <textarea
+            readOnly
+            value={code}
+            rows={2}
+            spellCheck={false}
+            onFocus={(e) => e.currentTarget.select()}
+            style={{ ...field, resize: "vertical", lineHeight: 1.5, fontSize: 11, fontFamily: "var(--font-mono, monospace)" }}
+          />
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={() => void copy()} disabled={!code} style={{ ...primaryBtn, opacity: code ? 1 : 0.5 }}>
+              {copied ? t("settings.chat.mcpServerCopied") : t("settings.chat.clipperCopy")}
             </button>
           </div>
         </div>

@@ -222,7 +222,9 @@ pub async fn fetch_by_arxiv(arxiv_id: &str) -> Result<EntryInput, String> {
     Ok(EntryInput {
         title,
         year,
-        entry_type: "article".to_string(),
+        // v0.4.0 で追加された Zotero 準拠の種別。arXiv はプレプリントサーバーなので
+        // "article" ではなく "preprint" とする（BibTeX 出力は @misc + eprint）。
+        entry_type: "preprint".to_string(),
         arxiv_id: Some(id),
         author_names,
         abstract_,
@@ -335,7 +337,7 @@ fn strip_html_tags(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn normalize_arxiv_id(id: &str) -> String {
+pub(crate) fn normalize_arxiv_id(id: &str) -> String {
     let id = id.trim();
     if let Some(pos) = id.rfind('/') {
         let rest = &id[pos + 1..];

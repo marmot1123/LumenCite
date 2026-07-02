@@ -330,6 +330,14 @@ export interface McpServerStatusInfo {
   write_enabled: boolean;
 }
 
+/** Web クリッパー（v0.5.0）の状態。get_clipper_status / set_clipper_enabled の戻り値。 */
+export interface ClipperStatusInfo {
+  enabled: boolean;
+  /** MCP サーバーと共用の HTTP サーバースレッドが起動中か。 */
+  server_running: boolean;
+  port: number;
+}
+
 /** backend の chat_sessions 行（entry_count を投影）。 */
 export interface ChatSession {
   id: number;

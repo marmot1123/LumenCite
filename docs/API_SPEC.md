@@ -598,6 +598,67 @@ type McpAuditEntry = {
   - **バルク対応**: `add_tag` / `add_to_collection` は単一 `entry_id` に加えて **`entry_ids`（整数配列）**を受け付け、1 回の呼び出しで複数エントリへ適用する（両者は併用可・重複は順序保持で除去）。ベストエフォートで、存在しないエントリはスキップして成功分を適用し、結果サマリ（適用件数＋スキップ件数）を返す。1 件も成功しなければ `isError`。タグは get-or-create をバッチで 1 回だけ行う。
 - write 成功時はサーバーが監査ログ記録＋ `.bib` 同期キック＋ `entries-changed` イベント（一覧ライブ反映）を発火する。
 
+### Web クリッパー（v0.5.0 追加）
+
+Chrome 拡張から起動中アプリへエントリを作成するローカル HTTP API。MCP サーバーと**同一プロセス・同一ポート・同一 Bearer トークン**を共有し、`handle_http_request` にパスベースルーティングを追加して `/clipper` を新設する（既存 JSON-RPC は `/mcp` ほか従来どおりで後方互換）。ゲートは新設定 `clipper.enabled`（"1"/""、デフォルト off）で、`mcp_server.write_enabled` とは独立。サーバープロセスは「`mcp_server.enabled` OR `clipper.enabled`」で起動する。
+
+**HTTP ルート:**
+
+| ルート | 認証 | 説明 |
+|--------|------|------|
+| `OPTIONS /clipper` | 不要 | CORS preflight。`Origin` が `chrome-extension://` で始まる場合のみ `Access-Control-Allow-*` を返す（204）。**認証チェックより前に処理**（preflight は Authorization ヘッダを持たないため） |
+| `GET /clipper` | Bearer | ペアリング疎通確認。`{"ok":true,"app":"LumenCite","version":"..."}` |
+| `POST /clipper` | Bearer | クリップ本体。`clipper.enabled` をリクエスト毎に評価（無効なら 403 `{"status":"error","code":"clipper_disabled"}`） |
+
+```ts
+// POST /clipper リクエストボディ
+type ClipRequest = {
+  url: string;
+  title?: string;
+  doi?: string;
+  arxiv_id?: string;
+  isbn?: string;
+  pdf_url?: string;        // citation_pdf_url。無くても arxiv_id から導出する
+  published_date?: string; // フォールバック用（先頭4桁を year に）
+  site_name?: string;      // フォールバック用（og:site_name → extra_fields.organization）
+  authors?: string[];      // citation_author 群（"Given Family"）。フォールバック用
+  tags?: string[];         // get-or-create で付与
+  collection_id?: number;
+};
+
+// 200 応答
+type ClipResponse = {
+  status: "created" | "duplicate";
+  entry_id: number;
+  title: string;
+  pdf?: "downloading";     // created かつ PDF URL があるとき。添付は応答後に非同期実行
+};
+```
+
+**サーバー側フロー:** `find_duplicate_entry`（DOI/arXiv/ISBN）→ 重複なら `duplicate` 応答（作成も PDF 添付もしない）→ 識別子があれば `metadata::fetch_by_doi/arxiv/isbn` でメタデータ解決 → `create_entry` → PDF URL（明示 or arXiv 導出）があれば**応答後に** `download_and_attach` を spawn（50MB 上限・30 秒タイムアウト・先頭チャンクの `%PDF-` マジック検証。失敗してもエントリは残る）。作成・添付の成功時は `.bib` 同期キック＋ `entries-changed` を発火。
+
+**メタデータ解決の規則:**
+- 試行順は DOI → arXiv → ISBN（各 10 秒タイムアウト）。ただし **arXiv の DataCite DOI（`10.48550/…`）は CrossRef に無い**ため、arxiv_id があるときは arXiv を先に試す。1 つ失敗しても次の識別子へカスケードする
+- 全滅・識別子なしは**フォールバック入力**へ（クリップ自体は失敗させない）: 拡張が送った `title` / `authors` / `published_date` / `site_name` を使い、**arxiv_id があれば `preprint`、無ければ `webpage`** 種別で作成する。識別子は素通しで保存し、後からのクリップでも重複検出が効く
+- フォールバックに落ちた理由（タイムアウト / API エラー）は stderr にログする
+- クリップの解決処理は serve スレッド上の `block_on` ではなく**ランタイムのワーカーへ spawn** して結果を待つ（本番で動作実績のある PDF ダウンロードと同じ実行モデルに揃える）。serve スレッド自体は応答を返すまで待つため、解決中は他のリクエストが後続待ちになる（上限はタイムアウトの 10 秒）
+
+**Tauri コマンド:**
+
+```ts
+type ClipperStatusInfo = {
+  enabled: boolean;        // clipper.enabled == "1"
+  server_running: boolean; // HTTP サーバースレッドが起動中か
+  port: number;
+};
+```
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `get_clipper_status` | — | `Result<ClipperStatusInfo>` |
+| `set_clipper_enabled` | `enabled: bool` | `Result<ClipperStatusInfo>` — 有効化時はサーバー未起動なら起動。無効化時、`mcp_server.enabled` も off ならサーバー停止 |
+| `get_clipper_connect_code` | — | `Result<String>` — 拡張に貼る接続コード。形式は `lc1.` + base64url(`{"v":1,"port":<u16>,"token":"<48hex>"}`)。トークン再生成（`regenerate_mcp_server_token`）でペアリングは無効化される |
+
 ### OCR（v0.2.0 追加）
 
 テキストレイヤーのないスキャン PDF を LLM Vision で OCR し、結果を `fulltext` にページ単位で保存する。詳細ビューの手動ボタンと LLM ツール（`ocr_pdf` / `attach_ocr_text`）で内部実装を共有する。

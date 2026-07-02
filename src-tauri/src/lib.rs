@@ -1,6 +1,7 @@
 mod backup;
 mod bibtex;
 mod db;
+mod download;
 mod keychain;
 mod llm;
 mod mcp;
@@ -589,29 +590,7 @@ fn attachments_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("attachments"))
 }
 
-fn unique_dest(dir: &std::path::Path, file_name: &str) -> PathBuf {
-    let candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let (stem, ext) = match file_name.rsplit_once('.') {
-        Some((s, e)) => (s.to_string(), format!(".{e}")),
-        None => (file_name.to_string(), String::new()),
-    };
-    for i in 1..1000 {
-        let next = dir.join(format!("{stem}_{i}{ext}"));
-        if !next.exists() {
-            return next;
-        }
-    }
-    dir.join(format!(
-        "{stem}_{}{ext}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ))
-}
+use download::unique_dest;
 
 #[tauri::command]
 async fn pick_pdf_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
@@ -2072,6 +2051,40 @@ async fn mcp_server_configured_port(pool: &SqlitePool) -> Result<u16, String> {
         .unwrap_or(mcp_server::DEFAULT_PORT))
 }
 
+/// bool 設定（"1" で有効）を読む。
+async fn setting_is_on(pool: &SqlitePool, key: &str) -> Result<bool, String> {
+    Ok(db::settings::get_setting(pool, key)
+        .await
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        == Some("1"))
+}
+
+/// ローカル HTTP サーバー（MCP サーバー / Web クリッパー共用）を起動し、
+/// 実バインドポートを設定へ保存して返す。既に起動中なら再起動になる。
+async fn start_http_server(state: &AppState, app: &AppHandle) -> Result<u16, String> {
+    let token = mcp_server::get_or_create_token(&state.db).await?;
+    let port = mcp_server_configured_port(&state.db).await?;
+    let bound = state
+        .mcp_server
+        .start(mcp_server_deps(state, app), port, token)?;
+    // OS が別ポートを割り当てた場合に追従できるよう、実バインドポートを保存。
+    db::settings::set_setting(&state.db, db::settings::MCP_SERVER_PORT_KEY, &bound.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(bound)
+}
+
+/// MCP・クリッパーの両方が無効ならサーバーを停止する（どちらかが使っていれば維持）。
+async fn stop_http_server_if_unused(state: &AppState) -> Result<(), String> {
+    let mcp_on = setting_is_on(&state.db, db::settings::MCP_SERVER_ENABLED_KEY).await?;
+    let clipper_on = setting_is_on(&state.db, db::settings::CLIPPER_ENABLED_KEY).await?;
+    if !mcp_on && !clipper_on {
+        state.mcp_server.stop();
+    }
+    Ok(())
+}
+
 /// 状態を組み立てる内部ヘルパ（複数コマンドから共有）。
 async fn build_mcp_server_status(
     pool: &SqlitePool,
@@ -2123,21 +2136,10 @@ async fn set_mcp_server_enabled(
     .map_err(|e| e.to_string())?;
 
     if enabled {
-        let token = mcp_server::get_or_create_token(&state.db).await?;
-        let port = mcp_server_configured_port(&state.db).await?;
-        let bound = state
-            .mcp_server
-            .start(mcp_server_deps(&state, &app), port, token)?;
-        // OS が別ポートを割り当てた場合に追従できるよう、実バインドポートを保存。
-        db::settings::set_setting(
-            &state.db,
-            db::settings::MCP_SERVER_PORT_KEY,
-            &bound.to_string(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        start_http_server(&state, &app).await?;
     } else {
-        state.mcp_server.stop();
+        // クリッパーがまだ使っている場合はサーバーを維持する
+        stop_http_server_if_unused(&state).await?;
     }
 
     build_mcp_server_status(&state.db, &state.mcp_server).await
@@ -2230,6 +2232,80 @@ async fn get_mcp_server_config_snippet(
     Ok(snippet)
 }
 
+// ─── Web クリッパー（v0.5.0） ────────────────────────────────────────────────
+
+/// Web クリッパーの状態（フロントの設定画面表示用）。
+#[derive(serde::Serialize)]
+struct ClipperStatusInfo {
+    /// `clipper.enabled == "1"`
+    enabled: bool,
+    /// 共用 HTTP サーバースレッドが起動中か
+    server_running: bool,
+    port: u16,
+}
+
+async fn build_clipper_status(
+    pool: &SqlitePool,
+    manager: &mcp_server::McpServerManager,
+) -> Result<ClipperStatusInfo, String> {
+    let enabled = setting_is_on(pool, db::settings::CLIPPER_ENABLED_KEY).await?;
+    let running_port = manager.running_port();
+    Ok(ClipperStatusInfo {
+        enabled,
+        server_running: running_port.is_some(),
+        port: running_port.unwrap_or(mcp_server_configured_port(pool).await?),
+    })
+}
+
+#[tauri::command]
+async fn get_clipper_status(state: State<'_, AppState>) -> Result<ClipperStatusInfo, String> {
+    build_clipper_status(&state.db, &state.mcp_server).await
+}
+
+#[tauri::command]
+async fn set_clipper_enabled(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    enabled: bool,
+) -> Result<ClipperStatusInfo, String> {
+    db::settings::set_setting(
+        &state.db,
+        db::settings::CLIPPER_ENABLED_KEY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if enabled {
+        // MCP 側で既に起動していればそのまま共用する（再起動しない）
+        if state.mcp_server.running_port().is_none() {
+            start_http_server(&state, &app).await?;
+        }
+    } else {
+        stop_http_server_if_unused(&state).await?;
+    }
+
+    build_clipper_status(&state.db, &state.mcp_server).await
+}
+
+/// ブラウザ拡張のオプションページに貼り付ける接続コードを返す。
+/// 形式: `lc1.` + base64url(`{"v":1,"port":<u16>,"token":"<48hex>"}`)（パディングなし）。
+/// トークン再生成（`regenerate_mcp_server_token`）でこのコードは無効になる。
+#[tauri::command]
+async fn get_clipper_connect_code(state: State<'_, AppState>) -> Result<String, String> {
+    use base64::Engine;
+    let port = state
+        .mcp_server
+        .running_port()
+        .unwrap_or(mcp_server_configured_port(&state.db).await?);
+    let token = mcp_server::get_or_create_token(&state.db).await?;
+    let payload = serde_json::json!({ "v": 1, "port": port, "token": token });
+    Ok(format!(
+        "lc1.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string())
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2314,16 +2390,23 @@ pub fn run() {
                 app_data_dir: data_dir.clone(),
             });
 
-            // LumenCite を MCP サーバーとして公開する設定が有効なら起動する。
+            // MCP サーバー公開 or Web クリッパーのどちらかが有効なら共用 HTTP サーバーを起動する。
             let srv_pool = pool.clone();
             let srv_dir = data_dir.clone();
             tauri::async_runtime::spawn(async move {
-                let enabled = db::settings::get_setting(&srv_pool, db::settings::MCP_SERVER_ENABLED_KEY)
-                    .await
-                    .ok()
-                    .flatten()
-                    .as_deref()
-                    == Some("1");
+                let is_on = |key: &'static str| {
+                    let pool = srv_pool.clone();
+                    async move {
+                        db::settings::get_setting(&pool, key)
+                            .await
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some("1")
+                    }
+                };
+                let enabled = is_on(db::settings::MCP_SERVER_ENABLED_KEY).await
+                    || is_on(db::settings::CLIPPER_ENABLED_KEY).await;
                 if !enabled {
                     return;
                 }
@@ -2482,6 +2565,9 @@ pub fn run() {
             get_mcp_audit_log,
             regenerate_mcp_server_token,
             get_mcp_server_config_snippet,
+            get_clipper_status,
+            set_clipper_enabled,
+            get_clipper_connect_code,
             ocr_pdf,
             run_backup_now,
             list_backups,

@@ -1,0 +1,23 @@
+{
+  "extName": { "message": "LumenCite Web クリッパー" },
+  "extDescription": { "message": "表示中のページの論文をワンクリックで LumenCite に保存します。" },
+  "clipTitle": { "message": "LumenCite にクリップ" },
+  "okCreated": { "message": "LumenCite に保存しました" },
+  "okDuplicate": { "message": "既にライブラリにあります" },
+  "errNotPaired": { "message": "未ペアリングです。オプションページで接続コードを貼り付けてください" },
+  "errNoAccess": { "message": "このページはクリップできません" },
+  "errUnreachable": { "message": "LumenCite に接続できません。アプリは起動していますか？" },
+  "errAuth": { "message": "ペアリングが無効です。オプションページで再ペアリングしてください" },
+  "errDisabled": { "message": "LumenCite の設定で Web クリッパーが無効になっています" },
+  "errServer": { "message": "LumenCite がエラーを返しました" },
+  "optionsTitle": { "message": "LumenCite クリッパー — ペアリング" },
+  "optionsInstructions": { "message": "LumenCite の 設定 → Chat / MCP → Web クリッパー を有効にし、接続コードをコピーして下に貼り付けてください。" },
+  "optionsSave": { "message": "接続テストして保存" },
+  "optionsTesting": { "message": "接続を確認中…" },
+  "optionsBadCode": { "message": "接続コードが正しくありません" },
+  "optionsPingFailed": { "message": "LumenCite に接続できませんでした。アプリの起動とクリッパーの有効化を確認してください。" },
+  "optionsPaired": {
+    "message": "ポート $PORT$ の LumenCite とペアリング済み",
+    "placeholders": { "port": { "content": "$1" } }
+  }
+}

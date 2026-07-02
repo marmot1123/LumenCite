@@ -17,6 +17,19 @@ pub async fn create_tag(pool: &SqlitePool, name: &str) -> Result<Tag, sqlx::Erro
     Ok(Tag { id, name: name.to_string() })
 }
 
+/// 名前でタグを取得し、無ければ作成する（チャットツール・Webクリッパー共用）。
+pub async fn get_or_create_tag(pool: &SqlitePool, name: &str) -> Result<Tag, sqlx::Error> {
+    if let Some(existing) =
+        sqlx::query_as::<_, Tag>("SELECT id, name FROM tags WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?
+    {
+        return Ok(existing);
+    }
+    create_tag(pool, name).await
+}
+
 pub async fn delete_tag(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
 
@@ -103,6 +116,17 @@ mod tests {
         let tag = create_tag(&pool, "ML").await.unwrap();
         assert!(tag.id > 0);
         assert_eq!(tag.name, "ML");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_or_create_tag_reuses_existing_and_creates_new(pool: SqlitePool) {
+        let created = get_or_create_tag(&pool, "ml").await.unwrap();
+        let reused = get_or_create_tag(&pool, "ml").await.unwrap();
+        assert_eq!(created.id, reused.id, "同名タグは再利用される");
+
+        let other = get_or_create_tag(&pool, "nlp").await.unwrap();
+        assert_ne!(other.id, created.id);
+        assert_eq!(get_tags(&pool).await.unwrap().len(), 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]
