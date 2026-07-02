@@ -41,6 +41,10 @@ pub struct ClipRequest {
     /// webpage フォールバック用: サイト名（og:site_name）。
     #[serde(default)]
     pub site_name: Option<String>,
+    /// ページの citation_author 等から抽出した著者名（"Given Family" 形式）。
+    /// メタデータ API での解決に失敗した場合のフォールバックに使う。
+    #[serde(default)]
+    pub authors: Option<Vec<String>>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     #[serde(default)]
@@ -102,42 +106,93 @@ fn build_webpage_input(req: &ClipRequest) -> EntryInput {
         extra_fields.insert("organization".to_string(), site.to_string());
     }
 
+    // arXiv ID を持つページはメタデータ解決に失敗しても「Web ページ」ではなく
+    // プレプリントとして登録する（種別・.bib 出力が自然になる）。
+    let entry_type = if non_empty(req.arxiv_id.as_deref()).is_some() {
+        "preprint"
+    } else {
+        "webpage"
+    };
+
+    let author_names: Vec<String> = req
+        .authors
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+
     EntryInput {
         title,
-        entry_type: "webpage".to_string(),
+        entry_type: entry_type.to_string(),
         url: Some(req.url.clone()),
         doi: req.doi.clone(),
         arxiv_id: req.arxiv_id.clone(),
         isbn: req.isbn.clone(),
         year,
+        author_names,
         extra_fields,
         ..Default::default()
     }
 }
 
-/// 識別子からメタデータを解決する（優先順 DOI → arXiv → ISBN、各 10 秒タイムアウト）。
-/// 失敗・識別子なしは webpage フォールバック。クリップ自体は失敗させない。
-async fn resolve_entry_input(req: &ClipRequest) -> EntryInput {
-    let fetched: Option<EntryInput> = if let Some(doi) = non_empty(req.doi.as_deref()) {
-        with_timeout(crate::metadata::fetch_by_doi(doi)).await
-    } else if let Some(arxiv) = non_empty(req.arxiv_id.as_deref()) {
-        with_timeout(crate::metadata::fetch_by_arxiv(arxiv)).await
-    } else if let Some(isbn) = non_empty(req.isbn.as_deref()) {
-        with_timeout(crate::metadata::fetch_by_isbn(isbn)).await
-    } else {
-        None
-    };
+/// 解決に使う識別子。
+#[derive(Debug, PartialEq)]
+enum Ident<'a> {
+    Doi(&'a str),
+    Arxiv(&'a str),
+    Isbn(&'a str),
+}
 
-    match fetched {
-        Some(mut input) => {
+/// メタデータ解決の試行順（pure）。基本は DOI → arXiv → ISBN。ただし arXiv の
+/// DataCite DOI（`10.48550/…`）は CrossRef に登録されておらず必ず失敗するため、
+/// arxiv_id があるときは arXiv を先に試す。
+fn identifier_candidates(req: &ClipRequest) -> Vec<Ident<'_>> {
+    let doi = non_empty(req.doi.as_deref());
+    let arxiv = non_empty(req.arxiv_id.as_deref());
+    let mut v: Vec<Ident<'_>> = Vec::new();
+
+    let doi_is_arxiv_datacite =
+        doi.is_some_and(|d| d.to_ascii_lowercase().starts_with("10.48550/"));
+    match (doi, arxiv) {
+        (Some(d), Some(a)) if doi_is_arxiv_datacite => {
+            v.push(Ident::Arxiv(a));
+            v.push(Ident::Doi(d));
+        }
+        (Some(d), Some(a)) => {
+            v.push(Ident::Doi(d));
+            v.push(Ident::Arxiv(a));
+        }
+        (Some(d), None) => v.push(Ident::Doi(d)),
+        (None, Some(a)) => v.push(Ident::Arxiv(a)),
+        (None, None) => {}
+    }
+    if let Some(i) = non_empty(req.isbn.as_deref()) {
+        v.push(Ident::Isbn(i));
+    }
+    v
+}
+
+/// 識別子からメタデータを解決する（各 10 秒タイムアウト）。1 つ失敗しても次の
+/// 識別子へカスケードし、全滅・識別子なしはフォールバック入力へ。
+/// クリップ自体は失敗させない。
+async fn resolve_entry_input(req: &ClipRequest) -> EntryInput {
+    for ident in identifier_candidates(req) {
+        let fetched = match ident {
+            Ident::Doi(d) => with_timeout(crate::metadata::fetch_by_doi(d)).await,
+            Ident::Arxiv(a) => with_timeout(crate::metadata::fetch_by_arxiv(a)).await,
+            Ident::Isbn(i) => with_timeout(crate::metadata::fetch_by_isbn(i)).await,
+        };
+        if let Some(mut input) = fetched {
             // メタデータ側に URL が無ければクリップ元ページの URL を採用する
             if input.url.as_deref().map_or(true, |u| u.trim().is_empty()) {
                 input.url = Some(req.url.clone());
             }
-            input
+            return input;
         }
-        None => build_webpage_input(req),
     }
+    build_webpage_input(req)
 }
 
 fn non_empty(s: Option<&str>) -> Option<&str> {
@@ -147,7 +202,21 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 async fn with_timeout(
     fut: impl std::future::Future<Output = Result<EntryInput, String>>,
 ) -> Option<EntryInput> {
-    tokio::time::timeout(METADATA_TIMEOUT, fut).await.ok()?.ok()
+    match tokio::time::timeout(METADATA_TIMEOUT, fut).await {
+        Ok(Ok(input)) => Some(input),
+        // フォールバックに落ちた理由を残す（E2E で気づけるように）
+        Ok(Err(e)) => {
+            eprintln!("clipper: metadata fetch failed: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "clipper: metadata fetch timed out after {}s",
+                METADATA_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
 }
 
 /// 明示 `pdf_url` を優先し、無ければ arXiv ID から PDF URL を導出する（pure）。
@@ -285,6 +354,45 @@ mod tests {
     }
 
     #[test]
+    fn build_webpage_input_uses_preprint_for_arxiv_and_passes_authors() {
+        let mut req = clip_req("https://arxiv.org/abs/2301.00001");
+        req.arxiv_id = Some("2301.00001".to_string());
+        req.authors = Some(vec!["Alice Smith".to_string(), "  ".to_string()]);
+        let input = build_webpage_input(&req);
+        assert_eq!(input.entry_type, "preprint", "arXiv ID があれば webpage ではなく preprint");
+        assert_eq!(input.author_names, vec!["Alice Smith".to_string()], "空白著者は除外");
+    }
+
+    #[test]
+    fn identifier_candidates_order_and_datacite_preference() {
+        let mut req = clip_req("u");
+        req.doi = Some("10.1234/x".to_string());
+        req.arxiv_id = Some("2301.00001".to_string());
+        req.isbn = Some("9780387310732".to_string());
+        assert_eq!(
+            identifier_candidates(&req),
+            vec![
+                Ident::Doi("10.1234/x"),
+                Ident::Arxiv("2301.00001"),
+                Ident::Isbn("9780387310732"),
+            ],
+            "通常は DOI → arXiv → ISBN"
+        );
+
+        // arXiv の DataCite DOI（10.48550/…）は CrossRef に無いので arXiv を先に試す
+        req.doi = Some("10.48550/arXiv.2301.00001".to_string());
+        assert_eq!(
+            identifier_candidates(&req)[..2],
+            [Ident::Arxiv("2301.00001"), Ident::Doi("10.48550/arXiv.2301.00001")],
+        );
+
+        // 空・空白の識別子は候補に入らない
+        let mut empty = clip_req("u");
+        empty.doi = Some("  ".to_string());
+        assert!(identifier_candidates(&empty).is_empty());
+    }
+
+    #[test]
     fn derive_pdf_url_prefers_explicit_over_arxiv() {
         let mut req = clip_req("https://arxiv.org/abs/2301.00001v2");
         req.arxiv_id = Some("2301.00001v2".to_string());
@@ -390,5 +498,69 @@ mod tests {
         // 識別子なしページは重複判定対象外のため 2 件目が作られる（v1 仕様）。
         let outcome2 = handle_clip(&pool, &req).await;
         assert_eq!(outcome2.response["status"], "created");
+    }
+}
+
+/// ネットワークを使う E2E 回帰テスト（`cargo test -- --ignored` で実行）。
+///
+/// v0.5.0 E2E で発覚したバグの回帰確認: serve_loop スレッド上の
+/// `tauri::async_runtime::block_on` では reqwest の I/O が進まず、メタデータ取得が
+/// 必ずタイムアウトして webpage フォールバックに落ちていた（著者なし・種別 webpage）。
+/// 修正後は `run_on_runtime` 経由でワーカー上で解決され、preprint + 著者が入る。
+#[cfg(test)]
+mod network_regression_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires network (arXiv API)"]
+    async fn clip_arxiv_via_http_server_resolves_metadata(pool: sqlx::SqlitePool) {
+        let manager = crate::mcp_server::McpServerManager::default();
+        let (sync_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let app_dir = std::env::temp_dir().join(format!("lc-clip-e2e-{}", std::process::id()));
+        let deps = crate::mcp_server::ServerDeps {
+            pool: pool.clone(),
+            app_data_dir: PathBuf::from(&app_dir),
+            sync_tx,
+            app: None,
+        };
+        crate::db::settings::set_setting(&pool, crate::db::settings::CLIPPER_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let token = "t".to_string();
+        let port = manager.start(deps, 0, token.clone()).unwrap();
+
+        // 拡張が実際に送るのと同じ形（citation_author 由来の authors 込み）。
+        // arXiv API はレート制限・遅延が起きやすいが、成功時（メタデータ解決）でも
+        // フォールバック時でも preprint 種別 + 著者あり になることを確認する。
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/clipper"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "url": "https://arxiv.org/abs/2105.06147",
+                "title": "The bulk-edge correspondence...",
+                "arxiv_id": "2105.06147",
+                "authors": ["Alice Tester", "Bob Example"],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "created", "{body}");
+
+        let (etype, nauthors): (String, i64) = sqlx::query_as(
+            "SELECT e.entry_type, (SELECT COUNT(*) FROM entry_authors ea WHERE ea.entry_id = e.id)
+             FROM entries e WHERE e.id = ?",
+        )
+        .bind(body["entry_id"].as_i64().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(etype, "preprint", "arXiv クリップは（フォールバックでも）preprint 種別");
+        assert!(nauthors > 0, "著者がメタデータ解決 or フォールバックで入る");
+
+        manager.stop();
+        std::fs::remove_dir_all(&app_dir).ok();
     }
 }

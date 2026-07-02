@@ -52,6 +52,15 @@ export function extractPage(
   // ── ISBN ─────────────────────────────────────────────────────────────
   const isbn = meta("citation_isbn");
 
+  // ── 著者（citation_author は複数出現。"Family, Given" は "Given Family" へ） ──
+  const authors = Array.from(doc.querySelectorAll('meta[name="citation_author"]'))
+    .map((el) => el.getAttribute("content")?.trim() ?? "")
+    .filter((s) => s.length > 0)
+    .map((s) => {
+      const parts = s.split(",");
+      return parts.length === 2 ? `${parts[1]!.trim()} ${parts[0]!.trim()}` : s;
+    });
+
   // ── PDF URL / タイトル / webpage フォールバック情報 ──────────────────
   const pdfUrl = meta("citation_pdf_url");
   const title = meta("citation_title") ?? meta("og:title") ?? (doc.title || undefined);
@@ -70,5 +79,6 @@ export function extractPage(
   if (pdfUrl) payload.pdf_url = pdfUrl;
   if (publishedDate) payload.published_date = publishedDate;
   if (siteName) payload.site_name = siteName;
+  if (authors.length > 0) payload.authors = authors;
   return payload;
 }

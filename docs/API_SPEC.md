@@ -619,6 +619,9 @@ type ClipRequest = {
   arxiv_id?: string;
   isbn?: string;
   pdf_url?: string;        // citation_pdf_url。無くても arxiv_id から導出する
+  published_date?: string; // フォールバック用（先頭4桁を year に）
+  site_name?: string;      // フォールバック用（og:site_name → extra_fields.organization）
+  authors?: string[];      // citation_author 群（"Given Family"）。フォールバック用
   tags?: string[];         // get-or-create で付与
   collection_id?: number;
 };
@@ -632,7 +635,13 @@ type ClipResponse = {
 };
 ```
 
-**サーバー側フロー:** `find_duplicate_entry`（DOI/arXiv/ISBN）→ 重複なら `duplicate` 応答（作成も PDF 添付もしない）→ 識別子があれば `metadata::fetch_by_doi/arxiv/isbn`（優先順 DOI→arXiv→ISBN、各 10 秒タイムアウト）でメタデータ解決、失敗・識別子なしは `webpage` エントリにフォールバック（クリップ自体は失敗させない）→ `create_entry` → PDF URL（明示 or arXiv 導出）があれば**応答後に** `download_and_attach` を spawn（50MB 上限・30 秒タイムアウト・先頭チャンクの `%PDF-` マジック検証。失敗してもエントリは残る）。作成・添付の成功時は `.bib` 同期キック＋ `entries-changed` を発火。
+**サーバー側フロー:** `find_duplicate_entry`（DOI/arXiv/ISBN）→ 重複なら `duplicate` 応答（作成も PDF 添付もしない）→ 識別子があれば `metadata::fetch_by_doi/arxiv/isbn` でメタデータ解決 → `create_entry` → PDF URL（明示 or arXiv 導出）があれば**応答後に** `download_and_attach` を spawn（50MB 上限・30 秒タイムアウト・先頭チャンクの `%PDF-` マジック検証。失敗してもエントリは残る）。作成・添付の成功時は `.bib` 同期キック＋ `entries-changed` を発火。
+
+**メタデータ解決の規則:**
+- 試行順は DOI → arXiv → ISBN（各 10 秒タイムアウト）。ただし **arXiv の DataCite DOI（`10.48550/…`）は CrossRef に無い**ため、arxiv_id があるときは arXiv を先に試す。1 つ失敗しても次の識別子へカスケードする
+- 全滅・識別子なしは**フォールバック入力**へ（クリップ自体は失敗させない）: 拡張が送った `title` / `authors` / `published_date` / `site_name` を使い、**arxiv_id があれば `preprint`、無ければ `webpage`** 種別で作成する。識別子は素通しで保存し、後からのクリップでも重複検出が効く
+- フォールバックに落ちた理由（タイムアウト / API エラー）は stderr にログする
+- クリップの解決処理は serve スレッド上の `block_on` ではなく**ランタイムのワーカーへ spawn** して結果を待つ（本番で動作実績のある PDF ダウンロードと同じ実行モデルに揃える）。serve スレッド自体は応答を返すまで待つため、解決中は他のリクエストが後続待ちになる（上限はタイムアウトの 10 秒）
 
 **Tauri コマンド:**
 

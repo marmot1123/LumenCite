@@ -10,6 +10,8 @@ export interface ClipPayload {
   pdf_url?: string;
   published_date?: string;
   site_name?: string;
+  /** citation_author から抽出した著者名（"Given Family" 形式）。フォールバック用。 */
+  authors?: string[];
 }
 
 /** POST /clipper の 200/4xx/5xx JSON 応答。 */

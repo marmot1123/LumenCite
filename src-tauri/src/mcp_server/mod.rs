@@ -593,7 +593,14 @@ fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &s
                     return;
                 }
             };
-            let outcome = tauri::async_runtime::block_on(clipper::handle_clip(&deps.pool, &clip_req));
+            // handle_clip は外部 API（CrossRef / arXiv / OpenLibrary）へ reqwest で
+            // アクセスする。serve_loop スレッド上の block_on では reqwest の I/O が
+            // 進まず必ずタイムアウトする（E2E で発覚）ため、ランタイムのワーカーへ
+            // spawn して結果をチャネルで待つ。
+            let outcome = {
+                let pool = deps.pool.clone();
+                run_on_runtime(async move { clipper::handle_clip(&pool, &clip_req).await })
+            };
             if outcome.mutated {
                 let _ = deps.sync_tx.send(());
                 if let Some(app) = &deps.app {
@@ -652,6 +659,23 @@ fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &s
             }
         }
     }
+}
+
+/// serve_loop スレッドから、非同期ランタイムの**ワーカー上で** future を実行して
+/// 完了を待つ。`tauri::async_runtime::block_on` はこのスレッド上で future を駆動する
+/// ため、reqwest のようなネットワーク I/O を含む future が進行しない。
+/// DB のみの future（sqlx）は block_on で問題ないが、外部 HTTP を含むものは必ず
+/// こちらを使うこと。
+fn run_on_runtime<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    tauri::async_runtime::spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv().expect("runtime task dropped without sending a result")
 }
 
 /// ボディを上限付きで読む（Content-Length は詐称できるため実読で判定）。
@@ -1124,5 +1148,35 @@ mod tests {
         assert!(names.contains(&"export_bibtex"));
 
         manager.stop();
+    }
+}
+
+#[cfg(test)]
+mod block_on_mechanism_tests {
+    use super::*;
+
+    /// serve_loop 相当（素の std::thread 上の tauri::async_runtime::block_on）で
+    /// reqwest + tokio::time::timeout が機能するかの機構テスト（ローカル fixture）。
+    #[test]
+    fn reqwest_inside_block_on_on_foreign_thread_works() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let _ = req.respond(tiny_http::Response::from_string("hello"));
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/x");
+
+        let handle = std::thread::spawn(move || {
+            tauri::async_runtime::block_on(async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    reqwest::get(&url).await.unwrap().text().await.unwrap()
+                })
+                .await
+            })
+        });
+        let result = handle.join().unwrap();
+        assert_eq!(result.expect("must not time out"), "hello");
     }
 }
