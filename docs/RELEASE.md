@@ -311,8 +311,8 @@ Web クリッパー（Chrome 拡張 + `/clipper` ローカル API）は main へ
 
 ### 10-1. 残作業（機能）
 
-- [ ] **更新通知**（v0.5.0 同梱候補）: GitHub API で全 OS「新版あり」通知のみ。Windows/Linux は手動 DL 誘導（`memory/project_update_delivery.md` の計画どおり）
-- [ ] **Codex（OpenAI CLI）向け MCP スニペット**（同梱候補）: `get_mcp_server_config_snippet` に `"codex"` arm を追加＋設定 UI スニペット＋実機疎通（SPEC.md「OpenAI ChatGPT / Codex 対応」参照。既存 `--mcp-stdio` shim 流用）
+- [x] **更新通知**（v0.5.0 同梱）: `check_latest_github_release` コマンド追加。GitHub API で全 OS「新版あり」判定 → 更新タブで updater `check()` と並行実行し、アプリ内更新不可なら「Releases を開く」通知バナー表示（DL/インストールはせず外部ブラウザで開くだけ・`latest.json`/署名鍵不要）。`memory/project_update_delivery.md` の計画どおり
+- [x] **Codex（OpenAI CLI）向け MCP スニペット**（同梱）: `get_mcp_server_config_snippet` に `"codex"` arm 追加（`~/.codex/config.toml` の `[mcp_servers.lumencite]` TOML・既存 `--mcp-stdio` shim 流用・Windows パスの `\` を TOML エスケープ）＋設定 UI にスニペット表示。Codex 実機で end-to-end 疎通確認済み（read/write）
 
 ### 10-2. 拡張の配布（新規手順）
 

@@ -58,4 +58,6 @@ unicode-normalization = "0.1"
 # async DB 呼び出しは tauri::async_runtime::block_on で橋渡しするため、tokio の
 # net/rt 機能追加や axum/hyper の重い依存は不要。
 tiny_http = "0.12"
+# v0.5.0: 更新通知（GitHub Releases の tag と現バージョンの semver 比較）
+semver = "1"
 
