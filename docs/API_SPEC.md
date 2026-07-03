@@ -505,6 +505,9 @@ type BackupInfo = { path: string; created_at: string; size_bytes: number };
 | `apply_update` | — | `Result<()>` — ダウンロード+検証+再起動 |
 | `get_updater_channel` | — | `"stable" \| "beta"` |
 | `set_updater_channel` | `channel: "stable" \| "beta"` | `Result<()>` |
+| `check_latest_github_release` | — | `Result<GithubReleaseInfo>` — **v0.5.0**: GitHub Releases API で最新 tag を取得し `env!("CARGO_PKG_VERSION")` と semver 比較（下記） |
+
+**`check_latest_github_release`（v0.5.0・通知のみの更新確認）:** `tauri-plugin-updater` とは独立した経路。`latest.json` は darwin エントリしか持たないため Windows/Linux では updater の `check()` が新版を見つけられない。この経路は GitHub API（`repos/marmot1123/LumenCite/releases/latest`）で全 OS 共通に新版有無を判定し、**DL/インストールはせず** `html_url`（Releases ページ）を返すだけなので updater 署名鍵も `latest.json` も不要で全 OS 安全。戻り値 `GithubReleaseInfo { current_version, latest_version, is_newer, html_url, body? }`。`is_newer` は tag（先頭 `v` 除去）と現行の semver 比較で、どちらか解釈不能なら `false`（誤って更新を促さない）。フロントの更新タブは updater `check()` と本コマンドを並行実行し、updater が `available` を返せば従来のアプリ内更新、そうでなく `is_newer` なら「Releases を開く」通知バナーを表示する。
 
 ### アプリ設定（settings）
 
@@ -588,9 +591,11 @@ type McpAuditEntry = {
 | `set_mcp_server_write_enabled` | `enabled: bool` | `Result<McpServerStatusInfo>` — **Phase 2**: write 系の公開可否を切替。サーバーはリクエスト毎に設定を読むため再起動不要 |
 | `get_mcp_audit_log` | `limit?: i64` | `Result<Vec<McpAuditEntry>>` — **Phase 2**: MCP 経由 write の監査ログ（新しい順。limit 既定 100） |
 | `regenerate_mcp_server_token` | — | `Result<String>` — token を再生成しキーチェーンへ保存。起動中なら新 token で再起動し、生成した token を返す（表示用） |
-| `get_mcp_server_config_snippet` | `client: String` | `Result<String>` — クライアント別の貼り付け設定。`"claude_code"` は `claude mcp add --transport http ...` コマンド、`"claude_desktop"` は本体を `--mcp-stdio` shim として起動する `mcpServers` JSON（**Phase 3**）、それ以外は URL + ヘッダ |
+| `get_mcp_server_config_snippet` | `client: String` | `Result<String>` — クライアント別の貼り付け設定。`"claude_code"` は `claude mcp add --transport http ...` コマンド、`"claude_desktop"` は本体を `--mcp-stdio` shim として起動する `mcpServers` JSON（**Phase 3**）、`"codex"` は `~/.codex/config.toml` の `[mcp_servers.lumencite]` TOML（同じ `--mcp-stdio` shim を stdio 起動。**v0.5.0**）、それ以外は URL + ヘッダ |
 
 **Phase 3（stdio shim）:** Claude Desktop は stdio トランスポートのみ対応しリモート HTTP MCP に直結できない。本体バイナリを `--mcp-stdio` 付きで起動すると（`main.rs` が GUI 起動前に検出）、Tauri を立ち上げず `mcp_shim::run_stdio_proxy` が「stdio ↔ localhost HTTP」プロキシとして動作し、`LUMENCITE_MCP_URL` / `LUMENCITE_MCP_TOKEN`（Claude Desktop 設定の `env`）を使って内蔵 MCP サーバーへ橋渡しする。別 sidecar バイナリにしないことで追加の署名・notarize 対象を増やさない。`claude_desktop` スニペットの `command` は `std::env::current_exe()` の絶対パス。
+
+**Codex（OpenAI CLI）対応（v0.5.0）:** Codex も stdio MCP のみ対応のため、`claude_desktop` と同じ `--mcp-stdio` shim を流用する。`"codex"` スニペットは `~/.codex/config.toml` に追記する `[mcp_servers.lumencite]` テーブル（`command`=実行ファイル絶対パス・`args`=`["--mcp-stdio"]`・`env` に URL/トークン）。TOML 基本文字列を使い Windows パスの `\` をエスケープする。
 
 **公開ツール（MCP `tools/list`）:**
 - **read 系（常時）**: `fulltext_search` / `get_entry` / `list_collections` / `list_tags`（チャットの read ツール定義を流用）＋ `search_entries`（メタデータ FTS）/ `resolve_citation_key`（実 cite key）/ `export_bibtex`（.bib テキスト）。

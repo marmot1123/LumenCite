@@ -1,5 +1,6 @@
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 
 export interface UpdateAvailable {
   status: "available";
@@ -46,6 +47,30 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
       status: "error",
       message: typeof e === "string" ? e : (e?.message ?? String(e)),
     };
+  }
+}
+
+/** バックエンド `check_latest_github_release` の戻り値。 */
+export interface GithubReleaseInfo {
+  currentVersion: string;
+  latestVersion: string;
+  isNewer: boolean;
+  htmlUrl: string;
+  body: string | null;
+}
+
+/**
+ * GitHub Releases の最新版を問い合わせる（tauri-plugin-updater とは独立の「通知のみ」経路）。
+ *
+ * `latest.json` は darwin エントリしか持たないため、Windows/Linux では Tauri updater の
+ * `check()` が新版を見つけられない。この関数は GitHub API で全 OS 共通に新版有無を判定し、
+ * ダウンロードはせず「Releases を開く」導線だけを提供する。失敗時は null を返す（throw しない）。
+ */
+export async function checkLatestRelease(): Promise<GithubReleaseInfo | null> {
+  try {
+    return await invoke<GithubReleaseInfo>("check_latest_github_release");
+  } catch {
+    return null;
   }
 }
 

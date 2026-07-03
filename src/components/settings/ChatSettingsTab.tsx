@@ -188,10 +188,12 @@ function McpServerPublic() {
   const [status, setStatus] = useState<McpServerStatusInfo | null>(null);
   const [snippet, setSnippet] = useState("");
   const [desktopSnippet, setDesktopSnippet] = useState("");
+  const [codexSnippet, setCodexSnippet] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [copiedDesktop, setCopiedDesktop] = useState(false);
+  const [copiedCodex, setCopiedCodex] = useState(false);
 
   const reload = () => {
     invoke<McpServerStatusInfo>("get_mcp_server_status").then(setStatus).catch(() => setStatus(null));
@@ -213,9 +215,13 @@ function McpServerPublic() {
       invoke<string>("get_mcp_server_config_snippet", { client: "claude_desktop" })
         .then(setDesktopSnippet)
         .catch(() => setDesktopSnippet(""));
+      invoke<string>("get_mcp_server_config_snippet", { client: "codex" })
+        .then(setCodexSnippet)
+        .catch(() => setCodexSnippet(""));
     } else {
       setSnippet("");
       setDesktopSnippet("");
+      setCodexSnippet("");
     }
   }, [enabled, running, port]);
 
@@ -240,6 +246,7 @@ function McpServerPublic() {
       if (enabled && running) {
         setSnippet(await invoke<string>("get_mcp_server_config_snippet", { client: "claude_code" }));
         setDesktopSnippet(await invoke<string>("get_mcp_server_config_snippet", { client: "claude_desktop" }));
+        setCodexSnippet(await invoke<string>("get_mcp_server_config_snippet", { client: "codex" }));
       }
     } catch (e) {
       setError(typeof e === "string" ? e : String(e));
@@ -338,6 +345,24 @@ function McpServerPublic() {
           <div style={{ display: "flex", gap: 6 }}>
             <button onClick={() => void copyTo(desktopSnippet, setCopiedDesktop)} disabled={!desktopSnippet} style={{ ...primaryBtn, opacity: desktopSnippet ? 1 : 0.5 }}>
               {copiedDesktop ? t("settings.chat.mcpServerCopied") : t("settings.chat.mcpServerDesktopCopy")}
+            </button>
+          </div>
+
+          {/* Codex (OpenAI CLI): stdio のみ → 本体を --mcp-stdio shim として起動する config.toml の [mcp_servers.*] */}
+          <div style={{ marginTop: 8, fontSize: 11.5, fontWeight: 600, color: "var(--text)" }}>{t("settings.chat.mcpServerCodexLabel")}</div>
+          <div style={{ fontSize: 11, color: "var(--text-mute)", lineHeight: 1.5 }}>{t("settings.chat.mcpServerCodexNote")}</div>
+          <div style={{ fontSize: 10.5, color: "var(--text-faint)", lineHeight: 1.5 }}>⚠️ {t("settings.chat.mcpServerDesktopPathWarn")}</div>
+          <textarea
+            readOnly
+            value={codexSnippet}
+            rows={4}
+            spellCheck={false}
+            onFocus={(e) => e.currentTarget.select()}
+            style={{ ...field, resize: "vertical", lineHeight: 1.5, fontSize: 11, fontFamily: "var(--font-mono, monospace)" }}
+          />
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={() => void copyTo(codexSnippet, setCopiedCodex)} disabled={!codexSnippet} style={{ ...primaryBtn, opacity: codexSnippet ? 1 : 0.5 }}>
+              {copiedCodex ? t("settings.chat.mcpServerCopied") : t("settings.chat.mcpServerCodexCopy")}
             </button>
           </div>
         </div>

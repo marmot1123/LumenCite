@@ -6,7 +6,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTheme } from "../hooks/useTheme";
 import { useLanguage } from "../hooks/useLanguage";
 import { Icon } from "./icons";
-import { checkForUpdate, applyUpdate, type UpdateAvailable } from "../lib/updater";
+import { checkForUpdate, applyUpdate, checkLatestRelease, type UpdateAvailable, type GithubReleaseInfo } from "../lib/updater";
 import { ChatSettingsTab } from "./settings/ChatSettingsTab";
 import { MODEL_PRESETS, defaultModelFor } from "../lib/models";
 import LumenciteLogo from "../../design/logo-exports/lumencite.svg?url";
@@ -514,9 +514,10 @@ function UpdatesTab() {
   const appVersion = useAppVersion();
   const [channel, setChannel] = useState<"stable" | "beta">("stable");
   const [status, setStatus] = useState<
-    "idle" | "checking" | "up_to_date" | "available" | "downloading" | "installing" | "error"
+    "idle" | "checking" | "up_to_date" | "available" | "notify" | "downloading" | "installing" | "error"
   >("idle");
   const [available, setAvailable] = useState<UpdateAvailable | null>(null);
+  const [release, setRelease] = useState<GithubReleaseInfo | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [progress, setProgress] = useState({ downloaded: 0, total: null as number | null });
 
@@ -524,17 +525,30 @@ function UpdatesTab() {
     setStatus("checking");
     setErrorMsg(null);
     setAvailable(null);
-    const result = await checkForUpdate();
+    setRelease(null);
+    // Tauri updater（macOS はアプリ内更新まで可能）と GitHub API（全 OS で新版有無だけ通知）を並行実行。
+    // Windows/Linux は latest.json に自 OS エントリが無く updater が新版を見つけられないため、
+    // GitHub 側を通知フォールバックとして使う（DL/インストールはせず Releases を開くだけ）。
+    const [result, gh] = await Promise.all([checkForUpdate(), checkLatestRelease()]);
     if (result.status === "available") {
+      // アプリ内更新が可能（主に macOS）。
       setAvailable(result);
       setStatus("available");
-    } else if (result.status === "up_to_date") {
+    } else if (gh?.isNewer) {
+      // updater は新版を出せないが GitHub に新版あり → 通知のみ（Releases を開く導線）。
+      setRelease(gh);
+      setStatus("notify");
+    } else if (result.status === "up_to_date" || gh) {
+      // updater が最新、または GitHub 照会が成功して新版なし。
       setStatus("up_to_date");
     } else {
-      setErrorMsg(t("settings.updates.checkError", { error: result.message }));
+      // 両経路とも失敗（updater エラー かつ GitHub 照会も失敗）。
+      setErrorMsg(t("settings.updates.checkError", { error: result.status === "error" ? result.message : "network error" }));
       setStatus("error");
     }
   };
+
+  const openReleases = () => { if (release) void openUrl(release.htmlUrl); };
 
   const handleInstall = async () => {
     if (!available) return;
@@ -595,6 +609,35 @@ function UpdatesTab() {
                   color: "var(--text)", whiteSpace: "pre-wrap", lineHeight: 1.5,
                   maxHeight: 200, overflow: "auto",
                 }}>{available.body}</pre>
+              </details>
+            )}
+          </div>
+        )}
+        {status === "notify" && release && (
+          <div style={{
+            marginTop: 12, padding: "10px 12px", borderRadius: 6,
+            background: "var(--accent-soft)", border: "1px solid var(--accent-ring)",
+          }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)" }}>
+              {t("settings.updates.available", { version: release.latestVersion })}
+            </div>
+            <div style={{ marginTop: 4, fontSize: 11.5, color: "var(--text-mute)", lineHeight: 1.5 }}>
+              {t("settings.updates.notifyNote")}
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <PrimaryBtn onClick={openReleases}>{t("settings.updates.openReleases")}</PrimaryBtn>
+            </div>
+            {release.body && (
+              <details style={{ marginTop: 8 }}>
+                <summary style={{ fontSize: 11, color: "var(--text-mute)", cursor: "pointer" }}>
+                  {t("settings.updates.releaseNotes")}
+                </summary>
+                <pre style={{
+                  marginTop: 4, padding: 8, borderRadius: 4,
+                  background: "var(--surface)", fontSize: 11,
+                  color: "var(--text)", whiteSpace: "pre-wrap", lineHeight: 1.5,
+                  maxHeight: 200, overflow: "auto",
+                }}>{release.body}</pre>
               </details>
             )}
           </div>

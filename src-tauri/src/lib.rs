@@ -2226,10 +2226,124 @@ async fn get_mcp_server_config_snippet(
             serde_json::to_string_pretty(&config)
                 .map_err(|e| format!("failed to serialize config: {e}"))?
         }
+        // Codex CLI（OpenAI）は `~/.codex/config.toml` の `[mcp_servers.<name>]` に
+        // stdio サーバーを登録する。Claude Desktop と同じ `--mcp-stdio` shim を流用する。
+        "codex" => {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("failed to resolve executable path: {e}"))?;
+            codex_config_snippet(&exe.to_string_lossy(), &url, &token)
+        }
         // その他の汎用リモート MCP クライアント向けには素の URL とヘッダを返す。
         _ => format!("URL: {url}\nHeader: Authorization: Bearer {token}"),
     };
     Ok(snippet)
+}
+
+/// TOML 基本文字列（`"..."`）用のエスケープ。Windows パスの `\` や `"`・制御文字を
+/// 安全に含められるようにする。
+fn toml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Codex CLI（`~/.codex/config.toml`）へ貼り付ける `[mcp_servers.lumencite]` スニペット。
+/// LumenCite 本体を `--mcp-stdio` ブリッジとして stdio 起動させ、接続先 URL とトークンを env で渡す。
+fn codex_config_snippet(exe: &str, url: &str, token: &str) -> String {
+    format!(
+        "[mcp_servers.lumencite]\ncommand = \"{}\"\nargs = [\"--mcp-stdio\"]\nenv = {{ LUMENCITE_MCP_URL = \"{}\", LUMENCITE_MCP_TOKEN = \"{}\" }}\n",
+        toml_escape(exe),
+        toml_escape(url),
+        toml_escape(token),
+    )
+}
+
+/// GitHub Releases の `tag_name`（例 `"v0.5.0"`）が現在のアプリバージョンより新しいか。
+/// 先頭の `v` は無視。いずれかが semver として解釈できなければ `false`
+/// （更新を誤って促さない安全側に倒す）。
+fn release_is_newer(current: &str, latest_tag: &str) -> bool {
+    let parse = |s: &str| semver::Version::parse(s.trim().trim_start_matches('v'));
+    match (parse(current), parse(latest_tag)) {
+        (Ok(cur), Ok(latest)) => latest > cur,
+        _ => false,
+    }
+}
+
+/// GitHub Releases の最新版情報（フロントの更新通知バナー表示用）。
+/// フロント（`updater.ts` の `GithubReleaseInfo`）は camelCase で受けるため rename する。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubReleaseInfo {
+    current_version: String,
+    latest_version: String,
+    /// `latest_version > current_version`
+    is_newer: bool,
+    html_url: String,
+    body: Option<String>,
+}
+
+/// GitHub Releases の最新 tag を取得し、現在のアプリバージョンと比較する。
+///
+/// tauri-plugin-updater とは独立した「通知のみ」の更新確認経路。`latest.json` も
+/// updater 署名鍵も使わず、ダウンロード/インストールもしない（フロントが `html_url` を
+/// 外部ブラウザで開くだけ）。そのため macOS の自動更新を壊さず **全 OS で安全**に、
+/// Windows/Linux ユーザーにも新版を通知できる。
+#[tauri::command]
+async fn check_latest_github_release() -> Result<GithubReleaseInfo, String> {
+    const CURRENT: &str = env!("CARGO_PKG_VERSION");
+    const LATEST_RELEASE_API: &str =
+        "https://api.github.com/repos/marmot1123/LumenCite/releases/latest";
+    const RELEASES_PAGE: &str = "https://github.com/marmot1123/LumenCite/releases/latest";
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("client build failed: {e}"))?;
+    let resp = client
+        .get(LATEST_RELEASE_API)
+        .header(reqwest::header::USER_AGENT, "LumenCite")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API returned {}", resp.status()));
+    }
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse response: {e}"))?;
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "response missing tag_name".to_string())?;
+    let html_url = json
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(RELEASES_PAGE)
+        .to_string();
+    let body = json
+        .get("body")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Ok(GithubReleaseInfo {
+        current_version: CURRENT.to_string(),
+        latest_version: tag.trim().trim_start_matches('v').to_string(),
+        is_newer: release_is_newer(CURRENT, tag),
+        html_url,
+        body,
+    })
 }
 
 // ─── Web クリッパー（v0.5.0） ────────────────────────────────────────────────
@@ -2565,6 +2679,7 @@ pub fn run() {
             get_mcp_audit_log,
             regenerate_mcp_server_token,
             get_mcp_server_config_snippet,
+            check_latest_github_release,
             get_clipper_status,
             set_clipper_enabled,
             get_clipper_connect_code,
@@ -2603,6 +2718,96 @@ mod db_init_tests {
     fn connect_text_includes_error_detail() {
         let (_t, body) = db_init_dialog_text(&DbInitFailure::Connect("database is locked".into()));
         assert!(body.contains("database is locked"));
+    }
+}
+
+#[cfg(test)]
+mod update_and_snippet_tests {
+    use super::*;
+
+    #[test]
+    fn release_is_newer_compares_semver_and_ignores_v_prefix() {
+        assert!(release_is_newer("0.4.0", "v0.5.0"));
+        assert!(release_is_newer("0.4.0", "0.5.0")); // v なしでも可
+        assert!(release_is_newer("0.5.0", "v0.5.1"));
+        assert!(!release_is_newer("0.5.0", "v0.5.0")); // 同一は「新しい」でない
+        assert!(!release_is_newer("0.5.0", "v0.4.9")); // 古い tag は促さない
+    }
+
+    #[test]
+    fn release_is_newer_is_false_on_unparseable() {
+        // どちらかが semver でないときは更新を誤って促さない（安全側）。
+        assert!(!release_is_newer("0.5.0", "nightly"));
+        assert!(!release_is_newer("dev", "v0.6.0"));
+        assert!(!release_is_newer("0.5.0", ""));
+    }
+
+    #[test]
+    fn release_is_newer_handles_prerelease() {
+        // prerelease は本リリースより古いと扱われる（semver 準拠）。
+        assert!(release_is_newer("0.5.0-beta.1", "v0.5.0"));
+        assert!(!release_is_newer("0.5.0", "v0.5.0-beta.1"));
+    }
+
+    #[test]
+    fn codex_snippet_is_valid_toml_table_with_stdio_shim() {
+        let s = codex_config_snippet("/Applications/LumenCite.app/exe", "http://127.0.0.1:7373/mcp", "tok123");
+        assert!(s.starts_with("[mcp_servers.lumencite]"));
+        assert!(s.contains("command = \"/Applications/LumenCite.app/exe\""));
+        assert!(s.contains("args = [\"--mcp-stdio\"]"));
+        assert!(s.contains("LUMENCITE_MCP_URL = \"http://127.0.0.1:7373/mcp\""));
+        assert!(s.contains("LUMENCITE_MCP_TOKEN = \"tok123\""));
+    }
+
+    #[test]
+    fn codex_snippet_escapes_windows_backslash_paths() {
+        // Windows の実行ファイルパスは `\` を含むため TOML 基本文字列でエスケープが要る。
+        let s = codex_config_snippet(r"C:\Program Files\LumenCite\lumencite.exe", "http://127.0.0.1:7373/mcp", "t");
+        assert!(s.contains(r#"command = "C:\\Program Files\\LumenCite\\lumencite.exe""#));
+        // エスケープ後の TOML が再パースできること（値が原文と一致）。
+        let parsed: toml_check::Value = toml_check::parse(&s);
+        assert_eq!(
+            parsed.command,
+            r"C:\Program Files\LumenCite\lumencite.exe"
+        );
+    }
+
+    // codex スニペットが本物の TOML パーサで読めることを検証する最小パーサ。
+    // 依存を増やさないため command 行だけを対象にした軽量実装。
+    mod toml_check {
+        pub struct Value {
+            pub command: String,
+        }
+        pub fn parse(s: &str) -> Value {
+            let line = s
+                .lines()
+                .find(|l| l.trim_start().starts_with("command = "))
+                .expect("command 行が無い");
+            let raw = line.trim_start().trim_start_matches("command = ").trim();
+            let inner = raw
+                .strip_prefix('"')
+                .and_then(|r| r.strip_suffix('"'))
+                .expect("基本文字列でない");
+            // TOML 基本文字列のエスケープを戻す。
+            let mut out = String::new();
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    match chars.next() {
+                        Some('\\') => out.push('\\'),
+                        Some('"') => out.push('"'),
+                        Some('n') => out.push('\n'),
+                        Some('r') => out.push('\r'),
+                        Some('t') => out.push('\t'),
+                        Some(other) => out.push(other),
+                        None => {}
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            Value { command: out }
+        }
     }
 }
 
