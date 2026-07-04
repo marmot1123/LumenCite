@@ -12,8 +12,8 @@ mod models;
 mod orcid;
 
 use models::{
-    Attachment, Author, AuthorIdentifierInput, AuthorInput, Collection, EntryDetail, EntryInput,
-    EntrySummary, FulltextHit, ImportResult, SidebarCounts, Tag,
+    Attachment, Author, AuthorIdentifierInput, AuthorInput, Collection, EntryDetail, EntryFilter,
+    EntryInput, EntrySummary, FulltextHit, ImportResult, SidebarCounts, Tag,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode},
@@ -118,8 +118,10 @@ async fn get_entries(
     collection_id: Option<i64>,
     tag_id: Option<i64>,
     view: Option<String>,
+    filter: Option<EntryFilter>,
 ) -> Result<Vec<EntrySummary>, String> {
-    db::entries::get_entries(&state.db, collection_id, tag_id, view.as_deref())
+    let filter = filter.unwrap_or_default();
+    db::entries::get_entries_filtered(&state.db, collection_id, tag_id, view.as_deref(), &filter)
         .await
         .map_err(|e| e.to_string())
 }
@@ -293,8 +295,10 @@ async fn search_entries(
     query: String,
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    filter: Option<EntryFilter>,
 ) -> Result<Vec<EntrySummary>, String> {
-    db::entries::search_entries(&state.db, &query, collection_id, tag_id)
+    let filter = filter.unwrap_or_default();
+    db::entries::search_entries_filtered(&state.db, &query, collection_id, tag_id, &filter)
         .await
         .map_err(|e| e.to_string())
 }

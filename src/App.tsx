@@ -24,7 +24,8 @@ import { CommandPalette } from "./components/CommandPalette";
 import { ChatScreen } from "./components/chat/ChatScreen";
 import { useChatStore } from "./chat/store";
 
-import type { EntrySummary, EntryDetail, EntryInput, Collection, Tag, ViewMode, SearchScope, FulltextHit, SidebarCounts, ImportResult, LlmSettings } from "./types";
+import type { EntrySummary, EntryDetail, EntryInput, Collection, Tag, ViewMode, SearchScope, FulltextHit, SidebarCounts, ImportResult, LlmSettings, EntryFilter } from "./types";
+import { EMPTY_FILTER, isFilterActive } from "./types";
 
 const EMPTY_COUNTS: SidebarCounts = {
   total: 0, starred: 0, unfiled: 0, trash: 0, collections: {}, tags: {},
@@ -34,6 +35,7 @@ type LoadEntriesArgs = {
   collectionId?: number | null;
   tagId?: number | null;
   view?: string | null;
+  filter?: EntryFilter;
 };
 
 // 特殊ビュー（starred / unfiled / trash）のときに backend へ渡す view パラメータ。
@@ -124,6 +126,8 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [searchScope, setSearchScope] = useState<SearchScope>("meta");
+  // 一覧の複合フィルタ（v0.6.0）。ビュー切替をまたいで保持し、明示クリアするまで持続する。
+  const [filter, setFilter] = useState<EntryFilter>(EMPTY_FILTER);
   const [fulltextHits, setFulltextHits] = useState<FulltextHit[]>([]);
   const [indexingCount, setIndexingCount] = useState(0);
   const [viewMode, setViewMode] = useState<ViewMode>("table");
@@ -234,7 +238,7 @@ export default function App() {
   // 応答順序ガード: 遅れて解決した古い検索・一覧応答が新しい表示を上書きしないようにする
   const loadSeqRef = useRef(0);
 
-  const loadEntries = (view = selectedView, query = debouncedSearch, scope = searchScope) => {
+  const loadEntries = (view = selectedView, query = debouncedSearch, scope = searchScope, flt = filter) => {
     // サイドバー件数は entries とは独立した集計値。loadEntries が呼ばれるたびに
     // refresh しておくことで、view 切替直後にも最新の件数が表示される。
     reloadCounts();
@@ -248,9 +252,12 @@ export default function App() {
     const tagId = view.startsWith("tag:") ? Number(view.slice(4)) : null;
     const viewName = viewParam(view);
     const trimmed = query.trim();
+    // フィルタは無制約なら backend へ渡さない（undefined 扱い）ことで従来経路と完全一致させる。
+    const filterArg = isFilterActive(flt) ? flt : undefined;
 
     if (scope === "fulltext") {
-      // 全文モード時は entries テーブルは現在のビューで埋めておき、結果リストは fulltextHits に持つ
+      // 全文モード時は entries テーブルは現在のビューで埋めておき、結果リストは fulltextHits に持つ。
+      // 全文検索結果へのフィルタ適用は v0.6.0 スコープ外（Toolbar でフィルタ無効化済み）。
       const args: LoadEntriesArgs = { collectionId, tagId, view: viewName };
       invoke<EntrySummary[]>("get_entries", args).then(ifCurrent(setEntries)).catch(console.error);
       if (trimmed) {
@@ -264,17 +271,17 @@ export default function App() {
     }
 
     if (trimmed) {
-      invoke<EntrySummary[]>("search_entries", { query: trimmed, collectionId, tagId })
+      invoke<EntrySummary[]>("search_entries", { query: trimmed, collectionId, tagId, filter: filterArg })
         .then(ifCurrent(setEntries))
         .catch(console.error);
     } else {
-      const args: LoadEntriesArgs = { collectionId, tagId, view: viewName };
+      const args: LoadEntriesArgs = { collectionId, tagId, view: viewName, filter: filterArg };
       invoke<EntrySummary[]>("get_entries", args).then(ifCurrent(setEntries)).catch(console.error);
     }
   };
 
-  // load entries when view, debounced search, or scope changes
-  useEffect(() => { loadEntries(); }, [selectedView, debouncedSearch, searchScope]);
+  // load entries when view, debounced search, scope, or filter changes
+  useEffect(() => { loadEntries(); }, [selectedView, debouncedSearch, searchScope, filter]);
 
   // チャット中に LLM が書き込みツールを実行すると dataVersion が進む。
   // チャット画面でも App 本体は mount されたままなので、ここで一覧を再読込しておけば
@@ -905,6 +912,10 @@ export default function App() {
           inTrash={selectedView === "trash"}
           onEmptyTrash={handleEmptyTrash}
           emptyTrashDisabled={entries.length === 0}
+          filter={filter}
+          onFilterChange={setFilter}
+          onClearFilter={() => setFilter(EMPTY_FILTER)}
+          tags={tags}
         />
         {searchScope === "meta" && (
           <ViewTabs viewMode={viewMode} onViewModeChange={setViewMode} />

@@ -2,10 +2,64 @@ use std::collections::HashMap;
 
 use crate::db::authors::{author_inputs_from, get_or_create_author};
 use crate::models::{
-    Attachment, Author, Collection, EntryDetail, EntryInput, EntryRelation, EntrySummary,
-    SidebarCounts, Tag,
+    Attachment, Author, Collection, EntryDetail, EntryFilter, EntryInput, EntryRelation,
+    EntrySummary, SidebarCounts, Tag, TagMatch,
 };
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+
+/// `EntryFilter` の各軸を ` AND ...` 句として QueryBuilder に追記する（v0.6.0）。
+/// エントリのエイリアスは `e` を前提とする。空フィルタなら何も追記しない。
+/// `get_entries_filtered` / 検索の両経路で共有する。
+fn push_filter<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a EntryFilter) {
+    if !filter.entry_types.is_empty() {
+        qb.push(" AND e.entry_type IN (");
+        let mut sep = qb.separated(", ");
+        for t in &filter.entry_types {
+            sep.push_bind(t);
+        }
+        sep.push_unseparated(")");
+    }
+    if let Some(y) = filter.year_min {
+        qb.push(" AND e.year >= ").push_bind(y);
+    }
+    if let Some(y) = filter.year_max {
+        qb.push(" AND e.year <= ").push_bind(y);
+    }
+    match filter.starred {
+        Some(true) => { qb.push(" AND e.starred = 1"); }
+        Some(false) => { qb.push(" AND e.starred = 0"); }
+        None => {}
+    }
+    match filter.has_attachment {
+        Some(true) => {
+            qb.push(" AND EXISTS (SELECT 1 FROM attachments a WHERE a.entry_id = e.id)");
+        }
+        Some(false) => {
+            qb.push(" AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.entry_id = e.id)");
+        }
+        None => {}
+    }
+    if !filter.tag_ids.is_empty() {
+        match filter.tag_match {
+            TagMatch::Or => {
+                qb.push(" AND e.id IN (SELECT entry_id FROM entry_tags WHERE tag_id IN (");
+                let mut sep = qb.separated(", ");
+                for tid in &filter.tag_ids {
+                    sep.push_bind(tid);
+                }
+                sep.push_unseparated("))");
+            }
+            TagMatch::And => {
+                // 各タグごとに存在を要求することで「すべて含む」を表現する。
+                for tid in &filter.tag_ids {
+                    qb.push(" AND e.id IN (SELECT entry_id FROM entry_tags WHERE tag_id = ")
+                        .push_bind(tid)
+                        .push(")");
+                }
+            }
+        }
+    }
+}
 
 #[derive(sqlx::FromRow)]
 struct ExtraFieldRow {
@@ -119,17 +173,29 @@ pub async fn search_entries(
     collection_id: Option<i64>,
     tag_id: Option<i64>,
 ) -> Result<Vec<EntrySummary>, sqlx::Error> {
+    search_entries_filtered(pool, query, collection_id, tag_id, &EntryFilter::default()).await
+}
+
+/// `search_entries` に `EntryFilter`（v0.6.0）を AND 合成した版。FTS/LIKE のヒットを
+/// さらにフィルタ条件で絞り込む。空クエリ時は `get_entries_filtered` にフォールバックする。
+pub async fn search_entries_filtered(
+    pool: &SqlitePool,
+    query: &str,
+    collection_id: Option<i64>,
+    tag_id: Option<i64>,
+    filter: &EntryFilter,
+) -> Result<Vec<EntrySummary>, sqlx::Error> {
     let tokens: Vec<&str> = query.split_whitespace().collect();
     if tokens.is_empty() {
-        return get_entries(pool, collection_id, tag_id, None).await;
+        return get_entries_filtered(pool, collection_id, tag_id, None, filter).await;
     }
 
     // trigram は 3 文字未満のクエリを正しく扱えないため、最短トークンが 3 文字未満の場合は
     // entries_fts の各列を LIKE でスキャンするフォールバックパスを使う。
     let ids = if tokens.iter().any(|t| t.chars().count() < 3) {
-        search_ids_like(pool, &tokens, collection_id, tag_id).await?
+        search_ids_like(pool, &tokens, collection_id, tag_id, filter).await?
     } else {
-        search_ids_fts(pool, &tokens, collection_id, tag_id).await?
+        search_ids_fts(pool, &tokens, collection_id, tag_id, filter).await?
     };
 
     let mut summaries = Vec::new();
@@ -144,32 +210,27 @@ async fn search_ids_fts(
     tokens: &[&str],
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    filter: &EntryFilter,
 ) -> Result<Vec<i64>, sqlx::Error> {
     let match_expr = build_fts_match_expr(tokens);
-    let mut sql = String::from(
-        "SELECT e.id AS id
-         FROM entries e
-         JOIN entries_fts f ON f.rowid = e.id
-         WHERE entries_fts MATCH ? AND e.deleted_at IS NULL",
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        "SELECT e.id FROM entries e JOIN entries_fts f ON f.rowid = e.id WHERE entries_fts MATCH ",
     );
-    if collection_id.is_some() {
-        sql.push_str(
-            " AND e.id IN (SELECT entry_id FROM entry_collections WHERE collection_id = ?)",
-        );
-    }
-    if tag_id.is_some() {
-        sql.push_str(" AND e.id IN (SELECT entry_id FROM entry_tags WHERE tag_id = ?)");
-    }
-    sql.push_str(" ORDER BY bm25(entries_fts)");
-
-    let mut q = sqlx::query(&sql).bind(&match_expr);
+    qb.push_bind(match_expr);
+    qb.push(" AND e.deleted_at IS NULL");
     if let Some(cid) = collection_id {
-        q = q.bind(cid);
+        qb.push(" AND e.id IN (SELECT entry_id FROM entry_collections WHERE collection_id = ")
+            .push_bind(cid)
+            .push(")");
     }
     if let Some(tid) = tag_id {
-        q = q.bind(tid);
+        qb.push(" AND e.id IN (SELECT entry_id FROM entry_tags WHERE tag_id = ")
+            .push_bind(tid)
+            .push(")");
     }
-    Ok(q.fetch_all(pool).await?.iter().map(|r| r.get("id")).collect())
+    push_filter(&mut qb, filter);
+    qb.push(" ORDER BY bm25(entries_fts)");
+    Ok(qb.build_query_scalar().fetch_all(pool).await?)
 }
 
 /// LIKE 検索用の部分一致パターン。`%` `_` `\` をエスケープしてリテラル扱いにする
@@ -189,44 +250,32 @@ async fn search_ids_like(
     tokens: &[&str],
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    filter: &EntryFilter,
 ) -> Result<Vec<i64>, sqlx::Error> {
-    let mut sql = String::from(
-        "SELECT e.id AS id
-         FROM entries e
-         JOIN entries_fts f ON f.rowid = e.id
-         WHERE e.deleted_at IS NULL",
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        "SELECT e.id FROM entries e JOIN entries_fts f ON f.rowid = e.id WHERE e.deleted_at IS NULL",
     );
-    for _ in tokens {
-        sql.push_str(
-            " AND (f.title LIKE ? ESCAPE '\\' OR f.authors_text LIKE ? ESCAPE '\\'
-                   OR f.tags_text LIKE ? ESCAPE '\\' OR f.abstract_text LIKE ? ESCAPE '\\'
-                   OR f.identifiers LIKE ? ESCAPE '\\')",
-        );
-    }
-    if collection_id.is_some() {
-        sql.push_str(
-            " AND e.id IN (SELECT entry_id FROM entry_collections WHERE collection_id = ?)",
-        );
-    }
-    if tag_id.is_some() {
-        sql.push_str(" AND e.id IN (SELECT entry_id FROM entry_tags WHERE tag_id = ?)");
-    }
-    sql.push_str(" ORDER BY e.created_at DESC");
-
-    let mut q = sqlx::query(&sql);
     for token in tokens {
         let pattern = like_pattern(token);
-        for _ in 0..5 {
-            q = q.bind(pattern.clone());
-        }
+        qb.push(" AND (f.title LIKE ").push_bind(pattern.clone()).push(" ESCAPE '\\'");
+        qb.push(" OR f.authors_text LIKE ").push_bind(pattern.clone()).push(" ESCAPE '\\'");
+        qb.push(" OR f.tags_text LIKE ").push_bind(pattern.clone()).push(" ESCAPE '\\'");
+        qb.push(" OR f.abstract_text LIKE ").push_bind(pattern.clone()).push(" ESCAPE '\\'");
+        qb.push(" OR f.identifiers LIKE ").push_bind(pattern).push(" ESCAPE '\\')");
     }
     if let Some(cid) = collection_id {
-        q = q.bind(cid);
+        qb.push(" AND e.id IN (SELECT entry_id FROM entry_collections WHERE collection_id = ")
+            .push_bind(cid)
+            .push(")");
     }
     if let Some(tid) = tag_id {
-        q = q.bind(tid);
+        qb.push(" AND e.id IN (SELECT entry_id FROM entry_tags WHERE tag_id = ")
+            .push_bind(tid)
+            .push(")");
     }
-    Ok(q.fetch_all(pool).await?.iter().map(|r| r.get("id")).collect())
+    push_filter(&mut qb, filter);
+    qb.push(" ORDER BY e.created_at DESC");
+    Ok(qb.build_query_scalar().fetch_all(pool).await?)
 }
 
 async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::Error> {
@@ -577,162 +626,70 @@ pub async fn set_summary(
     Ok(())
 }
 
+/// `get_entries_filtered` の無フィルタ版ショートカット。テスト・非フィルタ経路の利便のため残す。
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn get_entries(
     pool: &SqlitePool,
     collection_id: Option<i64>,
     tag_id: Option<i64>,
     view: Option<&str>,
 ) -> Result<Vec<EntrySummary>, sqlx::Error> {
+    get_entries_filtered(pool, collection_id, tag_id, view, &EntryFilter::default()).await
+}
+
+/// scope（collection/tag/view）に加えて `EntryFilter`（v0.6.0 複合フィルタ）を AND 合成して
+/// 一覧を返す。`filter` が空なら従来の `get_entries` と同じ結果になる。
+pub async fn get_entries_filtered(
+    pool: &SqlitePool,
+    collection_id: Option<i64>,
+    tag_id: Option<i64>,
+    view: Option<&str>,
+    filter: &EntryFilter,
+) -> Result<Vec<EntrySummary>, sqlx::Error> {
     // view = "trash" 以外はゴミ箱（deleted_at IS NOT NULL）を除外する。
     let trash_view = matches!(view, Some("trash"));
-    let trash_clause = if trash_view {
+
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT e.id FROM entries e WHERE ");
+    qb.push(if trash_view {
         "e.deleted_at IS NOT NULL"
     } else {
         "e.deleted_at IS NULL"
-    };
+    });
 
-    // フィルタ条件に応じて対象エントリIDを取得
-    let ids: Vec<i64> = if let Some(tid) = tag_id {
-        let sql = format!(
-            "SELECT e.id FROM entries e
-             JOIN entry_tags et ON et.entry_id = e.id
-             WHERE et.tag_id = ? AND {trash_clause}
-             ORDER BY e.created_at DESC"
-        );
-        sqlx::query(&sql)
-            .bind(tid)
-            .fetch_all(pool)
-            .await?
-            .iter()
-            .map(|r| r.get("id"))
-            .collect()
+    // scope: サイドバーの単一次元選択。tag_id > collection_id > 特殊 view の優先順で 1 つだけ効く。
+    if let Some(tid) = tag_id {
+        qb.push(" AND e.id IN (SELECT entry_id FROM entry_tags WHERE tag_id = ")
+            .push_bind(tid)
+            .push(")");
     } else if let Some(cid) = collection_id {
-        let sql = format!(
-            "SELECT e.id FROM entries e
-             JOIN entry_collections ec ON ec.entry_id = e.id
-             WHERE ec.collection_id = ? AND {trash_clause}
-             ORDER BY e.created_at DESC"
-        );
-        sqlx::query(&sql)
-            .bind(cid)
-            .fetch_all(pool)
-            .await?
-            .iter()
-            .map(|r| r.get("id"))
-            .collect()
+        qb.push(" AND e.id IN (SELECT entry_id FROM entry_collections WHERE collection_id = ")
+            .push_bind(cid)
+            .push(")");
     } else {
         match view {
-            Some("starred") => sqlx::query(
-                "SELECT id FROM entries
-                 WHERE starred = 1 AND deleted_at IS NULL
-                 ORDER BY created_at DESC",
-            )
-            .fetch_all(pool)
-            .await?
-            .iter()
-            .map(|r| r.get("id"))
-            .collect(),
-            Some("unfiled") => sqlx::query(
-                "SELECT e.id FROM entries e
-                 WHERE e.deleted_at IS NULL
-                   AND NOT EXISTS (
-                     SELECT 1 FROM entry_collections ec WHERE ec.entry_id = e.id
-                   )
-                 ORDER BY e.created_at DESC",
-            )
-            .fetch_all(pool)
-            .await?
-            .iter()
-            .map(|r| r.get("id"))
-            .collect(),
-            Some("trash") => sqlx::query(
-                "SELECT id FROM entries
-                 WHERE deleted_at IS NOT NULL
-                 ORDER BY deleted_at DESC",
-            )
-            .fetch_all(pool)
-            .await?
-            .iter()
-            .map(|r| r.get("id"))
-            .collect(),
-            _ => sqlx::query(
-                "SELECT id FROM entries
-                 WHERE deleted_at IS NULL
-                 ORDER BY created_at DESC",
-            )
-            .fetch_all(pool)
-            .await?
-            .iter()
-            .map(|r| r.get("id"))
-            .collect(),
+            Some("starred") => { qb.push(" AND e.starred = 1"); }
+            Some("unfiled") => {
+                qb.push(" AND NOT EXISTS (SELECT 1 FROM entry_collections ec WHERE ec.entry_id = e.id)");
+            }
+            _ => {}
         }
-    };
-
-    // 各IDについてサマリーを組み立てる
-    let mut summaries = Vec::new();
-    for id in ids {
-        let row = sqlx::query(
-            "SELECT id, title, year, entry_type, created_at, starred FROM entries WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_one(pool)
-        .await?;
-
-        let authors: Vec<Author> = sqlx::query_as(
-            "SELECT a.id, a.name,
-                    a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
-                    a.name_original, a.given_name_original, a.family_name_original, a.original_script,
-                    a.reading_family, a.reading_given,
-                    a.is_organization,
-                    a.email, a.homepage_url, a.notes,
-                    a.orcid, a.updated_at
-             FROM authors a
-             JOIN entry_authors ea ON ea.author_id = a.id
-             WHERE ea.entry_id = ?
-             ORDER BY ea.position",
-        )
-        .bind(id)
-        .fetch_all(pool)
-        .await?;
-
-        let tags: Vec<Tag> = sqlx::query_as(
-            "SELECT t.id, t.name FROM tags t
-             JOIN entry_tags et ON et.tag_id = t.id
-             WHERE et.entry_id = ?",
-        )
-        .bind(id)
-        .fetch_all(pool)
-        .await?;
-
-        let has_attachment: bool =
-            sqlx::query("SELECT COUNT(*) as cnt FROM attachments WHERE entry_id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .map(|r| r.get::<i64, _>("cnt") > 0)
-                .unwrap_or(false);
-
-        let journal: Option<String> = sqlx::query_scalar(
-            "SELECT field_value FROM extra_fields WHERE entry_id = ? AND field_name = 'journal'",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
-
-        summaries.push(EntrySummary {
-            id: row.get("id"),
-            title: row.get("title"),
-            year: row.get("year"),
-            entry_type: row.get("entry_type"),
-            created_at: row.get("created_at"),
-            authors,
-            tags,
-            has_attachment,
-            journal,
-            starred: row.get::<i64, _>("starred") != 0,
-        });
     }
 
+    // filter: 複合フィルタ（各軸 AND）。
+    push_filter(&mut qb, filter);
+
+    qb.push(if trash_view {
+        " ORDER BY e.deleted_at DESC"
+    } else {
+        " ORDER BY e.created_at DESC"
+    });
+
+    let ids: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
+
+    let mut summaries = Vec::with_capacity(ids.len());
+    for id in ids {
+        summaries.push(load_entry_summary(pool, id).await?);
+    }
     Ok(summaries)
 }
 
@@ -2529,5 +2486,171 @@ mod tests {
             assert_eq!(hits.len(), 1, "{q} should hit without rebuild");
             assert_eq!(hits[0].id, entry.id);
         }
+    }
+
+    // ── get_entries_filtered（v0.6.0 複合フィルタ）─────────────────────────────
+    use crate::models::{EntryFilter, TagMatch};
+
+    async fn make_entry_full(
+        pool: &SqlitePool,
+        title: &str,
+        entry_type: &str,
+        year: Option<i64>,
+        starred: bool,
+    ) -> i64 {
+        let e = create_entry(pool, &EntryInput {
+            title: title.to_string(),
+            entry_type: entry_type.to_string(),
+            year,
+            ..Default::default()
+        }).await.unwrap();
+        if starred {
+            set_starred(pool, e.id, true).await.unwrap();
+        }
+        e.id
+    }
+
+    async fn attach_dummy(pool: &SqlitePool, entry_id: i64) {
+        sqlx::query(
+            "INSERT INTO attachments (entry_id, file_name, file_path, mime_type)
+             VALUES (?, 'x.pdf', '/tmp/x.pdf', 'application/pdf')",
+        )
+        .bind(entry_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn empty_filter_matches_get_entries(pool: SqlitePool) {
+        make_entry_full(&pool, "A", "article", Some(2020), false).await;
+        make_entry_full(&pool, "B", "book", Some(2010), true).await;
+        let all = get_entries_filtered(&pool, None, None, None, &EntryFilter::default())
+            .await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn filter_by_entry_type(pool: SqlitePool) {
+        make_entry_full(&pool, "A", "article", None, false).await;
+        make_entry_full(&pool, "B", "book", None, false).await;
+        make_entry_full(&pool, "C", "article", None, false).await;
+
+        let f = EntryFilter { entry_types: vec!["article".into()], ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &f).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|e| e.entry_type == "article"));
+
+        // 複数種別は OR
+        let f2 = EntryFilter { entry_types: vec!["article".into(), "book".into()], ..Default::default() };
+        assert_eq!(get_entries_filtered(&pool, None, None, None, &f2).await.unwrap().len(), 3);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn filter_by_year_range(pool: SqlitePool) {
+        make_entry_full(&pool, "old", "article", Some(1999), false).await;
+        make_entry_full(&pool, "mid", "article", Some(2010), false).await;
+        make_entry_full(&pool, "new", "article", Some(2022), false).await;
+        make_entry_full(&pool, "noyear", "article", None, false).await;
+
+        let min = EntryFilter { year_min: Some(2010), ..Default::default() };
+        assert_eq!(get_entries_filtered(&pool, None, None, None, &min).await.unwrap().len(), 2);
+
+        let max = EntryFilter { year_max: Some(2010), ..Default::default() };
+        assert_eq!(get_entries_filtered(&pool, None, None, None, &max).await.unwrap().len(), 2);
+
+        let range = EntryFilter { year_min: Some(2000), year_max: Some(2015), ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &range).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "mid");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn filter_by_starred(pool: SqlitePool) {
+        make_entry_full(&pool, "s", "article", None, true).await;
+        make_entry_full(&pool, "n", "article", None, false).await;
+
+        let on = EntryFilter { starred: Some(true), ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &on).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "s");
+
+        let off = EntryFilter { starred: Some(false), ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &off).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "n");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn filter_by_has_attachment(pool: SqlitePool) {
+        let with = make_entry_full(&pool, "with", "article", None, false).await;
+        make_entry_full(&pool, "without", "article", None, false).await;
+        attach_dummy(&pool, with).await;
+
+        let yes = EntryFilter { has_attachment: Some(true), ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &yes).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "with");
+
+        let no = EntryFilter { has_attachment: Some(false), ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &no).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "without");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn filter_by_tags_or_and(pool: SqlitePool) {
+        let a = make_entry_full(&pool, "a", "article", None, false).await;
+        let b = make_entry_full(&pool, "b", "article", None, false).await;
+        let c = make_entry_full(&pool, "c", "article", None, false).await;
+        let t1: i64 = sqlx::query_scalar("INSERT INTO tags (name) VALUES ('t1') RETURNING id")
+            .fetch_one(&pool).await.unwrap();
+        let t2: i64 = sqlx::query_scalar("INSERT INTO tags (name) VALUES ('t2') RETURNING id")
+            .fetch_one(&pool).await.unwrap();
+        bulk_add_tag(&pool, &[a], t1).await.unwrap();          // a: t1
+        bulk_add_tag(&pool, &[b], t1).await.unwrap();          // b: t1, t2
+        bulk_add_tag(&pool, &[b], t2).await.unwrap();
+        bulk_add_tag(&pool, &[c], t2).await.unwrap();          // c: t2
+
+        // OR: t1 または t2 → a, b, c 全部
+        let or = EntryFilter { tag_ids: vec![t1, t2], tag_match: TagMatch::Or, ..Default::default() };
+        assert_eq!(get_entries_filtered(&pool, None, None, None, &or).await.unwrap().len(), 3);
+
+        // AND: t1 かつ t2 → b のみ
+        let and = EntryFilter { tag_ids: vec![t1, t2], tag_match: TagMatch::And, ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &and).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "b");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn filter_combines_with_scope_and_dimensions(pool: SqlitePool) {
+        // コレクション scope × 種別 × 年 の AND 合成
+        let cid: i64 = sqlx::query_scalar("INSERT INTO collections (name) VALUES ('C') RETURNING id")
+            .fetch_one(&pool).await.unwrap();
+        let a = make_entry_full(&pool, "a", "article", Some(2021), false).await; // in C, article, 2021
+        let b = make_entry_full(&pool, "b", "book", Some(2021), false).await;    // in C, book
+        let c = make_entry_full(&pool, "c", "article", Some(2000), false).await; // in C, article, old
+        make_entry_full(&pool, "d", "article", Some(2021), false).await;         // NOT in C
+        for id in [a, b, c] {
+            bulk_add_to_collection(&pool, &[id], cid).await.unwrap();
+        }
+
+        let f = EntryFilter { entry_types: vec!["article".into()], year_min: Some(2020), ..Default::default() };
+        let hits = get_entries_filtered(&pool, Some(cid), None, None, &f).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "a");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_entries_respects_filter(pool: SqlitePool) {
+        make_entry_full(&pool, "transformer networks", "article", Some(2021), false).await;
+        make_entry_full(&pool, "transformer theory", "book", Some(2021), false).await;
+
+        // クエリ "transformer" は 2 件ヒットするが、種別 article で 1 件に絞られる
+        let f = EntryFilter { entry_types: vec!["article".into()], ..Default::default() };
+        let hits = search_entries_filtered(&pool, "transformer", None, None, &f).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry_type, "article");
     }
 }

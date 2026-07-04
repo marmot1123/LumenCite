@@ -201,6 +201,44 @@ pub struct Collection {
     pub children: Vec<Collection>,
 }
 
+/// 複合タグフィルタの結合方法。`Or` = いずれかのタグを含む / `And` = すべてのタグを含む。
+/// serde は小文字（"or" / "and"）で受ける。既定は `Or`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TagMatch {
+    #[default]
+    Or,
+    And,
+}
+
+/// 一覧の複合フィルタ（v0.6.0）。scope（collection/tag/view）や検索クエリと AND で合成される。
+/// 全フィールドが空（`is_empty()` が true）なら無制約で、従来の挙動と一致する。
+/// ネストオブジェクトなのでキーは serde 定義どおり snake_case で受ける。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct EntryFilter {
+    /// 種別。非空なら `entry_type IN (...)`（要素どうしは OR）。
+    #[serde(default)]
+    pub entry_types: Vec<String>,
+    /// `year >= year_min`。
+    #[serde(default)]
+    pub year_min: Option<i64>,
+    /// `year <= year_max`。
+    #[serde(default)]
+    pub year_max: Option<i64>,
+    /// `Some(true)` = star 付きのみ / `Some(false)` = star なしのみ / `None` = 指定なし。
+    #[serde(default)]
+    pub starred: Option<bool>,
+    /// `Some(true)` = 添付あり / `Some(false)` = 添付なし / `None` = 指定なし。
+    #[serde(default)]
+    pub has_attachment: Option<bool>,
+    /// 複合タグ。非空なら `tag_match` で結合。scope の単一 tag_id とは独立に AND 合成。
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    /// `tag_ids` の結合方法（既定 Or）。
+    #[serde(default)]
+    pub tag_match: TagMatch,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
 pub struct EntryInput {
     pub title: String,
@@ -227,4 +265,48 @@ pub struct EntryInput {
     pub authors: Option<Vec<AuthorInput>>,
     #[serde(default)]
     pub tag_ids: Vec<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// フロント（types.ts の EntryFilter）が送る JSON 形状で正しくデシリアライズできること。
+    /// キーは snake_case、tag_match は小文字、省略された任意フィールドは None/空になる。
+    #[test]
+    fn entry_filter_deserializes_frontend_shape() {
+        let json = serde_json::json!({
+            "entry_types": ["article", "book"],
+            "year_min": 2020,
+            "year_max": 2023,
+            "starred": true,
+            "has_attachment": false,
+            "tag_ids": [1, 2],
+            "tag_match": "and"
+        });
+        let f: EntryFilter = serde_json::from_value(json).unwrap();
+        assert_eq!(f.entry_types, vec!["article", "book"]);
+        assert_eq!(f.year_min, Some(2020));
+        assert_eq!(f.year_max, Some(2023));
+        assert_eq!(f.starred, Some(true));
+        assert_eq!(f.has_attachment, Some(false));
+        assert_eq!(f.tag_ids, vec![1, 2]);
+        assert_eq!(f.tag_match, TagMatch::And);
+    }
+
+    /// 空フィルタ（EMPTY_FILTER 相当）と、全フィールド省略のどちらも既定値になる。
+    #[test]
+    fn entry_filter_defaults_are_permissive() {
+        let empty: EntryFilter = serde_json::from_value(serde_json::json!({
+            "entry_types": [], "tag_ids": [], "tag_match": "or"
+        })).unwrap();
+        assert!(empty.entry_types.is_empty());
+        assert_eq!(empty.tag_match, TagMatch::Or);
+        assert!(empty.starred.is_none());
+
+        // 全省略でも default で成立する
+        let bare: EntryFilter = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(bare.tag_match, TagMatch::Or);
+        assert!(bare.tag_ids.is_empty());
+    }
 }

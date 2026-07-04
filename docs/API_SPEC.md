@@ -278,7 +278,7 @@ type McpServerInfo = McpServerConfig & {
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `get_entries` | `collection_id?: i64, tag_id?: i64, view?: "starred"\|"unfiled"\|"trash"` | `Vec<EntrySummary>` |
+| `get_entries` | `collection_id?: i64, tag_id?: i64, view?: "starred"\|"unfiled"\|"trash", filter?: EntryFilter` | `Vec<EntrySummary>` |
 | `get_entry` | `id: i64` | `Result<EntryDetail>` |
 | `create_entry` | `input: EntryInput` | `Result<EntryDetail>` |
 | `update_entry` | `id: i64, input: EntryInput` | `Result<EntryDetail>` |
@@ -295,6 +295,24 @@ type McpServerInfo = McpServerConfig & {
 `create_entry` / `update_entry` の `EntryInput.citation_key` はサニタイズ後 `entries.citation_key` に保存する（空なら NULL = 自動）。既存の固定キーと重複する非 NULL 値は UNIQUE 制約で拒否される（`Result` の `Err`）。UI は保存前に `is_citation_key_available` で検証する。生成・重複回避の規則は `DATA_MODEL.md` の `citation_key` 節を参照。
 
 `get_entries` の `view` は特殊ビュー専用フィルタ。`collection_id` / `tag_id` と組み合わせる場合は `view` は無視され、コレクション/タグの所属で絞られる（いずれも `deleted_at IS NULL` を満たすもののみ）。`search_entries` は常にゴミ箱を除外する。
+
+**`filter`（v0.6.0・複合フィルタ）:** `get_entries` / `search_entries` の任意引数。省略・全フィールド空なら従来どおり無制約。scope（`collection_id`/`tag_id`/`view`）や検索クエリと **AND で合成**する。
+
+```ts
+type EntryFilter = {
+  entry_types?: string[];      // 種別。非空なら entry_type IN (...)（要素どうしは OR）
+  year_min?: number;           // year >= year_min
+  year_max?: number;           // year <= year_max
+  starred?: boolean;           // true=star付きのみ / false=starなしのみ /（省略=指定なし）
+  has_attachment?: boolean;    // true=添付あり / false=添付なし /（省略=指定なし）
+  tag_ids?: number[];          // 複合タグ。非空なら tag_match で結合
+  tag_match?: "and" | "or";    // tag_ids の結合（既定 "or"）。"and"=全タグを含む
+};
+```
+
+- 各軸どうしは AND。空（未指定）の軸は制約を課さない。フィールドはすべて省略可（Tauri のトップレベル引数と異なり、ネストオブジェクトのキーは serde 定義どおり **snake_case**）
+- `tag_ids` は scope の単一 `tag_id` とは独立に AND 合成される（サイドバーでタグ A を選びつつフィルタで B・C を AND 指定、等）
+- 全文検索（`fulltext_search`）への `filter` 適用は v0.6.0 では未対応
 
 ### BibTeX 自動同期
 
@@ -409,7 +427,7 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `search_entries` | `query: String, collection_id?: i64, tag_id?: i64` | `Vec<EntrySummary>` |
+| `search_entries` | `query: String, collection_id?: i64, tag_id?: i64, filter?: EntryFilter` | `Vec<EntrySummary>` |
 | `fulltext_search` | `query: String` | `Vec<FulltextResult>` |
 
 ```ts
@@ -424,6 +442,7 @@ type FulltextResult = {
 - 検索対象: title / authors / tags / abstract / 識別子（DOI・ISBN・arXiv ID）・year
 - トークナイザ: `trigram`（日本語・英語ともに 3-gram 部分一致）
 - `collection_id` / `tag_id` が指定された場合は、その絞り込みの中だけを検索する
+- `filter`（v0.6.0）が指定された場合は、FTS ヒットをさらに `EntryFilter` の条件で AND 絞り込みする（上記「文献」節の型定義参照）
 - 並び順: BM25 ランクスコア降順
 - 空クエリは呼び出さない（フロント側で `get_entries` にフォールバック）
 

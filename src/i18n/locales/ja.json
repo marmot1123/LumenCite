@@ -80,6 +80,27 @@
     "columns": "列",
     "sort": "並び替え"
   },
+  "filter": {
+    "title": "フィルタ",
+    "clearAll": "すべて解除",
+    "entryType": "種別",
+    "year": "年",
+    "yearFrom": "開始",
+    "yearTo": "終了",
+    "starred": "スター",
+    "starredYes": "スター付き",
+    "starredNo": "スターなし",
+    "attachment": "PDF 添付",
+    "attachmentYes": "添付あり",
+    "attachmentNo": "添付なし",
+    "any": "指定なし",
+    "tags": "タグ",
+    "tagMatch": "条件",
+    "tagMatch_or": "いずれか",
+    "tagMatch_and": "すべて",
+    "noTags": "タグがありません",
+    "fulltextDisabled": "全文検索にはフィルタを適用できません"
+  },
   "statusBar": {
     "entriesCount": "{{filtered}} / {{total}} 件",
     "selectionLabel": "選択中: {{state}}",
