@@ -17,6 +17,7 @@
   - 状態永続化: `zoom`, `leftOpen`, `rightOpen`, `metaTab` は localStorage、`page` はエントリごとに `settings` 表へ
 - PDF テキスト選択 → 3色ハイライト（yellow / green / blue）の作成・保存・ノート付与
 - PDF全文検索（既存 FTS5 を継続）
+  - **全文索引の手動トリガ（v0.7.0 追加）**: 通常は添付時に自動索引するが、過去に添付済み・索引失敗のエントリ向けに任意タイミングで再索引できる。詳細パネルの各添付に**索引状態バッジ + 索引/再索引ボタン**（`index_attachment`）を、設定 → データに**「未索引の PDF を一括索引」**（`index_missing_attachments` = `attachments_without_fulltext` で未索引 PDF を洗い出し順次 `pdf-extract` → `fulltext`）を用意。テキストレイヤーが無い（0 ページ）添付は「OCR 候補」として集計し、スキャン PDF は詳細ビューの OCR へ誘導する
 - キーボードショートカット: `←/→` ページ移動 / `⌘+/⌘-/⌘0` ズーム / `⌘F` 検索 / `⌘[/⌘]` サイドバートグル / `H` ハイライト / `N` ノート / `Esc` 戻る
 
 ### 数式表示

@@ -275,6 +275,9 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   const [attaching, setAttaching] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const [editingAuthorId, setEditingAuthorId] = useState<number | null>(null);
+  // 添付ごとの全文索引状態。
+  const [indexStatus, setIndexStatus] = useState<Record<number, "indexed" | "none" | "indexing">>({});
+  const [indexNote, setIndexNote] = useState<string | null>(null);
 
   useEffect(() => {
     setConfirmDelete(false);
@@ -282,7 +285,47 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setTagInputOpen(false);
     setTagInput("");
     setAttachError(null);
+    setIndexNote(null);
   }, [entry?.id]);
+
+  // 添付の全文索引状態を取得する（エントリ切替・添付増減で再取得）。
+  useEffect(() => {
+    let cancelled = false;
+    const atts = entry?.attachments ?? [];
+    if (atts.length === 0) {
+      setIndexStatus({});
+      return;
+    }
+    Promise.all(
+      atts.map(a =>
+        invoke<boolean>("is_attachment_indexed", { id: a.id })
+          .then(ok => [a.id, ok ? "indexed" : "none"] as const)
+          .catch(() => [a.id, "none"] as const),
+      ),
+    ).then(pairs => {
+      if (!cancelled) setIndexStatus(Object.fromEntries(pairs));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [entry?.id, entry?.attachments?.length]);
+
+  const handleIndexAttachment = async (attId: number) => {
+    setIndexNote(null);
+    setIndexStatus(s => ({ ...s, [attId]: "indexing" }));
+    try {
+      const pages = await invoke<number>("index_attachment", { id: attId });
+      setIndexStatus(s => ({ ...s, [attId]: pages > 0 ? "indexed" : "none" }));
+      setIndexNote(
+        pages > 0
+          ? t("detailPanel.indexDonePages", { count: pages })
+          : t("detailPanel.indexNoText"),
+      );
+    } catch (e: any) {
+      setIndexStatus(s => ({ ...s, [attId]: "none" }));
+      setIndexNote(e?.message ?? String(e));
+    }
+  };
 
   useEffect(() => {
     if (!showColDropdown) return;
@@ -566,6 +609,38 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                       }}
                       title={att.file_name}
                     >{att.file_name}</button>
+                    <span
+                      title={
+                        indexStatus[att.id] === "indexed"
+                          ? t("detailPanel.indexedBadge")
+                          : t("detailPanel.notIndexedBadge")
+                      }
+                      style={{
+                        width: 6, height: 6, borderRadius: "50%", flex: "none",
+                        background: indexStatus[att.id] === "indexed"
+                          ? "var(--accent)"
+                          : "var(--border-strong)",
+                      }}
+                    />
+                    <button
+                      onClick={() => handleIndexAttachment(att.id)}
+                      disabled={indexStatus[att.id] === "indexing"}
+                      style={{
+                        width: 16, height: 16, padding: 0, border: "none",
+                        background: "transparent",
+                        cursor: indexStatus[att.id] === "indexing" ? "default" : "pointer",
+                        display: "inline-flex", alignItems: "center", justifyContent: "center",
+                        borderRadius: 3, color: "var(--text-faint)",
+                        opacity: indexStatus[att.id] === "indexing" ? 0.5 : 1,
+                      }}
+                      title={
+                        indexStatus[att.id] === "indexed"
+                          ? t("detailPanel.reindexTitle")
+                          : t("detailPanel.indexNowTitle")
+                      }
+                    >
+                      <Icon name="sync" size={11} color="var(--text-faint)" />
+                    </button>
                     <button
                       onClick={() => handleDeleteAttachment(att.id)}
                       style={{
@@ -598,6 +673,11 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                 {attachError && (
                   <div style={{ fontSize: 11, color: "var(--danger-strong)", marginTop: 2 }}>
                     {attachError}
+                  </div>
+                )}
+                {indexNote && (
+                  <div style={{ fontSize: 11, color: "var(--text-mute)", marginTop: 2 }}>
+                    {indexNote}
                   </div>
                 )}
               </div>

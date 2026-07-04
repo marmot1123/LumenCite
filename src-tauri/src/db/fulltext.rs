@@ -81,6 +81,28 @@ pub async fn is_indexed(pool: &SqlitePool, attachment_id: i64) -> Result<bool, s
     Ok(row.get::<i64, _>("cnt") > 0)
 }
 
+/// まだ全文索引が無い PDF 添付を `(attachment_id, file_path)` で返す（ゴミ箱のエントリは除外）。
+/// 「未索引の添付を一括索引」バッチが処理対象を集めるのに使う。順序は id 昇順で安定。
+pub async fn attachments_without_fulltext(
+    pool: &SqlitePool,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT a.id AS id, a.file_path AS file_path
+         FROM attachments a
+         JOIN entries e ON e.id = a.entry_id
+         WHERE e.deleted_at IS NULL
+           AND a.mime_type LIKE '%pdf%'
+           AND NOT EXISTS (SELECT 1 FROM fulltext f WHERE f.attachment_id = a.id)
+         ORDER BY a.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<i64, _>("id"), r.get::<String, _>("file_path")))
+        .collect())
+}
+
 /// エントリに紐づく（索引済み PDF の）全文を `(page, content)` のリストで返す。
 /// 添付ごとの `attachment_id, page` 順で並べる。索引が無ければ空を返す。
 /// `generate_summary`（fulltext ソース）と MCP の `get_fulltext` が共有する。
@@ -572,5 +594,30 @@ mod tests {
 
         let hits = search_fulltext(&pool, "AI", None, None).await.unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn attachments_without_fulltext_lists_only_unindexed(pool: SqlitePool) {
+        let (_, indexed) = setup_attachment(&pool, "Indexed").await;
+        let (_, unindexed) = setup_attachment(&pool, "Unindexed").await;
+        index_attachment(&pool, indexed, &[(1, "some text".to_string())])
+            .await
+            .unwrap();
+
+        let missing = attachments_without_fulltext(&pool).await.unwrap();
+        let ids: Vec<i64> = missing.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&unindexed));
+        assert!(!ids.contains(&indexed));
+        // file_path も返る。
+        assert!(missing.iter().any(|(_, p)| p == "attachments/x/p.pdf"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn attachments_without_fulltext_excludes_trashed_entries(pool: SqlitePool) {
+        let (entry_id, att_id) = setup_attachment(&pool, "Trashed").await;
+        crate::db::entries::trash_entry(&pool, entry_id).await.unwrap();
+
+        let missing = attachments_without_fulltext(&pool).await.unwrap();
+        assert!(!missing.iter().any(|(id, _)| *id == att_id));
     }
 }

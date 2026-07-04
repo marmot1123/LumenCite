@@ -496,6 +496,12 @@
     "attachmentsLabel2": "Attachments",
     "addPdf": "Add PDF",
     "removeAttachment2": "Remove",
+    "indexNowTitle": "Index full text",
+    "reindexTitle": "Re-index full text",
+    "indexedBadge": "Indexed",
+    "notIndexedBadge": "Not indexed",
+    "indexDonePages": "Indexed {{count}} page(s)",
+    "indexNoText": "No text layer found (for scanned PDFs, try OCR in the detail view)",
     "tagsLabel2": "Tags",
     "addTag": "Add",
     "tagsPlaceholder2": "Tag name…",
@@ -809,7 +815,14 @@
       "exportMarkdown": "Export notes + summaries as Markdown",
       "exportDone": "Wrote to {{path}}",
       "exportCancelled": "Cancelled",
-      "exportError": "Export failed: {{error}}"
+      "exportError": "Export failed: {{error}}",
+      "fulltext": "Full-text index",
+      "fulltextDesc": "Index entries whose attached PDF isn't showing up in full-text search yet, all at once.",
+      "indexMissing": "Index unindexed PDFs",
+      "indexMissingBusy": "Indexing…",
+      "indexMissingNone": "No unindexed PDFs.",
+      "indexMissingDone": "Indexed {{indexed}} of {{total}} ({{needsOcr}} may need OCR, {{failed}} failed).",
+      "indexMissingError": "Bulk indexing failed: {{error}}"
     },
     "about": {
       "appTitle": "LumenCite",
