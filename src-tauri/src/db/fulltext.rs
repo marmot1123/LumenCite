@@ -81,6 +81,47 @@ pub async fn is_indexed(pool: &SqlitePool, attachment_id: i64) -> Result<bool, s
     Ok(row.get::<i64, _>("cnt") > 0)
 }
 
+/// エントリに紐づく（索引済み PDF の）全文を `(page, content)` のリストで返す。
+/// 添付ごとの `attachment_id, page` 順で並べる。索引が無ければ空を返す。
+/// `generate_summary`（fulltext ソース）と MCP の `get_fulltext` が共有する。
+pub async fn get_entry_fulltext(
+    pool: &SqlitePool,
+    entry_id: i64,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT f.page AS page, f.content AS content
+         FROM fulltext f
+         JOIN attachments a ON a.id = f.attachment_id
+         WHERE a.entry_id = ?
+         ORDER BY f.attachment_id, f.page",
+    )
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<i64, _>("page"), r.get::<String, _>("content")))
+        .collect())
+}
+
+/// エントリの索引済み全文ページ数（0 なら全文なし）。`get_entry` の `has_fulltext`
+/// フラグや `get_fulltext` の総ページ数表示に使う軽量カウント。
+pub async fn entry_fulltext_page_count(
+    pool: &SqlitePool,
+    entry_id: i64,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS cnt
+         FROM fulltext f
+         JOIN attachments a ON a.id = f.attachment_id
+         WHERE a.entry_id = ?",
+    )
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("cnt"))
+}
+
 fn build_match_expr(tokens: &[&str]) -> String {
     tokens
         .iter()

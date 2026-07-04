@@ -121,16 +121,64 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
     }));
     tools.push(json!({
         "name": "export_bibtex",
-        "description": "Export entries as BibTeX. Pass entry_ids to export specific entries, or omit \
-            to export the whole library (trash excluded). Returns the .bib text.",
+        "description": "Export entries as BibTeX. Pass citation_keys to export exactly the entries \
+            for a set of LaTeX \\cite{} keys (the best way to build a paper's refs.bib): keys keep \
+            the exact form used across the whole library — including disambiguating suffixes like \
+            'smith2020a' — and unresolved keys are reported back in `missing`. Or pass entry_ids to \
+            export specific entries by id, or omit both to export the whole library (trash \
+            excluded). With citation_keys the result is a JSON object {bibtex, found, missing}; \
+            otherwise the raw .bib text.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "citation_keys": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Citation keys (as in \\cite{}) to export; preserves library-wide keys and reports missing ones."
+                },
                 "entry_ids": {
                     "type": "array",
                     "items": { "type": "integer" },
                     "description": "Entry ids to export; omit for the whole library."
                 }
+            }
+        }
+    }));
+    tools.push(json!({
+        "name": "find_entries_by_citation_keys",
+        "description": "Resolve one or more BibTeX/LaTeX \\cite{} citation keys to library entries. \
+            For each key, reports whether it was found and, if so, the matching entry (entry_id, \
+            title, year, authors). Use this to bridge from \\cite keys in a .tex file to library \
+            entry ids — users think in citation keys, not numeric ids. The keys are matched exactly \
+            as they appear in .bib / \\cite{} exports (pinned or auto-generated, with suffixes).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "citation_keys": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Citation keys to resolve (as they appear in \\cite{})."
+                }
+            },
+            "required": ["citation_keys"]
+        }
+    }));
+    tools.push(json!({
+        "name": "get_fulltext",
+        "description": "Return the extracted full text of a library entry's indexed PDF, by \
+            entry_id or citation_key. Use this to actually read and summarise a specific paper — \
+            `get_entry` only returns metadata (abstract / notes), which are often empty. Returns \
+            {entry_id, indexed, total_pages, truncated, next_page, text}. If the entry has no \
+            attached/indexed PDF, `indexed` is false and there is no text — say so plainly and do \
+            NOT answer from general knowledge. Long papers are paginated: pass `page_start` (from a \
+            previous `next_page`) to keep reading, or raise `max_chars`.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry_id": { "type": "integer", "description": "Entry id." },
+                "citation_key": { "type": "string", "description": "Citation key (as in \\cite{}); alternative to entry_id." },
+                "max_chars": { "type": "integer", "description": "Max characters to return this call (default 24000)." },
+                "page_start": { "type": "integer", "description": "1-based PDF page to start from, for continuing a long paper (default 1)." }
             }
         }
     }));
@@ -291,6 +339,8 @@ async fn exec_tool(
         "search_entries" => exec_search_entries(pool, &args).await,
         "resolve_citation_key" => exec_resolve_citation_key(pool, &args).await,
         "export_bibtex" => exec_export_bibtex(pool, &args).await,
+        "find_entries_by_citation_keys" => exec_find_entries_by_citation_keys(pool, &args).await,
+        "get_fulltext" => exec_get_fulltext(pool, &args).await,
         // それ以外（delete_entry / ocr_* / 無効化中の write 等）は非公開。
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
@@ -334,6 +384,21 @@ async fn exec_resolve_citation_key(pool: &SqlitePool, args: &Value) -> Result<St
 }
 
 async fn exec_export_bibtex(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    // citation_keys が渡されたら「\cite キー → refs.bib」経路。全ライブラリの確定キーを
+    // 維持し（サブセット再 dedup をしない）、未解決キーは `missing` に載せて返す。
+    if let Some(arr) = args.get("citation_keys").and_then(|v| v.as_array()) {
+        let keys: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        let res = crate::bibtex::export_bibtex_by_keys(pool, &keys)
+            .await
+            .map_err(ToolError::Execution)?;
+        return Ok(serde_json::to_string(&json!({
+            "bibtex": res.bibtex,
+            "found": res.found,
+            "missing": res.missing,
+        }))
+        .unwrap_or_default());
+    }
+
     let entry_ids = args
         .get("entry_ids")
         .and_then(|v| v.as_array())
@@ -341,6 +406,121 @@ async fn exec_export_bibtex(pool: &SqlitePool, args: &Value) -> Result<String, T
     crate::bibtex::export_bibtex(pool, entry_ids)
         .await
         .map_err(ToolError::Execution)
+}
+
+async fn exec_find_entries_by_citation_keys(
+    pool: &SqlitePool,
+    args: &Value,
+) -> Result<String, ToolError> {
+    let keys: Vec<String> = args
+        .get("citation_keys")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .ok_or_else(|| {
+            ToolError::InvalidArguments(
+                "missing required argument: citation_keys (array of strings)".to_string(),
+            )
+        })?;
+
+    let index = crate::bibtex::citation_key_index(pool)
+        .await
+        .map_err(ToolError::Execution)?;
+    let key_to_id: std::collections::HashMap<&str, i64> =
+        index.iter().map(|(k, id)| (k.as_str(), *id)).collect();
+
+    let mut results = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for k in &keys {
+        if !seen.insert(k.as_str()) {
+            continue;
+        }
+        match key_to_id.get(k.as_str()) {
+            Some(&id) => {
+                let d = crate::db::entries::get_entry(pool, id).await?;
+                results.push(json!({
+                    "citation_key": k,
+                    "found": true,
+                    "entry_id": id,
+                    "title": d.title,
+                    "year": d.year,
+                    "authors": d.authors.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                }));
+            }
+            None => results.push(json!({ "citation_key": k, "found": false })),
+        }
+    }
+
+    Ok(serde_json::to_string(&json!({ "count": results.len(), "results": results }))
+        .unwrap_or_default())
+}
+
+async fn exec_get_fulltext(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    // entry_id 優先。無ければ citation_key から逆引き。
+    let entry_id = match args.get("entry_id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => match args.get("citation_key").and_then(|v| v.as_str()) {
+            Some(key) => match crate::bibtex::find_entry_id_by_citation_key(pool, key).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return Ok(serde_json::to_string(&json!({
+                        "indexed": false,
+                        "message": format!("no entry found for citation key '{key}'")
+                    }))
+                    .unwrap_or_default())
+                }
+                Err(e) => return Err(ToolError::Execution(e)),
+            },
+            None => {
+                return Err(ToolError::InvalidArguments(
+                    "provide entry_id (integer) or citation_key (string)".to_string(),
+                ))
+            }
+        },
+    };
+
+    let pages = crate::db::fulltext::get_entry_fulltext(pool, entry_id).await?;
+    if pages.is_empty() {
+        return Ok(serde_json::to_string(&json!({
+            "entry_id": entry_id,
+            "indexed": false,
+            "message": "this entry has no indexed full text (no attached/indexed PDF)"
+        }))
+        .unwrap_or_default());
+    }
+
+    let total_pages = pages.len() as i64;
+    let page_start = args.get("page_start").and_then(|v| v.as_i64()).unwrap_or(1).max(1);
+    let max_chars = args
+        .get("max_chars")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(24_000)
+        .clamp(1_000, 200_000) as usize;
+
+    // page_start 以降のページを、累計が max_chars に達するまでページ単位で連結する
+    // （ページ途中では切らない）。入りきらなかった最初のページを next_page に載せて
+    // 続き読みできるようにする。
+    let mut text = String::new();
+    let mut truncated = false;
+    let mut next_page: Option<i64> = None;
+    for (page, content) in pages.iter().filter(|(p, _)| *p >= page_start) {
+        if text.chars().count() >= max_chars {
+            next_page = Some(*page);
+            truncated = true;
+            break;
+        }
+        text.push_str(&format!("[page {page}]\n{content}\n\n"));
+    }
+
+    Ok(serde_json::to_string(&json!({
+        "entry_id": entry_id,
+        "indexed": true,
+        "total_pages": total_pages,
+        "returned_from_page": page_start,
+        "truncated": truncated,
+        "next_page": next_page,
+        "text": text.trim_end(),
+    }))
+    .unwrap_or_default())
 }
 
 // ─── 認可トークン ────────────────────────────────────────────────────────────
@@ -970,6 +1150,231 @@ mod tests {
         assert_eq!(resp["result"]["isError"], false);
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("exp2022"), "bib should contain the cite key: {text}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tools_call_get_entry_by_citation_key(pool: SqlitePool) {
+        let id = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Paper".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("doe2020".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        // entry_id を知らなくても cite key だけで引ける。
+        let resp = call_tool(&pool, "get_entry", json!({ "citation_key": "doe2020" })).await;
+        assert_eq!(resp["result"]["isError"], false);
+        let parsed: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["id"], id);
+        assert_eq!(parsed["citation_key"], "doe2020");
+
+        // 未知キーは（エラーではなく）見つからない旨のメッセージ。
+        let miss = call_tool(&pool, "get_entry", json!({ "citation_key": "nope1999" })).await;
+        assert_eq!(miss["result"]["isError"], false);
+        assert!(miss["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no entry found"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tools_call_find_entries_by_citation_keys(pool: SqlitePool) {
+        let id = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Findable".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("wong2019".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+        let resp = call_tool(
+            &pool,
+            "find_entries_by_citation_keys",
+            json!({ "citation_keys": ["wong2019", "missing2000"] }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], false);
+        let parsed: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let results = parsed["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["found"], true);
+        assert_eq!(results[0]["entry_id"], id);
+        assert_eq!(results[0]["title"], "Findable");
+        assert_eq!(results[1]["found"], false);
+        assert_eq!(results[1]["citation_key"], "missing2000");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tools_call_export_bibtex_by_citation_keys(pool: SqlitePool) {
+        create_entry(
+            &pool,
+            &EntryInput {
+                title: "Wanted".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("keep2021".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        create_entry(
+            &pool,
+            &EntryInput {
+                title: "Unwanted".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("skip2021".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = call_tool(
+            &pool,
+            "export_bibtex",
+            json!({ "citation_keys": ["keep2021", "ghost2000"] }),
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], false);
+        let parsed: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(parsed["bibtex"].as_str().unwrap().contains("keep2021"));
+        assert!(!parsed["bibtex"].as_str().unwrap().contains("skip2021"));
+        assert_eq!(parsed["found"], json!(["keep2021"]));
+        assert_eq!(parsed["missing"], json!(["ghost2000"]));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tools_call_get_fulltext_by_key_and_missing(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Full Paper".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("full2020".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            "attachments/x/p.pdf",
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap();
+        crate::db::fulltext::index_attachment(
+            &pool,
+            att.id,
+            &[
+                (1, "Introduction to widgets.".to_string()),
+                (2, "Widget conclusions.".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // citation_key で全文取得できる。
+        let resp = call_tool(&pool, "get_fulltext", json!({ "citation_key": "full2020" })).await;
+        assert_eq!(resp["result"]["isError"], false);
+        let parsed: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["indexed"], true);
+        assert_eq!(parsed["total_pages"], 2);
+        assert_eq!(parsed["truncated"], false);
+        let text = parsed["text"].as_str().unwrap();
+        assert!(text.contains("widgets"));
+        assert!(text.contains("conclusions"));
+
+        // PDF 未索引のエントリは indexed:false（捏造させないための明示シグナル）。
+        let bare = create_entry(
+            &pool,
+            &EntryInput {
+                title: "No PDF".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let resp2 = call_tool(&pool, "get_fulltext", json!({ "entry_id": bare.id })).await;
+        let parsed2: Value =
+            serde_json::from_str(resp2["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed2["indexed"], false);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tools_call_get_fulltext_paginates(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Long".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            "attachments/y/p.pdf",
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap();
+        crate::db::fulltext::index_attachment(
+            &pool,
+            att.id,
+            &[
+                (1, "a".repeat(3000)),
+                (2, "b".repeat(3000)),
+                (3, "c".repeat(3000)),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // max_chars を小さくすると 1 ページで打ち切り、next_page=2 が返る。
+        let resp = call_tool(
+            &pool,
+            "get_fulltext",
+            json!({ "entry_id": entry.id, "max_chars": 1000 }),
+        )
+        .await;
+        let parsed: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["next_page"], 2);
+
+        // page_start=2 で続きから読める。
+        let resp2 = call_tool(
+            &pool,
+            "get_fulltext",
+            json!({ "entry_id": entry.id, "max_chars": 1000, "page_start": 2 }),
+        )
+        .await;
+        let parsed2: Value =
+            serde_json::from_str(resp2["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed2["returned_from_page"], 2);
+        assert_eq!(parsed2["next_page"], 3);
     }
 
     #[sqlx::test(migrations = "./migrations")]

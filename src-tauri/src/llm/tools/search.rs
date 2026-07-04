@@ -34,21 +34,26 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "get_entry".to_string(),
-            description: "Retrieve full metadata for a single library entry by its numeric id. \
-                Returns title, year, authors, abstract, tags, DOI/arXiv id, notes, and the BibTeX \
-                citation key. The `citation_key` field is the user-pinned key (null when none is \
-                pinned), while `resolved_citation_key` is the key actually used in LaTeX \\cite{} / \
-                .bib exports (auto-generated from first author + year when not pinned). \
-                Use this after fulltext_search to fetch details about a specific result.".to_string(),
+            description: "Retrieve full metadata for a single library entry, either by its numeric \
+                id (`entry_id`) or by its BibTeX/LaTeX citation key (`citation_key`, as it appears \
+                in \\cite{}). Returns title, year, authors, abstract, tags, DOI/arXiv id, notes, and \
+                the BibTeX citation key. The `citation_key` field is the user-pinned key (null when \
+                none is pinned), while `resolved_citation_key` is the key actually used in LaTeX \
+                \\cite{} / .bib exports (auto-generated from first author + year when not pinned). \
+                Pass exactly one of entry_id / citation_key. Use this after fulltext_search, or to \
+                look up a paper straight from a \\cite key.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "entry_id": {
                         "type": "integer",
-                        "description": "Numeric id of the entry to retrieve"
+                        "description": "Numeric id of the entry to retrieve."
+                    },
+                    "citation_key": {
+                        "type": "string",
+                        "description": "Citation key of the entry (as in \\cite{}); alternative to entry_id."
                     }
-                },
-                "required": ["entry_id"]
+                }
             }),
             needs_approval: false,
         },
@@ -137,13 +142,23 @@ async fn get_entry_tool(
     ctx: &ToolContext<'_>,
     call: &ToolCallSpec,
 ) -> Result<String, ToolError> {
-    let entry_id = call
-        .arguments
-        .get("entry_id")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| {
-            ToolError::InvalidArguments("missing required argument: entry_id (integer)".to_string())
-        })?;
+    // entry_id 優先。無ければ citation_key から逆引きする（ユーザーの頭にあるのは
+    // entry_id ではなく \cite キーなので、key から直接引ける入口を用意する）。
+    let entry_id = match call.arguments.get("entry_id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => match call.arguments.get("citation_key").and_then(|v| v.as_str()) {
+            Some(key) => match crate::bibtex::find_entry_id_by_citation_key(ctx.pool, key).await {
+                Ok(Some(id)) => id,
+                Ok(None) => return Ok(format!("no entry found for citation key '{key}'")),
+                Err(e) => return Err(ToolError::Execution(e)),
+            },
+            None => {
+                return Err(ToolError::InvalidArguments(
+                    "provide entry_id (integer) or citation_key (string)".to_string(),
+                ))
+            }
+        },
+    };
 
     let detail = match entries::get_entry(ctx.pool, entry_id).await {
         Ok(d) => d,
@@ -160,6 +175,13 @@ async fn get_entry_tool(
     // 失敗しても get_entry 全体は落とさず null として返す。
     let resolved_key = crate::bibtex::resolve_citation_key(ctx.pool, entry_id).await.ok();
 
+    // 索引済み PDF 全文の有無。true なら get_fulltext で本文を読める（abstract/notes が
+    // 空でも一般知識に頼らず要約できる合図）。
+    let has_fulltext = crate::db::fulltext::entry_fulltext_page_count(ctx.pool, entry_id)
+        .await
+        .unwrap_or(0)
+        > 0;
+
     let obj = json!({
         "id": detail.id,
         "title": detail.title,
@@ -172,7 +194,8 @@ async fn get_entry_tool(
         "abstract": detail.abstract_,
         "notes": detail.notes,
         "citation_key": detail.citation_key,
-        "resolved_citation_key": resolved_key
+        "resolved_citation_key": resolved_key,
+        "has_fulltext": has_fulltext
     });
 
     Ok(serde_json::to_string(&obj).unwrap_or_default())
@@ -449,6 +472,71 @@ mod tests {
         let call = make_call("get_entry", json!({}));
         let result = try_execute(&ctx, &call).await.unwrap();
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_entry_by_citation_key(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Keyed Paper".to_string(),
+                entry_type: "article".to_string(),
+                citation_key: Some("keyed2020".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let ctx = ctx_all(&pool);
+        // entry_id ではなく cite key で引く。
+        let call = make_call("get_entry", json!({ "citation_key": "keyed2020" }));
+        let s = try_execute(&ctx, &call).await.unwrap().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["id"], entry.id);
+        assert_eq!(parsed["title"], "Keyed Paper");
+
+        // 未知キーは Ok の「見つからない」メッセージ（Err にしない）。
+        let call = make_call("get_entry", json!({ "citation_key": "ghost1999" }));
+        let s = try_execute(&ctx, &call).await.unwrap().unwrap();
+        assert!(s.contains("no entry found"), "got: {s}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_entry_reports_has_fulltext(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Doc".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ctx = ctx_all(&pool);
+
+        // 添付・索引なし → has_fulltext=false
+        let s = try_execute(&ctx, &make_call("get_entry", json!({ "entry_id": entry.id })))
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["has_fulltext"], false);
+
+        // PDF を索引 → true
+        let att = add_attachment(&pool, entry.id, "a/p.pdf", "p.pdf", "application/pdf")
+            .await
+            .unwrap();
+        crate::db::fulltext::index_attachment(&pool, att.id, &[(1, "hello world".to_string())])
+            .await
+            .unwrap();
+        let s2 = try_execute(&ctx, &make_call("get_entry", json!({ "entry_id": entry.id })))
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed2: serde_json::Value = serde_json::from_str(&s2).unwrap();
+        assert_eq!(parsed2["has_fulltext"], true);
     }
 
     // ── list_collections ─────────────────────────────────────────────────────
