@@ -26,6 +26,18 @@ A desktop reference management application for researchers, built with **Tauri 2
 
 最新版は [GitHub Releases](https://github.com/marmot1123/LumenCite/releases/latest) から入手できます（macOS: `.dmg` / Windows: `.msi`・`.exe` / Linux: `.AppImage`・`.deb`・`.rpm`）。macOS は署名＋notarize 済みで、アプリ内 **設定 → アップデート**から自動更新できます。
 
+### macOS: Homebrew
+
+macOS では [Homebrew](https://brew.sh/) 経由でもインストールできます（自前 tap [marmot1123/homebrew-lumencite](https://github.com/marmot1123/homebrew-lumencite) から universal `.dmg` を配布）。
+
+```bash
+brew tap marmot1123/lumencite
+brew trust marmot1123/lumencite   # Homebrew 6.0+ ではサードパーティ tap に必須
+brew install --cask lumencite
+```
+
+アップデートは `brew upgrade --cask lumencite`、またはアプリ内の自動更新（Tauri Updater）のどちらでも行えます。
+
 > ⚠️ **v0.1.0 をお使いの方へ:** v0.1.0 は updater 鍵の設定漏れにより**自動更新が動作しません**（「アップデートを確認」で `Invalid symbol 95, offset 7.` というエラーになります）。お手数ですが、上記 Releases から**最新版を一度だけ手動でダウンロードして入れ直して**ください。以降は自動更新が有効になります。v0.2.0 以降のバージョンはこの問題の影響を受けません。
 
 ## Requirements
