@@ -598,7 +598,15 @@ type McpAuditEntry = {
 **Codex（OpenAI CLI）対応（v0.5.0）:** Codex も stdio MCP のみ対応のため、`claude_desktop` と同じ `--mcp-stdio` shim を流用する。`"codex"` スニペットは `~/.codex/config.toml` に追記する `[mcp_servers.lumencite]` テーブル（`command`=実行ファイル絶対パス・`args`=`["--mcp-stdio"]`・`env` に URL/トークン）。TOML 基本文字列を使い Windows パスの `\` をエスケープする。
 
 **公開ツール（MCP `tools/list`）:**
-- **read 系（常時）**: `fulltext_search` / `get_entry` / `list_collections` / `list_tags`（チャットの read ツール定義を流用）＋ `search_entries`（メタデータ FTS）/ `resolve_citation_key`（実 cite key）/ `export_bibtex`（.bib テキスト）。
+- **read 系（常時）**: `fulltext_search` / `get_entry` / `list_collections` / `list_tags`（チャットの read ツール定義を流用）＋ `search_entries`（メタデータ FTS）/ `resolve_citation_key`（実 cite key）/ `export_bibtex`（.bib テキスト）/ `find_entries_by_citation_keys`（**v0.6.0**: cite key → entry 逆引き）/ `get_fulltext`（**v0.6.0**: 指定エントリの PDF 全文）。
+  - **cite key 逆引き（v0.6.0）**: ユーザー（と LaTeX ソース）が持っているのは entry_id ではなく `\cite{}` キーなので、キーから直接引ける経路を追加した。3 点セット:
+    - `find_entries_by_citation_keys` — `citation_keys`（文字列配列）→ 各キーの `{citation_key, found, entry_id?, title?, year?, authors?}` を返す。`\cite` キー群 → entry の解決を 1 コールでバッチ処理。未知キーは `found:false`。入力順・重複除去。
+    - `export_bibtex` に **`citation_keys`（文字列配列）**を追加。指定時は該当エントリのみを **全ライブラリ同期時と同一の cite key（`smith2020a` のような接尾辞も維持）**で書き出し、JSON `{bibtex, found, missing}` を返す（`\cite` キー → refs.bib 生成の中核）。`export_bibtex(Some(entry_ids))` はサブセット内で再 dedup するためこの用途には使えない点に注意。`entry_ids` も `citation_keys` も省略すれば従来どおり全件 `.bib` テキスト。
+    - `get_entry` は `entry_id` に加えて **`citation_key`** を受け付ける（いずれか一方を渡す）。cite key から直接メタデータ取得・要約できる。未解決キーは（`isError` ではなく）「見つからない」旨のテキストを返す。戻り値に **`has_fulltext`**（索引済み PDF 全文の有無）を追加。
+    - 逆引きは `bibtex::citation_key_index` / `find_entry_id_by_citation_key` / `export_bibtex_by_keys` が基盤で、`resolve_citation_key` と**同一のキー割当ロジック**（`assign_keys_from`）を共有するため `\cite{}` と必ず一致する。DB 層は Tauri 非依存なので将来の CLI もこの関数群を再利用する。
+  - **全文アクセス（v0.6.0）**: `fulltext_search` はキーワード検索（ヒットページのスニペット）だけで、**特定エントリの全文取得**はできなかった。abstract/notes が空だと MCP 経由の要約が一般知識にフォールバックする穴があったため `get_fulltext` を追加。
+    - `get_fulltext(entry_id? | citation_key?, max_chars?=24000, page_start?=1)` — 索引済み PDF の抽出テキストを返す。戻り値 `{entry_id, indexed, total_pages, truncated, next_page?, text}`。**索引済み PDF が無ければ `indexed:false`**（テキスト無し）を明示し、クライアントが「全文が無い」と言える（捏造防止）。長い論文はページ単位で切り、`page_start`（前回の `next_page`）で続き読みできる。`max_chars` は 1,000〜200,000 にクランプ。
+    - 基盤は `db::fulltext::get_entry_fulltext`（`(page, content)` を `attachment_id, page` 順で返す）と `entry_fulltext_page_count`。アプリ内蔵の `generate_summary`（fulltext ソース）も前者を共有し、全文ロードの単一ソース化。
 - **write 系（`mcp_server.write_enabled` 有効時のみ）**: `add_tag` / `update_notes` / `add_to_collection` / `create_entry` / `update_entry`（`mutate` の定義を流用）。**破壊系 `delete_entry` は常に非公開**で、`tools/call` でも許可リスト外として `isError` で拒否する。write 無効時に write ツールを呼ぶと `isError` で拒否。
   - **バルク対応**: `add_tag` / `add_to_collection` は単一 `entry_id` に加えて **`entry_ids`（整数配列）**を受け付け、1 回の呼び出しで複数エントリへ適用する（両者は併用可・重複は順序保持で除去）。ベストエフォートで、存在しないエントリはスキップして成功分を適用し、結果サマリ（適用件数＋スキップ件数）を返す。1 件も成功しなければ `isError`。タグは get-or-create をバッチで 1 回だけ行う。
 - write 成功時はサーバーが監査ログ記録＋ `.bib` 同期キック＋ `entries-changed` イベント（一覧ライブ反映）を発火する。

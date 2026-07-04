@@ -350,8 +350,10 @@ struct KeyRow {
 /// cite key を返す。`export_bibtex(None)` と同じ並び・同じ衝突回避を再現するため、
 /// 詳細ビューに「実際に書き出されるキー」を表示・コピーできる。
 /// 全 `EntryDetail` を読み込む代わりに base 生成に必要な列だけを取得して軽量化する。
-pub async fn resolve_citation_key(pool: &SqlitePool, entry_id: i64) -> Result<String, String> {
-    let rows: Vec<KeyRow> = sqlx::query_as(
+/// `resolve_citation_key` / `citation_key_index` が共有する軽量行の取得。ゴミ箱を除く
+/// 全エントリを export と同じ並び（created_at DESC, id DESC）で返す。
+async fn load_key_rows(pool: &SqlitePool) -> Result<Vec<KeyRow>, String> {
+    sqlx::query_as(
         "SELECT e.id, e.title, e.year, e.citation_key,
                 (SELECT a.name FROM entry_authors ea
                    JOIN authors a ON a.id = ea.author_id
@@ -362,8 +364,11 @@ pub async fn resolve_citation_key(pool: &SqlitePool, entry_id: i64) -> Result<St
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+}
 
+/// 軽量行に export と同じ規則で最終 cite key を割り当てる（並びは入力と同じ）。
+fn assign_keys_for_rows(rows: &[KeyRow]) -> Vec<String> {
     let items: Vec<(Option<String>, String)> = rows
         .iter()
         .map(|r| {
@@ -373,7 +378,12 @@ pub async fn resolve_citation_key(pool: &SqlitePool, entry_id: i64) -> Result<St
             )
         })
         .collect();
-    let keys = assign_keys_from(&items);
+    assign_keys_from(&items)
+}
+
+pub async fn resolve_citation_key(pool: &SqlitePool, entry_id: i64) -> Result<String, String> {
+    let rows = load_key_rows(pool).await?;
+    let keys = assign_keys_for_rows(&rows);
 
     if let Some(key) = rows.iter().zip(keys).find(|(r, _)| r.id == entry_id).map(|(_, k)| k) {
         return Ok(key);
@@ -384,6 +394,85 @@ pub async fn resolve_citation_key(pool: &SqlitePool, entry_id: i64) -> Result<St
     Ok(match &entry.citation_key {
         Some(k) => k.clone(),
         None => make_citation_key(&entry),
+    })
+}
+
+/// export（`.bib` 同期）と同一規則で割り当てた「実 cite key → entry_id」の対応表を、
+/// ゴミ箱を除く全エントリぶん返す。並びは export と同じ。逆引き（key→entry）と
+/// key 指定 export（`export_bibtex_by_keys`）の共有基盤。
+pub async fn citation_key_index(pool: &SqlitePool) -> Result<Vec<(String, i64)>, String> {
+    let rows = load_key_rows(pool).await?;
+    let keys = assign_keys_for_rows(&rows);
+    Ok(keys.into_iter().zip(rows.iter().map(|r| r.id)).collect())
+}
+
+/// 単一の cite key に対応する entry_id を返す（無ければ None）。`citation_key_index` と
+/// 同じ規則なので `\cite{key}` と必ず一致する。ユーザーの頭にあるのは entry_id ではなく
+/// cite key なので、key から詳細取得・要約する用途の入口になる。
+pub async fn find_entry_id_by_citation_key(
+    pool: &SqlitePool,
+    key: &str,
+) -> Result<Option<i64>, String> {
+    Ok(citation_key_index(pool)
+        .await?
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, id)| id))
+}
+
+/// `export_bibtex_by_keys` の結果。`found` / `missing` は入力キーのうち解決できた/
+/// できなかったものを重複除去・入力順で返す（呼び出し側が未解決キーを報告できる）。
+pub struct ExportByKeysResult {
+    pub bibtex: String,
+    pub found: Vec<String>,
+    pub missing: Vec<String>,
+}
+
+/// 指定した cite key 群に対応するエントリだけを、全ライブラリ同期時と同一の cite key で
+/// 書き出す。**サブセット内での再 dedup をしない**ため、`smith2020a` のような接尾辞付き
+/// キーもそのまま維持され、LaTeX の `\cite{}` と必ず一致する（`export_bibtex(Some(ids))`
+/// はサブセット内で再割り当てするため、この用途には使えない）。未知のキーは `missing` に
+/// 記録して出力から除外する。`\cite` キーから refs.bib を生成する中核。
+pub async fn export_bibtex_by_keys(
+    pool: &SqlitePool,
+    keys: &[String],
+) -> Result<ExportByKeysResult, String> {
+    // 全ライブラリの確定キー割り当て（並び順・接尾辞つき）。
+    let index = citation_key_index(pool).await?;
+    let key_to_id: HashMap<&str, i64> = index.iter().map(|(k, id)| (k.as_str(), *id)).collect();
+
+    // 要求キーを入力順・重複除去で found / missing に分類。
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    let mut wanted_ids: HashSet<i64> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for k in keys {
+        if !seen.insert(k.as_str()) {
+            continue;
+        }
+        match key_to_id.get(k.as_str()) {
+            Some(id) => {
+                found.push(k.clone());
+                wanted_ids.insert(*id);
+            }
+            None => missing.push(k.clone()),
+        }
+    }
+
+    // 全体の並びを保ちつつ対象エントリだけを、全体キーで出力する。
+    let opts = ExportOptions::load(pool).await?;
+    let mut parts = Vec::new();
+    for (key, id) in &index {
+        if wanted_ids.contains(id) {
+            let entry = get_entry(pool, *id).await.map_err(|e| e.to_string())?;
+            parts.push(entry_to_bibtex(&entry, key, &opts));
+        }
+    }
+
+    Ok(ExportByKeysResult {
+        bibtex: parts.join("\n"),
+        found,
+        missing,
     })
 }
 
@@ -1084,6 +1173,104 @@ mod tests {
         // 自動生成の smith2023 ではなくピン留めキーが使われる
         assert!(bib.contains("@article{mypinnedkey,"));
         assert!(!bib.contains("smith2023"));
+    }
+
+    // ── citation key 逆引き / key 指定 export ───────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn citation_key_index_matches_resolve(pool: sqlx::SqlitePool) {
+        let mk = |title: &str| EntryInput {
+            title: title.to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["Alice Smith".to_string()],
+            year: Some(2020),
+            ..Default::default()
+        };
+        let e1 = create_entry(&pool, &mk("Paper One")).await.unwrap();
+        let e2 = create_entry(&pool, &mk("Paper Two")).await.unwrap();
+
+        let index = citation_key_index(&pool).await.unwrap();
+        // index のキーは resolve_citation_key と 1 件ずつ一致する（同一規則の保証）。
+        for (key, id) in &index {
+            assert_eq!(*key, resolve_citation_key(&pool, *id).await.unwrap());
+        }
+        // 衝突する 2 件は base と接尾辞付きに割り当てられる。
+        let map: HashMap<i64, String> = index.iter().map(|(k, id)| (*id, k.clone())).collect();
+        let mut keys = vec![map[&e1.id].clone(), map[&e2.id].clone()];
+        keys.sort();
+        assert_eq!(keys, vec!["smith2020".to_string(), "smith2020a".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_bibtex_by_keys_preserves_global_suffix(pool: sqlx::SqlitePool) {
+        let mk = |title: &str| EntryInput {
+            title: title.to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["Alice Smith".to_string()],
+            year: Some(2020),
+            ..Default::default()
+        };
+        let e1 = create_entry(&pool, &mk("Paper One")).await.unwrap();
+        let _e2 = create_entry(&pool, &mk("Paper Two")).await.unwrap();
+
+        // e1 は全ライブラリでは接尾辞付き（smith2020a）に割り当てられる。
+        let e1_key = resolve_citation_key(&pool, e1.id).await.unwrap();
+        assert_eq!(e1_key, "smith2020a");
+
+        // その接尾辞付きキーだけを指定 export しても、サブセット再 dedup で smith2020 に
+        // 化けず、全体キー smith2020a を維持する（\cite{smith2020a} と一致させるため）。
+        let res = export_bibtex_by_keys(&pool, &["smith2020a".to_string()])
+            .await
+            .unwrap();
+        assert!(res.bibtex.contains("{smith2020a,"), "keeps global suffix key: {}", res.bibtex);
+        assert!(!res.bibtex.contains("{smith2020,"), "must not rewrite to base key: {}", res.bibtex);
+        assert_eq!(res.found, vec!["smith2020a".to_string()]);
+        assert!(res.missing.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_bibtex_by_keys_reports_missing_and_dedups(pool: sqlx::SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "Some Paper".to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["John Smith".to_string()],
+            year: Some(2023),
+            ..Default::default()
+        }).await.unwrap();
+        let key = resolve_citation_key(&pool, entry.id).await.unwrap(); // smith2023
+
+        // 既存 + 未知 + 重複 を混ぜて渡す。
+        let res = export_bibtex_by_keys(
+            &pool,
+            &[key.clone(), "nonexistent2000".to_string(), key.clone()],
+        )
+        .await
+        .unwrap();
+
+        assert!(res.bibtex.contains(&format!("{{{key},")));
+        assert_eq!(res.found, vec![key.clone()], "重複は除去される");
+        assert_eq!(res.missing, vec!["nonexistent2000".to_string()]);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_entry_id_by_citation_key_roundtrip(pool: sqlx::SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "Pinned Paper".to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["John Smith".to_string()],
+            year: Some(2023),
+            citation_key: Some("mypinnedkey".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        assert_eq!(
+            find_entry_id_by_citation_key(&pool, "mypinnedkey").await.unwrap(),
+            Some(entry.id)
+        );
+        assert_eq!(
+            find_entry_id_by_citation_key(&pool, "doesnotexist").await.unwrap(),
+            None
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

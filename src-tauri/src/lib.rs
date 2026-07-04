@@ -956,14 +956,12 @@ async fn generate_summary(
 
     // 要約対象テキストを決める
     let body = if source == "fulltext" {
-        let texts: Vec<String> = sqlx::query_scalar(
-            "SELECT content FROM fulltext WHERE attachment_id IN
-             (SELECT id FROM attachments WHERE entry_id = ?) ORDER BY page",
-        )
-        .bind(entry_id)
-        .fetch_all(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
+        let texts: Vec<String> = db::fulltext::get_entry_fulltext(&state.db, entry_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(_, content)| content)
+            .collect();
         if texts.is_empty() {
             entry.abstract_.clone().unwrap_or_default()
         } else {
