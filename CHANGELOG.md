@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-05
+
+The headline is a **command-line interface** for reading and writing the library headlessly, built for AI-agent × LaTeX workflows (the `lumencite-bib` Skill) and shell scripting. This release also adds manual/bulk full-text index triggers and one-shot arXiv PDF download when adding an entry. No migration is required; existing libraries upgrade unchanged.
+
+### Added
+
+- **CLI (read + write)** — the app binary doubles as a headless CLI (no new signed/notarized binary): when `argv[1]` is a known subcommand it runs as a CLI instead of launching the GUI, same shape as the existing `--mcp-stdio` bridge. **Read** commands (`search` / `get` / `bib` / `export` / `tags` / `collections` / `fulltext`) open a read-only pool with `PRAGMA query_only = ON`, so they coexist safely as WAL readers whether or not the GUI is running. `bib <citation_key…>` is the LaTeX core command — it emits `refs.bib` while preserving global keys (`smith2020a` won't get mangled). **Write** commands (`add` / `update` / `notes` / `tag` / `collect`) use **hybrid-C routing**: `--force` writes the DB directly (warns that a running app's list may go stale); otherwise if the MCP server is reachable it delegates over HTTP so the write goes through the publish-side write gate, `.bib` sync, and live GUI refresh; if the app is stopped it writes directly and best-effort syncs `.bib`. Both paths share a single source (`mcp_server::handle_rpc_with_write`), so tool logic and the audit log are shared. Output is JSON by default (`--human` for readable text); the DB path follows the Tauri `app_data_dir` rule and can be overridden with `LUMENCITE_DB_PATH`. Destructive commands (`delete` / trash) are out of scope.
+- **Manual & bulk full-text index triggers** — attachments are normally indexed on attach, but entries whose PDF was attached earlier or failed to index can now be (re)indexed on demand: the detail panel shows an **index-status badge + index/reindex button** (`index_attachment`) per attachment, and Settings → Data adds **"Index missing PDFs"** (`index_missing_attachments`, which finds un-indexed PDFs via `attachments_without_fulltext` and runs `pdf-extract` → full-text on each). PDFs with no text layer (0 pages) are counted as OCR candidates and steered toward the detail-view OCR.
+- **arXiv PDF download on add** — the AddSheet arXiv tab shows an "Also download the PDF from arXiv" checkbox (**default on**) under the metadata preview. On "Add to library", after `create_entry` the app calls `download_arxiv_pdf`, which fetches `https://arxiv.org/pdf/<id>` via the same `download::download_and_attach` path as the Web Clipper (50 MB cap, `%PDF-` validation, timeout), attaches it, and best-effort full-text indexes it in the background. A failed download (paywall / network / bad id) does not block entry creation — the user is pointed at manual attach in the detail panel. arXiv tab only (DOI / ISBN PDFs are publisher-dependent and out of scope).
+
 ## [0.6.0] - 2026-07-04
 
 The headline is the **composite entry filter** — the toolbar "Filter" button (a placeholder until now) opens a panel that narrows the list by several conditions at once. This is a broad-audience UX feature that needs no migration; it uses only existing schema.
