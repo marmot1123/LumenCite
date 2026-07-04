@@ -698,3 +698,24 @@ type ClipperStatusInfo = {
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
 | `ocr_pdf` | `entry_id: i64, pages?: Vec<i64>` | `Result<()>` — `pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック |
+
+---
+
+## CLI（v0.7.0 追加）
+
+GUI を起動せず、`argv[1]` が既知のサブコマンドなら本体バイナリをヘッドレス実行する（`--mcp-stdio` shim と同型のディスパッチ）。v0.7.0 のコマンドはすべて**読取専用**で、DB を `PRAGMA query_only = ON` の読取専用プールで直接開く（書き込みガードを構造的に保証）。DB パスは `dirs::data_dir()` + `com.lumencite.app`（環境変数 `LUMENCITE_DB_PATH` で上書き可）。
+
+- 既定出力は **JSON**（stdout）。`--human` で人間可読テキスト。エラーは stderr。
+- 終了コード: 成功 `0` / 使い方エラー `2` / 実行時エラー `1`。
+
+| コマンド | 引数 / フラグ | 出力 | 再利用する DB 関数 |
+|---------|--------------|------|-------------------|
+| `search <query…>` | `--collection <id>` `--tag <id>` `--type <t>…` `--year-min <N>` `--year-max <N>` `--starred` `--has-attachment` `--limit <N>` | `EntrySummary[]` | `db::entries::search_entries_filtered` |
+| `get <id\|citation_key>` | — | `EntryDetail` | `db::entries::get_entry` / `bibtex::find_entry_id_by_citation_key` |
+| `bib <citation_key…>` | — | BibTeX 文字列（stdout）＋未解決キーは stderr 警告 | `bibtex::export_bibtex_by_keys` |
+| `export` | `--key <k>…` `--collection <id>` `--tag <id>` ＋ `search` と同じフィルタ軸 | BibTeX 文字列 | `bibtex::export_bibtex_by_keys` / `search_entries_filtered` |
+| `tags` | — | `Tag[]` | `db::tags::get_tags` |
+| `collections` | — | `Collection[]` | `db::collections::get_collections` |
+| `fulltext <query…>` | `--collection <id>` `--tag <id>` | `FulltextHit[]` | `db::fulltext::search_fulltext` |
+
+ハイブリッド C（サーバ起動中は localhost HTTP プロキシ経由）と書き込み系コマンドは、書き込みガードを厳格化した上で次版で追加する。

@@ -102,6 +102,36 @@ pnpm --filter lumencite-clipper build   # extension/dist を生成
 
 `chrome://extensions` →「パッケージ化されていない拡張機能を読み込む」で `extension/dist` を選択すれば、上記のインストール手順 4〜5 に進めます。拡張のバージョン（`extension/manifest.json`）はアプリと独立採番です。
 
+## CLI（コマンドライン）
+
+LumenCite は GUI を起動せず、ターミナルからライブラリを**読取専用**で照会できる CLI を内蔵します（本体バイナリの `argv` 分岐で動作。新しいバイナリは増やしていません）。主な用途は **AI エージェント × LaTeX 執筆**（`\cite` キー → `refs.bib` 生成）とシェルスクリプト連携です。
+
+出力は既定で **JSON**（`jq` 連携向け）、`--human` で人間可読テキストに切り替わります。SQLite を `PRAGMA query_only = ON` の読取専用接続で開くため、GUI アプリ起動中でも安全に共存し、停止中でも動作します。
+
+```bash
+# メタデータ検索（フィルタ: --type / --year-min / --year-max / --starred / --has-attachment / --limit）
+lumencite search "quantum walk" --year-min 2018 --limit 10
+
+# 単一エントリ（数値 id でも citation key でも可）
+lumencite get smith2020a
+lumencite get smith2020a --human
+
+# \cite キー群から refs.bib を生成（キーは化けずに \cite と一致。未解決キーは stderr に警告）
+lumencite bib smith2020a jones2021 > refs.bib
+
+# フィルタ条件で BibTeX 一括エクスポート
+lumencite export --type article --year-min 2020 > articles.bib
+
+# タグ / コレクション一覧・PDF 全文検索
+lumencite tags
+lumencite collections
+lumencite fulltext "topological"
+```
+
+DB は Tauri の `app_data_dir`（macOS: `~/Library/Application Support/com.lumencite.app/lumencite.db`）を自動解決します。環境変数 `LUMENCITE_DB_PATH` で上書き可能です。ライブラリが未作成の場合はアプリを一度起動してください。
+
+> ℹ️ v0.7.0 の CLI は読取専用です。書き込み系コマンドと、サーバ起動中の HTTP プロキシ経由（ハイブリッド C）は、書き込みガードを厳格化した上で次版で追加予定です。
+
 ## Documentation
 
 - [docs/SPEC.md](docs/SPEC.md) — 機能仕様と v0.1.0 / Phase 2+ のロードマップ
