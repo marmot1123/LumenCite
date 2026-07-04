@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Icon } from "./icons";
-import type { SearchScope, ViewMode } from "../types";
+import { FilterPanel } from "./FilterPanel";
+import { filterCount } from "../types";
+import type { EntryFilter, SearchScope, Tag, ViewMode } from "../types";
 
 interface ToolbarProps {
   title: string;
@@ -18,6 +20,10 @@ interface ToolbarProps {
   inTrash?: boolean;
   onEmptyTrash?: () => void;
   emptyTrashDisabled?: boolean;
+  filter: EntryFilter;
+  onFilterChange: (f: EntryFilter) => void;
+  onClearFilter: () => void;
+  tags: Tag[];
 }
 
 interface ViewTabsProps {
@@ -166,8 +172,12 @@ function ScopeToggle({ scope, onChange }: { scope: SearchScope; onChange: (s: Se
   );
 }
 
-export function Toolbar({ title, subtitle, count, search, onSearchChange, searchScope, onSearchScopeChange, onAddOpen, onImport, onExportBibtex, exportDisabled, inTrash, onEmptyTrash, emptyTrashDisabled }: ToolbarProps) {
+export function Toolbar({ title, subtitle, count, search, onSearchChange, searchScope, onSearchScopeChange, onAddOpen, onImport, onExportBibtex, exportDisabled, inTrash, onEmptyTrash, emptyTrashDisabled, filter, onFilterChange, onClearFilter, tags }: ToolbarProps) {
   const { t } = useTranslation();
+  const [showFilter, setShowFilter] = useState(false);
+  const activeCount = filterCount(filter);
+  // フィルタは全文検索結果には適用しない（v0.6.0 スコープ外）ため fulltext では無効化。
+  const filterDisabled = searchScope === "fulltext";
   return (
     <header style={{ flexShrink: 0, borderBottom: "1px solid var(--border)", background: "var(--surface)" }}>
       {/* row 1 */}
@@ -239,7 +249,42 @@ export function Toolbar({ title, subtitle, count, search, onSearchChange, search
           />
           <ScopeToggle scope={searchScope} onChange={onSearchScopeChange} />
         </div>
-        <ToolbarBtn icon="filter" label={t("toolbar.filter")} />
+        <div style={{ position: "relative", display: "inline-flex" }}>
+          <button
+            onClick={filterDisabled ? undefined : () => setShowFilter(s => !s)}
+            disabled={filterDisabled}
+            title={filterDisabled ? t("filter.fulltextDisabled") : t("toolbar.filter")}
+            style={{
+              display: "inline-flex", alignItems: "center", gap: 5,
+              padding: "5px 9px 5px 8px", borderRadius: 6,
+              border: activeCount > 0 ? "1px solid var(--accent-strong)" : "1px solid transparent",
+              background: showFilter ? "var(--hover)" : "transparent",
+              color: filterDisabled ? "var(--text-faint)" : activeCount > 0 ? "var(--accent-strong)" : "var(--text)",
+              fontSize: 12, fontWeight: 500,
+              cursor: filterDisabled ? "not-allowed" : "pointer",
+            }}
+          >
+            <Icon name="filter" size={13} color={filterDisabled ? "var(--text-faint)" : activeCount > 0 ? "var(--accent-strong)" : "var(--text-mute)"} />
+            <span>{t("toolbar.filter")}</span>
+            {activeCount > 0 && (
+              <span style={{
+                minWidth: 15, height: 15, padding: "0 4px",
+                display: "inline-flex", alignItems: "center", justifyContent: "center",
+                borderRadius: 999, background: "var(--accent-strong)", color: "white",
+                fontSize: 9.5, fontWeight: 700, fontVariantNumeric: "tabular-nums",
+              }}>{activeCount}</span>
+            )}
+          </button>
+          {showFilter && !filterDisabled && (
+            <FilterPanel
+              filter={filter}
+              onChange={onFilterChange}
+              onClear={onClearFilter}
+              tags={tags}
+              onClose={() => setShowFilter(false)}
+            />
+          )}
+        </div>
         <div style={{ width: 1, height: 18, background: "var(--border)" }} />
         <ToolbarBtn icon="columns" label={t("toolbar.columns")} />
         <div style={{ flex: 1 }} />

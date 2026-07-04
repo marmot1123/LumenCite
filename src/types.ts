@@ -51,6 +51,53 @@ export type ResolvedTheme = "light" | "dark";
 export type AccentName = "amber" | "indigo" | "teal" | "rose";
 export type SearchScope = "meta" | "fulltext";
 
+export type TagMatch = "and" | "or";
+
+/**
+ * 一覧の複合フィルタ（v0.6.0）。get_entries / search_entries に渡す。
+ * ネストオブジェクトなので Tauri の camelCase 変換は効かず、キーは snake_case。
+ * 未指定（undefined / 空配列）の軸は制約を課さない。
+ */
+export interface EntryFilter {
+  entry_types: EntryType[];
+  year_min?: number;
+  year_max?: number;
+  starred?: boolean;
+  has_attachment?: boolean;
+  tag_ids: number[];
+  tag_match: TagMatch;
+}
+
+/** 何も制約しない空フィルタ。state 初期値・リセットに使う。 */
+export const EMPTY_FILTER: EntryFilter = {
+  entry_types: [],
+  tag_ids: [],
+  tag_match: "or",
+};
+
+/** フィルタが 1 つでも条件を持っているか（バッジ表示・active 判定用）。 */
+export function isFilterActive(f: EntryFilter): boolean {
+  return (
+    f.entry_types.length > 0 ||
+    f.year_min != null ||
+    f.year_max != null ||
+    f.starred != null ||
+    f.has_attachment != null ||
+    f.tag_ids.length > 0
+  );
+}
+
+/** 適用中の条件数（バッジの数字）。 */
+export function filterCount(f: EntryFilter): number {
+  let n = 0;
+  if (f.entry_types.length > 0) n++;
+  if (f.year_min != null || f.year_max != null) n++;
+  if (f.starred != null) n++;
+  if (f.has_attachment != null) n++;
+  if (f.tag_ids.length > 0) n++;
+  return n;
+}
+
 export interface ImportResult {
   imported: number;
   skipped: number;

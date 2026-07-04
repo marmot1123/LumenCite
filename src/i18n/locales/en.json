@@ -80,6 +80,27 @@
     "columns": "Columns",
     "sort": "Sort"
   },
+  "filter": {
+    "title": "Filter",
+    "clearAll": "Clear all",
+    "entryType": "Type",
+    "year": "Year",
+    "yearFrom": "From",
+    "yearTo": "To",
+    "starred": "Starred",
+    "starredYes": "Starred",
+    "starredNo": "Not starred",
+    "attachment": "PDF attachment",
+    "attachmentYes": "Has PDF",
+    "attachmentNo": "No PDF",
+    "any": "Any",
+    "tags": "Tags",
+    "tagMatch": "Match",
+    "tagMatch_or": "Any",
+    "tagMatch_and": "All",
+    "noTags": "No tags yet",
+    "fulltextDisabled": "Filters don't apply to full-text search"
+  },
   "statusBar": {
     "entriesCount": "{{filtered}} / {{total}}",
     "selectionLabel": "Selected: {{state}}",
