@@ -1,5 +1,6 @@
 mod backup;
 mod bibtex;
+pub mod cli;
 mod db;
 mod download;
 mod keychain;

@@ -102,6 +102,60 @@ pnpm --filter lumencite-clipper build   # extension/dist を生成
 
 `chrome://extensions` →「パッケージ化されていない拡張機能を読み込む」で `extension/dist` を選択すれば、上記のインストール手順 4〜5 に進めます。拡張のバージョン（`extension/manifest.json`）はアプリと独立採番です。
 
+## CLI（コマンドライン）
+
+LumenCite は GUI を起動せず、ターミナルからライブラリを照会・編集できる CLI を内蔵します（本体バイナリの `argv` 分岐で動作。新しいバイナリは増やしていません）。主な用途は **AI エージェント × LaTeX 執筆**（`\cite` キー → `refs.bib` 生成）とシェルスクリプト連携です。
+
+出力は既定で **JSON**（`jq` 連携向け）、`--human` で人間可読テキストに切り替わります。DB は Tauri の `app_data_dir`（macOS: `~/Library/Application Support/com.lumencite.app/lumencite.db`）を自動解決し、環境変数 `LUMENCITE_DB_PATH` で上書きできます。
+
+### 読取
+
+読取は SQLite を `PRAGMA query_only = ON` の読取専用接続で開くため、GUI アプリ起動中でも安全に共存し、停止中でも動作します。
+
+```bash
+# メタデータ検索（フィルタ: --type / --year-min / --year-max / --starred / --has-attachment / --limit）
+lumencite search "quantum walk" --year-min 2018 --limit 10
+
+# 単一エントリ（数値 id でも citation key でも可）
+lumencite get smith2020a
+lumencite get smith2020a --human
+
+# \cite キー群から refs.bib を生成（キーは化けずに \cite と一致。未解決キーは stderr に警告）
+lumencite bib smith2020a jones2021 > refs.bib
+
+# フィルタ条件で BibTeX 一括エクスポート
+lumencite export --type article --year-min 2020 > articles.bib
+
+# タグ / コレクション一覧・PDF 全文検索
+lumencite tags
+lumencite collections
+lumencite fulltext "topological"
+```
+
+### 書込
+
+```bash
+# エントリ作成（--field で type 固有フィールド、--author は繰り返し可）
+lumencite add --title "My Paper" --type article --year 2026 \
+  --author "Jane Doe" --citation-key doe2026a --field journal="Nature"
+
+# 既存エントリの部分更新（id でも citation key でも可）
+lumencite update doe2026a --year 2027 --notes "revised"
+
+# ノート設定 / タグ付与 / コレクション追加
+lumencite notes doe2026a "important background reference"
+lumencite tag doe2026a reading-list
+lumencite collect doe2026a 3
+```
+
+書込は **UI 陳腐化を避けるハイブリッド C** でルーティングされます:
+
+- **LumenCite アプリが起動中（MCP サーバー有効）** → localhost 経由でアプリに委譲し、変更が**一覧に即反映**され `.bib` も同期されます（MCP の書込は設定 → MCP サーバーで許可が必要）。
+- **アプリ停止中** → DB に直接書き込み、`.bib` を同期します。
+- `--force` を付けると、アプリ起動中でも DB に直接書き込みます（開いているウィンドウの一覧は更新するまで古い表示のままになる可能性があります）。
+
+> ℹ️ 破壊的操作（削除）、DOI/arXiv からのメタデータ自動取得付き作成、CLI を PATH に載せる配布導線（Homebrew の `binary` シンボリックリンク等）は次版以降で検討します。
+
 ## Documentation
 
 - [docs/SPEC.md](docs/SPEC.md) — 機能仕様と v0.1.0 / Phase 2+ のロードマップ

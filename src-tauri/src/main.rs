@@ -7,5 +7,10 @@ fn main() {
     if std::env::args().any(|a| a == "--mcp-stdio") {
         std::process::exit(lumencite_lib::mcp_shim::run_stdio_proxy());
     }
+    // v0.7.0 CLI: argv[1] が既知のサブコマンドなら GUI を起動せずヘッドレス実行する。
+    let args: Vec<String> = std::env::args().collect();
+    if lumencite_lib::cli::is_cli_invocation(&args) {
+        std::process::exit(lumencite_lib::cli::run());
+    }
     lumencite_lib::run()
 }

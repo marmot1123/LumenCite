@@ -698,3 +698,46 @@ type ClipperStatusInfo = {
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
 | `ocr_pdf` | `entry_id: i64, pages?: Vec<i64>` | `Result<()>` — `pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック |
+
+---
+
+## CLI（v0.7.0 追加）
+
+GUI を起動せず、`argv[1]` が `-` 始まりでない語（サブコマンド）または `--help`/`--version` なら本体バイナリをヘッドレス実行する（`--mcp-stdio` shim と同型のディスパッチ。引数なし・`-psn_…` 等は GUI）。DB パスは `dirs::data_dir()` + `com.lumencite.app`（環境変数 `LUMENCITE_DB_PATH` で上書き可）。
+
+- 既定出力は **JSON**（stdout）。`--human` で人間可読テキスト。エラー / 警告は stderr。
+- 終了コード: 成功 `0` / 使い方エラー `2` / 実行時エラー `1`。
+
+### 読取コマンド
+
+DB を `PRAGMA query_only = ON` の読取専用プールで直接開く（読取経路の書込を構造的に禁止）。
+
+| コマンド | 引数 / フラグ | 出力 | 再利用する DB 関数 |
+|---------|--------------|------|-------------------|
+| `search <query…>` | `--collection <id>` `--tag <id>` `--type <t>…` `--year-min <N>` `--year-max <N>` `--starred` `--has-attachment` `--limit <N>` | `EntrySummary[]` | `db::entries::search_entries_filtered` |
+| `get <id\|citation_key>` | — | `EntryDetail` | `db::entries::get_entry` / `bibtex::find_entry_id_by_citation_key` |
+| `bib <citation_key…>` | — | BibTeX 文字列（stdout）＋未解決キーは stderr 警告 | `bibtex::export_bibtex_by_keys` |
+| `export` | `--key <k>…` `--collection <id>` `--tag <id>` ＋ `search` と同じフィルタ軸 | BibTeX 文字列 | `bibtex::export_bibtex_by_keys` / `search_entries_filtered` |
+| `tags` | — | `Tag[]` | `db::tags::get_tags` |
+| `collections` | — | `Collection[]` | `db::collections::get_collections` |
+| `fulltext <query…>` | `--collection <id>` `--tag <id>` | `FulltextHit[]` | `db::fulltext::search_fulltext` |
+
+### 書込コマンド（ハイブリッド C）
+
+書込は次のルーティングで実行する（`--force` は全書込コマンド共通のグローバルフラグ）:
+
+1. `--force` → 直接 DB 書込（アプリ起動中なら一覧陳腐化の旨を stderr 警告）。
+2. MCP サーバー到達可（keychain トークン有 + `ping` 成功）→ **HTTP 委譲**。サーバーが `mcp_server.write_enabled` ゲート適用＋`.bib` 同期＋GUI 更新。ゲート off なら「有効化 or `--force`」を明示。
+3. 到達不可 → **直接 DB 書込** + `.bib` 同期（best-effort）。
+
+どちらも `tools/call`（JSON-RPC）を組み、HTTP は POST、直接は `mcp_server::handle_rpc_with_write(pool, dir, write_on=true, req)` を呼ぶ（ツール実装・監査ログ・`mutated` を共有）。ポートは `settings.mcp_server.port`（既定 `DEFAULT_PORT=3917`）、トークンは keychain `mcp_server.token`。
+
+| コマンド | 引数 / フラグ | MCP ツール |
+|---------|--------------|-----------|
+| `add` | `--title <T>`（必須）`--type` `--year` `--doi` `--isbn` `--arxiv` `--url` `--citation-key` `--notes` `--abstract` `--author <name>…` `--field <k=v>…` | `create_entry` |
+| `update <id\|citation_key>` | 上記フィールドフラグ（指定分のみ変更。`--citation-key ""` で unpin） | `update_entry` |
+| `notes <id\|citation_key> <text…>` | — | `update_notes` |
+| `tag <id\|citation_key> <tag_name>` | — | `add_tag` |
+| `collect <id\|citation_key> <collection_id>` | — | `add_to_collection` |
+
+破壊系（`delete_entry`）、DOI/arXiv メタデータ自動取得付き `add`、CLI の PATH 配置は次版以降。
