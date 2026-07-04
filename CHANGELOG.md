@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-04
+
+The headline is the **composite entry filter** — the toolbar "Filter" button (a placeholder until now) opens a panel that narrows the list by several conditions at once. This is a broad-audience UX feature that needs no migration; it uses only existing schema.
+
+### Added
+
+- **Composite entry filter** — the list toolbar's Filter button now opens a popover that stacks multiple conditions with **AND**: entry **type** (multi-select, OR within the axis), **year** range (min / max), **starred** (3-state), **has PDF attachment** (3-state), and **tags** (multi-select with an **AND / OR** toggle, independent of the sidebar's single-tag scope). The filter composes with the sidebar view scope (collection / tag / starred / unfiled / trash) and with metadata search (`search_entries`), and is active in the trash view. Filter state persists across view switches until explicitly cleared, and the toolbar shows an active-condition count badge with one-click clear. Full-text search (`fulltext_search`) is out of scope for this release, so the Filter button is disabled there. Backend adds an `EntryFilter` object shared by a `push_filter()` query-builder helper across the FTS / LIKE / plain paths; no migration is required. Unread/read filtering was deferred (documented as a future item, since it needs a schema column).
+
 ## [0.5.0] - 2026-07-03
 
 The headline is the **Web Clipper** — a Chrome extension that saves the paper on the current browser page to LumenCite with one click. This release also adds all-OS update notifications and Codex (OpenAI CLI) support for the MCP server. No migration is needed; the only new setting is `clipper.enabled` (default off), so existing libraries upgrade unchanged.
