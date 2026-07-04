@@ -1,0 +1,78 @@
+name: Update Homebrew tap
+
+# 正式リリースが publish された時点で自前 Homebrew tap
+# (marmot1123/homebrew-lumencite) の cask を自動更新する。
+#
+# LumenCite のリリースは release.yml が draft を作り、Windows 署名済み
+# インストーラを手動添付してから publish する運用のため、macOS の
+# universal .dmg は publish 時点で必ず存在する。したがって発火は
+# `release: published`（draft → 公開の瞬間）が最適。
+#
+# 前提: リポジトリ Secret `HOMEBREW_TAP_TOKEN` に、tap リポジトリ
+# marmot1123/homebrew-lumencite へ `contents: write` できる PAT を登録しておくこと
+# （デフォルトの GITHUB_TOKEN は別リポジトリへ push できないため必須）。
+# 未登録だと Checkout tap ステップで 403 になる。docs/RELEASE.md 参照。
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sync (e.g. v0.6.0)"
+        required: true
+
+jobs:
+  update-cask:
+    runs-on: ubuntu-latest
+    # プレリリースでは更新しない（workflow_dispatch は prerelease フィールドが無いので通す）
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false }}
+    steps:
+      - name: Resolve tag / version
+        id: meta
+        run: |
+          TAG="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download universal .dmg and compute sha256
+        id: sha
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/LumenCite_${VERSION}_universal.dmg"
+          echo "Fetching ${URL}"
+          curl -fL --retry 5 --retry-delay 15 -o app.dmg "${URL}"
+          SHA="$(sha256sum app.dmg | cut -d' ' -f1)"
+          echo "sha256=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "sha256=${SHA}"
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: marmot1123/homebrew-lumencite
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Bump cask version + sha256
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          SHA="${{ steps.sha.outputs.sha256 }}"
+          CASK="tap/Casks/lumencite.rb"
+          sed -i -E "s|^  version \".*\"|  version \"${VERSION}\"|" "${CASK}"
+          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" "${CASK}"
+          echo "----- updated cask -----"
+          cat "${CASK}"
+
+      - name: Commit and push
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Casks/lumencite.rb; then
+            echo "Cask already up to date; nothing to commit."
+            exit 0
+          fi
+          git add Casks/lumencite.rb
+          git commit -m "lumencite ${{ steps.meta.outputs.version }}"
+          git push
