@@ -417,6 +417,7 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
 | `add_attachment` | `entry_id: i64, file_path: String` | `Result<Attachment>` |
+| `download_arxiv_pdf` | `entry_id: i64, arxiv_id: String` | `Result<Attachment>` — arXiv PDF を DL して添付（v0.7.0） |
 | `delete_attachment` | `id: i64` | `Result<()>` |
 | `open_attachment` | `id: i64` | `Result<()>` |
 | `index_attachment` | `id: i64` | `Result<i64>` — 索引した非空ページ数 |
@@ -427,6 +428,8 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 `index_attachment` はPDFからテキストを抽出してFTS5インデックスに登録する（冪等：既存行を削除して再登録）。`add_attachment` 後に自動で呼ばれるほか、詳細パネルの索引/再索引ボタンからも任意タイミングで呼べる。
 
 `index_missing_attachments` は、まだ全文索引の無い PDF 添付（ゴミ箱を除く）を `db::fulltext::attachments_without_fulltext` で洗い出し、順に `pdf-extract` で抽出して索引する。過去に添付済み・自動索引を逃したエントリの後追い用（設定 → データの「未索引の PDF を一括索引」）。
+
+`download_arxiv_pdf` は、arXiv からメタデータ取得してエントリを作成した直後に「PDF も一括で取得する」ためのコマンド（AddSheet の arXiv タブのチェックボックス。デフォルト ON）。`arxiv_id` を正規化して `https://arxiv.org/pdf/<id>` を `download::download_and_attach`（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き）でダウンロードし添付、成功後はバックグラウンドで `pdf-extract` → 全文索引を試みる（索引失敗は無視）。ペイウォールやネットワーク障害で失敗しても呼び出し側はエントリ作成を成功扱いにする（フロントは警告ログのみで詳細パネルからの手動添付に誘導）。
 
 ```ts
 type IndexMissingResult = {

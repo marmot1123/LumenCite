@@ -436,7 +436,9 @@
       "fetchFromDoi": "CrossRef から取得します",
       "fetchFromArxiv": "arXiv API から取得します",
       "fetchFromIsbn": "Open Library から取得します",
-      "authorMore": " 他{{count}}名"
+      "authorMore": " 他{{count}}名",
+      "downloadPdf": "arXiv から PDF も一緒にダウンロード",
+      "downloadingPdf": "PDF をダウンロード中…"
     },
     "addToLibrary": "ライブラリに追加",
     "addingToLibrary": "追加中…",

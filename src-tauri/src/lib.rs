@@ -663,6 +663,63 @@ async fn add_attachment(
     }
 }
 
+/// arXiv ID から PDF をダウンロードして `entry_id` に添付する。
+///
+/// 文献をメタデータ取得で追加した直後に「PDF も一括で取得する」ためのコマンド。
+/// `https://arxiv.org/pdf/<id>` を `download::download_and_attach`（50MB 上限・
+/// `%PDF-` マジックバイト検証・タイムアウト）でダウンロードし、成功したら
+/// バックグラウンドで全文索引を試みる（索引失敗は無視 — 後追いで手動索引可能）。
+///
+/// ペイウォールやネットワーク障害で失敗しても、呼び出し側はエントリ作成を
+/// 成功扱いにする想定（クリッパーと同じ方針）。
+#[tauri::command]
+async fn download_arxiv_pdf(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    entry_id: i64,
+    arxiv_id: String,
+) -> Result<Attachment, String> {
+    let id = metadata::normalize_arxiv_id(&arxiv_id);
+    if id.is_empty() {
+        return Err("arXiv ID が空です".to_string());
+    }
+    let url = format!("https://arxiv.org/pdf/{}", id);
+
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let att = download::download_and_attach(
+        &state.db,
+        &app_data_dir,
+        entry_id,
+        &url,
+        download::DownloadCaps::default(),
+    )
+    .await?;
+
+    // 添付済み PDF をバックグラウンドで全文索引する（best-effort）。
+    // テキストレイヤーが無い（スキャン）PDF や抽出失敗は黙って諦める。
+    let pool = state.db.clone();
+    let att_id = att.id;
+    let abs = app_data_dir
+        .join("attachments")
+        .join(entry_id.to_string())
+        .join(&att.file_name);
+    tauri::async_runtime::spawn(async move {
+        let extracted =
+            tauri::async_runtime::spawn_blocking(move || pdf_extract::extract_text_by_pages(&abs))
+                .await;
+        if let Ok(Ok(pages_text)) = extracted {
+            let pages: Vec<(i64, String)> = pages_text
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| ((i + 1) as i64, t))
+                .collect();
+            let _ = db::fulltext::index_attachment(&pool, att_id, &pages).await;
+        }
+    });
+
+    Ok(att)
+}
+
 #[tauri::command]
 async fn delete_attachment(
     app: tauri::AppHandle,
@@ -2719,6 +2776,7 @@ pub fn run() {
             sync_bibtex_now,
             pick_pdf_file,
             add_attachment,
+            download_arxiv_pdf,
             delete_attachment,
             read_attachment_bytes,
             open_pdf_viewer,

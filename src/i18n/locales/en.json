@@ -436,7 +436,9 @@
       "fetchFromDoi": "Fetch from CrossRef",
       "fetchFromArxiv": "Fetch from arXiv API",
       "fetchFromIsbn": "Fetch from Open Library",
-      "authorMore": " +{{count}} more"
+      "authorMore": " +{{count}} more",
+      "downloadPdf": "Also download the PDF from arXiv",
+      "downloadingPdf": "Downloading PDF…"
     },
     "addToLibrary": "Add to library",
     "addingToLibrary": "Adding…",

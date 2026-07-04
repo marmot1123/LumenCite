@@ -14,7 +14,7 @@ interface AddSheetProps {
 }
 
 type AddTab = "doi" | "arxiv" | "isbn" | "bibtex" | "manual";
-type Phase = "input" | "loading" | "preview" | "error" | "saving";
+type Phase = "input" | "loading" | "preview" | "error" | "saving" | "downloading";
 
 const FETCH_COMMANDS: Record<string, string> = {
   doi:   "fetch_metadata_by_doi",
@@ -50,6 +50,8 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
   const [preview, setPreview] = useState<EntryInput | null>(null);
   const [error, setError] = useState("");
   const [duplicateId, setDuplicateId] = useState<number | null>(null);
+  // arXiv タブでは PDF も一括ダウンロードする（デフォルト ON）。
+  const [downloadPdf, setDownloadPdf] = useState(true);
 
   const handleFetch = async () => {
     if (!value.trim()) return;
@@ -84,6 +86,20 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
     setPhase("saving");
     try {
       const entry = await invoke<EntryDetail>("create_entry", { input: preview });
+      // arXiv の場合は PDF も一括でダウンロードして添付する。
+      // ダウンロード失敗（ペイウォール・ネットワーク等）はエントリ作成を
+      // 妨げない — 警告だけ出して詳細パネルから後で添付できるようにする。
+      const arxivId = preview.arxiv_id?.trim();
+      if (tabId === "arxiv" && downloadPdf && arxivId) {
+        setPhase("downloading");
+        try {
+          await invoke("download_arxiv_pdf", { entryId: entry.id, arxivId });
+        } catch (e) {
+          // エントリは作成済み。PDF 失敗は詳細パネルから後で添付できるので
+          // 作成を妨げず、ログのみに留めて閉じる。
+          console.warn("arXiv PDF download failed:", e);
+        }
+      }
       onCreated(entry);
     } catch (e) {
       setError(String(e));
@@ -100,7 +116,7 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
           onKeyDown={e => e.key === "Enter" && handleFetch()}
           placeholder={PLACEHOLDERS[tabId]}
           autoFocus
-          disabled={phase === "loading" || phase === "saving"}
+          disabled={phase === "loading" || phase === "saving" || phase === "downloading"}
           style={{
             flex: 1, padding: "8px 10px", borderRadius: 6,
             border: "1px solid var(--border-strong)",
@@ -111,7 +127,7 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
         />
         <button
           onClick={handleFetch}
-          disabled={!value.trim() || phase === "loading" || phase === "saving"}
+          disabled={!value.trim() || phase === "loading" || phase === "saving" || phase === "downloading"}
           style={{
             padding: "8px 14px", borderRadius: 6, border: "none",
             background: "var(--accent-strong)", color: "white",
@@ -185,6 +201,23 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
         </div>
       )}
 
+      {/* arXiv のみ: PDF も一括ダウンロードするか */}
+      {(phase === "preview" || phase === "saving" || phase === "downloading") && preview && tabId === "arxiv" && (
+        <label style={{
+          marginTop: 12, display: "flex", alignItems: "center", gap: 8,
+          fontSize: 12, color: "var(--text-mute)", cursor: "pointer",
+        }}>
+          <input
+            type="checkbox"
+            checked={downloadPdf}
+            onChange={e => setDownloadPdf(e.target.checked)}
+            disabled={phase === "saving" || phase === "downloading"}
+            style={{ cursor: "pointer" }}
+          />
+          {t("addSheet.identifier.downloadPdf")}
+        </label>
+      )}
+
       <div style={{
         marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 8,
         paddingTop: 14, borderTop: "1px solid var(--border)",
@@ -206,7 +239,9 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
             opacity: phase !== "preview" ? 0.4 : 1,
           }}
         >
-          {phase === "saving"
+          {phase === "downloading"
+            ? t("addSheet.identifier.downloadingPdf")
+            : phase === "saving"
             ? t("addSheet.addingToLibrary")
             : duplicateId != null ? t("addSheet.identifier.createAnyway") : t("addSheet.addToLibrary")}
         </button>
