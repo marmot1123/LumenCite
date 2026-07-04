@@ -279,10 +279,6 @@ LumenCite ライブラリを **ターミナルから直接読める** CLI を実
 
 **非対象（次版以降）:** 破壊系（`delete` / trash）。DOI/arXiv からのメタデータ自動取得付き `add`（ネットワーク取得は別スコープ）。CSL 引用スタイル。CLI 用の PATH 配置（Homebrew `binary` シンボリックリンク等の配布導線）は別途の単発 Win として扱う。
 
----
-
-## v0.8.0
-
 ### arXiv 追加時の PDF 一括ダウンロード
 
 文献追加（AddSheet）の **arXiv タブ**で ID からメタデータを取得すると、プレビュー下に「arXiv から PDF も一緒にダウンロード」チェックボックス（**デフォルト ON**）を表示する。「ライブラリに追加」で `create_entry` の直後に `download_arxiv_pdf` を呼び、`https://arxiv.org/pdf/<id>` を Web クリッパーと同じ `download::download_and_attach`（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き）でダウンロードして添付する。

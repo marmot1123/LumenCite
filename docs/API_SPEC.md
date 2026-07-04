@@ -417,7 +417,7 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
 | `add_attachment` | `entry_id: i64, file_path: String` | `Result<Attachment>` |
-| `download_arxiv_pdf` | `entry_id: i64, arxiv_id: String` | `Result<Attachment>` — arXiv PDF を DL して添付（v0.8.0） |
+| `download_arxiv_pdf` | `entry_id: i64, arxiv_id: String` | `Result<Attachment>` — arXiv PDF を DL して添付（v0.7.0） |
 | `delete_attachment` | `id: i64` | `Result<()>` |
 | `open_attachment` | `id: i64` | `Result<()>` |
 | `index_attachment` | `id: i64` | `Result<i64>` — 索引した非空ページ数 |
