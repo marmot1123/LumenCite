@@ -341,10 +341,40 @@ Web クリッパー（Chrome 拡張 + `/clipper` ローカル API）は main へ
 
 ---
 
+## 11. Homebrew tap（macOS・自前 tap で配布）
+
+macOS ユーザーは `brew install --cask` でも導入できる。公式 homebrew-cask は notability 要件（自己申請は ★225 / fork 90 / watch 90 未満は却下）を満たせないため、**自前 tap** で配布する。
+
+- **tap リポジトリ**: [`marmot1123/homebrew-lumencite`](https://github.com/marmot1123/homebrew-lumencite)（別リポジトリ・public）。cask は `Casks/lumencite.rb`。
+- **インストール**（利用者側）:
+  ```sh
+  brew tap marmot1123/lumencite
+  brew trust marmot1123/lumencite   # Homebrew 6.0+ はサードパーティ tap に trust が必須
+  brew install --cask lumencite
+  ```
+- cask は universal `.dmg`（`LumenCite_<version>_universal.dmg`）を GitHub Releases から取得。`auto_updates true`（アプリ内 Tauri updater と併用）/ `depends_on macos: :big_sur`。
+
+### 11-1. リリースごとの cask 更新（自動）
+
+`.github/workflows/update-homebrew-tap.yml` が **リリース publish 時（`release: published`）に発火**し、universal `.dmg` の sha256 を計算して tap の cask の `version` / `sha256` を書き換え push する。draft → publish の運用なので publish 時点で `.dmg` は必ず存在する。プレリリースでは動かない。
+
+- **前提 Secret（初回のみ・必須）**: LumenCite リポジトリの Settings → Secrets and variables → Actions に **`HOMEBREW_TAP_TOKEN`** を登録する。値は tap リポジトリ `marmot1123/homebrew-lumencite` に `contents: write` できる **PAT**（fine-grained PAT を homebrew-lumencite だけにスコープ、`Contents: Read and write` 推奨。classic なら `repo` スコープ）。デフォルトの `GITHUB_TOKEN` は別リポジトリへ push できないため必須。未登録だと "Checkout tap" ステップが 403 で失敗する。
+- **手動再実行**: 取りこぼした時は Actions から `Update Homebrew tap` を `workflow_dispatch`（`tag=vX.Y.Z`）で再実行できる。
+- **フォールバック（手動）**: cask の `version` と `sha256`（`shasum -a 256 <dmg>`）を書き換えて push するだけ。`brew bump-cask-pr` でも可。
+
+### 11-2. 動作確認
+
+- publish 後、tap リポジトリに `lumencite X.Y.Z` コミットが入っているか
+- `brew update && brew info --cask lumencite` が新バージョンを表示するか
+- 必要なら `brew style Casks/lumencite.rb` / `brew audit --cask --online marmot1123/lumencite/lumencite`
+
+---
+
 ## 関連
 
 - `tauri.conf.json` — bundle / updater 設定
 - `.github/workflows/release.yml` — 自動リリースワークフロー
+- `.github/workflows/update-homebrew-tap.yml` — publish 時に Homebrew tap の cask を自動更新
 - <https://tauri.app/distribute/sign/macos/> — Tauri 公式 macOS 署名ドキュメント
 - <https://tauri.app/distribute/sign/windows/> — Tauri 公式 Windows 署名ドキュメント
 - <https://tauri.app/plugin/updater/> — Tauri Updater プラグイン公式
