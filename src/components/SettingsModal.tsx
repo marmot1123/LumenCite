@@ -725,6 +725,33 @@ function DataTab() {
     }
   };
 
+  const handleIndexMissing = async () => {
+    setBusy("index_missing");
+    setMessage(null);
+    setError(null);
+    try {
+      const r = await invoke<{ total: number; indexed: number; needs_ocr: number; failed: number }>(
+        "index_missing_attachments",
+      );
+      if (r.total === 0) {
+        setMessage(t("settings.data.indexMissingNone"));
+      } else {
+        setMessage(
+          t("settings.data.indexMissingDone", {
+            indexed: r.indexed,
+            total: r.total,
+            needsOcr: r.needs_ocr,
+            failed: r.failed,
+          }),
+        );
+      }
+    } catch (e) {
+      setError(t("settings.data.indexMissingError", { error: errMsg(e) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <>
       <Section title={t("settings.data.backup")} description={t("settings.data.backupDesc")}>
@@ -750,6 +777,12 @@ function DataTab() {
             {t("settings.data.exportMarkdown")}
           </SecondaryBtn>
         </div>
+      </Section>
+
+      <Section title={t("settings.data.fulltext")} description={t("settings.data.fulltextDesc")}>
+        <SecondaryBtn onClick={handleIndexMissing} disabled={busy === "index_missing"}>
+          {busy === "index_missing" ? t("settings.data.indexMissingBusy") : t("settings.data.indexMissing")}
+        </SecondaryBtn>
       </Section>
 
       {message && (

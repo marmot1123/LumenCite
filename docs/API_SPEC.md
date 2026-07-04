@@ -419,9 +419,23 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 | `add_attachment` | `entry_id: i64, file_path: String` | `Result<Attachment>` |
 | `delete_attachment` | `id: i64` | `Result<()>` |
 | `open_attachment` | `id: i64` | `Result<()>` |
-| `index_attachment` | `attachment_id: i64` | `Result<()>` |
+| `index_attachment` | `id: i64` | `Result<i64>` — 索引した非空ページ数 |
+| `is_attachment_indexed` | `id: i64` | `Result<bool>` — fulltext 行が 1 件以上あるか |
+| `unindex_attachment` | `id: i64` | `Result<()>` |
+| `index_missing_attachments` | — | `Result<IndexMissingResult>` — 未索引 PDF を一括索引（v0.7.0） |
 
-`index_attachment` はPDFからテキストを抽出してFTS5インデックスに登録する。`add_attachment` 後に非同期で呼ぶ想定。
+`index_attachment` はPDFからテキストを抽出してFTS5インデックスに登録する（冪等：既存行を削除して再登録）。`add_attachment` 後に自動で呼ばれるほか、詳細パネルの索引/再索引ボタンからも任意タイミングで呼べる。
+
+`index_missing_attachments` は、まだ全文索引の無い PDF 添付（ゴミ箱を除く）を `db::fulltext::attachments_without_fulltext` で洗い出し、順に `pdf-extract` で抽出して索引する。過去に添付済み・自動索引を逃したエントリの後追い用（設定 → データの「未索引の PDF を一括索引」）。
+
+```ts
+type IndexMissingResult = {
+  total: number;     // 処理対象（未索引 PDF）の総数
+  indexed: number;   // テキストを抽出して索引できた数
+  needs_ocr: number; // 0 ページ＝テキストレイヤー無し（OCR 候補）
+  failed: number;    // 読み込み/抽出に失敗した数
+};
+```
 
 ### 検索（search）
 

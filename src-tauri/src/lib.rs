@@ -767,6 +767,84 @@ async fn index_attachment(
     Ok(indexed_pages)
 }
 
+/// 「未索引の PDF を一括索引」の結果サマリ。
+#[derive(serde::Serialize)]
+struct IndexMissingResult {
+    /// 処理対象（未索引 PDF 添付）の総数。
+    total: i64,
+    /// テキストを抽出して索引できた添付数。
+    indexed: i64,
+    /// テキストレイヤーが無く 0 ページだった添付数（OCR 候補）。
+    needs_ocr: i64,
+    /// ファイル読み込み / 抽出に失敗した添付数。
+    failed: i64,
+}
+
+/// まだ全文索引が無い PDF 添付を洗い出し、順にテキスト抽出して索引する。
+/// 添付時の自動索引を逃したエントリ（過去分・失敗分）を後追いで索引するための一括処理。
+#[tauri::command]
+async fn index_missing_attachments(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<IndexMissingResult, String> {
+    let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let targets = db::fulltext::attachments_without_fulltext(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let total = targets.len() as i64;
+    let mut indexed = 0i64;
+    let mut needs_ocr = 0i64;
+    let mut failed = 0i64;
+
+    for (att_id, file_path) in targets {
+        let abs = root.join(&file_path);
+        // pdf-extract は重い同期処理なので 1 件ずつ blocking スレッドへ逃がす。
+        let extracted = tauri::async_runtime::spawn_blocking(move || {
+            pdf_extract::extract_text_by_pages(&abs).map_err(|e| e.to_string())
+        })
+        .await;
+
+        let pages_text = match extracted {
+            Ok(Ok(p)) => p,
+            // spawn の join 失敗・抽出失敗どちらも「失敗」扱いで次へ。
+            _ => {
+                failed += 1;
+                continue;
+            }
+        };
+
+        let pages: Vec<(i64, String)> = pages_text
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| ((i + 1) as i64, t))
+            .collect();
+        let non_empty = pages.iter().filter(|(_, t)| !t.trim().is_empty()).count();
+
+        if db::fulltext::index_attachment(&state.db, att_id, &pages)
+            .await
+            .is_err()
+        {
+            failed += 1;
+            continue;
+        }
+
+        if non_empty > 0 {
+            indexed += 1;
+        } else {
+            // テキストレイヤーが無い（スキャン PDF 等）。OCR で拾う候補。
+            needs_ocr += 1;
+        }
+    }
+
+    Ok(IndexMissingResult {
+        total,
+        indexed,
+        needs_ocr,
+        failed,
+    })
+}
+
 #[tauri::command]
 async fn unindex_attachment(
     state: State<'_, AppState>,
@@ -2644,6 +2722,7 @@ pub fn run() {
             read_attachment_bytes,
             open_pdf_viewer,
             index_attachment,
+            index_missing_attachments,
             unindex_attachment,
             is_attachment_indexed,
             fulltext_search,
