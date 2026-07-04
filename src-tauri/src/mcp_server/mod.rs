@@ -204,14 +204,28 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
 
 /// JSON-RPC リクエスト 1 件を処理する。通知（`id` 無し）の場合は `response: None`。
 /// `mutated` が true なら write が成功したので、呼び出し側が `.bib` 同期 / UI イベントを発火する。
+///
+/// write の可否は `mcp_server.write_enabled` 設定から評価する（公開サーバー用ゲート）。
 pub async fn handle_rpc(pool: &SqlitePool, app_data_dir: &Path, req: &Value) -> RpcOutcome {
+    let write_on = write_enabled(pool).await;
+    handle_rpc_with_write(pool, app_data_dir, write_on, req).await
+}
+
+/// `handle_rpc` の write_on 明示版。CLI の**直接 DB 書込経路**は、公開サーバー用の
+/// `mcp_server.write_enabled` 設定とは独立に（CLI 側でサーバー到達性ゲートを済ませた上で）
+/// `write_on = true` を渡して同じツール実装・監査ログ・`mutated` フラグを再利用する。
+pub async fn handle_rpc_with_write(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    write_on: bool,
+    req: &Value,
+) -> RpcOutcome {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // 通知（id 無し）には応答しない（JSON-RPC 2.0）。
     let Some(id) = req.get("id").cloned() else {
         return RpcOutcome { response: None, mutated: false };
     };
     let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-    let write_on = write_enabled(pool).await;
 
     let (resp, mutated) = match method {
         "initialize" => (

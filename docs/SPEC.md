@@ -247,17 +247,20 @@ LumenCite ライブラリを **ターミナルから直接読める** CLI を実
 - 新規バイナリを増やさず（署名・notarize 対象を増やさない）、`main.rs` で `argv[1]` が既知の CLI サブコマンドなら Tauri/GUI を起動せず CLI として実行する。既存の `--mcp-stdio` shim と同型。
 - 引数なし = 従来どおり GUI 起動。`--mcp-stdio` = 従来どおり stdio shim。
 
-**バックエンド接続（v0.7.0 は読取専用）:**
-- ロードマップ上の最終形は**ハイブリッド C**（サーバ起動中は localhost HTTP プロキシ経由、無ければ DB 直接）だが、v0.7.0 のコマンドは**すべて読取専用**なので、原則「読みは自由」に従い **SQLite を直接読む**。
-- 接続は `PRAGMA query_only = ON` を全コネクションに適用した読取専用プールで開き、**CLI が絶対に書き込まないことを構造的に保証**する（書き込みガード）。これにより GUI アプリ起動中でも WAL の並行リーダーとして安全に共存でき、アプリ停止中でも動作する（CLI の主用途）。
+**バックエンド接続:**
+- **読取コマンド**は原則「読みは自由」に従い **SQLite を直接読む**。接続は `PRAGMA query_only = ON` を全コネクションに適用した読取専用プールで開き、読取経路が絶対に書き込まないことを構造的に保証する。GUI アプリ起動中でも WAL の並行リーダーとして安全に共存でき、アプリ停止中でも動作する（CLI の主用途）。
+- **書込コマンド**は**ハイブリッド C** でルーティングする（地雷＝「アプリ起動中 × 直接 DB 書込」による UI 陳腐化 / WAL 競合を回避）:
+  1. `--force` 指定 → 直接 DB 書込（アプリが開いていれば一覧が陳腐化しうる旨を stderr に警告）。
+  2. MCP サーバーに到達可（keychain にトークン有 + localhost へ `ping` 成功）→ **HTTP 経由**でサーバーに委譲。サーバーが公開用の書込ゲート（`mcp_server.write_enabled`）を適用し、成功時は `.bib` 同期と GUI 一覧のリアルタイム更新まで行う（＝UI が陳腐化しない安全経路）。到達可だが書込ゲート off の場合は「アプリ設定で有効化するか `--force`」を明示する。
+  3. 到達不可（アプリ停止と判断）→ **直接 DB 書込**。成功後に `.bib` 同期を best-effort で行う。
+- 実装は単一ソース: どちらの経路も MCP の `tools/call`（JSON-RPC）と同じリクエスト形状を作り、HTTP なら POST、直接なら `mcp_server::handle_rpc_with_write` を `write_on = true` で呼ぶ（ツール実装・監査ログ・`mutated` フラグを共有。書込は監査ログにも残る）。書込対象は MCP の write ツールに揃える（`create_entry` / `update_entry` / `update_notes` / `add_tag` / `add_to_collection`。破壊系 `delete_entry` は非公開）。
 - DB パスは Tauri の `app_data_dir` と同一規則で解決する: `dirs::data_dir()` + identifier `com.lumencite.app`（macOS: `~/Library/Application Support/com.lumencite.app/lumencite.db`）。環境変数 `LUMENCITE_DB_PATH` で上書き可（テスト・非標準配置向け）。ライブラリが未作成なら「アプリを一度起動してください」と明示エラーにする（勝手に空 DB を作らない）。
-- HTTP プロキシ経由の**ハイブリッド C 本実装は、書き込みコマンドを導入する次版**で行う（`mcp_shim.rs` の proxy パターンを流用。地雷＝「アプリ起動中 × MCP off × CLI 書込」による UI 陳腐化 / WAL 競合を、書込はアプリ停止時のみ・起動中は明示フラグで強行、で回避）。
 
 **出力形式:**
-- 既定は **JSON**（AI エージェント / `jq` 連携が主用途）。`--human` フラグで人間可読なテキスト出力に切替。
-- 正常系は stdout、エラーは stderr。終了コードは 成功=0 / 使い方エラー=2 / 実行時エラー=1。
+- 既定は **JSON**（AI エージェント / `jq` 連携が主用途）。`--human` フラグで人間可読なテキスト出力に切替。書込コマンドはツールの結果メッセージ（例: `Entry created with id=42.`）を stdout に出す。
+- 正常系は stdout、エラー / 警告は stderr。終了コードは 成功=0 / 使い方エラー=2 / 実行時エラー=1。
 
-**サブコマンド（v0.7.0 スコープ）:**
+**サブコマンド（読取・v0.7.0 スコープ）:**
 - `search <query…> [--collection <id>] [--tag <id>] [--type <t>]… [--year-min N] [--year-max N] [--starred] [--has-attachment] [--limit N]` — メタデータ検索（`search_entries_filtered` を再利用）。`EntryFilter` の各軸をフラグで指定できる。
 - `get <id|citation_key>` — 単一エントリ詳細（`get_entry` / cite key は `find_entry_id_by_citation_key` で解決）。
 - `bib <citation_key…>` — 指定した `\cite` キー群から `refs.bib` を生成（`export_bibtex_by_keys` を再利用。全体キーを維持するため `smith2020a` が化けない）。stdout に BibTeX、解決できなかったキーは stderr に警告。**LaTeX 執筆の中核コマンド**。
@@ -266,7 +269,14 @@ LumenCite ライブラリを **ターミナルから直接読める** CLI を実
 - `collections` — コレクション一覧（ネスト含む、`get_collections`）。
 - `fulltext <query…>` — PDF 全文検索（`search_fulltext`）。ヒットのエントリ・ページ・スニペットを返す。
 
-**非対象（次版以降）:** 書き込み系（`add` / `update` / タグ付け等）と HTTP プロキシ経由のハイブリッド C。CSL 引用スタイル。CLI 用の PATH 配置（Homebrew `binary` シンボリックリンク等の配布導線）は別途の単発 Win として扱う。
+**サブコマンド（書込・v0.7.0 スコープ。全経路 `--force` 対応）:**
+- `add --title <T> [--type <t>] [--year N] [--doi/--isbn/--arxiv/--url/--citation-key/--notes/--abstract <v>] [--author <name>]… [--field <key=value>]…` — エントリ作成（`create_entry`）。
+- `update <id|citation_key> [同上フィールドフラグ]…` — 既存エントリの部分更新（`update_entry`。指定フィールドのみ変更。`--citation-key ""` で unpin）。
+- `notes <id|citation_key> <text…>` — ノート設定（`update_notes`）。
+- `tag <id|citation_key> <tag_name>` — タグ付与（`add_tag`。無ければ作成）。
+- `collect <id|citation_key> <collection_id>` — コレクションへ追加（`add_to_collection`）。
+
+**非対象（次版以降）:** 破壊系（`delete` / trash）。DOI/arXiv からのメタデータ自動取得付き `add`（ネットワーク取得は別スコープ）。CSL 引用スタイル。CLI 用の PATH 配置（Homebrew `binary` シンボリックリンク等の配布導線）は別途の単発 Win として扱う。
 
 ---
 

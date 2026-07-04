@@ -104,9 +104,13 @@ pnpm --filter lumencite-clipper build   # extension/dist を生成
 
 ## CLI（コマンドライン）
 
-LumenCite は GUI を起動せず、ターミナルからライブラリを**読取専用**で照会できる CLI を内蔵します（本体バイナリの `argv` 分岐で動作。新しいバイナリは増やしていません）。主な用途は **AI エージェント × LaTeX 執筆**（`\cite` キー → `refs.bib` 生成）とシェルスクリプト連携です。
+LumenCite は GUI を起動せず、ターミナルからライブラリを照会・編集できる CLI を内蔵します（本体バイナリの `argv` 分岐で動作。新しいバイナリは増やしていません）。主な用途は **AI エージェント × LaTeX 執筆**（`\cite` キー → `refs.bib` 生成）とシェルスクリプト連携です。
 
-出力は既定で **JSON**（`jq` 連携向け）、`--human` で人間可読テキストに切り替わります。SQLite を `PRAGMA query_only = ON` の読取専用接続で開くため、GUI アプリ起動中でも安全に共存し、停止中でも動作します。
+出力は既定で **JSON**（`jq` 連携向け）、`--human` で人間可読テキストに切り替わります。DB は Tauri の `app_data_dir`（macOS: `~/Library/Application Support/com.lumencite.app/lumencite.db`）を自動解決し、環境変数 `LUMENCITE_DB_PATH` で上書きできます。
+
+### 読取
+
+読取は SQLite を `PRAGMA query_only = ON` の読取専用接続で開くため、GUI アプリ起動中でも安全に共存し、停止中でも動作します。
 
 ```bash
 # メタデータ検索（フィルタ: --type / --year-min / --year-max / --starred / --has-attachment / --limit）
@@ -128,9 +132,29 @@ lumencite collections
 lumencite fulltext "topological"
 ```
 
-DB は Tauri の `app_data_dir`（macOS: `~/Library/Application Support/com.lumencite.app/lumencite.db`）を自動解決します。環境変数 `LUMENCITE_DB_PATH` で上書き可能です。ライブラリが未作成の場合はアプリを一度起動してください。
+### 書込
 
-> ℹ️ v0.7.0 の CLI は読取専用です。書き込み系コマンドと、サーバ起動中の HTTP プロキシ経由（ハイブリッド C）は、書き込みガードを厳格化した上で次版で追加予定です。
+```bash
+# エントリ作成（--field で type 固有フィールド、--author は繰り返し可）
+lumencite add --title "My Paper" --type article --year 2026 \
+  --author "Jane Doe" --citation-key doe2026a --field journal="Nature"
+
+# 既存エントリの部分更新（id でも citation key でも可）
+lumencite update doe2026a --year 2027 --notes "revised"
+
+# ノート設定 / タグ付与 / コレクション追加
+lumencite notes doe2026a "important background reference"
+lumencite tag doe2026a reading-list
+lumencite collect doe2026a 3
+```
+
+書込は **UI 陳腐化を避けるハイブリッド C** でルーティングされます:
+
+- **LumenCite アプリが起動中（MCP サーバー有効）** → localhost 経由でアプリに委譲し、変更が**一覧に即反映**され `.bib` も同期されます（MCP の書込は設定 → MCP サーバーで許可が必要）。
+- **アプリ停止中** → DB に直接書き込み、`.bib` を同期します。
+- `--force` を付けると、アプリ起動中でも DB に直接書き込みます（開いているウィンドウの一覧は更新するまで古い表示のままになる可能性があります）。
+
+> ℹ️ 破壊的操作（削除）、DOI/arXiv からのメタデータ自動取得付き作成、CLI を PATH に載せる配布導線（Homebrew の `binary` シンボリックリンク等）は次版以降で検討します。
 
 ## Documentation
 

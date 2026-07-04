@@ -11,9 +11,12 @@
 //! リーダーとして安全に共存し、停止中でも動く。HTTP プロキシ経由のハイブリッド C 本実装と
 //! 書き込みコマンドは、書き込みガードを厳格化した上で次版で追加する。
 
+mod write;
+
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
+use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
@@ -61,6 +64,11 @@ struct Cli {
     #[arg(long, global = true)]
     human: bool,
 
+    /// For write commands: write directly to the DB even if the LumenCite app is running
+    /// (its window may show stale data until refreshed). Ignored by read commands.
+    #[arg(long, global = true)]
+    force: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -87,6 +95,106 @@ enum Command {
     Collections,
     /// Full-text search across attached PDFs.
     Fulltext(FulltextArgs),
+    /// Create a new entry (write).
+    Add(AddArgs),
+    /// Update fields of an existing entry by id or citation key (write).
+    Update(UpdateArgs),
+    /// Set the notes of an entry by id or citation key (write).
+    Notes(NotesArgs),
+    /// Add a tag (by name) to an entry by id or citation key (write).
+    Tag(TagArgs),
+    /// Add an entry (by id or citation key) to a collection by id (write).
+    Collect(CollectArgs),
+}
+
+#[derive(Args, Debug)]
+struct AddArgs {
+    /// Title of the work (required).
+    #[arg(long)]
+    title: String,
+    /// BibTeX entry type (e.g. article, book, inproceedings; default misc).
+    #[arg(long = "type")]
+    entry_type: Option<String>,
+    #[arg(long)]
+    year: Option<i64>,
+    #[arg(long)]
+    doi: Option<String>,
+    #[arg(long)]
+    isbn: Option<String>,
+    #[arg(long)]
+    arxiv: Option<String>,
+    #[arg(long)]
+    url: Option<String>,
+    /// Pinned citation key used in LaTeX \cite{} (must be globally unique).
+    #[arg(long = "citation-key")]
+    citation_key: Option<String>,
+    #[arg(long)]
+    notes: Option<String>,
+    #[arg(long = "abstract")]
+    abstract_: Option<String>,
+    /// Author name in display order; repeatable.
+    #[arg(long = "author", value_name = "NAME")]
+    authors: Vec<String>,
+    /// Type-specific field as key=value (e.g. --field journal=Nature); repeatable.
+    #[arg(long = "field", value_name = "KEY=VALUE")]
+    fields: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct UpdateArgs {
+    /// Numeric id or citation key of the entry to update.
+    id_or_key: String,
+    #[arg(long)]
+    title: Option<String>,
+    #[arg(long = "type")]
+    entry_type: Option<String>,
+    #[arg(long)]
+    year: Option<i64>,
+    #[arg(long)]
+    doi: Option<String>,
+    #[arg(long)]
+    isbn: Option<String>,
+    #[arg(long)]
+    arxiv: Option<String>,
+    #[arg(long)]
+    url: Option<String>,
+    /// New pinned citation key; pass an empty string to unpin.
+    #[arg(long = "citation-key")]
+    citation_key: Option<String>,
+    #[arg(long)]
+    notes: Option<String>,
+    #[arg(long = "abstract")]
+    abstract_: Option<String>,
+    /// Replacement author list (replaces existing authors); repeatable.
+    #[arg(long = "author", value_name = "NAME")]
+    authors: Vec<String>,
+    /// Type-specific field to set as key=value; repeatable.
+    #[arg(long = "field", value_name = "KEY=VALUE")]
+    fields: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct NotesArgs {
+    /// Numeric id or citation key of the entry.
+    id_or_key: String,
+    /// Notes text (joined with spaces).
+    notes: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct TagArgs {
+    /// Numeric id or citation key of the entry.
+    id_or_key: String,
+    /// Tag name (created if it does not exist).
+    tag_name: String,
+}
+
+#[derive(Args, Debug)]
+struct CollectArgs {
+    /// Numeric id or citation key of the entry.
+    id_or_key: String,
+    /// Collection id to add the entry to.
+    collection_id: i64,
 }
 
 /// `search` / `export` 共通のメタデータフィルタ軸（`EntryFilter` にマップ）。
@@ -210,8 +318,10 @@ pub fn run() -> i32 {
 /// DB パスを解決してから、パース済みコマンドを実行する。
 async fn execute(cli: Cli) -> Result<CmdOutput, String> {
     let db_path = resolve_db_path()?;
+    // 読取専用プール。書込コマンドでも「ポート設定の読み出し」と「citation key→id 解決」に使う。
     let pool = open_readonly_pool(&db_path).await?;
     let human = cli.human;
+    let force = cli.force;
 
     let result = match cli.command {
         Command::Search(a) => {
@@ -231,10 +341,138 @@ async fn execute(cli: Cli) -> Result<CmdOutput, String> {
             let q = a.query.join(" ");
             cmd_fulltext(&pool, &q, a.collection, a.tag, human).await
         }
+        // ── write（ハイブリッド C ルーティング。詳細は cli::write） ──
+        Command::Add(a) => match build_add_request(&a) {
+            Ok(req) => write::dispatch_write(&db_path, &pool, req, force).await,
+            Err(e) => Err(e),
+        },
+        Command::Update(a) => match resolve_entry_id(&pool, &a.id_or_key).await {
+            Ok(id) => match build_update_request(id, &a) {
+                Ok(req) => write::dispatch_write(&db_path, &pool, req, force).await,
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        },
+        Command::Notes(a) => match resolve_entry_id(&pool, &a.id_or_key).await {
+            Ok(id) => {
+                let req = write::tools_call(
+                    "update_notes",
+                    json!({ "entry_id": id, "notes": a.notes.join(" ") }),
+                );
+                write::dispatch_write(&db_path, &pool, req, force).await
+            }
+            Err(e) => Err(e),
+        },
+        Command::Tag(a) => match resolve_entry_id(&pool, &a.id_or_key).await {
+            Ok(id) => {
+                let req = write::tools_call(
+                    "add_tag",
+                    json!({ "entry_id": id, "tag_name": a.tag_name }),
+                );
+                write::dispatch_write(&db_path, &pool, req, force).await
+            }
+            Err(e) => Err(e),
+        },
+        Command::Collect(a) => match resolve_entry_id(&pool, &a.id_or_key).await {
+            Ok(id) => {
+                let req = write::tools_call(
+                    "add_to_collection",
+                    json!({ "entry_id": id, "collection_id": a.collection_id }),
+                );
+                write::dispatch_write(&db_path, &pool, req, force).await
+            }
+            Err(e) => Err(e),
+        },
     };
 
     pool.close().await;
     result
+}
+
+/// `add` の引数を `create_entry` の `tools/call` リクエストへ写す。
+fn build_add_request(a: &AddArgs) -> Result<serde_json::Value, String> {
+    let mut args = serde_json::Map::new();
+    args.insert("title".into(), json!(a.title));
+    if let Some(v) = &a.entry_type {
+        args.insert("entry_type".into(), json!(v));
+    }
+    if let Some(v) = a.year {
+        args.insert("year".into(), json!(v));
+    }
+    if let Some(v) = &a.doi {
+        args.insert("doi".into(), json!(v));
+    }
+    if let Some(v) = &a.isbn {
+        args.insert("isbn".into(), json!(v));
+    }
+    if let Some(v) = &a.arxiv {
+        args.insert("arxiv_id".into(), json!(v));
+    }
+    if let Some(v) = &a.url {
+        args.insert("url".into(), json!(v));
+    }
+    if let Some(v) = &a.citation_key {
+        args.insert("citation_key".into(), json!(v));
+    }
+    if let Some(v) = &a.notes {
+        args.insert("notes".into(), json!(v));
+    }
+    if let Some(v) = &a.abstract_ {
+        args.insert("abstract".into(), json!(v));
+    }
+    if !a.authors.is_empty() {
+        args.insert("author_names".into(), json!(a.authors));
+    }
+    let extra = write::parse_fields(&a.fields)?;
+    if !extra.is_empty() {
+        args.insert("extra_fields".into(), serde_json::Value::Object(extra));
+    }
+    Ok(write::tools_call("create_entry", serde_json::Value::Object(args)))
+}
+
+/// `update` の引数を `update_entry` の `tools/call` リクエストへ写す（`entry_id` は解決済み）。
+/// `citation_key` は空文字も「unpin」の指示として明示的に渡す。
+fn build_update_request(entry_id: i64, a: &UpdateArgs) -> Result<serde_json::Value, String> {
+    let mut args = serde_json::Map::new();
+    args.insert("entry_id".into(), json!(entry_id));
+    if let Some(v) = &a.title {
+        args.insert("title".into(), json!(v));
+    }
+    if let Some(v) = &a.entry_type {
+        args.insert("entry_type".into(), json!(v));
+    }
+    if let Some(v) = a.year {
+        args.insert("year".into(), json!(v));
+    }
+    if let Some(v) = &a.doi {
+        args.insert("doi".into(), json!(v));
+    }
+    if let Some(v) = &a.isbn {
+        args.insert("isbn".into(), json!(v));
+    }
+    if let Some(v) = &a.arxiv {
+        args.insert("arxiv_id".into(), json!(v));
+    }
+    if let Some(v) = &a.url {
+        args.insert("url".into(), json!(v));
+    }
+    if let Some(v) = &a.citation_key {
+        args.insert("citation_key".into(), json!(v));
+    }
+    if let Some(v) = &a.notes {
+        args.insert("notes".into(), json!(v));
+    }
+    if let Some(v) = &a.abstract_ {
+        args.insert("abstract".into(), json!(v));
+    }
+    if !a.authors.is_empty() {
+        args.insert("author_names".into(), json!(a.authors));
+    }
+    let extra = write::parse_fields(&a.fields)?;
+    if !extra.is_empty() {
+        args.insert("extra_fields".into(), serde_json::Value::Object(extra));
+    }
+    Ok(write::tools_call("update_entry", serde_json::Value::Object(args)))
 }
 
 /// DB パス: `LUMENCITE_DB_PATH` 優先、無ければ `dirs::data_dir()/<identifier>/lumencite.db`
@@ -646,5 +884,133 @@ mod tests {
             .execute(&pool)
             .await;
         assert!(w.is_err());
+    }
+
+    // ── write: リクエスト生成（純粋関数） ──
+
+    #[test]
+    fn build_add_request_maps_flags_to_create_entry() {
+        let a = AddArgs {
+            title: "My Paper".into(),
+            entry_type: Some("article".into()),
+            year: Some(2020),
+            doi: Some("10.1/x".into()),
+            isbn: None,
+            arxiv: Some("2303.1".into()),
+            url: None,
+            citation_key: Some("me2020a".into()),
+            notes: None,
+            abstract_: None,
+            authors: vec!["Jane Doe".into(), "John Roe".into()],
+            fields: vec!["journal=Nature".into()],
+        };
+        let req = build_add_request(&a).unwrap();
+        assert_eq!(req["params"]["name"], "create_entry");
+        let args = &req["params"]["arguments"];
+        assert_eq!(args["title"], "My Paper");
+        assert_eq!(args["arxiv_id"], "2303.1");
+        assert_eq!(args["citation_key"], "me2020a");
+        assert_eq!(args["author_names"][1], "John Roe");
+        assert_eq!(args["extra_fields"]["journal"], "Nature");
+        assert!(args.get("isbn").is_none());
+    }
+
+    #[test]
+    fn build_update_request_includes_entry_id_and_empty_citation_key() {
+        let a = UpdateArgs {
+            id_or_key: "ignored".into(),
+            title: None,
+            entry_type: None,
+            year: Some(2021),
+            doi: None,
+            isbn: None,
+            arxiv: None,
+            url: None,
+            citation_key: Some(String::new()), // unpin
+            notes: None,
+            abstract_: None,
+            authors: vec![],
+            fields: vec![],
+        };
+        let req = build_update_request(7, &a).unwrap();
+        assert_eq!(req["params"]["name"], "update_entry");
+        assert_eq!(req["params"]["arguments"]["entry_id"], 7);
+        assert_eq!(req["params"]["arguments"]["year"], 2021);
+        assert_eq!(req["params"]["arguments"]["citation_key"], "");
+    }
+
+    // ── write: 実行（handle_rpc_with_write を write_on=true で直接呼ぶ直接経路と同じ道） ──
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_request_creates_entry_via_write_handler(pool: SqlitePool) {
+        let a = AddArgs {
+            title: "Created By CLI".into(),
+            entry_type: Some("article".into()),
+            year: Some(2024),
+            doi: None,
+            isbn: None,
+            arxiv: None,
+            url: None,
+            citation_key: Some("cli2024a".into()),
+            notes: None,
+            abstract_: None,
+            authors: vec!["Jane Doe".into()],
+            fields: vec![],
+        };
+        let req = build_add_request(&a).unwrap();
+        let outcome =
+            crate::mcp_server::handle_rpc_with_write(&pool, Path::new(""), true, &req).await;
+        assert!(outcome.mutated, "create_entry should mutate");
+
+        // 実際に作られ、cite key で引けること。
+        let id = crate::bibtex::find_entry_id_by_citation_key(&pool, "cli2024a")
+            .await
+            .unwrap();
+        assert!(id.is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tag_request_adds_tag_via_write_handler(pool: SqlitePool) {
+        let created =
+            db::entries::create_entry(&pool, &sample_input("Taggable", "tag2020a", 2020))
+                .await
+                .unwrap();
+        let req = write::tools_call(
+            "add_tag",
+            json!({ "entry_id": created.id, "tag_name": "reading-list" }),
+        );
+        let outcome =
+            crate::mcp_server::handle_rpc_with_write(&pool, Path::new(""), true, &req).await;
+        assert!(outcome.mutated);
+
+        let tags = db::tags::get_tags(&pool).await.unwrap();
+        assert!(tags.iter().any(|t| t.name == "reading-list"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn write_handler_without_write_on_does_not_mutate(pool: SqlitePool) {
+        // write_on=false（公開ゲート off 相当）なら create は拒否され、mutate しない。
+        let a = AddArgs {
+            title: "Should Not Exist".into(),
+            entry_type: None,
+            year: None,
+            doi: None,
+            isbn: None,
+            arxiv: None,
+            url: None,
+            citation_key: Some("nope2020a".into()),
+            notes: None,
+            abstract_: None,
+            authors: vec![],
+            fields: vec![],
+        };
+        let req = build_add_request(&a).unwrap();
+        let outcome =
+            crate::mcp_server::handle_rpc_with_write(&pool, Path::new(""), false, &req).await;
+        assert!(!outcome.mutated);
+        let id = crate::bibtex::find_entry_id_by_citation_key(&pool, "nope2020a")
+            .await
+            .unwrap();
+        assert!(id.is_none());
     }
 }
