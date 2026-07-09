@@ -135,12 +135,17 @@ export function DetailView({
     return () => clearTimeout(handle);
   }, [entry.id, page, isPrimaryActive]);
 
-  // 添付切替: ページは 1 に戻し、選択中の添付を先頭に表示する。
+  // 添付切替: 補助添付はページ 1 から表示する。primary へ戻るときは
+  // last_page（primary 基準で永続化）を復元し、記憶ページを 1 で潰さない。
   const handleSelectAttachment = useCallback((id: number) => {
     setSelectedAttachmentId(id);
-    setPage(1);
+    const backToPrimary = id === attachments[0]?.id;
+    const nextPage = backToPrimary && lastPersistedPage.current > 0
+      ? lastPersistedPage.current
+      : 1;
+    setPage(nextPage);
     setScrollTick(t => t + 1);
-  }, []);
+  }, [attachments]);
 
   // リーダー内から PDF を追加（本文＋補助資料など）。追加分を即座に表示する。
   const handleAttachPdf = useCallback(async () => {
