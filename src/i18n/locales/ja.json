@@ -77,7 +77,6 @@
     "emptyTrashEmpty": "ゴミ箱は空です",
     "emptyTrashWarn": "ゴミ箱内のすべての文献を永久に削除します",
     "filter": "フィルタ",
-    "sort": "並び替え",
     "clearSearch": "検索をクリア"
   },
   "filter": {

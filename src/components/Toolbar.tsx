@@ -300,8 +300,6 @@ export function Toolbar({ title, subtitle, count, search, onSearchChange, search
             />
           )}
         </div>
-        <div style={{ flex: 1 }} />
-        <ToolbarBtn icon="sortAsc" label={t("toolbar.sort")} />
       </div>
     </header>
   );
