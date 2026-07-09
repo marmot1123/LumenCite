@@ -228,8 +228,8 @@ export function Toolbar({ title, subtitle, count, search, onSearchChange, search
       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 16px 10px" }}>
         <div style={{
           display: "flex", alignItems: "center", gap: 6,
-          flex: 1, maxWidth: 460,
-          padding: "5px 10px",
+          flex: 1, maxWidth: 560,
+          padding: "5px 6px 5px 10px",
           background: "var(--surface-2)",
           border: "1px solid var(--border)",
           borderRadius: 6, height: 28,
@@ -243,12 +243,27 @@ export function Toolbar({ title, subtitle, count, search, onSearchChange, search
               ? t("toolbar.searchPlaceholder.fulltext")
               : t("toolbar.searchPlaceholder.meta")}
             style={{
-              flex: 1, border: "none", outline: "none", background: "transparent",
+              flex: 1, minWidth: 0, border: "none", outline: "none", background: "transparent",
               fontSize: 12.5, color: "var(--text)",
             }}
           />
-          <ScopeToggle scope={searchScope} onChange={onSearchScopeChange} />
+          {search && (
+            <button
+              onClick={() => onSearchChange("")}
+              title={t("toolbar.clearSearch")}
+              aria-label={t("toolbar.clearSearch")}
+              style={{
+                display: "inline-flex", alignItems: "center", justifyContent: "center",
+                width: 16, height: 16, padding: 0, flexShrink: 0,
+                border: "none", borderRadius: 999, background: "transparent",
+                color: "var(--text-faint)", cursor: "pointer",
+              }}
+            >
+              <Icon name="close" size={12} color="var(--text-faint)" />
+            </button>
+          )}
         </div>
+        <ScopeToggle scope={searchScope} onChange={onSearchScopeChange} />
         <div style={{ position: "relative", display: "inline-flex" }}>
           <button
             onClick={filterDisabled ? undefined : () => setShowFilter(s => !s)}
@@ -285,10 +300,6 @@ export function Toolbar({ title, subtitle, count, search, onSearchChange, search
             />
           )}
         </div>
-        <div style={{ width: 1, height: 18, background: "var(--border)" }} />
-        <ToolbarBtn icon="columns" label={t("toolbar.columns")} />
-        <div style={{ flex: 1 }} />
-        <ToolbarBtn icon="sortAsc" label={t("toolbar.sort")} />
       </div>
     </header>
   );
