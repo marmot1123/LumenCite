@@ -10,6 +10,8 @@ import { PdfToolbar, type PdfMode } from "./PdfToolbar";
 import { Thumbnails } from "./Thumbnails";
 import { PdfPane } from "./PdfPane";
 import { MetaPanel, type MetaTabId } from "./MetaPanel";
+import { Icon } from "../icons";
+import { pickAndAttachPdf } from "../../lib/attachments";
 import type { EntryDetail, Highlight, HighlightInput } from "../../types";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = PdfWorker;
@@ -25,6 +27,8 @@ interface DetailViewProps {
   onChat: () => void;
   /** info タブの AuthorEditor で著者が更新された後、親で entry の再フェッチを行う。 */
   onAuthorEdited?: () => void;
+  /** リーダー内で PDF を追加した後、親で entry の再フェッチを行う。 */
+  onAttachmentsChanged?: () => void;
 }
 
 function readNum(key: string, fallback: number): number {
@@ -61,6 +65,7 @@ export function DetailView({
   onSummarize,
   onChat,
   onAuthorEdited,
+  onAttachmentsChanged,
 }: DetailViewProps) {
   const { t } = useTranslation();
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
@@ -70,6 +75,20 @@ export function DetailView({
   const [scrollTick, setScrollTick] = useState(0);
   const [ocrBusy, setOcrBusy] = useState(false);
   const [ocrMsg, setOcrMsg] = useState<string | null>(null);
+
+  // 複数添付の切替。null のときは先頭（primary）を表示する。
+  const [selectedAttachmentId, setSelectedAttachmentId] = useState<number | null>(null);
+  const [attaching, setAttaching] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
+
+  // 表示中の添付。複数あれば選択中の 1 件、無選択なら先頭（primary）を開く。
+  const attachments = entry.attachments;
+  const activeAttachment =
+    attachments.find(a => a.id === selectedAttachmentId) ?? attachments[0] ?? null;
+  const activeIndex = activeAttachment
+    ? attachments.findIndex(a => a.id === activeAttachment.id)
+    : -1;
+  const isPrimaryActive = activeAttachment != null && activeAttachment.id === attachments[0]?.id;
 
   const [zoom, setZoom] = useState<number>(() => readNum("lc-detail-zoom", 100));
   const [leftOpen, setLeftOpen] = useState<boolean>(() => readBool("lc-detail-leftOpen", true));
@@ -105,17 +124,42 @@ export function DetailView({
 
   // page が変わったら DB の last_page を更新（簡易デバウンス）。
   // 保存値のロード完了前は書き込まない（初期値 1 で保存値を潰さないため）。
+  // last_page はエントリ単位（primary PDF 基準）なので、補助添付を閲覧中は
+  // 本文の記憶ページを潰さないよう書き込まない。
   useEffect(() => {
-    if (!lastPageLoaded.current || lastPersistedPage.current === page) return;
+    if (!lastPageLoaded.current || lastPersistedPage.current === page || !isPrimaryActive) return;
     const handle = setTimeout(() => {
       lastPersistedPage.current = page;
       invoke("set_setting", { key: `pdf.last_page.${entry.id}`, value: String(page) }).catch(() => { /* noop */ });
     }, 500);
     return () => clearTimeout(handle);
-  }, [entry.id, page]);
+  }, [entry.id, page, isPrimaryActive]);
 
-  // PDF 読み込み
-  const primaryAttachment = entry.attachments[0] ?? null;
+  // 添付切替: ページは 1 に戻し、選択中の添付を先頭に表示する。
+  const handleSelectAttachment = useCallback((id: number) => {
+    setSelectedAttachmentId(id);
+    setPage(1);
+    setScrollTick(t => t + 1);
+  }, []);
+
+  // リーダー内から PDF を追加（本文＋補助資料など）。追加分を即座に表示する。
+  const handleAttachPdf = useCallback(async () => {
+    if (attaching) return;
+    setAttachError(null);
+    try {
+      setAttaching(true);
+      const att = await pickAndAttachPdf(entry.id);
+      if (!att) return;
+      setSelectedAttachmentId(att.id);
+      setPage(1);
+      setScrollTick(t => t + 1);
+      onAttachmentsChanged?.();
+    } catch (e: any) {
+      setAttachError(e?.message ?? String(e));
+    } finally {
+      setAttaching(false);
+    }
+  }, [entry.id, attaching, onAttachmentsChanged]);
 
   // OCR（スキャン PDF を Vision で文字起こしして全文検索に取り込む）
   const handleOcr = useCallback(async () => {
@@ -132,7 +176,7 @@ export function DetailView({
     }
   }, [entry.id, t]);
   useEffect(() => {
-    if (!primaryAttachment) {
+    if (!activeAttachment) {
       setDoc(null);
       return;
     }
@@ -143,7 +187,7 @@ export function DetailView({
     (async () => {
       try {
         const bytes = await invoke<number[] | Uint8Array>("read_attachment_bytes", {
-          id: primaryAttachment.id,
+          id: activeAttachment.id,
         });
         const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
         const task = pdfjsLib.getDocument({ data });
@@ -158,7 +202,7 @@ export function DetailView({
       }
     })();
     return () => { cancelled = true; if (loaded) loaded.destroy(); };
-  }, [primaryAttachment?.id]);
+  }, [activeAttachment?.id]);
 
   // ハイライト読み込み
   const reloadHighlights = useCallback(() => {
@@ -291,10 +335,10 @@ export function DetailView({
         onToggleStar={onToggleStar}
         onSummarize={onSummarize}
         onChat={onChat}
-        onOcr={primaryAttachment ? handleOcr : undefined}
+        onOcr={activeAttachment ? handleOcr : undefined}
         ocrBusy={ocrBusy}
-        onDownload={primaryAttachment ? () => onOpenInWindow?.(primaryAttachment.id) : undefined}
-        onPrint={primaryAttachment ? handlePrint : undefined}
+        onDownload={activeAttachment ? () => onOpenInWindow?.(activeAttachment.id) : undefined}
+        onPrint={activeAttachment ? handlePrint : undefined}
       />
       {ocrMsg && (
         <div
@@ -323,8 +367,71 @@ export function DetailView({
             onLeftOpenChange={setLeftOpen}
             rightOpen={rightOpen}
             onRightOpenChange={setRightOpen}
-            onOpenInWindow={primaryAttachment ? () => onOpenInWindow?.(primaryAttachment.id) : undefined}
+            onOpenInWindow={activeAttachment ? () => onOpenInWindow?.(activeAttachment.id) : undefined}
           />
+          {attachments.length >= 1 && (
+            <div style={{
+              flexShrink: 0, display: "flex", alignItems: "center", gap: 8,
+              padding: "5px 10px", borderBottom: "1px solid var(--border)",
+              background: "var(--surface-2)", fontSize: 12, color: "var(--text)",
+            }}>
+              <Icon name="paperclip" size={12} color="var(--text-faint)" />
+              {attachments.length >= 2 ? (
+                <>
+                  <select
+                    aria-label={t("detail.attachments.select")}
+                    value={activeAttachment?.id ?? ""}
+                    onChange={e => handleSelectAttachment(Number(e.target.value))}
+                    title={activeAttachment?.file_name}
+                    style={{
+                      maxWidth: 360, minWidth: 0, padding: "2px 6px", borderRadius: 5,
+                      border: "1px solid var(--border)", background: "var(--surface)",
+                      color: "var(--text)", fontSize: 12,
+                    }}
+                  >
+                    {attachments.map(att => (
+                      <option key={att.id} value={att.id}>{att.file_name}</option>
+                    ))}
+                  </select>
+                  <span style={{ color: "var(--text-faint)", flexShrink: 0 }}>
+                    {t("detail.attachments.position", { current: activeIndex + 1, total: attachments.length })}
+                  </span>
+                </>
+              ) : (
+                <span
+                  title={activeAttachment?.file_name}
+                  style={{
+                    flex: 1, minWidth: 0, color: "var(--text-mute)",
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}
+                >{activeAttachment?.file_name}</span>
+              )}
+              <div style={{ flex: 1 }} />
+              <button
+                onClick={handleAttachPdf}
+                disabled={attaching}
+                style={{
+                  flexShrink: 0, display: "flex", alignItems: "center", gap: 5,
+                  padding: "3px 9px", borderRadius: 5, border: "1px solid var(--border)",
+                  background: "var(--surface)", color: "var(--text)", fontSize: 12,
+                  cursor: attaching ? "default" : "pointer", opacity: attaching ? 0.6 : 1,
+                }}
+              >
+                <Icon name="plus" size={11} color="var(--text-mute)" />
+                {attaching ? t("detail.attachments.adding") : t("detail.attachments.add")}
+              </button>
+            </div>
+          )}
+          {attachError && (
+            <div
+              onClick={() => setAttachError(null)}
+              style={{
+                flexShrink: 0, padding: "5px 12px", fontSize: 12, cursor: "pointer",
+                background: "var(--surface-2)", borderBottom: "1px solid var(--border)",
+                color: "var(--danger, #c0392b)",
+              }}
+            >{t("detail.attachments.addError", { error: attachError })}</div>
+          )}
           <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
             {leftOpen && doc && (
               <Thumbnails doc={doc} current={page} onSelect={handlePageRequest} />

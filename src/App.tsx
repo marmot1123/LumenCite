@@ -838,6 +838,11 @@ export default function App() {
             reloadDetail(detail.id);
             loadEntries();
           }}
+          onAttachmentsChanged={() => {
+            // 添付追加で一覧の添付バッジ・件数も変わりうるため両方再読込する
+            reloadDetail(detail.id);
+            loadEntries();
+          }}
         />
         {globalOverlays}
         {showSummary && (

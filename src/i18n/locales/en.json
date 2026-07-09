@@ -176,6 +176,13 @@
       "searchPlaceholder": "Search in document…",
       "openInWindow": "Open in new window"
     },
+    "attachments": {
+      "select": "Select attachment",
+      "position": "{{current}} / {{total}}",
+      "add": "Add PDF",
+      "adding": "Adding…",
+      "addError": "Failed to attach PDF: {{error}}"
+    },
     "tab": {
       "info": "Info",
       "highlights": "Highlights",

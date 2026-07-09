@@ -176,6 +176,13 @@
       "searchPlaceholder": "本文を検索…",
       "openInWindow": "新しいウィンドウで開く"
     },
+    "attachments": {
+      "select": "添付 PDF を選択",
+      "position": "{{current}} / {{total}}",
+      "add": "PDF を追加",
+      "adding": "追加中…",
+      "addError": "PDF の添付に失敗しました: {{error}}"
+    },
     "tab": {
       "info": "情報",
       "highlights": "ハイライト",
