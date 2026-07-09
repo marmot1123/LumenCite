@@ -77,8 +77,8 @@
     "emptyTrashEmpty": "Trash is empty",
     "emptyTrashWarn": "Permanently delete all entries in trash",
     "filter": "Filter",
-    "columns": "Columns",
-    "sort": "Sort"
+    "sort": "Sort",
+    "clearSearch": "Clear search"
   },
   "filter": {
     "title": "Filter",
