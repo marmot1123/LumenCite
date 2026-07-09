@@ -8,7 +8,8 @@ import { MathMarkdown } from "./MathMarkdown";
 import { AuthorEditor } from "./AuthorEditor";
 import { AuthorChip } from "./AuthorChip";
 import { EXTRA_FIELDS_BY_TYPE, EXTRA_FIELD_LABEL_KEYS } from "../types";
-import type { Attachment, Collection, EntryDetail, EntryType, Tag } from "../types";
+import type { Collection, EntryDetail, EntryType, Tag } from "../types";
+import { pickAndAttachPdf } from "../lib/attachments";
 
 interface DetailPanelProps {
   entry: EntryDetail | null;
@@ -364,9 +365,8 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setAttachError(null);
     try {
       setAttaching(true);
-      const path = await invoke<string | null>("pick_pdf_file");
-      if (!path) return;
-      const att = await invoke<Attachment>("add_attachment", { entryId: entry.id, sourcePath: path });
+      const att = await pickAndAttachPdf(entry.id);
+      if (!att) return;
       onAttachmentsChanged?.();
       onAttachmentAdded?.(att.id);
     } catch (e: any) {

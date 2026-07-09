@@ -289,6 +289,35 @@ LumenCite ライブラリを **ターミナルから直接読める** CLI を実
 
 ---
 
+## v0.8.0
+
+### 1エントリ複数 PDF 添付（本文＋補助資料）— Phase 1
+
+同じ DOI の論文に **本文 PDF** と **supplemental material（SI）等の補助 PDF** が別ファイルで存在するとき、両方を同じエントリに添付して閲覧・全文検索できるようにする。「同一 DOI ＝同一の著作」という前提に立ち、補助 PDF は**別エントリ（別文献）ではなく、本文論文に紐づく添付ファイルの一つ**として扱う（Zotero が添付を item の子として複数ぶら下げるのと同型のモデル）。
+
+**設計方針（モデル A）:**
+- 1 エントリに複数の添付をぶら下げる。補助資料に独自の cite key や BibTeX エントリは与えない（＝引用は本文論文に一本化される）。
+- 単独で `\cite` したい独立 DOI を持つデータセット/コード等は本スコープ外。将来 `entry_relations` の `supplement_of`（現状スキーマ・表示のみで書込パス未実装）を別エントリとして扱う別機能に切り出す。
+
+**スキーマ / API への影響 — なし（migration 不要）:**
+- `attachments` テーブルは既に `entry_id` に**ユニーク制約を持たず**、1 エントリに複数添付を許す。`get_entry_detail` も添付を全件（`Vec<Attachment>`）返す。
+- 全文索引（`fulltext`）は**既に `attachment_id` 単位**で動作し、添付ごとに独立して索引される。補助 PDF を足せば自動でその添付も全文検索対象になる（`attachments_without_fulltext` → `index_attachment` の既存経路）。
+- BibTeX / cite key には無影響（添付はエクスポート対象外）。
+- 既存の Tauri コマンド（`add_attachment` / `open_pdf_viewer` / `read_attachment_bytes` / `delete_attachment` / `pick_pdf_file`）をそのまま流用。**新規コマンドは追加しない**。
+
+**Phase 1 の実装スコープ（フロントエンドのみ）:**
+- **フルスクリーンリーダー（`DetailView`）の添付切替**: 現状 `attachments[0]` 固定で先頭 1 件しか開けない箇所を、**添付セレクタ**に置き換える。添付が 2 件以上あるときにツールバー／サムネイル列上部へドロップダウン（またはタブ）を表示し、選択中の `attachmentId` を state として保持して PDF ビューワー・OCR・印刷・別ウィンドウ表示すべてへ渡す。添付が 1 件のときは従来どおり選択 UI を出さない。
+- **リーダー内の手動 PDF 追加導線**: `DetailView` からも PDF を追加できるようにする。ロジックはサイドパネル（`DetailPanel`）に既にある `handleAttachPdf`（`pick_pdf_file` → `add_attachment`）を共通化して流用する。サイドパネルの複数添付リスト表示・削除・個別「開く」は既存のまま維持。
+- 追加した補助 PDF は既存のバックグラウンド全文索引経路に乗せ、直後から `fulltext_search` の対象にする。
+
+**Phase 1 で「本文＋SI を両方登録して両方読める」が成立する。** DB・全文索引・サイドパネルの複数添付表示／手動追加は既に揃っているため、Phase 1 は実質フロントエンド（リーダーの添付切替とリーダー内追加導線）のみで完結し、migration も新規 API も伴わない。
+
+**後続フェーズ（v0.8.0 スコープ外・将来）:**
+- **Phase 2（添付のラベル／種別）**: primary の判定が現状「配列の 0 番目」という暗黙の順序依存になっているため、`attachments` に `kind`（`document` / `supplement` / `other`、NULL=`document` 扱い）と任意 `label`（例 "Supplementary Information"）を追加する migration を入れ、リーダー既定表示を `kind='document'` 優先にし、補助資料を「補助資料」バッジで区別する。
+- **Phase 3（取込導線の「既存に添付」分岐）**: Web クリッパーが既存エントリ（DOI/arXiv 一致）にヒットしたとき、現状の「何もせず `duplicate` 返却」ではなく、**補助 PDF を既存エントリの添付として追加**する分岐（`apply_clip` に `attach_to_existing` オプション、`kind='supplement'` 既定）を足す。CLI / MCP からの `add_attachment` 到達も併せて検討し、AI エージェント経由での SI 添付を自動化できるようにする。
+
+---
+
 ## Phase 2（残り）
 
 > ✅ v0.2.0 で消化: 複数文献の横断 Chat / LLM 結果の DB（ノート）書き込み / MCP **クライアント** → 上記「v0.2.0」セクション参照
