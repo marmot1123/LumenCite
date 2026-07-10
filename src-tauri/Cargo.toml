@@ -39,7 +39,7 @@ tauri-plugin-dialog = "2"
 # gtk3 が両立すると rfd の build.rs が "can't enable both" で panic するため）。
 # gtk3 機能は mac/win では no-op、Linux は webkit2gtk-4.1-dev 経由で gtk+-3.0 が入る。
 rfd = { version = "0.16", default-features = false, features = ["gtk3"] }
-pdf-extract = "0.9"
+pdf-extract = "0.12"
 # `rt-multi-thread` は v0.7.0 CLI 用。CLI は GUI/Tauri を起動せず、自前の tokio ランタイムで
 # 読取専用 DB 呼び出し（sqlx runtime-tokio）を block_on するため。
 tokio = { version = "1", features = ["sync", "time", "macros", "process", "io-util", "rt-multi-thread"] }

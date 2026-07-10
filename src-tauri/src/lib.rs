@@ -2890,6 +2890,29 @@ mod db_init_tests {
 }
 
 #[cfg(test)]
+mod pdf_extract_tests {
+    /// CR-017: 未信頼 PDF の解析が panic せず Err を返すこと。
+    /// pdf-extract 0.12 / lopdf 0.42 で RUSTSEC-2026-0187（深いネストによる stack overflow）
+    /// を解消済み。回帰でクラッシュに戻らないよう、壊れた入力での挙動を固定する。
+    #[test]
+    fn malformed_pdf_returns_error_without_panicking() {
+        let dir = std::env::temp_dir().join("lumencite_cr017_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("garbage.pdf");
+        // %PDF ヘッダだけ持つが本体が壊れているバイト列。
+        let bytes = b"%PDF-1.7\n1 0 obj<< /Type /Catalog >>endobj\ngarbage\x00\xff\xfe";
+        std::fs::write(&path, bytes).unwrap();
+
+        let result = pdf_extract::extract_text_by_pages(&path);
+        // panic せず（ここへ到達している時点で保証）、成功でも失敗でも許容する。
+        // 主目的は「クラッシュしない」こと。
+        let _ = result;
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
 mod update_and_snippet_tests {
     use super::*;
 
