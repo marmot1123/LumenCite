@@ -504,9 +504,36 @@ fn suffix_letters(mut n: usize) -> String {
     String::from_utf8(s).unwrap()
 }
 
+/// 同期を直列化するグローバルロック（CR-009）。
+/// 手動「今すぐ同期」と debounce 自動同期が同時に走っても、tmp 生成 → replace が
+/// 交錯しないようにする。
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// tmp ファイル名を一意にするためのプロセス内カウンタ。
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// tmp を宛先へ置き換える。Unix の rename は既存を原子的に上書きする。
+/// Windows は宛先がロック/存在で rename が失敗し得るため、宛先を消してから rename し直す。
+fn replace_file(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if cfg!(windows) && dest.exists() {
+                std::fs::remove_file(dest)?;
+                std::fs::rename(tmp, dest)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 /// 全エントリ（ゴミ箱を除く）の BibTeX を指定パスへ書き出す。
-/// 部分書き込みによる壊れたファイルを避けるため、隣に `.tmp` を作って rename する。
+/// 部分書き込みによる壊れたファイルを避けるため、同一ディレクトリに一意な tmp を作って
+/// 置き換える。同期処理はグローバルロックで直列化する（CR-009）。
 pub async fn sync_bibtex(pool: &SqlitePool, path: &std::path::Path) -> Result<(), String> {
+    // 直列化: 同時実行の tmp 衝突・部分状態を防ぐ。
+    let _guard = SYNC_LOCK.lock().await;
+
     let content = export_bibtex(pool, None).await?;
 
     let parent = path
@@ -520,11 +547,14 @@ pub async fn sync_bibtex(pool: &SqlitePool, path: &std::path::Path) -> Result<()
         .file_name()
         .ok_or_else(|| "同期先パスのファイル名が取得できません".to_string())?
         .to_string_lossy();
-    let tmp_path = path.with_file_name(format!(".{file_name}.tmp"));
+    // 一意な tmp 名（pid + カウンタ）。固定名だと並行同期で競合する。
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path =
+        path.with_file_name(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
 
     std::fs::write(&tmp_path, content).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        // rename 失敗時は中途半端な tmp を残さない
+    replace_file(&tmp_path, path).map_err(|e| {
+        // replace 失敗時は中途半端な tmp を残さない
         let _ = std::fs::remove_file(&tmp_path);
         e.to_string()
     })?;
@@ -1380,9 +1410,51 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("Synced Paper"));
-        // tmp file は残らない
-        let leftover = dir.join(".refs.bib.tmp");
-        assert!(!leftover.exists());
+        // tmp file は残らない（拡張子 .tmp のものが 1 つも無い）。
+        let tmp_leftover = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!tmp_leftover, "tmp ファイルが残っている");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CR-009: 2 回目以降の同期でも既存 .bib を上書きできる（Windows rename 退行防止）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn sync_bibtex_repeated_overwrites(pool: sqlx::SqlitePool) {
+        let dir = std::env::temp_dir().join(format!(
+            "lumencite_sync_repeat_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("refs.bib");
+
+        create_entry(&pool, &EntryInput {
+            title: "First Paper".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+        sync_bibtex(&pool, &path).await.unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("First Paper"));
+
+        // 2 回目: 別エントリを足して再同期 → 既存を上書きして両方含む。
+        create_entry(&pool, &EntryInput {
+            title: "Second Paper".to_string(),
+            entry_type: "article".to_string(),
+            ..Default::default()
+        }).await.unwrap();
+        sync_bibtex(&pool, &path).await.unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("First Paper") && content.contains("Second Paper"));
+
+        // tmp は残らない。
+        let tmp_leftover = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!tmp_leftover);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
