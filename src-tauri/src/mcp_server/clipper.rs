@@ -396,9 +396,11 @@ mod tests {
     fn derive_pdf_url_prefers_explicit_over_arxiv() {
         let mut req = clip_req("https://arxiv.org/abs/2301.00001v2");
         req.arxiv_id = Some("2301.00001v2".to_string());
+        // arXiv ID は canonical 化される（版番号を落とす・CR-019）。arXiv は版番号なしの
+        // URL で最新版 PDF を返すため、これで問題ない。
         assert_eq!(
             derive_pdf_url(&req).as_deref(),
-            Some("https://arxiv.org/pdf/2301.00001v2")
+            Some("https://arxiv.org/pdf/2301.00001")
         );
 
         req.pdf_url = Some("https://example.com/paper.pdf".to_string());

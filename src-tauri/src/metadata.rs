@@ -337,20 +337,31 @@ fn strip_html_tags(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// arXiv ID を正準化する（CR-019）。
+///
+/// - `arXiv:` / `arxiv:` プレフィックスを剥がす（大小無視）
+/// - 末尾の版番号 `vN` を除去する（新形式 `2301.00001v5` / 旧形式 `hep-th/9901001v2` の両方）
+/// - **旧形式のカテゴリ（スラッシュより前）は保持する**（`math.GT/0309136` を
+///   `0309136` に潰さない。URL 構築と重複検出の両方で必要）
 pub(crate) fn normalize_arxiv_id(id: &str) -> String {
     let id = id.trim();
-    if let Some(pos) = id.rfind('/') {
-        let rest = &id[pos + 1..];
-        // strip version suffix like v5
-        return rest
-            .find('v')
-            .map_or(rest, |v| &rest[..v])
-            .to_string();
+    let id = id
+        .strip_prefix("arXiv:")
+        .or_else(|| id.strip_prefix("arxiv:"))
+        .unwrap_or(id)
+        .trim();
+    strip_arxiv_version(id).to_string()
+}
+
+/// 末尾の版番号 `vN`（`v` + 1 桁以上の数字）を取り除く。無ければそのまま。
+fn strip_arxiv_version(s: &str) -> &str {
+    if let Some(vpos) = s.rfind('v') {
+        let after = &s[vpos + 1..];
+        if !after.is_empty() && after.bytes().all(|b| b.is_ascii_digit()) {
+            return &s[..vpos];
+        }
     }
-    if let Some(s) = id.strip_prefix("arXiv:").or_else(|| id.strip_prefix("arxiv:")) {
-        return s.to_string();
-    }
-    id.to_string()
+    s
 }
 
 fn extract_first_xml_text(xml: &str, tag: &str) -> Option<String> {
@@ -382,6 +393,28 @@ fn extract_all_xml_text(xml: &str, tag: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── normalize_arxiv_id（CR-019） ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_arxiv_strips_version_new_format() {
+        assert_eq!(normalize_arxiv_id("2301.00001v5"), "2301.00001");
+        assert_eq!(normalize_arxiv_id("2301.00001"), "2301.00001");
+    }
+
+    #[test]
+    fn normalize_arxiv_strips_prefix() {
+        assert_eq!(normalize_arxiv_id("arXiv:2301.00001v2"), "2301.00001");
+        assert_eq!(normalize_arxiv_id("  arxiv:2301.00001 "), "2301.00001");
+    }
+
+    #[test]
+    fn normalize_arxiv_preserves_old_format_category() {
+        // 旧形式のカテゴリを潰さない（以前は 0309136 に消えていた）。
+        assert_eq!(normalize_arxiv_id("math.GT/0309136"), "math.GT/0309136");
+        assert_eq!(normalize_arxiv_id("hep-th/9901001v2"), "hep-th/9901001");
+        assert_eq!(normalize_arxiv_id("arXiv:cond-mat/0102536v1"), "cond-mat/0102536");
+    }
 
     // ── crossref_to_input ────────────────────────────────────────────────────
 

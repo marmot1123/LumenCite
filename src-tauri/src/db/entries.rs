@@ -1062,7 +1062,11 @@ pub async fn find_duplicate_entry(
     isbn: Option<&str>,
 ) -> Result<Option<i64>, sqlx::Error> {
     let doi_norm = doi.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
-    let arxiv_norm = arxiv_id.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    // arXiv は prefix / 版番号 / 旧形式カテゴリを canonical 化してから比較する（CR-019）。
+    // stored 側は SQL の LOWER で揃えるので、正準化後も lowercase して合わせる。
+    let arxiv_norm = arxiv_id
+        .map(|s| crate::metadata::normalize_arxiv_id(s).to_lowercase())
+        .filter(|s| !s.is_empty());
     let isbn_norm = isbn.map(normalize_isbn).filter(|s| !s.is_empty());
 
     if doi_norm.is_none() && arxiv_norm.is_none() && isbn_norm.is_none() {
@@ -2038,6 +2042,22 @@ mod tests {
 
         let hit = find_duplicate_entry(&pool, None, Some("2301.00001"), None).await.unwrap();
         assert_eq!(hit, Some(existing.id));
+    }
+
+    /// CR-019: 版番号付き / prefix 付きの arXiv クエリでも同一エントリにヒットする。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_matches_arxiv_ignoring_version_and_prefix(pool: SqlitePool) {
+        let existing = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        for q in ["2301.00001v3", "arXiv:2301.00001", "arxiv:2301.00001v9"] {
+            let hit = find_duplicate_entry(&pool, None, Some(q), None).await.unwrap();
+            assert_eq!(hit, Some(existing.id), "query {q} should match");
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]
