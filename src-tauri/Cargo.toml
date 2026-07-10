@@ -47,6 +47,9 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 # 外部 MCP の env 秘密値を DB に平文で置かないための保存時暗号化（CR-012）。
 # 復号鍵（マスター鍵）だけを OS keychain に置き、値は AES-256-GCM で settings に格納する。
 aes-gcm = "0.10"
+# GUI 生存判定用の advisory ロック（CR-011）。GUI が保持し、CLI 書込経路が存在確認する。
+# プロセス終了時に OS が自動解放するため stale ロックが残らない。
+fs2 = "0.4"
 futures-util = "0.3"
 eventsource-stream = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

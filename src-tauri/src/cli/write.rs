@@ -6,7 +6,10 @@
 //! 2. MCP サーバーに到達可（keychain にトークン有 + `ping` 成功）→ **HTTP 経由**でサーバーに
 //!    委譲する。サーバーが公開用の書込ゲート（`mcp_server.write_enabled`）を適用し、成功時は
 //!    `.bib` 同期と GUI 一覧のリアルタイム更新まで行う（＝UI が陳腐化しない安全経路）。
-//! 3. 到達不可（アプリ停止と判断）→ **直接 DB 書込**。成功後に `.bib` 同期を best-effort で行う。
+//! 3. 到達不可 → **GUI 生存を独立に判定**（`GUI_LOCK_FILE` の advisory ロック・CR-011）。
+//!    - GUI 停止を確認できた → **直接 DB 書込**。成功後に `.bib` 同期を best-effort で行う。
+//!    - GUI 起動中（＝MCP は無効だがアプリは開いている）→ fail closed。`--force` を要求する。
+//!      MCP 到達不可を一律「アプリ停止」と解釈して live DB を壊すのを防ぐ。
 //!
 //! どちらの経路も MCP の `tools/call`（JSON-RPC）と同じリクエスト形状を作り、HTTP なら POST、
 //! 直接なら [`crate::mcp_server::handle_rpc_with_write`] を `write_on = true` で呼ぶ（ツール実装・
@@ -42,14 +45,50 @@ pub async fn dispatch_write(
     request: Value,
     force: bool,
 ) -> Result<CmdOutput, String> {
-    let server = if force {
-        None
-    } else {
-        probe_server(ro_pool).await
-    };
-    match server {
-        Some((url, token)) => write_via_http(&url, &token, &request).await,
-        None => write_direct(db_path, &request, force).await,
+    // --force は無条件で直接書込（陳腐化警告付き）。
+    if force {
+        return write_direct(db_path, &request, true).await;
+    }
+    // MCP サーバーへ委譲できるなら安全経路（UI リアルタイム更新 + .bib 同期）。
+    if let Some((url, token)) = probe_server(ro_pool).await {
+        return write_via_http(&url, &token, &request).await;
+    }
+    // MCP へ委譲できない。GUI が動いていないと**証明できた場合のみ**直接書く（CR-011）。
+    // MCP サーバー無効でも GUI 自体は起動している場合があり、その live DB を直接書くと
+    // UI 陳腐化 / WAL 競合を招くため、GUI 生存が確認できたら fail closed で --force を要求する。
+    let app_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    if gui_is_running(app_dir) {
+        return Err(
+            "the LumenCite app appears to be running but its MCP server is not reachable, \
+             so writing directly to the database could corrupt data or leave the app showing \
+             stale results. Enable the LumenCite MCP server for safe live updates, or re-run \
+             with --force to write directly anyway."
+                .to_string(),
+        );
+    }
+    write_direct(db_path, &request, false).await
+}
+
+/// GUI が起動中か（CR-011）。GUI が保持する advisory ロックを try_lock で確かめる。
+/// ロックが取れなければ GUI 起動中、取れれば（即解放して）停止中と判断する。
+/// 判定できない異常時は安全側に倒して「起動中」とみなす。
+fn gui_is_running(app_dir: &Path) -> bool {
+    use fs2::FileExt;
+    let path = app_dir.join(crate::GUI_LOCK_FILE);
+    // ロックファイルが無い＝GUI が一度も起動していない → 停止中とみなす。
+    if !path.exists() {
+        return false;
+    }
+    match std::fs::OpenOptions::new().write(true).open(&path) {
+        Ok(file) => match file.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = FileExt::unlock(&file);
+                false // 取れた = 誰も握っていない = GUI 停止中
+            }
+            Err(_) => true, // 取れない = GUI が握っている = 起動中
+        },
+        // 開けない等の異常時は安全側（起動中扱い）。
+        Err(_) => true,
     }
 }
 
@@ -231,6 +270,37 @@ pub fn parse_fields(fields: &[String]) -> Result<serde_json::Map<String, Value>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── GUI 生存判定（CR-011） ────────────────────────────────────────────
+
+    #[test]
+    fn gui_is_running_false_when_no_lock_file() {
+        let dir = std::env::temp_dir().join(format!("lc-gui-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // ロックファイルが無い → 停止中。
+        assert!(!gui_is_running(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gui_is_running_reflects_lock_state() {
+        use fs2::FileExt;
+        let dir = std::env::temp_dir().join(format!("lc-gui-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(crate::GUI_LOCK_FILE);
+
+        // GUI が握っている状態を模して排他ロックを保持。
+        let held = std::fs::OpenOptions::new()
+            .create(true).truncate(false).write(true).open(&path).unwrap();
+        held.lock_exclusive().unwrap();
+        assert!(gui_is_running(&dir), "ロック保持中は起動中と判定");
+
+        // 解放すれば停止中と判定。
+        FileExt::unlock(&held).unwrap();
+        assert!(!gui_is_running(&dir), "ロック解放後は停止中と判定");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn tools_call_shapes_jsonrpc() {

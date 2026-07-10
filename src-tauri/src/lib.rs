@@ -34,6 +34,28 @@ use tauri::{
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::oneshot;
 
+/// GUI 生存ロックのファイル名。GUI と CLI で同じパスを見る（CR-011）。
+pub const GUI_LOCK_FILE: &str = "lumencite.gui.lock";
+
+/// GUI が起動中である印の advisory ロックを保持する。プロセスが生きている限り握り続ける
+/// よう、File をプロセス寿命の static に格納する。OS がプロセス終了時に自動解放するので
+/// stale ロックは残らない。2 個目のインスタンスでロックが取れなくても起動は妨げない。
+fn acquire_gui_lock(data_dir: &std::path::Path) {
+    use fs2::FileExt;
+    static GUI_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    let path = data_dir.join(GUI_LOCK_FILE);
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        if file.try_lock_exclusive().is_ok() {
+            let _ = GUI_LOCK.set(file);
+        }
+    }
+}
+
 pub struct AppState {
     pub db: SqlitePool,
     /// BibTeX 自動同期リクエストを送る送信側。受信側のタスクが debounce して実行する。
@@ -2755,6 +2777,11 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
+
+            // GUI 生存フラグ（CR-011）: このロックを保持している間は「GUI 起動中」。
+            // CLI の直接書込経路がこれを見て、MCP 委譲できないときに live DB を壊さないよう
+            // 判断する。try_lock なので 2 個目のインスタンスでも起動を妨げない。
+            acquire_gui_lock(&data_dir);
 
             let options = SqliteConnectOptions::new()
                 .filename(data_dir.join("lumencite.db"))
