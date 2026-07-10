@@ -93,16 +93,25 @@ fn error_response(request_line: &str, code: i64, message: &str) -> Option<String
 /// 戻り値はプロセス終了コード。
 pub fn run_stdio_proxy() -> i32 {
     let url = std::env::var("LUMENCITE_MCP_URL").unwrap_or_default();
-    let token = std::env::var("LUMENCITE_MCP_TOKEN").unwrap_or_default();
+    // token は env 優先だが、shim は LumenCite 本体と同じバイナリなので、未指定なら
+    // OS keychain から直接読む（CR-013）。これで生成 config / shell history にトークンを
+    // 書かずに済む。env は後方互換のフォールバックとして残す。
+    let mut token = std::env::var("LUMENCITE_MCP_TOKEN").unwrap_or_default();
+    if token.is_empty() {
+        if let Ok(Some(k)) = crate::keychain::get(&crate::keychain::account_for_mcp_token()) {
+            token = k;
+        }
+    }
     if url.is_empty() || token.is_empty() {
         let missing = if url.is_empty() {
             "LUMENCITE_MCP_URL"
         } else {
-            "LUMENCITE_MCP_TOKEN"
+            "LUMENCITE_MCP_TOKEN (and no token found in the keychain)"
         };
         eprintln!(
             "lumencite-mcp: {missing} is not set. \
-             Copy the Claude Desktop config snippet from LumenCite settings."
+             Copy the config snippet from LumenCite settings (and make sure the app has run \
+             once so the token exists in the keychain)."
         );
         return 2;
     }

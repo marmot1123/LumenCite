@@ -2557,6 +2557,8 @@ async fn get_mcp_server_config_snippet(
         "claude_desktop" => {
             let exe = std::env::current_exe()
                 .map_err(|e| format!("failed to resolve executable path: {e}"))?;
+            // token は config に書かない（CR-013）。shim が同一バイナリとして keychain から
+            // 直接読むため、env は URL だけで足りる。history / 設定ファイル汚染を避ける。
             let config = serde_json::json!({
                 "mcpServers": {
                     "lumencite": {
@@ -2564,7 +2566,6 @@ async fn get_mcp_server_config_snippet(
                         "args": ["--mcp-stdio"],
                         "env": {
                             "LUMENCITE_MCP_URL": url,
-                            "LUMENCITE_MCP_TOKEN": token,
                         }
                     }
                 }
@@ -2577,7 +2578,7 @@ async fn get_mcp_server_config_snippet(
         "codex" => {
             let exe = std::env::current_exe()
                 .map_err(|e| format!("failed to resolve executable path: {e}"))?;
-            codex_config_snippet(&exe.to_string_lossy(), &url, &token)
+            codex_config_snippet(&exe.to_string_lossy(), &url)
         }
         // その他の汎用リモート MCP クライアント向けには素の URL とヘッダを返す。
         _ => format!("URL: {url}\nHeader: Authorization: Bearer {token}"),
@@ -2603,13 +2604,13 @@ fn toml_escape(s: &str) -> String {
 }
 
 /// Codex CLI（`~/.codex/config.toml`）へ貼り付ける `[mcp_servers.lumencite]` スニペット。
-/// LumenCite 本体を `--mcp-stdio` ブリッジとして stdio 起動させ、接続先 URL とトークンを env で渡す。
-fn codex_config_snippet(exe: &str, url: &str, token: &str) -> String {
+/// LumenCite 本体を `--mcp-stdio` ブリッジとして stdio 起動させる Codex 用スニペット。
+/// token は config に書かない（CR-013）— shim が同一バイナリとして keychain から読む。
+fn codex_config_snippet(exe: &str, url: &str) -> String {
     format!(
-        "[mcp_servers.lumencite]\ncommand = \"{}\"\nargs = [\"--mcp-stdio\"]\nenv = {{ LUMENCITE_MCP_URL = \"{}\", LUMENCITE_MCP_TOKEN = \"{}\" }}\n",
+        "[mcp_servers.lumencite]\ncommand = \"{}\"\nargs = [\"--mcp-stdio\"]\nenv = {{ LUMENCITE_MCP_URL = \"{}\" }}\n",
         toml_escape(exe),
         toml_escape(url),
-        toml_escape(token),
     )
 }
 
@@ -3199,18 +3200,19 @@ mod update_and_snippet_tests {
 
     #[test]
     fn codex_snippet_is_valid_toml_table_with_stdio_shim() {
-        let s = codex_config_snippet("/Applications/LumenCite.app/exe", "http://127.0.0.1:7373/mcp", "tok123");
+        let s = codex_config_snippet("/Applications/LumenCite.app/exe", "http://127.0.0.1:7373/mcp");
         assert!(s.starts_with("[mcp_servers.lumencite]"));
         assert!(s.contains("command = \"/Applications/LumenCite.app/exe\""));
         assert!(s.contains("args = [\"--mcp-stdio\"]"));
         assert!(s.contains("LUMENCITE_MCP_URL = \"http://127.0.0.1:7373/mcp\""));
-        assert!(s.contains("LUMENCITE_MCP_TOKEN = \"tok123\""));
+        // token は config に書かない（shim が keychain から読む・CR-013）。
+        assert!(!s.contains("LUMENCITE_MCP_TOKEN"));
     }
 
     #[test]
     fn codex_snippet_escapes_windows_backslash_paths() {
         // Windows の実行ファイルパスは `\` を含むため TOML 基本文字列でエスケープが要る。
-        let s = codex_config_snippet(r"C:\Program Files\LumenCite\lumencite.exe", "http://127.0.0.1:7373/mcp", "t");
+        let s = codex_config_snippet(r"C:\Program Files\LumenCite\lumencite.exe", "http://127.0.0.1:7373/mcp");
         assert!(s.contains(r#"command = "C:\\Program Files\\LumenCite\\lumencite.exe""#));
         // エスケープ後の TOML が再パースできること（値が原文と一致）。
         let parsed: toml_check::Value = toml_check::parse(&s);
