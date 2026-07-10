@@ -380,6 +380,9 @@ export default function App() {
       if (sort.key === "title")   { av = a.title;                        bv = b.title; }
       if (sort.key === "authors") { av = a.authors[0]?.name ?? "";       bv = b.authors[0]?.name ?? ""; }
       if (sort.key === "year")    { av = a.year ?? 0;                    bv = b.year ?? 0; }
+      // Added（登録日時）: created_at は ISO 風文字列なので辞書順比較でよい（CR-036）。
+      // これが無いと "added" 列は常に同順（バックエンド順のまま）で asc/desc が効かなかった。
+      if (sort.key === "added")   { av = a.created_at ?? "";             bv = b.created_at ?? ""; }
       return av < bv ? -dir : av > bv ? dir : 0;
     });
 
