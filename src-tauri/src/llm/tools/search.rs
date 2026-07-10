@@ -110,7 +110,7 @@ async fn fulltext_search(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidArguments("missing required argument: query".to_string()))?;
 
-    let mut hits = fulltext::search_fulltext(ctx.pool, query, None, None).await?;
+    let mut hits = fulltext::search_fulltext(ctx.pool, query, None, None, None).await?;
 
     // Scope filtering: when mode is "entries", keep only hits whose entry_id is in scope.
     if ctx.scope_mode == "entries" {

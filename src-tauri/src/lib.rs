@@ -187,10 +187,28 @@ async fn bulk_purge(
     state: State<'_, AppState>,
     ids: Vec<i64>,
 ) -> Result<(), String> {
-    db::entries::bulk_purge(&state.db, &ids)
+    // 実際にゴミ箱から消えた id だけが返る（現役エントリは purge されない・CR-001）。
+    let purged = db::entries::bulk_purge(&state.db, &ids)
         .await
         .map_err(|e| e.to_string())?;
-    for id in &ids {
+    for id in &purged {
+        remove_entry_attachment_dir(&app, *id);
+    }
+    request_sync(&state);
+    Ok(())
+}
+
+/// ゴミ箱を空にする。表示中の id ではなく DB 側で `deleted_at IS NOT NULL` を評価するため、
+/// 検索・フィルタで現役エントリが紛れても hard delete しない（CR-001）。
+#[tauri::command]
+async fn empty_trash(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let purged = db::entries::purge_trash(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    for id in &purged {
         remove_entry_attachment_dir(&app, *id);
     }
     request_sync(&state);
@@ -296,12 +314,20 @@ async fn search_entries(
     query: String,
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    view: Option<String>,
     filter: Option<EntryFilter>,
 ) -> Result<Vec<EntrySummary>, String> {
     let filter = filter.unwrap_or_default();
-    db::entries::search_entries_filtered(&state.db, &query, collection_id, tag_id, &filter)
-        .await
-        .map_err(|e| e.to_string())
+    db::entries::search_entries_filtered(
+        &state.db,
+        &query,
+        collection_id,
+        tag_id,
+        view.as_deref(),
+        &filter,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ── authors (v0.3.0 M7) ───────────────────────────────────────────────────────
@@ -926,8 +952,9 @@ async fn fulltext_search(
     query: String,
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    view: Option<String>,
 ) -> Result<Vec<FulltextHit>, String> {
-    db::fulltext::search_fulltext(&state.db, &query, collection_id, tag_id)
+    db::fulltext::search_fulltext(&state.db, &query, collection_id, tag_id, view.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -2736,6 +2763,7 @@ pub fn run() {
             bulk_trash,
             bulk_restore,
             bulk_purge,
+            empty_trash,
             bulk_add_to_collection,
             bulk_add_tag,
             search_entries,

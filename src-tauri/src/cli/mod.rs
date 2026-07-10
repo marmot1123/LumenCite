@@ -543,7 +543,7 @@ async fn cmd_search(
     limit: Option<usize>,
     human: bool,
 ) -> Result<CmdOutput, String> {
-    let mut rows = db::entries::search_entries_filtered(pool, query, collection, tag, filter)
+    let mut rows = db::entries::search_entries_filtered(pool, query, collection, tag, None, filter)
         .await
         .map_err(|e| e.to_string())?;
     if let Some(n) = limit {
@@ -626,7 +626,7 @@ async fn cmd_export(
         let index = crate::bibtex::citation_key_index(pool).await?;
         let id_to_key: std::collections::HashMap<i64, String> =
             index.into_iter().map(|(k, id)| (id, k)).collect();
-        let rows = db::entries::search_entries_filtered(pool, "", collection, tag, filter)
+        let rows = db::entries::search_entries_filtered(pool, "", collection, tag, None, filter)
             .await
             .map_err(|e| e.to_string())?;
         rows.iter()
@@ -678,7 +678,7 @@ async fn cmd_fulltext(
     tag: Option<i64>,
     human: bool,
 ) -> Result<CmdOutput, String> {
-    let hits = db::fulltext::search_fulltext(pool, query, collection, tag)
+    let hits = db::fulltext::search_fulltext(pool, query, collection, tag, None)
         .await
         .map_err(|e| e.to_string())?;
     let stdout = if human {

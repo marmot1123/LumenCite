@@ -261,7 +261,8 @@ export default function App() {
       const args: LoadEntriesArgs = { collectionId, tagId, view: viewName };
       invoke<EntrySummary[]>("get_entries", args).then(ifCurrent(setEntries)).catch(console.error);
       if (trimmed) {
-        invoke<FulltextHit[]>("fulltext_search", { query: trimmed, collectionId, tagId })
+        // view を渡してゴミ箱と現役を分離する（CR-001）。trash ビューでの検索が現役を返さない。
+        invoke<FulltextHit[]>("fulltext_search", { query: trimmed, collectionId, tagId, view: viewName })
           .then(ifCurrent(setFulltextHits))
           .catch((e) => { console.error(e); ifCurrent(setFulltextHits)([]); });
       } else {
@@ -271,7 +272,8 @@ export default function App() {
     }
 
     if (trimmed) {
-      invoke<EntrySummary[]>("search_entries", { query: trimmed, collectionId, tagId, filter: filterArg })
+      // view を渡してゴミ箱と現役を分離する（CR-001）。
+      invoke<EntrySummary[]>("search_entries", { query: trimmed, collectionId, tagId, view: viewName, filter: filterArg })
         .then(ifCurrent(setEntries))
         .catch(console.error);
     } else {
@@ -403,12 +405,14 @@ export default function App() {
   };
 
   // ゴミ箱ビュー全体に対する一括永久削除。
+  // 表示中 id ではなく専用 empty_trash コマンド（DB 側で deleted_at IS NOT NULL を評価）を使う。
+  // これにより、検索・フィルタで現役エントリが表示に混ざっても hard delete されない（CR-001）。
   const handleEmptyTrash = () => {
     const ids = entries.map(e => e.id);
     if (ids.length === 0) return;
     const ok = window.confirm(t("confirm.permanentDelete", { count: ids.length }));
     if (!ok) return;
-    invoke("bulk_purge", { ids })
+    invoke("empty_trash")
       .then(() => { clearSelection(); setDetail(null); loadEntries(); })
       .catch(console.error);
   };

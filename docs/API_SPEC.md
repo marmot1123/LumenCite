@@ -294,7 +294,7 @@ type McpServerInfo = McpServerConfig & {
 
 `create_entry` / `update_entry` の `EntryInput.citation_key` はサニタイズ後 `entries.citation_key` に保存する（空なら NULL = 自動）。既存の固定キーと重複する非 NULL 値は UNIQUE 制約で拒否される（`Result` の `Err`）。UI は保存前に `is_citation_key_available` で検証する。生成・重複回避の規則は `DATA_MODEL.md` の `citation_key` 節を参照。
 
-`get_entries` の `view` は特殊ビュー専用フィルタ。`collection_id` / `tag_id` と組み合わせる場合は `view` は無視され、コレクション/タグの所属で絞られる（いずれも `deleted_at IS NULL` を満たすもののみ）。`search_entries` は常にゴミ箱を除外する。
+`get_entries` の `view` は特殊ビュー専用フィルタ。`collection_id` / `tag_id` と組み合わせる場合は `view` は無視され、コレクション/タグの所属で絞られる（いずれも `deleted_at IS NULL` を満たすもののみ）。`search_entries` / `fulltext_search` も同じ `view` を受け取り、`view = "trash"` のときはゴミ箱内（`deleted_at IS NOT NULL`）を、それ以外（省略含む）は現役（`deleted_at IS NULL`）を対象に検索する（CR-001）。これによりゴミ箱ビューでの検索結果に現役エントリが紛れ込まない。
 
 **`filter`（v0.6.0・複合フィルタ）:** `get_entries` / `search_entries` の任意引数。省略・全フィールド空なら従来どおり無制約。scope（`collection_id`/`tag_id`/`view`）や検索クエリと **AND で合成**する。
 
@@ -349,7 +349,8 @@ type BibtexSyncEvent = {
 |---------|------|--------|
 | `bulk_trash` | `ids: Vec<i64>` | `Result<()>` |
 | `bulk_restore` | `ids: Vec<i64>` | `Result<()>` |
-| `bulk_purge` | `ids: Vec<i64>` | `Result<()>` — entries_fts と fulltext もまとめてクリーンアップ |
+| `bulk_purge` | `ids: Vec<i64>` | `Result<()>` — **ゴミ箱内（`deleted_at IS NOT NULL`）の id だけ**を hard delete。現役エントリの id が混ざっても無視する（CR-001）。entries_fts と fulltext もまとめてクリーンアップ |
+| `empty_trash` | なし | `Result<()>` — ゴミ箱を空にする。表示中 id ではなく DB 側で `deleted_at IS NOT NULL` を評価するため、検索・フィルタで現役が混ざっても安全（CR-001） |
 | `bulk_add_to_collection` | `ids: Vec<i64>, collection_id: i64` | `Result<()>` — 重複は INSERT OR IGNORE |
 | `bulk_add_tag` | `ids: Vec<i64>, tag_id: i64` | `Result<()>` — 重複は INSERT OR IGNORE |
 
@@ -444,8 +445,8 @@ type IndexMissingResult = {
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `search_entries` | `query: String, collection_id?: i64, tag_id?: i64, filter?: EntryFilter` | `Vec<EntrySummary>` |
-| `fulltext_search` | `query: String` | `Vec<FulltextResult>` |
+| `search_entries` | `query: String, collection_id?: i64, tag_id?: i64, view?: String, filter?: EntryFilter` | `Vec<EntrySummary>` |
+| `fulltext_search` | `query: String, collection_id?: i64, tag_id?: i64, view?: String` | `Vec<FulltextResult>` |
 
 ```ts
 type FulltextResult = {
