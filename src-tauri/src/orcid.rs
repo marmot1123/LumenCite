@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(by_scheme.get("researcher_id").unwrap().value, "A-1234-2015");
         assert_eq!(by_scheme.get("loop").unwrap().value, "999");
         // 未知タイプも小文字 snake_case で取り込まれる
-        assert!(by_scheme.get("some_new_service").is_some());
+        assert!(by_scheme.contains_key("some_new_service"));
     }
 
     #[test]

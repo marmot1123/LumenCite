@@ -233,10 +233,10 @@ fn split_authors(s: &str) -> Vec<&str> {
 }
 
 fn utf8_char_len(first: u8) -> usize {
-    if first < 0x80 {
+    // < 0x80 は ASCII、0x80..0xC0 は連続バイト単独（不正だがループを進めるため 1 とする）。
+    // どちらも 1 なのでまとめる。
+    if first < 0xC0 {
         1
-    } else if first < 0xC0 {
-        1 // 連続バイト単独は不正だがループを進めるため 1 にする
     } else if first < 0xE0 {
         2
     } else if first < 0xF0 {

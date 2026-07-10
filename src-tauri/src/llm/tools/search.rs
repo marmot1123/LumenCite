@@ -377,7 +377,7 @@ mod tests {
 
         let s = try_execute(&ctx, &call).await.unwrap().unwrap();
         assert!(s.contains("1 hits"), "scope should exclude e2, got: {s}");
-        let parsed: serde_json::Value = serde_json::from_str(s.splitn(2, '\n').nth(1).unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(s.split_once('\n').unwrap().1).unwrap();
         assert_eq!(parsed["hits"][0]["entry_id"], e1.id);
     }
 

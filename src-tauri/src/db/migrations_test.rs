@@ -3,8 +3,7 @@
 //! `#[sqlx::test(migrations = "./migrations")]` は常に全マイグレーション適用済みの
 //! pool を渡してくるので「マイグレーション適用前後の差分」が見たいテストは
 //! [`apply_migrations_up_to`] で段階適用する。
-
-#![cfg(test)]
+//! （モジュールは `db::mod` 側で `#[cfg(test)]` ゲート済み。）
 
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::SqlitePoolOptions;

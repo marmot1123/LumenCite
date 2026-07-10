@@ -186,7 +186,7 @@ async fn resolve_entry_input(req: &ClipRequest) -> EntryInput {
         };
         if let Some(mut input) = fetched {
             // メタデータ側に URL が無ければクリップ元ページの URL を採用する
-            if input.url.as_deref().map_or(true, |u| u.trim().is_empty()) {
+            if input.url.as_deref().is_none_or(|u| u.trim().is_empty()) {
                 input.url = Some(req.url.clone());
             }
             return input;

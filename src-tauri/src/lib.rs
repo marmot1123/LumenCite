@@ -3139,10 +3139,10 @@ mod chat_runtime_tests {
 
         // session 2 を解決しても session 1 は待ちのまま。
         rt.resolve_approval(2, "call-x", true);
-        assert_eq!(rx2.await.unwrap(), true);
+        assert!(rx2.await.unwrap());
 
         rt.resolve_approval(1, "call-x", false);
-        assert_eq!(rx1.await.unwrap(), false);
+        assert!(!rx1.await.unwrap());
     }
 }
 
@@ -3317,7 +3317,7 @@ mod chat_command_tests {
         let rt = ChatRuntime::default();
         let rx = rt.register_approval(7, "call-1");
         rt.resolve_approval(7, "call-1", true);
-        assert_eq!(rx.await.unwrap(), true);
+        assert!(rx.await.unwrap());
         // 解決済みなので二度目は何も起きない（パニックしない）
         rt.resolve_approval(7, "call-1", false);
     }
@@ -3329,7 +3329,7 @@ mod chat_command_tests {
         let rx = rt.register_approval(42, "call-x");
         rt.cancel(42);
         assert!(flag.load(Ordering::SeqCst), "cancel flag should be set");
-        assert_eq!(rx.await.unwrap(), false, "pending approval should be denied");
+        assert!(!rx.await.unwrap(), "pending approval should be denied");
         rt.finish(42);
     }
 
@@ -3342,6 +3342,6 @@ mod chat_command_tests {
         rt.cancel(1); // 別セッションを中断
         // セッション 2 の承認待ちは残っている → 明示的に許可できる
         rt.resolve_approval(2, "b-call", true);
-        assert_eq!(rx_b.await.unwrap(), true);
+        assert!(rx_b.await.unwrap());
     }
 }

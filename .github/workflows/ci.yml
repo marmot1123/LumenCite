@@ -60,9 +60,10 @@ jobs:
       - name: cargo test
         working-directory: src-tauri
         run: cargo test
+      # ベースラインの警告は解消済み（CR-039）なので -D warnings で回帰を止める。
       - name: cargo clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       # 依存の既知脆弱性を可視化する（CR-031）。現状 quick-xml 0.39.3 が wayland-scanner
       # のビルド時 proc-macro 経由で残る（Linux 限定・信頼済み Wayland プロトコル XML を

@@ -241,7 +241,7 @@ async fn search_ids_fts(
     }
     push_filter(&mut qb, filter);
     qb.push(" ORDER BY bm25(entries_fts)");
-    Ok(qb.build_query_scalar().fetch_all(pool).await?)
+    qb.build_query_scalar().fetch_all(pool).await
 }
 
 /// LIKE 検索用の部分一致パターン。`%` `_` `\` をエスケープしてリテラル扱いにする
@@ -288,7 +288,7 @@ async fn search_ids_like(
     }
     push_filter(&mut qb, filter);
     qb.push(" ORDER BY e.created_at DESC");
-    Ok(qb.build_query_scalar().fetch_all(pool).await?)
+    qb.build_query_scalar().fetch_all(pool).await
 }
 
 async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::Error> {
