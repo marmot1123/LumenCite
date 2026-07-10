@@ -7,16 +7,21 @@ import type { ClipPayload } from "./types.js";
 
 const BADGE_CLEAR_MS = 4000;
 let busy = false;
+// バッジ世代番号（CR-029）。古い clear タイマーが新しいバッジを消さないようにする。
+let badgeGen = 0;
 
 function msg(key: string): string {
   return chrome.i18n.getMessage(key) || key;
 }
 
 async function showBadge(text: string, color: string, title: string): Promise<void> {
+  const gen = ++badgeGen;
   await chrome.action.setBadgeBackgroundColor({ color });
   await chrome.action.setBadgeText({ text });
   await chrome.action.setTitle({ title });
   setTimeout(() => {
+    // 自分より新しいバッジが出ていたら消さない。
+    if (gen !== badgeGen) return;
     void chrome.action.setBadgeText({ text: "" });
     void chrome.action.setTitle({ title: msg("clipTitle") });
   }, BADGE_CLEAR_MS);

@@ -18,6 +18,19 @@ function baseUrl(cfg: ClipperConfig): string {
   return `http://127.0.0.1:${cfg.port}/clipper`;
 }
 
+/** localhost 応答が無いまま無限に待たないための締切付き fetch（CR-029）。 */
+const REQUEST_TIMEOUT_MS = 10_000;
+
+async function fetchWithTimeout(url: string, init: RequestInit, ms = REQUEST_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** クリップ結果。fetch 不能（アプリ未起動等）は kind: "unreachable"。 */
 export type ClipOutcome =
   | { kind: "response"; status: number; body: ClipResponse }
@@ -25,7 +38,7 @@ export type ClipOutcome =
 
 export async function ping(cfg: ClipperConfig): Promise<boolean> {
   try {
-    const resp = await fetch(baseUrl(cfg), {
+    const resp = await fetchWithTimeout(baseUrl(cfg), {
       headers: { Authorization: `Bearer ${cfg.token}` },
     });
     if (!resp.ok) return false;
@@ -38,7 +51,7 @@ export async function ping(cfg: ClipperConfig): Promise<boolean> {
 
 export async function clip(cfg: ClipperConfig, payload: ClipPayload): Promise<ClipOutcome> {
   try {
-    const resp = await fetch(baseUrl(cfg), {
+    const resp = await fetchWithTimeout(baseUrl(cfg), {
       method: "POST",
       headers: {
         Authorization: `Bearer ${cfg.token}`,
