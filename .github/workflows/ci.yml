@@ -1,0 +1,65 @@
+name: CI
+
+# PR / push 用の軽量チェック（CR-030）。以前は release ワークフローしか無く、476 の Rust
+# テストも拡張機能テストも PR で走らなかったため、P0（Trash purge）やコマンド未登録を検出
+# できなかった。ここで frontend ビルド・Rust テスト/clippy・拡張テスト/ビルドを回す。
+#
+# 追補予定（本 PR のスコープ外）: frontend の unit/E2E（Playwright/Tauri）と、
+# frontend の invoke() 名と Rust handler 登録を突き合わせる contract テスト。
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# 同一 ref の古い実行はキャンセルして無駄なランナー消費を避ける。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend build + extension tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Type-check + build frontend
+        run: pnpm build
+      - name: Extension tests
+        run: pnpm --filter lumencite-clipper test
+      - name: Extension build
+        run: pnpm --filter lumencite-clipper build
+
+  rust:
+    name: Rust test + clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --all-features
