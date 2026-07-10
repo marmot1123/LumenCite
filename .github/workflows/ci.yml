@@ -63,3 +63,14 @@ jobs:
       - name: cargo clippy
         working-directory: src-tauri
         run: cargo clippy --all-targets --all-features
+
+      # 依存の既知脆弱性を可視化する（CR-031）。現状 quick-xml 0.39.3 が wayland-scanner
+      # のビルド時 proc-macro 経由で残る（Linux 限定・信頼済み Wayland プロトコル XML を
+      # ビルド時に解析するのみ・実行時の未信頼入力面なし）。upstream 更新までは PR を
+      # 止めないよう continue-on-error にしておき、内容はログで確認する。
+      - name: cargo audit (advisory, non-blocking)
+        working-directory: src-tauri
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit
