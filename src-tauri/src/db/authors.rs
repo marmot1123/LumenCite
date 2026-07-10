@@ -134,6 +134,7 @@ pub(crate) async fn get_or_create_author(
     input: &AuthorInput,
 ) -> Result<Author, sqlx::Error> {
     // ① ORCID 照合（authors.orcid 列 と author_identifiers の両方を見る）
+    let has_orcid = trimmed(&input.orcid).is_some();
     if let Some(orcid) = trimmed(&input.orcid) {
         if let Some(a) = find_by_orcid_in_tx(tx, &orcid).await? {
             return Ok(a);
@@ -143,10 +144,16 @@ pub(crate) async fn get_or_create_author(
     // ② 正規化 name 照合（NFKC + lowercase）
     //    SQLite では NFKC 関数が無いので全件比較する。個人ライブラリ規模では十分。
     //    将来 authors.normalized_name 列を持たせて O(1) lookup に置き換える余地あり。
-    let norm = normalize_name(&input.name);
-    if !norm.is_empty() {
-        if let Some(a) = find_by_normalized_name_in_tx(tx, &norm).await? {
-            return Ok(a);
+    //
+    //    **CR-005**: 入力に ORCID がある（= stable identifier が与えられている）のに ① で
+    //    一致しなかった場合は、氏名だけの統合を行わない。既存の同名著者（ORCID 無し・別
+    //    ORCID）へ誤って統合し、入力の ORCID も失われるのを防ぐため、新規著者として作成する。
+    if !has_orcid {
+        let norm = normalize_name(&input.name);
+        if !norm.is_empty() {
+            if let Some(a) = find_by_normalized_name_in_tx(tx, &norm).await? {
+                return Ok(a);
+            }
         }
     }
 
@@ -691,6 +698,54 @@ mod tests {
         let second = get_or_create_author(
             &mut tx,
             &input_with_orcid("M. Seki", "0000-0002-1825-0097"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(first.id, second.id);
+    }
+
+    /// CR-005: 既存の同名著者（ORCID 無し）と、別 ORCID を持つ同名の別人を統合しない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_or_create_author_does_not_merge_homonym_with_new_orcid(pool: SqlitePool) {
+        // 既存 "John Smith"（ORCID 無し）。
+        let mut tx = pool.begin().await.unwrap();
+        let existing = get_or_create_author(&mut tx, &input("John Smith"))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // 同名だが ORCID を持つ別人。氏名だけで統合してはならず、新規作成される。
+        let mut tx = pool.begin().await.unwrap();
+        let other = get_or_create_author(
+            &mut tx,
+            &input_with_orcid("John Smith", "0000-0002-1825-0097"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_ne!(existing.id, other.id, "別 ORCID の同名は別著者にすべき");
+        assert_eq!(other.orcid.as_deref(), Some("0000-0002-1825-0097"), "新 ORCID が保存される");
+    }
+
+    /// CR-005 補足: 既存に同 ORCID があれば別表記でも従来どおり統合する（退行防止）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_or_create_author_still_merges_on_matching_orcid(pool: SqlitePool) {
+        let mut tx = pool.begin().await.unwrap();
+        let first = get_or_create_author(
+            &mut tx,
+            &input_with_orcid("Jane Doe", "0000-0001-2345-6789"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let second = get_or_create_author(
+            &mut tx,
+            &input_with_orcid("J. Doe", "0000-0001-2345-6789"),
         )
         .await
         .unwrap();
