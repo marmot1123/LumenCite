@@ -734,7 +734,8 @@
       "whitelistDesc": "Which write tools run automatically vs. ask each time. Reads are always automatic; delete and MCP writes always ask and can't be changed here.",
       "auto": "Automatic",
       "confirm": "Ask each time",
-      "whitelistNote": "Changes apply to new tool calls."
+      "whitelistNote": "Changes apply to new tool calls.",
+      "whitelistSaveError": "Failed to save; the change was reverted"
     },
     "appearance": {
       "language": "Language",

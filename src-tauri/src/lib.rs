@@ -1065,6 +1065,70 @@ fn get_default_summary_prompt() -> String {
     llm::DEFAULT_SYSTEM_PROMPT.to_string()
 }
 
+// ── 用途別 settings コマンド（CR-002） ─────────────────────────────────────
+// 任意キーを書ける汎用 setter は API keys や MCP config も上書きできて危険なので、
+// 検証付きの用途別コマンドに分ける。
+
+/// Chat ツールの自動承認ホワイトリスト（tool_name -> bool）を取得する。
+#[tauri::command]
+async fn get_tool_whitelist(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    let json = db::settings::get_setting(&state.db, db::settings::CHAT_TOOL_WHITELIST_KEY)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default())
+}
+
+/// Chat ツールの自動承認ホワイトリストを保存する。
+/// override 可能なツール名（`OVERRIDABLE_TOOLS`）以外のキーは拒否する。
+#[tauri::command]
+async fn set_tool_whitelist(
+    state: State<'_, AppState>,
+    overrides: std::collections::HashMap<String, bool>,
+) -> Result<(), String> {
+    for key in overrides.keys() {
+        if !llm::tools::approval::OVERRIDABLE_TOOLS.contains(&key.as_str()) {
+            return Err(format!("unknown or non-overridable tool: {key}"));
+        }
+    }
+    let json = serde_json::to_string(&overrides).map_err(|e| e.to_string())?;
+    db::settings::set_setting(&state.db, db::settings::CHAT_TOOL_WHITELIST_KEY, &json)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// PDF ビューの最後に開いていたページ（エントリ単位）を取得する。未設定なら None。
+#[tauri::command]
+async fn get_pdf_last_page(
+    state: State<'_, AppState>,
+    entry_id: i64,
+) -> Result<Option<i64>, String> {
+    let key = format!("pdf.last_page.{entry_id}");
+    let v = db::settings::get_setting(&state.db, &key)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(v.and_then(|s| s.parse::<i64>().ok()).filter(|&n| n > 0))
+}
+
+/// PDF ビューの最後に開いていたページを保存する。1 以上のみ受理する。
+#[tauri::command]
+async fn set_pdf_last_page(
+    state: State<'_, AppState>,
+    entry_id: i64,
+    page: i64,
+) -> Result<(), String> {
+    if page < 1 {
+        return Err("page must be >= 1".to_string());
+    }
+    let key = format!("pdf.last_page.{entry_id}");
+    db::settings::set_setting(&state.db, &key, &page.to_string())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn set_api_key(provider: String, key: String) -> Result<(), String> {
     let account = keychain::account_for_api_key(&provider);
@@ -2820,6 +2884,10 @@ pub fn run() {
             get_llm_settings,
             save_llm_settings,
             get_default_summary_prompt,
+            get_tool_whitelist,
+            set_tool_whitelist,
+            get_pdf_last_page,
+            set_pdf_last_page,
             set_api_key,
             delete_api_key,
             has_api_key,

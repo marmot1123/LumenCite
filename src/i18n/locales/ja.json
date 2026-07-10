@@ -734,7 +734,8 @@
       "whitelistDesc": "書き換え系ツールを自動実行するか都度確認するか。読み取り系は常に自動、delete と MCP write は常に確認（ここでは変更不可）です。",
       "auto": "自動",
       "confirm": "都度確認",
-      "whitelistNote": "変更は以降のツール呼び出しに適用されます。"
+      "whitelistNote": "変更は以降のツール呼び出しに適用されます。",
+      "whitelistSaveError": "保存に失敗しました。変更は元に戻しました"
     },
     "appearance": {
       "language": "言語",

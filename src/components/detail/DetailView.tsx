@@ -109,10 +109,10 @@ export function DetailView({
   const lastPageLoaded = useRef(false);
   const lastPersistedPage = useRef<number>(-1);
   useEffect(() => {
-    invoke<string | null>("get_setting", { key: `pdf.last_page.${entry.id}` })
-      .then(v => {
-        const n = v ? parseInt(v, 10) : NaN;
-        if (Number.isFinite(n) && n > 0) {
+    // 検証付きの用途別コマンド（CR-002）。汎用 get_setting は廃止。
+    invoke<number | null>("get_pdf_last_page", { entryId: entry.id })
+      .then(n => {
+        if (typeof n === "number" && n > 0) {
           lastPersistedPage.current = n; // 保存済みの値なので再書き込み不要
           setPage(n);
           setScrollTick(t => t + 1);
@@ -130,7 +130,7 @@ export function DetailView({
     if (!lastPageLoaded.current || lastPersistedPage.current === page || !isPrimaryActive) return;
     const handle = setTimeout(() => {
       lastPersistedPage.current = page;
-      invoke("set_setting", { key: `pdf.last_page.${entry.id}`, value: String(page) }).catch(() => { /* noop */ });
+      invoke("set_pdf_last_page", { entryId: entry.id, page }).catch(() => { /* noop */ });
     }, 500);
     return () => clearTimeout(handle);
   }, [entry.id, page, isPrimaryActive]);

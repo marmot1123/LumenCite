@@ -34,6 +34,18 @@
 
 use std::collections::HashMap;
 
+/// whitelist で自動承認可否を override できるツール名の集合。
+/// `set_tool_whitelist` コマンドが受理キーを検証するのに使う（CR-002）。
+/// frontend の `OVERRIDABLE_TOOLS` と一致させること。
+pub const OVERRIDABLE_TOOLS: &[&str] = &[
+    "add_tag",
+    "update_notes",
+    "attach_ocr_text",
+    "add_to_collection",
+    "create_entry",
+    "update_entry",
+];
+
 /// `tool_name` が自動承認（ユーザー確認不要）かどうかを返す純粋関数。
 ///
 /// 詳細は当モジュールのドキュメントを参照。
@@ -235,6 +247,19 @@ mod tests {
     fn none_whitelist_uses_defaults() {
         assert!(should_auto_approve("add_tag", None));
         assert!(!should_auto_approve("create_entry", None));
+    }
+
+    // ── OVERRIDABLE_TOOLS 不変条件（CR-002） ───────────────────────────────
+
+    #[test]
+    fn overridable_tools_are_actually_overridable() {
+        // 一覧の各ツールは whitelist で挙動が反転できること（read/delete/mcp/未知は不可）。
+        for tool in OVERRIDABLE_TOOLS {
+            let default = should_auto_approve(tool, None);
+            let flipped_json = format!("{{\"{tool}\": {}}}", !default);
+            let flipped = should_auto_approve(tool, Some(&flipped_json));
+            assert_eq!(flipped, !default, "{tool} should be overridable via whitelist");
+        }
     }
 
     #[test]
