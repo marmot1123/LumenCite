@@ -61,6 +61,22 @@ pub async fn update_attachment_pages(
     Ok(())
 }
 
+/// PDF を抽出して全文索引に取り込む（添付成功後の自動索引・CR-027）。best-effort。
+/// テキストレイヤーが無い / 抽出失敗（スキャン PDF 等）は黙って諦める（OCR で後追い可能）。
+/// 全経路（手動添付・arXiv 取得・クリッパー）が同じ post-attach 索引を通るよう共有する。
+pub async fn extract_and_index(pool: &SqlitePool, abs_path: std::path::PathBuf, attachment_id: i64) {
+    let extracted =
+        tokio::task::spawn_blocking(move || pdf_extract::extract_text_by_pages(&abs_path)).await;
+    if let Ok(Ok(pages_text)) = extracted {
+        let pages: Vec<(i64, String)> = pages_text
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| ((i + 1) as i64, t))
+            .collect();
+        let _ = index_attachment(pool, attachment_id, &pages).await;
+    }
+}
+
 pub async fn unindex_attachment(
     pool: &SqlitePool,
     attachment_id: i64,

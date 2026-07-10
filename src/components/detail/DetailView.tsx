@@ -171,7 +171,11 @@ export function DetailView({
     setOcrBusy(true);
     setOcrMsg(t("detail.header.ocrRunning"));
     try {
-      const summary = await invoke<string>("ocr_pdf", { entryId: entry.id });
+      // 選択中の添付を OCR する（複数 PDF で常に先頭を対象にしない・CR-027）。
+      const summary = await invoke<string>("ocr_pdf", {
+        entryId: entry.id,
+        attachmentId: activeAttachment?.id ?? null,
+      });
       setOcrMsg(t("detail.header.ocrDone", { summary }));
     } catch (e) {
       const msg = typeof e === "string" ? e : (e as Error)?.message ?? String(e);

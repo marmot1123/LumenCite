@@ -709,7 +709,17 @@ async fn add_attachment(
     .await;
 
     match result {
-        Ok(att) => Ok(att),
+        Ok(att) => {
+            // 添付成功後にバックグラウンドで全文索引する（SPEC: 添付後に自動索引・CR-027）。
+            // リーダーからの手動添付もこの経路を通るので、以前は索引されなかった。
+            let pool = state.db.clone();
+            let att_id = att.id;
+            let abs = dest.clone();
+            tauri::async_runtime::spawn(async move {
+                db::fulltext::extract_and_index(&pool, abs, att_id).await;
+            });
+            Ok(att)
+        }
         Err(e) => {
             // DB 登録失敗時はコピー済みファイルを掃除する
             let _ = std::fs::remove_file(&dest);
@@ -750,8 +760,7 @@ async fn download_arxiv_pdf(
     )
     .await?;
 
-    // 添付済み PDF をバックグラウンドで全文索引する（best-effort）。
-    // テキストレイヤーが無い（スキャン）PDF や抽出失敗は黙って諦める。
+    // 添付済み PDF をバックグラウンドで全文索引する（best-effort・共有ヘルパ・CR-027）。
     let pool = state.db.clone();
     let att_id = att.id;
     let abs = app_data_dir
@@ -759,17 +768,7 @@ async fn download_arxiv_pdf(
         .join(entry_id.to_string())
         .join(&att.file_name);
     tauri::async_runtime::spawn(async move {
-        let extracted =
-            tauri::async_runtime::spawn_blocking(move || pdf_extract::extract_text_by_pages(&abs))
-                .await;
-        if let Ok(Ok(pages_text)) = extracted {
-            let pages: Vec<(i64, String)> = pages_text
-                .into_iter()
-                .enumerate()
-                .map(|(i, t)| ((i + 1) as i64, t))
-                .collect();
-            let _ = db::fulltext::index_attachment(&pool, att_id, &pages).await;
-        }
+        db::fulltext::extract_and_index(&pool, abs, att_id).await;
     });
 
     Ok(att)
@@ -1741,9 +1740,10 @@ async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(),
 async fn ocr_pdf(
     state: State<'_, AppState>,
     entry_id: i64,
+    attachment_id: Option<i64>,
     pages: Option<Vec<i64>>,
 ) -> Result<String, String> {
-    llm::tools::ocr::run_ocr(&state.db, &state.app_data_dir, entry_id, pages)
+    llm::tools::ocr::run_ocr(&state.db, &state.app_data_dir, entry_id, attachment_id, pages)
         .await
         .map_err(|e| e.to_string())
 }

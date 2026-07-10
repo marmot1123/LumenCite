@@ -430,6 +430,8 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 
 `index_missing_attachments` は、まだ全文索引の無い PDF 添付（ゴミ箱を除く）を `db::fulltext::attachments_without_fulltext` で洗い出し、順に `pdf-extract` で抽出して索引する。過去に添付済み・自動索引を逃したエントリの後追い用（設定 → データの「未索引の PDF を一括索引」）。
 
+**添付後の自動索引（CR-027）:** 手動添付（`add_attachment`）・arXiv 取得（`download_arxiv_pdf`）・Web クリッパー（MCP `spawn_pdf_job`）のいずれの経路も、添付成功後に共有ヘルパ `db::fulltext::extract_and_index` でバックグラウンド索引する（best-effort・スキャン PDF は OCR へ誘導）。以前はリーダーからの手動添付とクリッパー経路が索引されなかった。
+
 `download_arxiv_pdf` は、arXiv からメタデータ取得してエントリを作成した直後に「PDF も一括で取得する」ためのコマンド（AddSheet の arXiv タブのチェックボックス。デフォルト ON）。`arxiv_id` を正規化して `https://arxiv.org/pdf/<id>` を `download::download_and_attach`（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き）でダウンロードし添付、成功後はバックグラウンドで `pdf-extract` → 全文索引を試みる（索引失敗は無視）。ペイウォールやネットワーク障害で失敗しても呼び出し側はエントリ作成を成功扱いにする（フロントは警告ログのみで詳細パネルからの手動添付に誘導）。
 
 ```ts
@@ -716,7 +718,7 @@ type ClipperStatusInfo = {
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `ocr_pdf` | `entry_id: i64, pages?: Vec<i64>` | `Result<()>` — `pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック |
+| `ocr_pdf` | `entry_id: i64, attachment_id?: i64, pages?: Vec<i64>` | `Result<()>` — `attachment_id` 省略時は先頭 PDF、指定時はその添付を OCR（複数 PDF 対応・CR-027）。`pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック |
 
 ---
 

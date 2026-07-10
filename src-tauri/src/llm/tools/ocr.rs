@@ -22,6 +22,10 @@ pub fn specs() -> Vec<ToolSpec> {
             "type": "object",
             "properties": {
                 "entry_id": { "type": "integer", "description": "The entry whose PDF to OCR." },
+                "attachment_id": {
+                    "type": "integer",
+                    "description": "Optional specific PDF attachment to OCR. Omit to use the entry's first PDF."
+                },
                 "pages": {
                     "type": "array",
                     "items": { "type": "integer" },
@@ -54,7 +58,8 @@ pub async fn try_execute(
         .get("pages")
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_i64()).collect::<Vec<i64>>());
-    Some(run_ocr(ctx.pool, ctx.app_data_dir, entry_id, pages).await)
+    let attachment_id = call.arguments.get("attachment_id").and_then(|v| v.as_i64());
+    Some(run_ocr(ctx.pool, ctx.app_data_dir, entry_id, attachment_id, pages).await)
 }
 
 /// entry の PDF 添付を OCR して `fulltext` に保存する。
@@ -62,18 +67,34 @@ pub async fn run_ocr(
     pool: &sqlx::SqlitePool,
     app_data_dir: &Path,
     entry_id: i64,
+    attachment_id: Option<i64>,
     pages: Option<Vec<i64>>,
 ) -> Result<String, ToolError> {
-    // 1. 最初の PDF 添付
-    let row: Option<(i64, String)> = sqlx::query_as(
-        "SELECT id, file_path FROM attachments
-         WHERE entry_id = ? AND mime_type = 'application/pdf' ORDER BY id LIMIT 1",
-    )
-    .bind(entry_id)
-    .fetch_optional(pool)
-    .await?;
+    // 1. 対象 PDF 添付。attachment_id 指定があればその添付を、無ければ最初の PDF を使う（CR-027）。
+    //    複数 PDF のとき「常に先頭」を OCR してしまわないよう、UI からは選択中の添付 id を渡す。
+    let row: Option<(i64, String)> = match attachment_id {
+        Some(att_id) => {
+            sqlx::query_as(
+                "SELECT id, file_path FROM attachments
+                 WHERE id = ? AND entry_id = ? AND mime_type = 'application/pdf'",
+            )
+            .bind(att_id)
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT id, file_path FROM attachments
+                 WHERE entry_id = ? AND mime_type = 'application/pdf' ORDER BY id LIMIT 1",
+            )
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await?
+        }
+    };
     let (attachment_id, file_path) = row
-        .ok_or_else(|| ToolError::Execution(format!("entry {entry_id} has no PDF attachment")))?;
+        .ok_or_else(|| ToolError::Execution(format!("entry {entry_id} has no matching PDF attachment")))?;
     let abs_path = app_data_dir.join(&file_path);
 
     // 2. OCR プロバイダ/モデル（未設定なら chat 用にフォールバック）+ API キー
