@@ -1312,32 +1312,37 @@ enum ChatStreamEvent {
     },
 }
 
+/// ツール承認待ちがユーザー応答を待つ上限（CR-014）。これを超えたら fail-closed で拒否する。
+/// セッションを離れて放置された run が永久に承認待ちで居座るのを防ぐ。
+const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// 進行中チャットの承認待ち・中断状態を保持する共有ランタイム。
 #[derive(Default)]
 pub struct ChatRuntime {
-    /// call_id -> 承認待ちの送信側
-    pending: Mutex<HashMap<String, PendingApproval>>,
-    /// session_id -> 中断フラグ
+    /// (session_id, call_id) -> 承認待ちの送信側。
+    /// call_id は provider 管理で session 間衝突し得るため session_id と複合キーにする（CR-014）。
+    pending: Mutex<HashMap<(i64, String), oneshot::Sender<bool>>>,
+    /// session_id -> 中断フラグ。存在すること自体が「その session で run が進行中」を表す。
     cancels: Mutex<HashMap<i64, Arc<AtomicBool>>>,
 }
 
-struct PendingApproval {
-    session_id: i64,
-    tx: oneshot::Sender<bool>,
-}
-
 impl ChatRuntime {
-    /// セッションの中断フラグを作成・登録して返す。
-    fn begin(&self, session_id: i64) -> Arc<AtomicBool> {
+    /// セッションの run を開始する。**同一セッションで既に run が進行中なら `None`** を返し、
+    /// 並行 send を拒否させる（CR-014: cancel フラグの上書き・二重実行を防ぐ）。
+    fn begin(&self, session_id: i64) -> Option<Arc<AtomicBool>> {
+        let mut cancels = self.cancels.lock().unwrap();
+        if cancels.contains_key(&session_id) {
+            return None;
+        }
         let flag = Arc::new(AtomicBool::new(false));
-        self.cancels.lock().unwrap().insert(session_id, flag.clone());
-        flag
+        cancels.insert(session_id, flag.clone());
+        Some(flag)
     }
 
     /// セッション終了時の後始末（中断フラグと残った承認待ちを除去）。
     fn finish(&self, session_id: i64) {
         self.cancels.lock().unwrap().remove(&session_id);
-        self.pending.lock().unwrap().retain(|_, p| p.session_id != session_id);
+        self.pending.lock().unwrap().retain(|(sid, _), _| *sid != session_id);
     }
 
     /// ツール承認待ちを登録し、決定を待つ受信側を返す。
@@ -1346,14 +1351,19 @@ impl ChatRuntime {
         self.pending
             .lock()
             .unwrap()
-            .insert(call_id.to_string(), PendingApproval { session_id, tx });
+            .insert((session_id, call_id.to_string()), tx);
         rx
     }
 
-    /// UI からの承認/拒否を該当する待ちに伝える。
-    fn resolve_approval(&self, call_id: &str, approved: bool) {
-        if let Some(p) = self.pending.lock().unwrap().remove(call_id) {
-            let _ = p.tx.send(approved);
+    /// UI からの承認/拒否を該当する待ちに伝える。session_id で当該セッションの待ちだけを解決する。
+    fn resolve_approval(&self, session_id: i64, call_id: &str, approved: bool) {
+        if let Some(tx) = self
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&(session_id, call_id.to_string()))
+        {
+            let _ = tx.send(approved);
         }
     }
 
@@ -1363,14 +1373,14 @@ impl ChatRuntime {
             flag.store(true, Ordering::SeqCst);
         }
         let mut pending = self.pending.lock().unwrap();
-        let ids: Vec<String> = pending
-            .iter()
-            .filter(|(_, p)| p.session_id == session_id)
-            .map(|(k, _)| k.clone())
+        let keys: Vec<(i64, String)> = pending
+            .keys()
+            .filter(|(sid, _)| *sid == session_id)
+            .cloned()
             .collect();
-        for id in ids {
-            if let Some(p) = pending.remove(&id) {
-                let _ = p.tx.send(false);
+        for key in keys {
+            if let Some(tx) = pending.remove(&key) {
+                let _ = tx.send(false);
             }
         }
     }
@@ -1424,7 +1434,16 @@ impl llm::chat::ChatLoopHost for ChannelHost {
 
     async fn request_approval(&mut self, call: &llm::ToolCallSpec) -> bool {
         let rx = self.runtime.register_approval(self.session_id, &call.call_id);
-        rx.await.unwrap_or(false)
+        // idle timeout（CR-014）: UI が応答しないまま放置されても永久待機しない。
+        match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+            Ok(Ok(approved)) => approved,
+            _ => {
+                // timeout / sender drop はどちらも fail-closed（拒否）。pending も掃除する。
+                self.runtime
+                    .resolve_approval(self.session_id, &call.call_id, false);
+                false
+            }
+        }
     }
 
     async fn on_tool_executed(&mut self, call_id: &str, result_summary: &str) {
@@ -1710,10 +1729,11 @@ async fn ocr_pdf(
 #[tauri::command]
 async fn approve_tool_call(
     state: State<'_, AppState>,
+    session_id: i64,
     call_id: String,
     approved: bool,
 ) -> Result<(), String> {
-    state.chat.resolve_approval(&call_id, approved);
+    state.chat.resolve_approval(session_id, &call_id, approved);
     Ok(())
 }
 
@@ -1794,7 +1814,15 @@ async fn chat_send_message(
     let mut tools = llm::tools::all_tool_specs();
     tools.extend(state.mcp.tool_specs().await);
 
-    let cancel = state.chat.begin(session_id);
+    // 同一セッションで run が進行中なら拒否する（CR-014）。二重実行や cancel フラグ上書きを防ぐ。
+    let cancel = match state.chat.begin(session_id) {
+        Some(flag) => flag,
+        None => {
+            let msg = "this chat session already has a message in progress".to_string();
+            let _ = channel.send(ChatStreamEvent::Error { message: msg.clone() });
+            return Err(msg);
+        }
+    };
     let mut host = ChannelHost {
         channel: channel.clone(),
         runtime: state.chat.clone(),
@@ -3058,6 +3086,40 @@ mod db_init_tests {
 }
 
 #[cfg(test)]
+mod chat_runtime_tests {
+    use super::*;
+
+    /// CR-014: 同一セッションで run 進行中なら 2 回目の begin は None（並行 run 拒否）。
+    #[test]
+    fn begin_rejects_concurrent_run_for_same_session() {
+        let rt = ChatRuntime::default();
+        let first = rt.begin(1);
+        assert!(first.is_some());
+        assert!(rt.begin(1).is_none(), "同一セッションの二重 run は拒否");
+        // 別セッションは並行 OK。
+        assert!(rt.begin(2).is_some());
+        // finish 後は再度開始できる。
+        rt.finish(1);
+        assert!(rt.begin(1).is_some());
+    }
+
+    /// CR-014: approval は (session_id, call_id) で解決され、別セッションの同名 call を誤解決しない。
+    #[tokio::test]
+    async fn resolve_approval_is_scoped_to_session() {
+        let rt = ChatRuntime::default();
+        let rx1 = rt.register_approval(1, "call-x");
+        let rx2 = rt.register_approval(2, "call-x"); // 同じ call_id 別セッション
+
+        // session 2 を解決しても session 1 は待ちのまま。
+        rt.resolve_approval(2, "call-x", true);
+        assert_eq!(rx2.await.unwrap(), true);
+
+        rt.resolve_approval(1, "call-x", false);
+        assert_eq!(rx1.await.unwrap(), false);
+    }
+}
+
+#[cfg(test)]
 mod pdf_extract_tests {
     /// CR-017: 未信頼 PDF の解析が panic せず Err を返すこと。
     /// pdf-extract 0.12 / lopdf 0.42 で RUSTSEC-2026-0187（深いネストによる stack overflow）
@@ -3227,16 +3289,16 @@ mod chat_command_tests {
     async fn runtime_resolve_approval_delivers_decision() {
         let rt = ChatRuntime::default();
         let rx = rt.register_approval(7, "call-1");
-        rt.resolve_approval("call-1", true);
+        rt.resolve_approval(7, "call-1", true);
         assert_eq!(rx.await.unwrap(), true);
         // 解決済みなので二度目は何も起きない（パニックしない）
-        rt.resolve_approval("call-1", false);
+        rt.resolve_approval(7, "call-1", false);
     }
 
     #[tokio::test]
     async fn runtime_cancel_denies_pending_and_sets_flag() {
         let rt = ChatRuntime::default();
-        let flag = rt.begin(42);
+        let flag = rt.begin(42).unwrap();
         let rx = rt.register_approval(42, "call-x");
         rt.cancel(42);
         assert!(flag.load(Ordering::SeqCst), "cancel flag should be set");
@@ -3252,7 +3314,7 @@ mod chat_command_tests {
         let rx_b = rt.register_approval(2, "b-call");
         rt.cancel(1); // 別セッションを中断
         // セッション 2 の承認待ちは残っている → 明示的に許可できる
-        rt.resolve_approval("b-call", true);
+        rt.resolve_approval(2, "b-call", true);
         assert_eq!(rx_b.await.unwrap(), true);
     }
 }
