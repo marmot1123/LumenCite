@@ -4,6 +4,8 @@ use sqlx::SqlitePool;
 pub struct Highlight {
     pub id: i64,
     pub entry_id: i64,
+    /// どの添付 PDF に属すか（CR-015）。旧データ移行で NULL が残り得る。
+    pub attachment_id: Option<i64>,
     pub page: i64,
     pub x: f64,
     pub y: f64,
@@ -18,6 +20,9 @@ pub struct Highlight {
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct HighlightInput {
     pub entry_id: i64,
+    /// ハイライトを付けている添付 PDF（CR-015）。
+    #[serde(default)]
+    pub attachment_id: Option<i64>,
     pub page: i64,
     pub x: f64,
     pub y: f64,
@@ -38,14 +43,34 @@ fn valid_color(color: &str) -> bool {
     matches!(color, "yellow" | "green" | "blue")
 }
 
+/// SELECT で使う列並び。`Highlight` の順序と一致させること。
+const HIGHLIGHT_COLUMNS: &str =
+    "id, entry_id, attachment_id, page, x, y, width, height, color, text, note, created_at";
+
 pub async fn list_by_entry(pool: &SqlitePool, entry_id: i64) -> Result<Vec<Highlight>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT id, entry_id, page, x, y, width, height, color, text, note, created_at
+    sqlx::query_as(&format!(
+        "SELECT {HIGHLIGHT_COLUMNS}
          FROM highlights
          WHERE entry_id = ?
-         ORDER BY page ASC, y DESC, id ASC",
-    )
+         ORDER BY page ASC, y DESC, id ASC"
+    ))
     .bind(entry_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// 添付 PDF 単位でハイライトを返す（CR-015）。UI は選択中の添付でこれを使う。
+pub async fn list_by_attachment(
+    pool: &SqlitePool,
+    attachment_id: i64,
+) -> Result<Vec<Highlight>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {HIGHLIGHT_COLUMNS}
+         FROM highlights
+         WHERE attachment_id = ?
+         ORDER BY page ASC, y DESC, id ASC"
+    ))
+    .bind(attachment_id)
     .fetch_all(pool)
     .await
 }
@@ -58,10 +83,11 @@ pub async fn create(pool: &SqlitePool, input: &HighlightInput) -> Result<Highlig
         )));
     }
     let id = sqlx::query(
-        "INSERT INTO highlights (entry_id, page, x, y, width, height, color, text, note)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO highlights (entry_id, attachment_id, page, x, y, width, height, color, text, note)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.entry_id)
+    .bind(input.attachment_id)
     .bind(input.page)
     .bind(input.x)
     .bind(input.y)
@@ -74,10 +100,9 @@ pub async fn create(pool: &SqlitePool, input: &HighlightInput) -> Result<Highlig
     .await?
     .last_insert_rowid();
 
-    sqlx::query_as(
-        "SELECT id, entry_id, page, x, y, width, height, color, text, note, created_at
-         FROM highlights WHERE id = ?",
-    )
+    sqlx::query_as(&format!(
+        "SELECT {HIGHLIGHT_COLUMNS} FROM highlights WHERE id = ?"
+    ))
     .bind(id)
     .fetch_one(pool)
     .await
@@ -118,10 +143,9 @@ pub async fn update(
         }
     }
 
-    sqlx::query_as(
-        "SELECT id, entry_id, page, x, y, width, height, color, text, note, created_at
-         FROM highlights WHERE id = ?",
-    )
+    sqlx::query_as(&format!(
+        "SELECT {HIGHLIGHT_COLUMNS} FROM highlights WHERE id = ?"
+    ))
     .bind(id)
     .fetch_one(pool)
     .await
@@ -159,9 +183,24 @@ mod tests {
         entry.id
     }
 
+    /// entry に PDF 添付を 1 つ作り、その attachment_id を返す。
+    async fn make_attachment(pool: &SqlitePool, entry_id: i64, name: &str) -> i64 {
+        crate::db::attachments::add_attachment(
+            pool,
+            entry_id,
+            &format!("attachments/{entry_id}/{name}"),
+            name,
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
     fn input(entry_id: i64, page: i64, color: &str, text: &str) -> HighlightInput {
         HighlightInput {
             entry_id,
+            attachment_id: None,
             page,
             x: 10.0,
             y: 720.0,
@@ -204,6 +243,44 @@ mod tests {
         assert_eq!(list[0].text, "high"); // y=600 が先
         assert_eq!(list[1].text, "low");
         assert_eq!(list[2].page, 2);
+    }
+
+    /// CR-015: ハイライトは添付単位で分離され、別 PDF の同ページには現れない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn highlights_are_scoped_per_attachment(pool: SqlitePool) {
+        let entry_id = make_entry(&pool).await;
+        let primary = make_attachment(&pool, entry_id, "primary.pdf").await;
+        let supplement = make_attachment(&pool, entry_id, "supplement.pdf").await;
+
+        // 両添付の 3 ページ目にハイライトを付ける。
+        create(&pool, &HighlightInput { attachment_id: Some(primary), ..input(entry_id, 3, "yellow", "on primary") })
+            .await.unwrap();
+        create(&pool, &HighlightInput { attachment_id: Some(supplement), ..input(entry_id, 3, "green", "on supplement") })
+            .await.unwrap();
+
+        let p = list_by_attachment(&pool, primary).await.unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].text, "on primary");
+
+        let s = list_by_attachment(&pool, supplement).await.unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].text, "on supplement");
+    }
+
+    /// CR-015: 添付を消すとその添付のハイライトも CASCADE で消える。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deleting_attachment_cascades_highlights(pool: SqlitePool) {
+        let entry_id = make_entry(&pool).await;
+        let att = make_attachment(&pool, entry_id, "a.pdf").await;
+        create(&pool, &HighlightInput { attachment_id: Some(att), ..input(entry_id, 1, "yellow", "x") })
+            .await.unwrap();
+
+        sqlx::query("DELETE FROM attachments WHERE id = ?")
+            .bind(att).execute(&pool).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM highlights WHERE attachment_id = ?")
+            .bind(att).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]

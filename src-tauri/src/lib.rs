@@ -972,6 +972,17 @@ async fn get_highlights(
         .map_err(|e| e.to_string())
 }
 
+/// 選択中の添付 PDF に属すハイライトだけを返す（CR-015）。
+#[tauri::command]
+async fn get_highlights_by_attachment(
+    state: State<'_, AppState>,
+    attachment_id: i64,
+) -> Result<Vec<db::highlights::Highlight>, String> {
+    db::highlights::list_by_attachment(&state.db, attachment_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn create_highlight(
     state: State<'_, AppState>,
@@ -2955,6 +2966,7 @@ pub fn run() {
             is_attachment_indexed,
             fulltext_search,
             get_highlights,
+            get_highlights_by_attachment,
             create_highlight,
             update_highlight,
             delete_highlight,

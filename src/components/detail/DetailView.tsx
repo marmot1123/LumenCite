@@ -209,12 +209,15 @@ export function DetailView({
     return () => { cancelled = true; if (loaded) loaded.destroy(); };
   }, [activeAttachment?.id]);
 
-  // ハイライト読み込み
+  // ハイライト読み込み: 選択中の添付 PDF に属すものだけを読む（CR-015）。
+  // 添付が無い場合は空。添付切替のたびに読み直す。
+  const activeAttachmentId = activeAttachment?.id ?? null;
   const reloadHighlights = useCallback(() => {
-    invoke<Highlight[]>("get_highlights", { entryId: entry.id })
+    if (activeAttachmentId == null) { setHighlights([]); return; }
+    invoke<Highlight[]>("get_highlights_by_attachment", { attachmentId: activeAttachmentId })
       .then(setHighlights)
       .catch(() => { /* noop */ });
-  }, [entry.id]);
+  }, [activeAttachmentId]);
 
   useEffect(() => { reloadHighlights(); }, [reloadHighlights]);
 
@@ -452,6 +455,7 @@ export function DetailView({
               mode={mode}
               highlights={highlights}
               entryId={entry.id}
+              attachmentId={activeAttachmentId}
               onCreateHighlight={handleCreateHighlight}
             />
           </div>

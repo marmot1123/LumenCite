@@ -496,8 +496,9 @@ type ImportResult = { imported: number; skipped: number };
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `get_highlights` | `entry_id: i64` | `Result<Vec<Highlight>>` — ページ昇順、同ページ内は `y` 降順 |
-| `create_highlight` | `input: HighlightInput` | `Result<Highlight>` |
+| `get_highlights` | `entry_id: i64` | `Result<Vec<Highlight>>` — ページ昇順、同ページ内は `y` 降順（エントリ全添付を含む） |
+| `get_highlights_by_attachment` | `attachment_id: i64` | `Result<Vec<Highlight>>` — 指定添付 PDF のハイライトのみ（CR-015）。UI は選択中の添付でこれを使う |
+| `create_highlight` | `input: HighlightInput` | `Result<Highlight>` — `input.attachment_id` で属す添付を指定 |
 | `update_highlight` | `id: i64, color?: HighlightColor, note?: String` | `Result<Highlight>` — 部分更新 |
 | `delete_highlight` | `id: i64` | `Result<()>` |
 

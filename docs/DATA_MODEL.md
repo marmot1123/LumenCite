@@ -159,6 +159,7 @@ arXivプレプリントと出版版など、別エントリとして管理しつ
 |--------|-----|------|
 | `id` | INTEGER PK | |
 | `entry_id` | INTEGER FK → entries | ON DELETE CASCADE |
+| `attachment_id` | INTEGER FK → attachments | ON DELETE CASCADE。**どの添付 PDF に属すか**（CR-015 / migration 0011）。旧データは各エントリの primary（最小 id）添付へ移行。添付削除で当該ハイライトも CASCADE |
 | `page` | INTEGER NOT NULL | 1 始まりのページ番号 |
 | `x` | REAL NOT NULL | バウンディング左下 X（PDF pt） |
 | `y` | REAL NOT NULL | バウンディング左下 Y（PDF pt） |
@@ -169,7 +170,7 @@ arXivプレプリントと出版版など、別エントリとして管理しつ
 | `note` | TEXT | ハイライトに紐付くノート（任意） |
 | `created_at` | TEXT NOT NULL | DEFAULT `CURRENT_TIMESTAMP` |
 
-インデックス: `idx_highlights_entry_page ON highlights(entry_id, page)`
+インデックス: `idx_highlights_entry_page ON highlights(entry_id, page)`、`idx_highlights_attachment_page ON highlights(attachment_id, page)`（CR-015）
 
 ---
 
