@@ -344,6 +344,8 @@ struct KeyRow {
     year: Option<i64>,
     citation_key: Option<String>,
     first_author: Option<String>,
+    /// 第一著者の構造化姓（cite key を「姓+年」で作る際に name の末尾トークンより優先・CR-032）。
+    first_author_family: Option<String>,
 }
 
 /// 指定エントリが `.bib` 同期（ゴミ箱を除く全エントリ書き出し）で実際に割り当てられる
@@ -357,7 +359,10 @@ async fn load_key_rows(pool: &SqlitePool) -> Result<Vec<KeyRow>, String> {
         "SELECT e.id, e.title, e.year, e.citation_key,
                 (SELECT a.name FROM entry_authors ea
                    JOIN authors a ON a.id = ea.author_id
-                  WHERE ea.entry_id = e.id ORDER BY ea.position LIMIT 1) AS first_author
+                  WHERE ea.entry_id = e.id ORDER BY ea.position LIMIT 1) AS first_author,
+                (SELECT a.family_name FROM entry_authors ea
+                   JOIN authors a ON a.id = ea.author_id
+                  WHERE ea.entry_id = e.id ORDER BY ea.position LIMIT 1) AS first_author_family
          FROM entries e
          WHERE e.deleted_at IS NULL
          ORDER BY e.created_at DESC, e.id DESC",
@@ -374,7 +379,12 @@ fn assign_keys_for_rows(rows: &[KeyRow]) -> Vec<String> {
         .map(|r| {
             (
                 r.citation_key.clone(),
-                make_base_key(r.first_author.as_deref(), &r.title, r.year),
+                make_base_key(
+                    r.first_author_family.as_deref(),
+                    r.first_author.as_deref(),
+                    &r.title,
+                    r.year,
+                ),
             )
         })
         .collect();
@@ -655,8 +665,17 @@ fn entry_to_bibtex(entry: &EntryDetail, key: &str, opts: &ExportOptions) -> Stri
     if !entry.authors.is_empty() {
         // 各著者名を個別にエスケープしてから " and " で連結する
         // （区切りの " and " 自体はエスケープ対象に含まれない）。
+        // 団体著者（is_organization）は追加の波括弧で囲み、BibTeX の "Last, First"
+        // 解析を抑止して literal 名として扱わせる（CR-032）。
         let author_str = entry.authors.iter()
-            .map(|a| escape_bibtex(&a.name))
+            .map(|a| {
+                let escaped = escape_bibtex(&a.name);
+                if a.is_organization {
+                    format!("{{{}}}", escaped)
+                } else {
+                    escaped
+                }
+            })
             .collect::<Vec<_>>()
             .join(" and ");
         fields.push(format!("  author     = {{{}}}", author_str));
@@ -698,8 +717,10 @@ fn entry_to_bibtex(entry: &EntryDetail, key: &str, opts: &ExportOptions) -> Stri
 }
 
 fn make_citation_key(entry: &EntryDetail) -> String {
+    let first = entry.authors.first();
     make_base_key(
-        entry.authors.first().map(|a| a.name.as_str()),
+        first.and_then(|a| a.family_name.as_deref()),
+        first.map(|a| a.name.as_str()),
         &entry.title,
         entry.year,
     )
@@ -708,20 +729,48 @@ fn make_citation_key(entry: &EntryDetail) -> String {
 /// 自動 cite key の base（接尾辞なし）を `第一著者の姓 + 年` で生成する。著者がいなければ
 /// タイトル先頭語、年がなければ `nd`。英数字と `_` 以外を除去する。
 /// `make_citation_key`（EntryDetail 経由）と `resolve_citation_key`（軽量行経由）で共有する。
-fn make_base_key(first_author: Option<&str>, title: &str, year: Option<i64>) -> String {
-    let author_part = match first_author {
-        Some(name) if !name.trim().is_empty() => {
-            name.split_whitespace().last().unwrap_or(name).to_lowercase()
-        }
-        _ => title.split_whitespace().next().unwrap_or("unknown").to_lowercase(),
+///
+/// 姓は **構造化 `family_name` を優先**する（CR-032）。無ければ `name` の末尾トークンに
+/// フォールバックするが、これは "van der Berg" や日本語（"関 元樹"=姓が先頭）で誤るため、
+/// family_name があるときはそちらを使う。
+fn make_base_key(
+    family_name: Option<&str>,
+    name: Option<&str>,
+    title: &str,
+    year: Option<i64>,
+) -> String {
+    let family = family_name.map(str::trim).filter(|s| !s.is_empty());
+    let name_last = name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|n| n.split_whitespace().last().unwrap_or(n));
+
+    let author_part = match family.or(name_last) {
+        Some(s) => s.to_lowercase(),
+        None => title.split_whitespace().next().unwrap_or("unknown").to_lowercase(),
     };
 
     let year_part = year.map(|y| y.to_string()).unwrap_or_else(|| "nd".to_string());
 
-    format!("{}{}", author_part, year_part)
+    let key: String = format!("{}{}", author_part, year_part)
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
+        .collect();
+
+    // family_name が非 ASCII（漢字等）で全て除去され年だけになった場合は、name 末尾
+    // トークンでの再構成を試みる（ラテン別表記が name にあるケースの救済）。
+    if key == year_part {
+        if let Some(alt) = name_last {
+            let alt_key: String = format!("{}{}", alt.to_lowercase(), year_part)
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if alt_key != year_part {
+                return alt_key;
+            }
+        }
+    }
+    key
 }
 
 #[cfg(test)]
@@ -1143,6 +1192,45 @@ mod tests {
 
         let bib = export_bibtex(&pool, Some(vec![entry.id])).await.unwrap();
         assert!(bib.contains("@article{smith2023,"));
+    }
+
+    /// CR-032: cite key は構造化 family_name を優先する（name 末尾トークンより正確）。
+    #[test]
+    fn make_base_key_prefers_structured_family_name() {
+        // "van der Berg": name 末尾トークンだと "berg" だが、family_name を使って "vanderberg"。
+        assert_eq!(
+            make_base_key(Some("van der Berg"), Some("Jan van der Berg"), "T", Some(2020)),
+            "vanderberg2020"
+        );
+        // family_name 無しは name 末尾トークンにフォールバック。
+        assert_eq!(make_base_key(None, Some("John Smith"), "T", Some(2021)), "smith2021");
+        // 著者不在はタイトル先頭語。
+        assert_eq!(make_base_key(None, None, "Deep Learning", Some(2022)), "deep2022");
+        // 年が無ければ nd。
+        assert_eq!(make_base_key(Some("Smith"), None, "T", None), "smithnd");
+    }
+
+    /// CR-032: 団体著者は BibTeX 出力で追加波括弧 `{{...}}` により literal 保護される。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_wraps_organization_author_in_braces(pool: sqlx::SqlitePool) {
+        let entry = create_entry(&pool, &EntryInput {
+            title: "WHO Report".to_string(),
+            entry_type: "report".to_string(),
+            authors: Some(vec![crate::models::AuthorInput {
+                name: "World Health Organization".to_string(),
+                is_organization: true,
+                ..Default::default()
+            }]),
+            year: Some(2021),
+            ..Default::default()
+        }).await.unwrap();
+
+        let bib = export_bibtex(&pool, Some(vec![entry.id])).await.unwrap();
+        // author = {{World Health Organization}} のように二重波括弧で囲まれる。
+        assert!(
+            bib.contains("author     = {{World Health Organization}}"),
+            "org author should be brace-protected: {bib}"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
