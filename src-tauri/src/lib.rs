@@ -11,6 +11,7 @@ pub mod mcp_shim;
 mod metadata;
 mod models;
 mod orcid;
+mod secretbox;
 
 use models::{
     Attachment, Author, AuthorIdentifierInput, AuthorInput, Collection, EntryDetail, EntryFilter,
@@ -1566,6 +1567,32 @@ struct McpServerInfo {
     status: Option<mcp::McpServerStatus>,
 }
 
+/// 保存用に env の値を暗号化する（CR-012）。既に暗号化済みの値はそのまま。
+fn encrypt_server_env(mut c: mcp::McpServerConfig) -> Result<mcp::McpServerConfig, String> {
+    for v in c.env.values_mut() {
+        if !secretbox::is_encrypted(v) {
+            *v = secretbox::encrypt(v)?;
+        }
+    }
+    Ok(c)
+}
+
+/// 起動用に env の値を復号する。暗号化されていない値（旧・平文）はそのまま返す。
+fn decrypt_server_env(mut c: mcp::McpServerConfig) -> Result<mcp::McpServerConfig, String> {
+    for v in c.env.values_mut() {
+        *v = secretbox::decrypt(v)?;
+    }
+    Ok(c)
+}
+
+/// 一覧表示用に env の値を伏せる。キー名だけ残し、秘密値はフロントに返さない（CR-012）。
+fn mask_server_env(mut c: mcp::McpServerConfig) -> mcp::McpServerConfig {
+    for v in c.env.values_mut() {
+        *v = String::new();
+    }
+    c
+}
+
 #[tauri::command]
 async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>, String> {
     let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
@@ -1575,6 +1602,7 @@ async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInf
     let statuses = state.mcp.statuses().await;
     let infos = mcp::parse_servers_config(&json)
         .into_iter()
+        .map(mask_server_env) // 秘密値は返さない
         .map(|c| {
             let status = statuses.get(&c.id).cloned();
             McpServerInfo { id: c.id, command: c.command, args: c.args, env: c.env, status }
@@ -1594,7 +1622,8 @@ async fn add_mcp_server(
         .unwrap_or_default();
     let mut servers = mcp::parse_servers_config(&json);
     servers.retain(|s| s.id != config.id);
-    servers.push(config.clone());
+    // 保存は暗号化した env で行う。起動はフロントから受け取った平文 config で行う。
+    servers.push(encrypt_server_env(config.clone())?);
     db::settings::set_setting(
         &state.db,
         db::settings::MCP_SERVERS_KEY,
@@ -1602,6 +1631,23 @@ async fn add_mcp_server(
     )
     .await
     .map_err(|e| e.to_string())?;
+    state.mcp.start(config).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 保存済み config（env は暗号化）を読み出して復号し、再起動する。
+/// フロントは秘密値を持たないので、再起動は id だけを渡して backend 側で組み立てる（CR-012）。
+#[tauri::command]
+async fn restart_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let config = mcp::parse_servers_config(&json)
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("no such MCP server: {id}"))?;
+    let config = decrypt_server_env(config)?;
     state.mcp.start(config).await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -2781,7 +2827,38 @@ pub fn run() {
                 if let Ok(Some(json)) =
                     db::settings::get_setting(&mcp_pool, db::settings::MCP_SERVERS_KEY).await
                 {
-                    for cfg in mcp::parse_servers_config(&json) {
+                    let servers = mcp::parse_servers_config(&json);
+
+                    // 旧・平文の env を一度だけ暗号化して保存し直す（CR-012 の migration）。
+                    // 平文値が 1 つでもあれば全体を暗号化して書き戻す。
+                    let has_plaintext = servers.iter().any(|s| {
+                        s.env.values().any(|v| !v.is_empty() && !secretbox::is_encrypted(v))
+                    });
+                    if has_plaintext {
+                        let migrated: Result<Vec<_>, _> =
+                            servers.iter().cloned().map(encrypt_server_env).collect();
+                        match migrated {
+                            Ok(encrypted) => {
+                                let _ = db::settings::set_setting(
+                                    &mcp_pool,
+                                    db::settings::MCP_SERVERS_KEY,
+                                    &mcp::serialize_servers_config(&encrypted),
+                                )
+                                .await;
+                            }
+                            Err(e) => eprintln!("MCP env migration failed: {e}"),
+                        }
+                    }
+
+                    // 起動は復号した env で行う。
+                    for cfg in servers {
+                        let cfg = match decrypt_server_env(cfg) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("MCP env decrypt failed: {e}");
+                                continue;
+                            }
+                        };
                         if let Err(e) = mcp.start(cfg).await {
                             eprintln!("MCP server start failed: {e}");
                         }
@@ -2908,6 +2985,7 @@ pub fn run() {
             generate_chat_title,
             list_mcp_servers,
             add_mcp_server,
+            restart_mcp_server,
             remove_mcp_server,
             get_mcp_server_status,
             set_mcp_server_enabled,

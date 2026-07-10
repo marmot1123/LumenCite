@@ -75,14 +75,12 @@ function McpServers() {
   };
   useEffect(reload, []);
 
-  // 既存サーバーの再起動（env 修正後など）。add_mcp_server は同 config を保存し直して
-  // start を走らせる。成否に関わらず backend が status を更新するので reload で反映する。
+  // 既存サーバーの再起動。env の秘密値はフロントに返さない（CR-012）ため、id だけを渡して
+  // backend が保存済み config（暗号化 env）を復号して起動する。成否に関わらず reload で反映。
   const retry = async (s: McpServerInfo) => {
     setBusy(true);
     try {
-      await invoke("add_mcp_server", {
-        config: { id: s.id, command: s.command, args: s.args, env: s.env },
-      });
+      await invoke("restart_mcp_server", { id: s.id });
     } catch { /* status は backend 側で更新済み */ }
     finally { setBusy(false); reload(); }
   };

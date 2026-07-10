@@ -306,7 +306,7 @@ LLM APIキー等の機密情報は **OS キーチェーン**（macOS Keychain / 
 | `llm.ocr_provider` | `openai` \| `anthropic`（未設定可） | OCR 用 LLM プロバイダ。未設定なら `llm.provider` にフォールバック |
 | `llm.ocr_model` | モデル識別子（未設定可） | OCR 用モデル。未設定なら `llm.model` にフォールバック |
 | `chat.tool_whitelist` | JSON | ツール別自動承認のデフォルト上書き。`delete_*` / MCP write 系は上書き不可 |
-| `mcp.servers` | JSON | 外部 MCP サーバー設定（クライアント側）。Claude Desktop の `mcpServers` 互換形式 |
+| `mcp.servers` | JSON | 外部 MCP サーバー設定（クライアント側）。Claude Desktop の `mcpServers` 互換形式。**`env` の値は平文で置かない**（CR-012）。値は `secretbox`（AES-256-GCM）で暗号化し `enc:v1:<base64>` 形式で保存する。復号鍵はキーチェーン（`secretbox.master_key`）。一覧 API はキー名のみ返し値は伏せる。旧・平文値は起動時に一度だけ暗号化して書き戻す |
 
 #### キー追加（v0.3.0）
 
@@ -317,7 +317,7 @@ LLM APIキー等の機密情報は **OS キーチェーン**（macOS Keychain / 
 | `mcp_server.port` | 文字列の数値（未設定なら既定 `3917`） | MCP サーバーのバインドポート。`port=0` で起動した場合は OS 割り当ての実ポートをここに保存する |
 | `mcp_server.write_enabled` | `"1"` \| `"0"`（または未設定） | **Phase 2**: MCP サーバー公開で write 系ツールを許可するフラグ（既定 false）。承認 UI が無いためサーバー側でこのゲートを enforce する。サーバーはリクエスト毎に評価するので変更は再起動不要 |
 
-OS キーチェーン側のサービス名: `com.lumencite.app`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。MCP **サーバー公開**の Bearer 認可トークンも同サービスのアカウント名 `mcp_server.token` に保管する（`settings` には置かない）。MCP サーバーに渡す秘匿情報（API キー等）が必要な場合も、平文を `settings` に置かず環境変数 or キーチェーン経由とする。
+OS キーチェーン側のサービス名: `com.lumencite.app`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。MCP **サーバー公開**の Bearer 認可トークンも同サービスのアカウント名 `mcp_server.token` に保管する（`settings` には置かない）。外部 MCP **クライアント**に渡す `env` 秘匿情報（API キー等）は、`secretbox.master_key`（キーチェーンの 32byte マスター鍵）で AES-256-GCM 暗号化して `settings` に保存する（平文は置かない・CR-012）。マスター鍵はプロセス内でキャッシュするため keychain へ触るのは起動〜MCP 起動時の実質 1 回。**資格情報のローテーション**は、外部 MCP を一旦削除して新しい `env` で再登録すれば、古い暗号値は上書きされる。
 
 ### `mcp_audit_log` — MCP 経由 write の監査ログ（Phase 2 / migration 0010）
 

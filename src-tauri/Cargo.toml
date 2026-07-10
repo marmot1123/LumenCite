@@ -44,6 +44,9 @@ pdf-extract = "0.12"
 # 読取専用 DB 呼び出し（sqlx runtime-tokio）を block_on するため。
 tokio = { version = "1", features = ["sync", "time", "macros", "process", "io-util", "rt-multi-thread"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# 外部 MCP の env 秘密値を DB に平文で置かないための保存時暗号化（CR-012）。
+# 復号鍵（マスター鍵）だけを OS keychain に置き、値は AES-256-GCM で settings に格納する。
+aes-gcm = "0.10"
 futures-util = "0.3"
 eventsource-stream = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
