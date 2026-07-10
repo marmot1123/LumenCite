@@ -604,6 +604,7 @@
     "discard": "破棄",
     "regenerate": "再生成",
     "close": "閉じる",
+    "saveError": "保存に失敗しました",
     "noApiKey": "API キーが設定されていません",
     "noApiKeyHelp": "設定画面で API キーを登録してください。",
     "openSettings": "設定を開く",

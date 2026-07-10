@@ -715,12 +715,12 @@ export default function App() {
       tag_ids:      detail.tags.map(t => t.id),
       [field]:      trimmed || undefined,
     };
-    invoke<EntryDetail>("update_entry", { id: targetId, input })
+    // Promise を返して呼び出し側が await / エラーハンドリングできるようにする（CR-034）。
+    return invoke<EntryDetail>("update_entry", { id: targetId, input })
       .then(updated => {
         // 編集中に別の文献に切り替えていた場合は detail を上書きしない
         setDetail(prev => (prev && prev.id === targetId ? updated : prev));
-      })
-      .catch(console.error);
+      });
   };
 
   const handleRemoveTagFromEntry = (tagId: number) => {
@@ -857,7 +857,8 @@ export default function App() {
             entry={detail}
             onClose={() => setShowSummary(false)}
             onSavedToNotes={async (newNotes) => {
-              handleUpdateField("notes", newNotes);
+              // 保存を await し、失敗は SummarySheet 側で表示させる（成功時のみ閉じる・CR-034）。
+              await handleUpdateField("notes", newNotes);
               setShowSummary(false);
             }}
             onOpenSettings={() => { setShowSummary(false); setShowSettings(true); }}
@@ -1077,7 +1078,8 @@ export default function App() {
           entry={detail}
           onClose={() => setShowSummary(false)}
           onSavedToNotes={async (newNotes) => {
-            handleUpdateField("notes", newNotes);
+            // 保存を await し、失敗は SummarySheet 側で表示させる（成功時のみ閉じる・CR-034）。
+            await handleUpdateField("notes", newNotes);
             setShowSummary(false);
           }}
           onOpenSettings={() => { setShowSummary(false); setShowSettings(true); }}

@@ -604,6 +604,7 @@
     "discard": "Discard",
     "regenerate": "Regenerate",
     "close": "Close",
+    "saveError": "Failed to save",
     "noApiKey": "API key is not configured",
     "noApiKeyHelp": "Please register an API key in Settings.",
     "openSettings": "Open Settings",
