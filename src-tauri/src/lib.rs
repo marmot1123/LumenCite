@@ -622,7 +622,7 @@ fn attachments_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("attachments"))
 }
 
-use download::unique_dest;
+use download::create_unique_file;
 
 #[tauri::command]
 async fn pick_pdf_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
@@ -661,8 +661,14 @@ async fn add_attachment(
     let entry_dir = root.join(entry_id.to_string());
     std::fs::create_dir_all(&entry_dir).map_err(|e| e.to_string())?;
 
-    let dest = unique_dest(&entry_dir, &file_name);
-    std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+    // 名前を原子的に予約してから中身をコピーする（CR-008）。予約済みの空ファイルを
+    // copy で上書きするので、並行追加でも 1 ファイルを 2 行で共有することがない。
+    let (file, dest) = create_unique_file(&entry_dir, &file_name).map_err(|e| e.to_string())?;
+    drop(file);
+    if let Err(e) = std::fs::copy(&src, &dest) {
+        let _ = std::fs::remove_file(&dest); // 予約した空ファイルを残さない
+        return Err(e.to_string());
+    }
 
     let rel_path = format!(
         "attachments/{}/{}",
@@ -753,16 +759,20 @@ async fn delete_attachment(
     state: State<'_, AppState>,
     id: i64,
 ) -> Result<(), String> {
-    // fulltext は FK が無いので明示的に消す（attachments の cascade では拾えない）
-    let _ = db::fulltext::unindex_attachment(&state.db, id).await;
-
-    let removed = db::attachments::delete_attachment(&state.db, id)
+    // 添付レコードと全文索引を単一トランザクションで削除（CR-008）。orphan index を残さない。
+    let removed = db::attachments::delete_attachment_with_fulltext(&state.db, id)
         .await
         .map_err(|e| e.to_string())?;
 
+    // ファイル本体は best-effort で削除。失敗しても DB は整合しているので致命ではないが、
+    // 握りつぶさずログに残す（掃除漏れの検知用）。
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let abs = root.join(&removed.file_path);
-    let _ = std::fs::remove_file(&abs);
+    if let Err(e) = std::fs::remove_file(&abs) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("attachment file removal failed ({}): {e}", abs.display());
+        }
+    }
     Ok(())
 }
 

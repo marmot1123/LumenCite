@@ -328,10 +328,11 @@ mod tests {
         .await
         .unwrap();
 
+        // file_path は UNIQUE（CR-008）なので entry.id を含めて一意にする。
         let att = add_attachment(
             pool,
             entry.id,
-            "attachments/x/p.pdf",
+            &format!("attachments/{}/p.pdf", entry.id),
             "p.pdf",
             "application/pdf",
         )
@@ -617,7 +618,7 @@ mod tests {
         assert!(ids.contains(&unindexed));
         assert!(!ids.contains(&indexed));
         // file_path も返る。
-        assert!(missing.iter().any(|(_, p)| p == "attachments/x/p.pdf"));
+        assert!(missing.iter().any(|(_, p)| p.ends_with("/p.pdf")));
     }
 
     #[sqlx::test(migrations = "./migrations")]

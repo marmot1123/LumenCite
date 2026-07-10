@@ -182,10 +182,12 @@ arXivプレプリントと出版版など、別エントリとして管理しつ
 |--------|-----|------|
 | `id` | INTEGER PK | |
 | `entry_id` | INTEGER FK → entries | ON DELETE CASCADE |
-| `file_path` | TEXT NOT NULL | アプリデータディレクトリからの相対パス |
+| `file_path` | TEXT NOT NULL | アプリデータディレクトリからの相対パス。**UNIQUE**（`idx_attachments_file_path` / migration 0012・CR-008）。保存側は O_EXCL で名前を原子的に予約するので 1 ファイルを 2 行が共有しない |
 | `file_name` | TEXT NOT NULL | 表示用ファイル名 |
 | `mime_type` | TEXT NOT NULL | デフォルト `application/pdf` |
 | `created_at` | TEXT | |
+
+添付削除は `delete_attachment_with_fulltext` が attachments 行と全文索引（`fulltext`）を単一トランザクションで消す（orphan index を残さない・CR-008）。ファイル本体の削除は best-effort（失敗はログのみ）。
 
 ---
 

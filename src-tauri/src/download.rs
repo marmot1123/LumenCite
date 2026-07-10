@@ -196,8 +196,13 @@ pub async fn download_and_attach(
     std::fs::create_dir_all(&entry_dir).map_err(|e| e.to_string())?;
 
     let file_name = suggested_file_name(url, cd_name.as_deref());
-    let dest = unique_dest(&entry_dir, &file_name);
-    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+    // 名前を原子的に予約してから書き込む（CR-008）。
+    let (mut file, dest) = create_unique_file(&entry_dir, &file_name).map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+    }
+    drop(file);
 
     let dest_name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
     let rel_path = format!("attachments/{}/{}", entry_id, dest_name);
@@ -275,28 +280,38 @@ fn sanitize_file_name(name: &str) -> String {
     cleaned.chars().take(120).collect()
 }
 
-/// `dir` 内で未使用のファイル名を返す（既存なら `_1`, `_2`… を付ける）。
-pub(crate) fn unique_dest(dir: &Path, file_name: &str) -> PathBuf {
-    let candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
+/// `dir` 内で未使用のファイル名を **原子的に予約**し、作成済みの空ファイルとパスを返す（CR-008）。
+/// `create_new`（O_CREAT|O_EXCL）で名前を確保するため、並行追加で `exists()` チェックが
+/// すり抜けて同名を上書き（1 ファイルを 2 行が共有 / 片方消失）することがない。
+pub(crate) fn create_unique_file(
+    dir: &Path,
+    file_name: &str,
+) -> std::io::Result<(std::fs::File, PathBuf)> {
+    fn try_create(p: &Path) -> std::io::Result<Option<std::fs::File>> {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(p) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    let first = dir.join(file_name);
+    if let Some(f) = try_create(&first)? {
+        return Ok((f, first));
     }
     let (stem, ext) = match file_name.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
         None => (file_name.to_string(), String::new()),
     };
-    for i in 1..1000 {
-        let next = dir.join(format!("{stem}_{i}{ext}"));
-        if !next.exists() {
-            return next;
+    for i in 1..10000 {
+        let cand = dir.join(format!("{stem}_{i}{ext}"));
+        if let Some(f) = try_create(&cand)? {
+            return Ok((f, cand));
         }
     }
-    dir.join(format!(
-        "{stem}_{}{ext}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not find a free attachment file name",
     ))
 }
 
@@ -370,6 +385,28 @@ mod tests {
         // ガード有効（既定）なら loopback への接続は解決段階で拒否される。
         let err = fetch_pdf("http://127.0.0.1:9/x.pdf", DownloadCaps::default()).await.unwrap_err();
         assert!(err.contains("non-public"), "{err}");
+    }
+
+    // ── 原子的な名前予約（CR-008） ────────────────────────────────────────
+
+    #[test]
+    fn create_unique_file_reserves_distinct_names() {
+        let dir = temp_app_dir("uniq");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (_f1, p1) = create_unique_file(&dir, "paper.pdf").unwrap();
+        let (_f2, p2) = create_unique_file(&dir, "paper.pdf").unwrap();
+        let (_f3, p3) = create_unique_file(&dir, "paper.pdf").unwrap();
+
+        // 3 回とも別パスが予約され、全て実在する。
+        assert_ne!(p1, p2);
+        assert_ne!(p2, p3);
+        assert_ne!(p1, p3);
+        assert!(p1.exists() && p2.exists() && p3.exists());
+        assert_eq!(p1.file_name().unwrap(), "paper.pdf");
+        assert_eq!(p2.file_name().unwrap(), "paper_1.pdf");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
