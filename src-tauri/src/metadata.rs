@@ -14,6 +14,9 @@ pub async fn fetch_by_doi(doi: &str) -> Result<EntryInput, String> {
     let url = format!("https://api.crossref.org/works/{}", doi);
     let client = reqwest::Client::builder()
         .user_agent("LumenCite/0.1 (mailto:support@lumencite.app)")
+        // connect / 全体タイムアウト（CR-033）。呼び出し側の tokio timeout とは別に client 側でも張る。
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
 

@@ -33,7 +33,13 @@ impl ChatProvider for AnthropicProvider {
         }
         let payload = build_messages_body(model, system, messages, tools);
 
-        let client = reqwest::Client::new();
+        // ストリーミング（CR-033）: connect と read（チャンク間 idle）のタイムアウトのみ。
+        // 全体 timeout は長い生成を切らないため張らない。
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(120))
+            .build()
+            .map_err(|e| LlmError::Stream(e.to_string()))?;
         let resp = client
             .post(ENDPOINT)
             .header("x-api-key", api_key)
@@ -398,7 +404,12 @@ where
         ],
     });
 
-    let client = reqwest::Client::new();
+    // OCR/vision（単発応答・CR-033）: connect + 全体タイムアウトを張る。
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| LlmError::Stream(e.to_string()))?;
     let resp = client
         .post(ENDPOINT)
         .header("x-api-key", api_key)
