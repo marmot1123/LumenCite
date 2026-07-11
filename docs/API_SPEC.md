@@ -512,6 +512,7 @@ type ImportResult = { imported: number; skipped: number };
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
 | `generate_summary` | `entry_id: i64, source: "abstract" \| "fulltext", channel: Channel<SummaryStreamEvent>` | `Result<()>` — ストリーミング送出。完了時にDB側 `entries.summary` も更新 |
+| `cancel_summary` | `entry_id: i64` | `Result<()>` — 進行中の要約生成を中断（sheet close / 再生成時にフロントが呼ぶ）。LLM future を drop して有料 HTTP リクエストを実際に停止。対応 run が無ければ no-op（CR-034） |
 | `get_llm_settings` | — | `LlmSettings` |
 | `save_llm_settings` | `settings: LlmSettings` | `Result<()>` |
 | `get_api_key` | `provider: "openai" \| "anthropic"` | `Result<Option<String>>` — OSキーチェーンから取得（マスク表示用） |
