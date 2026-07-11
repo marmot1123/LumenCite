@@ -1,3 +1,4 @@
+mod attachment_trash;
 mod backup;
 mod bibtex;
 pub mod cli;
@@ -327,11 +328,17 @@ async fn delete_entry(
 }
 
 /// hard delete 後に添付の実ファイル（attachments/<entry_id>/）を削除する。
-/// DB 削除成功後に呼ぶ。ファイル側の失敗は無視する。
+/// DB 削除成功後に呼ぶ。rename-to-trash + sweep で堅牢化し、消せなくても
+/// 孤立ディレクトリを残さない（永続 retry queue・CR-008）。
 fn remove_entry_attachment_dir(app: &tauri::AppHandle, entry_id: i64) {
-    if let Ok(root) = attachments_root(app) {
-        let _ = std::fs::remove_dir_all(root.join(entry_id.to_string()));
+    let Ok(app_data) = app.path().app_data_dir() else {
+        return;
+    };
+    let dir = app_data.join("attachments").join(entry_id.to_string());
+    if let Err(e) = attachment_trash::move_to_trash(&app_data, &dir) {
+        eprintln!("attachment dir trash failed ({}): {e}", dir.display());
     }
+    attachment_trash::sweep_trash(&app_data);
 }
 
 #[tauri::command]
@@ -788,15 +795,14 @@ async fn delete_attachment(
         .await
         .map_err(|e| e.to_string())?;
 
-    // ファイル本体は best-effort で削除。失敗しても DB は整合しているので致命ではないが、
-    // 握りつぶさずログに残す（掃除漏れの検知用）。
+    // ファイル本体は rename-to-trash で退避してから sweep する（CR-008）。
+    // ロック中でも rename は成功しやすく、消せなくても trash が永続 retry queue になる。
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let abs = root.join(&removed.file_path);
-    if let Err(e) = std::fs::remove_file(&abs) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("attachment file removal failed ({}): {e}", abs.display());
-        }
+    if let Err(e) = attachment_trash::move_to_trash(&root, &abs) {
+        eprintln!("attachment trash failed ({}): {e}", abs.display());
     }
+    attachment_trash::sweep_trash(&root);
     Ok(())
 }
 
@@ -2939,6 +2945,16 @@ pub fn run() {
                 mcp: mcp.clone(),
                 mcp_server: mcp_server.clone(),
                 app_data_dir: data_dir.clone(),
+            });
+
+            // 起動時に添付 trash を sweep する（前回の削除でロック等により消せず
+            // 残った孤立ファイル/ディレクトリを回収する・CR-008 永続 retry queue）。
+            let trash_dir = data_dir.clone();
+            std::thread::spawn(move || {
+                let n = attachment_trash::sweep_trash(&trash_dir);
+                if n > 0 {
+                    eprintln!("attachment trash: swept {n} leftover item(s) at startup");
+                }
             });
 
             // MCP サーバー公開 or Web クリッパーのどちらかが有効なら共用 HTTP サーバーを起動する。
