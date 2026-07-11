@@ -33,6 +33,36 @@ pub struct ToolContext<'a> {
     pub app_data_dir: &'a Path,
 }
 
+impl ToolContext<'_> {
+    /// entry がチャットのスコープ内か（CR-024）。`scope_mode="all"` なら常に true、
+    /// `"entries"` のときは対象集合に含まれる id のみ true。read/write 双方で使う。
+    pub fn entry_in_scope(&self, entry_id: i64) -> bool {
+        self.scope_mode != "entries" || self.scope_entry_ids.contains(&entry_id)
+    }
+
+    /// 指定 id 群のうちスコープ外のものを返す（空なら全て許可）。複数 entry を扱う tool 用。
+    pub fn out_of_scope(&self, ids: &[i64]) -> Vec<i64> {
+        if self.scope_mode != "entries" {
+            return Vec::new();
+        }
+        ids.iter()
+            .copied()
+            .filter(|id| !self.scope_entry_ids.contains(id))
+            .collect()
+    }
+
+    /// 単一 entry のスコープ検査。スコープ外なら実行を拒否するエラーを返す。
+    pub fn ensure_entry_in_scope(&self, entry_id: i64) -> Result<(), ToolError> {
+        if self.entry_in_scope(entry_id) {
+            Ok(())
+        } else {
+            Err(ToolError::Execution(format!(
+                "entry {entry_id} is outside the current chat scope"
+            )))
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ToolError {
     UnknownTool(String),

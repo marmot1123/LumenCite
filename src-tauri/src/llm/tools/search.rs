@@ -160,6 +160,9 @@ async fn get_entry_tool(
         },
     };
 
+    // チャットのスコープ外 entry は読ませない（CR-024）。
+    ctx.ensure_entry_in_scope(entry_id)?;
+
     let detail = match entries::get_entry(ctx.pool, entry_id).await {
         Ok(d) => d,
         Err(sqlx::Error::RowNotFound) => {

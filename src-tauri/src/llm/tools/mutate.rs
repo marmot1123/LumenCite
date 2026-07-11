@@ -278,6 +278,14 @@ async fn execute_add_tag(
     let entry_ids = parse_entry_ids(&call.arguments)?;
     let tag_name = parse_str(&call.arguments, "tag_name")?;
 
+    // チャットのスコープ外 entry を弾く（CR-024）。
+    let oos = ctx.out_of_scope(&entry_ids);
+    if !oos.is_empty() {
+        return Err(ToolError::Execution(format!(
+            "entries {oos:?} are outside the current chat scope"
+        )));
+    }
+
     // 存在しない ID は先に切り分け、実在 ID にのみ適用する。
     let present = existing_entry_ids(ctx.pool, &entry_ids).await?;
     let (found, missing) = partition_existing(entry_ids, &present);
@@ -304,6 +312,7 @@ async fn execute_update_notes(
 ) -> Result<String, ToolError> {
     let entry_id = parse_i64(&call.arguments, "entry_id")?;
     let notes = parse_str(&call.arguments, "notes")?;
+    ctx.ensure_entry_in_scope(entry_id)?; // CR-024
 
     let rows = sqlx::query(
         "UPDATE entries SET notes = ?, updated_at = datetime('now') WHERE id = ?",
@@ -327,6 +336,14 @@ async fn execute_add_to_collection(
 ) -> Result<String, ToolError> {
     let entry_ids = parse_entry_ids(&call.arguments)?;
     let collection_id = parse_i64(&call.arguments, "collection_id")?;
+
+    // チャットのスコープ外 entry を弾く（CR-024）。
+    let oos = ctx.out_of_scope(&entry_ids);
+    if !oos.is_empty() {
+        return Err(ToolError::Execution(format!(
+            "entries {oos:?} are outside the current chat scope"
+        )));
+    }
 
     // コレクション不在を「エントリが見つからない」と誤報しないよう先に検証する。
     let collection_exists: bool =
@@ -419,6 +436,7 @@ async fn execute_update_entry(
 ) -> Result<String, ToolError> {
     let args = &call.arguments;
     let entry_id = parse_i64(args, "entry_id")?;
+    ctx.ensure_entry_in_scope(entry_id)?; // CR-024
 
     // Fetch the current entry to preserve fields not provided
     let current = crate::db::entries::get_entry(ctx.pool, entry_id).await?;
@@ -501,6 +519,7 @@ async fn execute_delete_entry(
     call: &ToolCallSpec,
 ) -> Result<String, ToolError> {
     let entry_id = parse_i64(&call.arguments, "entry_id")?;
+    ctx.ensure_entry_in_scope(entry_id)?; // CR-024
 
     crate::db::entries::delete_entry(ctx.pool, entry_id).await?;
 
@@ -822,6 +841,35 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(notes.as_deref(), Some("Very interesting paper."));
+    }
+
+    /// CR-024: scope_mode="entries" のとき、スコープ外 entry への write は拒否される。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn write_tool_rejects_out_of_scope_entry(pool: SqlitePool) {
+        let in_scope = make_entry(&pool, "In scope").await;
+        let out_scope = make_entry(&pool, "Out of scope").await;
+        let scope = [in_scope];
+        let ctx = ToolContext {
+            scope_mode: "entries",
+            scope_entry_ids: &scope,
+            ..make_ctx(&pool)
+        };
+
+        // スコープ外への update_notes は Execution エラーで拒否され、DB は変わらない。
+        let c = call("update_notes", json!({"entry_id": out_scope, "notes": "x"}));
+        let result = try_execute(&ctx, &c).await.unwrap();
+        assert!(matches!(result, Err(ToolError::Execution(_))));
+        let notes: Option<String> = sqlx::query_scalar("SELECT notes FROM entries WHERE id = ?")
+            .bind(out_scope).fetch_one(&pool).await.unwrap();
+        assert!(notes.is_none(), "スコープ外 entry は変更されない");
+
+        // スコープ内は通る。
+        let c = call("update_notes", json!({"entry_id": in_scope, "notes": "ok"}));
+        try_execute(&ctx, &c).await.unwrap().unwrap();
+
+        // add_tag もスコープ外を弾く。
+        let c = call("add_tag", json!({"entry_id": out_scope, "tag_name": "ml"}));
+        assert!(matches!(try_execute(&ctx, &c).await.unwrap(), Err(ToolError::Execution(_))));
     }
 
     #[sqlx::test(migrations = "./migrations")]

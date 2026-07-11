@@ -58,6 +58,10 @@ pub async fn try_execute(
         .get("pages")
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_i64()).collect::<Vec<i64>>());
+    // チャットのスコープ外 entry は OCR させない（CR-024）。
+    if let Err(e) = ctx.ensure_entry_in_scope(entry_id) {
+        return Some(Err(e));
+    }
     let attachment_id = call.arguments.get("attachment_id").and_then(|v| v.as_i64());
     Some(run_ocr(ctx.pool, ctx.app_data_dir, entry_id, attachment_id, pages).await)
 }
