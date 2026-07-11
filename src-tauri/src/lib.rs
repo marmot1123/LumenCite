@@ -2923,6 +2923,26 @@ pub fn run() {
                 }
             });
 
+            // CR-019: 既存行の識別子 canonical 列を埋め（migration 0013 の後段）、重複が
+            // 無い識別子には best-effort で partial UNIQUE 索引を張る。既存重複があると
+            // migration では brick するため、起動時に安全側で実行する。失敗しても起動は
+            // 止めず log だけ残す（次回起動で再試行される・いずれも冪等）。
+            let canon_pool = pool.clone();
+            tauri::async_runtime::spawn(async move {
+                match db::entries::backfill_canonical_identifiers(&canon_pool).await {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("CR-019: backfilled canonical identifiers for {n} entries"),
+                    Err(e) => eprintln!("CR-019 canonical backfill failed: {e}"),
+                }
+                match db::entries::try_create_identifier_unique_indexes(&canon_pool).await {
+                    Ok(cols) if !cols.is_empty() => {
+                        eprintln!("CR-019: created UNIQUE indexes for {}", cols.join(", "))
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("CR-019 unique index creation failed: {e}"),
+                }
+            });
+
             // BibTeX 自動同期のコーディネーター。各ミューテーションが sync_tx.send() で
             // 通知し、受信タスクが debounce して書き出す。
             let (sync_tx, sync_rx) = unbounded_channel::<()>();

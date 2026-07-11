@@ -1142,6 +1142,102 @@ pub async fn find_duplicate_entry(
     Ok(row.map(|(id,)| id))
 }
 
+/// canonical 列（`doi/arxiv/isbn_canonical`）を持つ 3 つの識別子。列名・非UNIQUE索引名・
+/// best-effort UNIQUE 索引名を 1 か所で対応づける。
+const CANONICAL_IDENTIFIERS: &[(&str, &str)] = &[
+    ("doi", "doi_canonical"),
+    ("arxiv", "arxiv_canonical"),
+    ("isbn", "isbn_canonical"),
+];
+
+/// 既存行の canonical 列を Rust の canonical_*() で埋める（CR-019・migration 0013 の後段）。
+///
+/// migration は arXiv の版番号除去などを SQL で表現できないため列を足すだけにしてあり、
+/// 実際の backfill はここで行う。canonical が未設定（NULL）で raw 識別子がある行だけを
+/// 対象にするので、埋め終われば以降の起動では対象 0 件の no-op になり冪等。
+/// 更新した行数を返す。
+pub async fn backfill_canonical_identifiers(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    // (id, doi, arxiv_id, isbn) の生識別子行。
+    type RawIdentifierRow = (i64, Option<String>, Option<String>, Option<String>);
+    // backfill が必要な行（raw があるのに canonical が NULL）だけを引く。
+    let rows: Vec<RawIdentifierRow> = sqlx::query_as(
+        "SELECT id, doi, arxiv_id, isbn FROM entries
+         WHERE (doi      IS NOT NULL AND doi_canonical   IS NULL)
+            OR (arxiv_id IS NOT NULL AND arxiv_canonical IS NULL)
+            OR (isbn     IS NOT NULL AND isbn_canonical  IS NULL)",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut updated = 0u64;
+    for (id, doi, arxiv, isbn) in rows {
+        let doi_c = doi.as_deref().and_then(canonical_doi);
+        let arxiv_c = arxiv.as_deref().and_then(canonical_arxiv);
+        let isbn_c = isbn.as_deref().and_then(canonical_isbn);
+        let n = sqlx::query(
+            "UPDATE entries SET doi_canonical = ?, arxiv_canonical = ?, isbn_canonical = ? WHERE id = ?",
+        )
+        .bind(&doi_c)
+        .bind(&arxiv_c)
+        .bind(&isbn_c)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        updated += n;
+    }
+    tx.commit().await?;
+    Ok(updated)
+}
+
+/// best-effort で識別子の partial UNIQUE 索引を張る（CR-019）。
+///
+/// 既存 DB に重複があると `CREATE UNIQUE INDEX` は失敗する。migration 内で張ると
+/// 起動不能（brick）になるため、起動時にここで **重複が無い識別子だけ** UNIQUE を張る。
+/// 重複が残る識別子は索引を張らず（既存の非UNIQUE索引のまま）、警告としてスキップ扱い。
+///
+/// 部分索引の条件は `deleted_at IS NULL`（= dedup が対象とする現役エントリのみ）に揃える。
+/// これによりゴミ箱内の重複や trash↔現役の共存では制約が働かず、restore 側の衝突ガード
+/// （[`restore_entry`]）と合わせて一貫する。作成できた canonical 列名の一覧を返す。
+pub async fn try_create_identifier_unique_indexes(
+    pool: &SqlitePool,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut created = Vec::new();
+    for (short, col) in CANONICAL_IDENTIFIERS {
+        // 現役エントリの中に同一 canonical 値が 2 件以上あるか。
+        let has_dup: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM entries
+                 WHERE deleted_at IS NULL AND {col} IS NOT NULL
+                 GROUP BY {col} HAVING COUNT(*) > 1
+             )"
+        ))
+        .fetch_one(pool)
+        .await?;
+
+        if has_dup {
+            eprintln!(
+                "CR-019: {col} に現役の重複があるため UNIQUE 索引をスキップ（非UNIQUE索引のまま）"
+            );
+            continue;
+        }
+
+        sqlx::query(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_{short}_canonical_unique
+                 ON entries({col}) WHERE {col} IS NOT NULL AND deleted_at IS NULL"
+        ))
+        .execute(pool)
+        .await?;
+        created.push((*col).to_string());
+    }
+    Ok(created)
+}
+
 pub async fn set_starred(pool: &SqlitePool, id: i64, starred: bool) -> Result<(), sqlx::Error> {
     let rows = sqlx::query(
         "UPDATE entries SET starred = ?, updated_at = datetime('now') WHERE id = ?",
@@ -2338,6 +2434,110 @@ mod tests {
         }).await.unwrap();
 
         assert_ne!(second.id, first.id, "ゴミ箱内とは重複扱いしないので新規作成される");
+    }
+
+    /// 生の identifier を直接 INSERT する（legacy 行や重複を意図的に作るテスト用。
+    /// create_entry は dedup してしまうので使えない）。canonical 列は指定値で埋める。
+    async fn insert_raw_entry(
+        pool: &SqlitePool,
+        title: &str,
+        arxiv_id: Option<&str>,
+        arxiv_canonical: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical)
+             VALUES (?, 'article', ?, ?)",
+        )
+        .bind(title)
+        .bind(arxiv_id)
+        .bind(arxiv_canonical)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    // ── backfill_canonical_identifiers / try_create_identifier_unique_indexes（CR-019） ──
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_fills_canonical_and_is_idempotent(pool: SqlitePool) {
+        // canonical 未設定の legacy 行を用意する。
+        let id = insert_raw_entry(&pool, "A", Some("arXiv:2301.00001v7"), None).await;
+
+        let n = backfill_canonical_identifiers(&pool).await.unwrap();
+        assert_eq!(n, 1);
+        let c: Option<String> =
+            sqlx::query_scalar("SELECT arxiv_canonical FROM entries WHERE id = ?")
+                .bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(c.as_deref(), Some("2301.00001"));
+
+        // 2 回目は対象 0 件。
+        let n2 = backfill_canonical_identifiers(&pool).await.unwrap();
+        assert_eq!(n2, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unique_index_created_on_clean_db_blocks_direct_duplicate(pool: SqlitePool) {
+        create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let created = try_create_identifier_unique_indexes(&pool).await.unwrap();
+        assert!(created.contains(&"arxiv_canonical".to_string()));
+
+        // dedup を迂回して直接同一 canonical を入れると UNIQUE 制約で弾かれる。
+        let err = sqlx::query(
+            "INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical)
+             VALUES ('dup', 'article', '2301.00001', '2301.00001')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(err.is_err(), "partial UNIQUE が二重登録を弾くべき");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unique_index_skipped_when_existing_duplicate(pool: SqlitePool) {
+        // 現役の重複を 2 件（直接 INSERT で作る）。
+        insert_raw_entry(&pool, "A", Some("2301.00001"), Some("2301.00001")).await;
+        insert_raw_entry(&pool, "B", Some("2301.00001"), Some("2301.00001")).await;
+
+        let created = try_create_identifier_unique_indexes(&pool).await.unwrap();
+        assert!(!created.contains(&"arxiv_canonical".to_string()), "重複ありでは張らない");
+
+        // 索引が無いので 3 件目の直接 INSERT も通る（brick せず既存も壊さない）。
+        let ok = sqlx::query(
+            "INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical)
+             VALUES ('C', 'article', '2301.00001', '2301.00001')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(ok.is_ok());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unique_index_allows_trashed_and_live_same_identifier(pool: SqlitePool) {
+        let first = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        trash_entry(&pool, first.id).await.unwrap();
+
+        // 索引を張る（現役は 0 件なので張れる）。
+        try_create_identifier_unique_indexes(&pool).await.unwrap();
+
+        // ゴミ箱の同一識別子があっても現役を新規作成できる（部分索引が deleted_at IS NULL 限定）。
+        let second = create_entry(&pool, &EntryInput {
+            title: "B".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        assert_ne!(second.id, first.id);
     }
 
     #[sqlx::test(migrations = "./migrations")]
