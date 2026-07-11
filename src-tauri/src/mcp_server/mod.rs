@@ -631,11 +631,73 @@ impl McpServerManager {
     }
 }
 
+/// 同時に処理するリクエストの上限（CR-023）。
+/// clip はメタデータ取得で最大 ~30s ブロックし得るため、直列だと 1 件で全 traffic が
+/// 止まる。ワーカースレッドへ分散しつつ、暴走クライアントによるスレッド無制限生成は防ぐ。
+const MAX_CONCURRENT_REQUESTS: usize = 8;
+
+/// 単純なカウンティングセマフォ（`tiny_http` は std スレッドで回るため tokio のものは使わない）。
+/// 容量待ちの間も `stop` を監視し、停止時は待ちを解いて `None` を返す。
+struct Semaphore {
+    state: Mutex<usize>,
+    cv: std::sync::Condvar,
+}
+
+/// 取得した permit。drop で 1 枠解放する。
+struct Permit(Arc<Semaphore>);
+
+impl Semaphore {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Semaphore {
+            state: Mutex::new(max),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+
+    /// 1 枠確保する。容量が空くまで待つが、`stop` が立ったら `None` を返す。
+    fn acquire(self: &Arc<Self>, stop: &AtomicBool) -> Option<Permit> {
+        let mut avail = self.state.lock().unwrap();
+        while *avail == 0 {
+            if stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            let (guard, _) = self
+                .cv
+                .wait_timeout(avail, Duration::from_millis(300))
+                .unwrap();
+            avail = guard;
+        }
+        *avail -= 1;
+        Some(Permit(self.clone()))
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut avail = self.0.state.lock().unwrap();
+        *avail += 1;
+        self.0.cv.notify_one();
+    }
+}
+
 fn serve_loop(server: tiny_http::Server, stop: Arc<AtomicBool>, deps: ServerDeps, token: String) {
+    // 同時処理数を上限付きで並列化する（CR-023: 1 件の遅い clip が全 traffic を止めない）。
+    let sem = Semaphore::new(MAX_CONCURRENT_REQUESTS);
     // recv_timeout で定期的に stop フラグを確認しつつ accept する。
     while !stop.load(Ordering::SeqCst) {
         match server.recv_timeout(Duration::from_millis(300)) {
-            Ok(Some(req)) => handle_http_request(req, &deps, &token),
+            Ok(Some(req)) => {
+                // 容量待ち。stop が立てば None → ループ終了。
+                let Some(permit) = sem.acquire(&stop) else {
+                    break;
+                };
+                let deps = deps.clone();
+                let token = token.clone();
+                std::thread::spawn(move || {
+                    let _permit = permit; // drop で枠を解放する
+                    handle_http_request(req, &deps, &token);
+                });
+            }
             Ok(None) => continue, // タイムアウト → ループ先頭で stop を再確認
             Err(_) => break,
         }
@@ -933,6 +995,22 @@ mod tests {
 
     fn req(method: &str, params: Value) -> Value {
         json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+    }
+
+    /// CR-023: セマフォは上限まで permit を出し、超過は解放待ちにする。
+    /// drop で枠が戻り、stop が立てば待ちを解いて `None` を返す。
+    #[test]
+    fn semaphore_bounds_concurrency_and_respects_stop() {
+        let sem = Semaphore::new(2);
+        let stop = AtomicBool::new(false);
+        let p1 = sem.acquire(&stop).expect("1st permit");
+        let _p2 = sem.acquire(&stop).expect("2nd permit");
+        // 満杯: stop を立てると 3 つ目は待たずに None。
+        stop.store(true, Ordering::SeqCst);
+        assert!(sem.acquire(&stop).is_none(), "満杯 + stop で None");
+        // 1 枠戻せば（stop 中でも空きがあるので）取得できる。
+        drop(p1);
+        assert!(sem.acquire(&stop).is_some(), "解放後は取得できる");
     }
 
     async fn call_tool(pool: &SqlitePool, name: &str, args: Value) -> Value {
