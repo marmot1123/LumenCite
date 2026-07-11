@@ -109,10 +109,10 @@ export function DetailView({
   const lastPageLoaded = useRef(false);
   const lastPersistedPage = useRef<number>(-1);
   useEffect(() => {
-    invoke<string | null>("get_setting", { key: `pdf.last_page.${entry.id}` })
-      .then(v => {
-        const n = v ? parseInt(v, 10) : NaN;
-        if (Number.isFinite(n) && n > 0) {
+    // 検証付きの用途別コマンド（CR-002）。汎用 get_setting は廃止。
+    invoke<number | null>("get_pdf_last_page", { entryId: entry.id })
+      .then(n => {
+        if (typeof n === "number" && n > 0) {
           lastPersistedPage.current = n; // 保存済みの値なので再書き込み不要
           setPage(n);
           setScrollTick(t => t + 1);
@@ -130,7 +130,7 @@ export function DetailView({
     if (!lastPageLoaded.current || lastPersistedPage.current === page || !isPrimaryActive) return;
     const handle = setTimeout(() => {
       lastPersistedPage.current = page;
-      invoke("set_setting", { key: `pdf.last_page.${entry.id}`, value: String(page) }).catch(() => { /* noop */ });
+      invoke("set_pdf_last_page", { entryId: entry.id, page }).catch(() => { /* noop */ });
     }, 500);
     return () => clearTimeout(handle);
   }, [entry.id, page, isPrimaryActive]);
@@ -171,7 +171,11 @@ export function DetailView({
     setOcrBusy(true);
     setOcrMsg(t("detail.header.ocrRunning"));
     try {
-      const summary = await invoke<string>("ocr_pdf", { entryId: entry.id });
+      // 選択中の添付を OCR する（複数 PDF で常に先頭を対象にしない・CR-027）。
+      const summary = await invoke<string>("ocr_pdf", {
+        entryId: entry.id,
+        attachmentId: activeAttachment?.id ?? null,
+      });
       setOcrMsg(t("detail.header.ocrDone", { summary }));
     } catch (e) {
       const msg = typeof e === "string" ? e : (e as Error)?.message ?? String(e);
@@ -209,12 +213,15 @@ export function DetailView({
     return () => { cancelled = true; if (loaded) loaded.destroy(); };
   }, [activeAttachment?.id]);
 
-  // ハイライト読み込み
+  // ハイライト読み込み: 選択中の添付 PDF に属すものだけを読む（CR-015）。
+  // 添付が無い場合は空。添付切替のたびに読み直す。
+  const activeAttachmentId = activeAttachment?.id ?? null;
   const reloadHighlights = useCallback(() => {
-    invoke<Highlight[]>("get_highlights", { entryId: entry.id })
+    if (activeAttachmentId == null) { setHighlights([]); return; }
+    invoke<Highlight[]>("get_highlights_by_attachment", { attachmentId: activeAttachmentId })
       .then(setHighlights)
       .catch(() => { /* noop */ });
-  }, [entry.id]);
+  }, [activeAttachmentId]);
 
   useEffect(() => { reloadHighlights(); }, [reloadHighlights]);
 
@@ -311,7 +318,7 @@ export function DetailView({
         return;
       }
       if ((e.key === "h" || e.key === "H") && !editable) { setMode("highlight"); return; }
-      if ((e.key === "n" || e.key === "N") && !editable) { setMode("note"); return; }
+      // note/pen モードは未実装のためショートカットも無効化（CR-028）。
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -452,6 +459,7 @@ export function DetailView({
               mode={mode}
               highlights={highlights}
               entryId={entry.id}
+              attachmentId={activeAttachmentId}
               onCreateHighlight={handleCreateHighlight}
             />
           </div>

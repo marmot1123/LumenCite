@@ -109,6 +109,8 @@ export type HighlightColor = "yellow" | "green" | "blue";
 export interface Highlight {
   id: number;
   entry_id: number;
+  /** 属する添付 PDF（CR-015）。旧データ移行で null が残り得る */
+  attachment_id: number | null;
   page: number;
   x: number;
   y: number;
@@ -122,6 +124,8 @@ export interface Highlight {
 
 export interface HighlightInput {
   entry_id: number;
+  /** ハイライトを付けている添付 PDF（CR-015） */
+  attachment_id?: number | null;
   page: number;
   x: number;
   y: number;

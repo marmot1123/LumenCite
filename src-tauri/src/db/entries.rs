@@ -173,7 +173,7 @@ pub async fn search_entries(
     collection_id: Option<i64>,
     tag_id: Option<i64>,
 ) -> Result<Vec<EntrySummary>, sqlx::Error> {
-    search_entries_filtered(pool, query, collection_id, tag_id, &EntryFilter::default()).await
+    search_entries_filtered(pool, query, collection_id, tag_id, None, &EntryFilter::default()).await
 }
 
 /// `search_entries` に `EntryFilter`（v0.6.0）を AND 合成した版。FTS/LIKE のヒットを
@@ -183,19 +183,20 @@ pub async fn search_entries_filtered(
     query: &str,
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    view: Option<&str>,
     filter: &EntryFilter,
 ) -> Result<Vec<EntrySummary>, sqlx::Error> {
     let tokens: Vec<&str> = query.split_whitespace().collect();
     if tokens.is_empty() {
-        return get_entries_filtered(pool, collection_id, tag_id, None, filter).await;
+        return get_entries_filtered(pool, collection_id, tag_id, view, filter).await;
     }
 
     // trigram は 3 文字未満のクエリを正しく扱えないため、最短トークンが 3 文字未満の場合は
     // entries_fts の各列を LIKE でスキャンするフォールバックパスを使う。
     let ids = if tokens.iter().any(|t| t.chars().count() < 3) {
-        search_ids_like(pool, &tokens, collection_id, tag_id, filter).await?
+        search_ids_like(pool, &tokens, collection_id, tag_id, view, filter).await?
     } else {
-        search_ids_fts(pool, &tokens, collection_id, tag_id, filter).await?
+        search_ids_fts(pool, &tokens, collection_id, tag_id, view, filter).await?
     };
 
     let mut summaries = Vec::new();
@@ -205,11 +206,21 @@ pub async fn search_entries_filtered(
     Ok(summaries)
 }
 
+/// 検索経路の view スコープ（CR-001）。`view = "trash"` ならゴミ箱内、それ以外は現役のみ。
+fn push_view_scope(qb: &mut QueryBuilder<Sqlite>, view: Option<&str>) {
+    if matches!(view, Some("trash")) {
+        qb.push(" AND e.deleted_at IS NOT NULL");
+    } else {
+        qb.push(" AND e.deleted_at IS NULL");
+    }
+}
+
 async fn search_ids_fts(
     pool: &SqlitePool,
     tokens: &[&str],
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    view: Option<&str>,
     filter: &EntryFilter,
 ) -> Result<Vec<i64>, sqlx::Error> {
     let match_expr = build_fts_match_expr(tokens);
@@ -217,7 +228,7 @@ async fn search_ids_fts(
         "SELECT e.id FROM entries e JOIN entries_fts f ON f.rowid = e.id WHERE entries_fts MATCH ",
     );
     qb.push_bind(match_expr);
-    qb.push(" AND e.deleted_at IS NULL");
+    push_view_scope(&mut qb, view);
     if let Some(cid) = collection_id {
         qb.push(" AND e.id IN (SELECT entry_id FROM entry_collections WHERE collection_id = ")
             .push_bind(cid)
@@ -230,7 +241,7 @@ async fn search_ids_fts(
     }
     push_filter(&mut qb, filter);
     qb.push(" ORDER BY bm25(entries_fts)");
-    Ok(qb.build_query_scalar().fetch_all(pool).await?)
+    qb.build_query_scalar().fetch_all(pool).await
 }
 
 /// LIKE 検索用の部分一致パターン。`%` `_` `\` をエスケープしてリテラル扱いにする
@@ -250,11 +261,13 @@ async fn search_ids_like(
     tokens: &[&str],
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    view: Option<&str>,
     filter: &EntryFilter,
 ) -> Result<Vec<i64>, sqlx::Error> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-        "SELECT e.id FROM entries e JOIN entries_fts f ON f.rowid = e.id WHERE e.deleted_at IS NULL",
+        "SELECT e.id FROM entries e JOIN entries_fts f ON f.rowid = e.id WHERE 1 = 1",
     );
+    push_view_scope(&mut qb, view);
     for token in tokens {
         let pattern = like_pattern(token);
         qb.push(" AND (f.title LIKE ").push_bind(pattern.clone()).push(" ESCAPE '\\'");
@@ -275,7 +288,7 @@ async fn search_ids_like(
     }
     push_filter(&mut qb, filter);
     qb.push(" ORDER BY e.created_at DESC");
-    Ok(qb.build_query_scalar().fetch_all(pool).await?)
+    qb.build_query_scalar().fetch_all(pool).await
 }
 
 async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::Error> {
@@ -875,30 +888,72 @@ pub async fn bulk_restore(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Er
 }
 
 /// 永久削除（hard delete）の一括版。entries_fts と fulltext も同時にクリーンアップする。
-pub async fn bulk_purge(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Error> {
+///
+/// **安全策（CR-001）**: ゴミ箱にある（`deleted_at IS NOT NULL`）エントリだけを消す。
+/// 現役エントリの id が混ざっても hard delete しない。実際に消えた id を返すので、
+/// 呼び出し側は添付ファイルの後始末をその id にだけ行える。
+pub async fn bulk_purge(pool: &SqlitePool, ids: &[i64]) -> Result<Vec<i64>, sqlx::Error> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut tx = pool.begin().await?;
+    let mut purged = Vec::new();
     for id in ids {
-        sqlx::query("DELETE FROM entries_fts WHERE rowid = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "DELETE FROM fulltext WHERE attachment_id IN (
-                SELECT id FROM attachments WHERE entry_id = ?
-            )",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM entries WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        // ゴミ箱にある行だけを対象にする。現役エントリなら fts/fulltext も触らずスキップ。
+        let is_trashed: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM entries WHERE id = ? AND deleted_at IS NOT NULL")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if is_trashed.is_none() {
+            continue;
+        }
+        purge_one(&mut tx, *id).await?;
+        purged.push(*id);
     }
     tx.commit().await?;
+    Ok(purged)
+}
+
+/// ゴミ箱を空にする。表示中の id ではなく DB 側で `deleted_at IS NOT NULL` を評価するため、
+/// 検索やフィルタで現役エントリが混ざる余地がない（CR-001）。消えた id を返す。
+pub async fn purge_trash(pool: &SqlitePool) -> Result<Vec<i64>, sqlx::Error> {
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM entries WHERE deleted_at IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = pool.begin().await?;
+    for id in &ids {
+        purge_one(&mut tx, *id).await?;
+    }
+    tx.commit().await?;
+    Ok(ids)
+}
+
+/// 1 エントリ分の hard delete（entries_fts / fulltext / entries）。呼び出し側で対象確定済み。
+async fn purge_one(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM entries_fts WHERE rowid = ?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM fulltext WHERE attachment_id IN (
+            SELECT id FROM attachments WHERE entry_id = ?
+        )",
+    )
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM entries WHERE id = ?")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -1007,7 +1062,11 @@ pub async fn find_duplicate_entry(
     isbn: Option<&str>,
 ) -> Result<Option<i64>, sqlx::Error> {
     let doi_norm = doi.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
-    let arxiv_norm = arxiv_id.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    // arXiv は prefix / 版番号 / 旧形式カテゴリを canonical 化してから比較する（CR-019）。
+    // stored 側は SQL の LOWER で揃えるので、正準化後も lowercase して合わせる。
+    let arxiv_norm = arxiv_id
+        .map(|s| crate::metadata::normalize_arxiv_id(s).to_lowercase())
+        .filter(|s| !s.is_empty());
     let isbn_norm = isbn.map(normalize_isbn).filter(|s| !s.is_empty());
 
     if doi_norm.is_none() && arxiv_norm.is_none() && isbn_norm.is_none() {
@@ -1417,8 +1476,11 @@ mod tests {
     async fn bulk_purge_removes_rows_and_fts(pool: SqlitePool) {
         let a = make_entry(&pool, "Disposable A").await;
         let b = make_entry(&pool, "Disposable B").await;
+        // purge はゴミ箱内だけを消す（CR-001）。先に trash へ入れる。
+        bulk_trash(&pool, &[a, b]).await.unwrap();
 
-        bulk_purge(&pool, &[a, b]).await.unwrap();
+        let purged = bulk_purge(&pool, &[a, b]).await.unwrap();
+        assert_eq!(purged.len(), 2);
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
             .fetch_one(&pool).await.unwrap();
@@ -1426,6 +1488,61 @@ mod tests {
         let fts_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries_fts")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(fts_count, 0);
+    }
+
+    /// CR-001: 現役（未 trash）エントリの id を bulk_purge に渡しても hard delete しない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn bulk_purge_skips_live_entries(pool: SqlitePool) {
+        let live = make_entry(&pool, "Live paper").await;
+        let trashed = make_entry(&pool, "Trashed paper").await;
+        bulk_trash(&pool, &[trashed]).await.unwrap();
+
+        // 現役 live と trashed をまとめて渡しても、消えるのは trashed だけ。
+        let purged = bulk_purge(&pool, &[live, trashed]).await.unwrap();
+        assert_eq!(purged, vec![trashed]);
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE id = ?")
+            .bind(live)
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(remaining, 1, "現役エントリは残っていること");
+    }
+
+    /// CR-001: purge_trash はゴミ箱内だけを消し、現役はすべて残す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn purge_trash_only_removes_trashed(pool: SqlitePool) {
+        let live = make_entry(&pool, "Live").await;
+        let t1 = make_entry(&pool, "Trash 1").await;
+        let t2 = make_entry(&pool, "Trash 2").await;
+        bulk_trash(&pool, &[t1, t2]).await.unwrap();
+
+        let mut purged = purge_trash(&pool).await.unwrap();
+        purged.sort();
+        let mut expected = vec![t1, t2];
+        expected.sort();
+        assert_eq!(purged, expected);
+
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM entries")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(ids, vec![live]);
+    }
+
+    /// CR-001: trash ビューでの検索はゴミ箱内エントリを返し、現役検索はゴミ箱を除外する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_respects_trash_view(pool: SqlitePool) {
+        let live = make_entry(&pool, "transformer live").await;
+        let trashed = make_entry(&pool, "transformer trashed").await;
+        bulk_trash(&pool, &[trashed]).await.unwrap();
+        let f = EntryFilter::default();
+
+        // 通常（view=None）は現役のみ。
+        let live_hits =
+            search_entries_filtered(&pool, "transformer", None, None, None, &f).await.unwrap();
+        assert_eq!(live_hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![live]);
+
+        // trash ビューはゴミ箱内のみ。
+        let trash_hits =
+            search_entries_filtered(&pool, "transformer", None, None, Some("trash"), &f).await.unwrap();
+        assert_eq!(trash_hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![trashed]);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1925,6 +2042,22 @@ mod tests {
 
         let hit = find_duplicate_entry(&pool, None, Some("2301.00001"), None).await.unwrap();
         assert_eq!(hit, Some(existing.id));
+    }
+
+    /// CR-019: 版番号付き / prefix 付きの arXiv クエリでも同一エントリにヒットする。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_matches_arxiv_ignoring_version_and_prefix(pool: SqlitePool) {
+        let existing = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        for q in ["2301.00001v3", "arXiv:2301.00001", "arxiv:2301.00001v9"] {
+            let hit = find_duplicate_entry(&pool, None, Some(q), None).await.unwrap();
+            assert_eq!(hit, Some(existing.id), "query {q} should match");
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2649,7 +2782,7 @@ mod tests {
 
         // クエリ "transformer" は 2 件ヒットするが、種別 article で 1 件に絞られる
         let f = EntryFilter { entry_types: vec!["article".into()], ..Default::default() };
-        let hits = search_entries_filtered(&pool, "transformer", None, None, &f).await.unwrap();
+        let hits = search_entries_filtered(&pool, "transformer", None, None, None, &f).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry_type, "article");
     }

@@ -80,6 +80,27 @@ pub fn list_backups(app_dir: &Path) -> Result<Vec<BackupInfo>, String> {
     Ok(entries)
 }
 
+fn prune_old_backups(backups_dir: &Path, keep: usize) -> std::io::Result<()> {
+    let mut paths: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(backups_dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("lumencite-") || !name.ends_with(".db") {
+                return None;
+            }
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((e.path(), modified))
+        })
+        .collect();
+
+    // 新しい順にソートし、keep 件を超えたものを削除
+    paths.sort_by_key(|p| std::cmp::Reverse(p.1));
+    for (path, _) in paths.into_iter().skip(keep) {
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,25 +121,4 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
-}
-
-fn prune_old_backups(backups_dir: &Path, keep: usize) -> std::io::Result<()> {
-    let mut paths: Vec<(PathBuf, std::time::SystemTime)> = fs::read_dir(backups_dir)?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.starts_with("lumencite-") || !name.ends_with(".db") {
-                return None;
-            }
-            let modified = e.metadata().ok()?.modified().ok()?;
-            Some((e.path(), modified))
-        })
-        .collect();
-
-    // 新しい順にソートし、keep 件を超えたものを削除
-    paths.sort_by(|a, b| b.1.cmp(&a.1));
-    for (path, _) in paths.into_iter().skip(keep) {
-        let _ = fs::remove_file(path);
-    }
-    Ok(())
 }

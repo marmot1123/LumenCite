@@ -261,7 +261,8 @@ export default function App() {
       const args: LoadEntriesArgs = { collectionId, tagId, view: viewName };
       invoke<EntrySummary[]>("get_entries", args).then(ifCurrent(setEntries)).catch(console.error);
       if (trimmed) {
-        invoke<FulltextHit[]>("fulltext_search", { query: trimmed, collectionId, tagId })
+        // view を渡してゴミ箱と現役を分離する（CR-001）。trash ビューでの検索が現役を返さない。
+        invoke<FulltextHit[]>("fulltext_search", { query: trimmed, collectionId, tagId, view: viewName })
           .then(ifCurrent(setFulltextHits))
           .catch((e) => { console.error(e); ifCurrent(setFulltextHits)([]); });
       } else {
@@ -271,7 +272,8 @@ export default function App() {
     }
 
     if (trimmed) {
-      invoke<EntrySummary[]>("search_entries", { query: trimmed, collectionId, tagId, filter: filterArg })
+      // view を渡してゴミ箱と現役を分離する（CR-001）。
+      invoke<EntrySummary[]>("search_entries", { query: trimmed, collectionId, tagId, view: viewName, filter: filterArg })
         .then(ifCurrent(setEntries))
         .catch(console.error);
     } else {
@@ -378,6 +380,9 @@ export default function App() {
       if (sort.key === "title")   { av = a.title;                        bv = b.title; }
       if (sort.key === "authors") { av = a.authors[0]?.name ?? "";       bv = b.authors[0]?.name ?? ""; }
       if (sort.key === "year")    { av = a.year ?? 0;                    bv = b.year ?? 0; }
+      // Added（登録日時）: created_at は ISO 風文字列なので辞書順比較でよい（CR-036）。
+      // これが無いと "added" 列は常に同順（バックエンド順のまま）で asc/desc が効かなかった。
+      if (sort.key === "added")   { av = a.created_at ?? "";             bv = b.created_at ?? ""; }
       return av < bv ? -dir : av > bv ? dir : 0;
     });
 
@@ -403,12 +408,14 @@ export default function App() {
   };
 
   // ゴミ箱ビュー全体に対する一括永久削除。
+  // 表示中 id ではなく専用 empty_trash コマンド（DB 側で deleted_at IS NOT NULL を評価）を使う。
+  // これにより、検索・フィルタで現役エントリが表示に混ざっても hard delete されない（CR-001）。
   const handleEmptyTrash = () => {
     const ids = entries.map(e => e.id);
     if (ids.length === 0) return;
     const ok = window.confirm(t("confirm.permanentDelete", { count: ids.length }));
     if (!ok) return;
-    invoke("bulk_purge", { ids })
+    invoke("empty_trash")
       .then(() => { clearSelection(); setDetail(null); loadEntries(); })
       .catch(console.error);
   };
@@ -708,12 +715,12 @@ export default function App() {
       tag_ids:      detail.tags.map(t => t.id),
       [field]:      trimmed || undefined,
     };
-    invoke<EntryDetail>("update_entry", { id: targetId, input })
+    // Promise を返して呼び出し側が await / エラーハンドリングできるようにする（CR-034）。
+    return invoke<EntryDetail>("update_entry", { id: targetId, input })
       .then(updated => {
         // 編集中に別の文献に切り替えていた場合は detail を上書きしない
         setDetail(prev => (prev && prev.id === targetId ? updated : prev));
-      })
-      .catch(console.error);
+      });
   };
 
   const handleRemoveTagFromEntry = (tagId: number) => {
@@ -850,7 +857,8 @@ export default function App() {
             entry={detail}
             onClose={() => setShowSummary(false)}
             onSavedToNotes={async (newNotes) => {
-              handleUpdateField("notes", newNotes);
+              // 保存を await し、失敗は SummarySheet 側で表示させる（成功時のみ閉じる・CR-034）。
+              await handleUpdateField("notes", newNotes);
               setShowSummary(false);
             }}
             onOpenSettings={() => { setShowSummary(false); setShowSettings(true); }}
@@ -1070,7 +1078,8 @@ export default function App() {
           entry={detail}
           onClose={() => setShowSummary(false)}
           onSavedToNotes={async (newNotes) => {
-            handleUpdateField("notes", newNotes);
+            // 保存を await し、失敗は SummarySheet 側で表示させる（成功時のみ閉じる・CR-034）。
+            await handleUpdateField("notes", newNotes);
             setShowSummary(false);
           }}
           onOpenSettings={() => { setShowSummary(false); setShowSettings(true); }}

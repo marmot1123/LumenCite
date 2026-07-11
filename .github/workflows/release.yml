@@ -84,12 +84,21 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # OCR 用 pdfium (Universal) を取得して bundle.macOS.frameworks の参照先へ置く。
-      - name: Download pdfium (macOS)
+      # サプライチェーン対策（CR-004）: `latest` ではなく **リリースを固定**し、展開前に
+      # SHA-256 を検証する。upstream が侵害・差し替えされても、第三者バイナリが署名・
+      # notarization を受けて配布されることを防ぐ。
+      # 更新手順: PDFIUM_TAG を上げ、`curl -fsSL <url> | shasum -a 256` で新しい値を求めて
+      # PDFIUM_SHA256 を差し替える（GitHub API の asset digest とも一致する）。
+      - name: Download and verify pdfium (macOS)
         if: startsWith(matrix.platform, 'macos')
+        env:
+          PDFIUM_TAG: chromium/7934
+          PDFIUM_SHA256: c3eaf0e4722398f64a9b806976efab378b9cb553743e7b9e27b594a4336c25e7
         run: |
           mkdir -p src-tauri/pdfium tmp-pdfium
           curl -fL -o tmp-pdfium/pdfium.tgz \
-            https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-univ.tgz
+            "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/pdfium-mac-univ.tgz"
+          echo "${PDFIUM_SHA256}  tmp-pdfium/pdfium.tgz" | shasum -a 256 -c -
           tar -xzf tmp-pdfium/pdfium.tgz -C tmp-pdfium
           cp tmp-pdfium/lib/libpdfium.dylib src-tauri/pdfium/libpdfium.dylib
           rm -rf tmp-pdfium

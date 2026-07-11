@@ -134,6 +134,7 @@ pub(crate) async fn get_or_create_author(
     input: &AuthorInput,
 ) -> Result<Author, sqlx::Error> {
     // ① ORCID 照合（authors.orcid 列 と author_identifiers の両方を見る）
+    let has_orcid = trimmed(&input.orcid).is_some();
     if let Some(orcid) = trimmed(&input.orcid) {
         if let Some(a) = find_by_orcid_in_tx(tx, &orcid).await? {
             return Ok(a);
@@ -143,10 +144,16 @@ pub(crate) async fn get_or_create_author(
     // ② 正規化 name 照合（NFKC + lowercase）
     //    SQLite では NFKC 関数が無いので全件比較する。個人ライブラリ規模では十分。
     //    将来 authors.normalized_name 列を持たせて O(1) lookup に置き換える余地あり。
-    let norm = normalize_name(&input.name);
-    if !norm.is_empty() {
-        if let Some(a) = find_by_normalized_name_in_tx(tx, &norm).await? {
-            return Ok(a);
+    //
+    //    **CR-005**: 入力に ORCID がある（= stable identifier が与えられている）のに ① で
+    //    一致しなかった場合は、氏名だけの統合を行わない。既存の同名著者（ORCID 無し・別
+    //    ORCID）へ誤って統合し、入力の ORCID も失われるのを防ぐため、新規著者として作成する。
+    if !has_orcid {
+        let norm = normalize_name(&input.name);
+        if !norm.is_empty() {
+            if let Some(a) = find_by_normalized_name_in_tx(tx, &norm).await? {
+                return Ok(a);
+            }
         }
     }
 
@@ -263,19 +270,45 @@ async fn insert_author(
     .await?;
     let id = result.last_insert_rowid();
 
-    // orcid を authors 列に書いたら、author_identifiers にも同じ値を併記する
-    // （v0.3.0 の互換運用）。UNIQUE 違反は他著者と衝突した場合のみで、その時は
-    // ORCID 照合で先にヒットしているはず → 通常は起きない。
-    if let Some(o) = orcid.as_deref() {
+    // 構造化 identifiers（scopus / researcherid 等）も保存する（CR-006）。以前はここで
+    // ORCID しか書かず、新規作成時に ORCID 以外の identifier が失われていた。
+    let mut wrote_orcid_via_identifiers = false;
+    for ident in &input.identifiers {
+        let scheme = ident.scheme.trim();
+        let value = ident.value.trim();
+        if scheme.is_empty() || value.is_empty() {
+            continue;
+        }
         sqlx::query(
-            "INSERT INTO author_identifiers (author_id, scheme, value)
-             VALUES (?, 'orcid', ?)
+            "INSERT INTO author_identifiers (author_id, scheme, value, url)
+             VALUES (?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
         )
         .bind(id)
-        .bind(o)
+        .bind(scheme)
+        .bind(value)
+        .bind(ident.url.as_deref().map(str::trim).filter(|s| !s.is_empty()))
         .execute(&mut **tx)
         .await?;
+        if scheme == "orcid" {
+            wrote_orcid_via_identifiers = true;
+        }
+    }
+
+    // orcid を authors 列に書いたら、author_identifiers にも同じ値を併記する
+    // （v0.3.0 の互換運用）。identifiers 経由で既に書かれていれば重複させない。
+    if !wrote_orcid_via_identifiers {
+        if let Some(o) = orcid.as_deref() {
+            sqlx::query(
+                "INSERT INTO author_identifiers (author_id, scheme, value)
+                 VALUES (?, 'orcid', ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .bind(o)
+            .execute(&mut **tx)
+            .await?;
+        }
     }
 
     // 挿入後に再フェッチして DEFAULT / generated 値を含む正しい Author を返す
@@ -691,6 +724,84 @@ mod tests {
         let second = get_or_create_author(
             &mut tx,
             &input_with_orcid("M. Seki", "0000-0002-1825-0097"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(first.id, second.id);
+    }
+
+    /// CR-006: 新規作成時に構造化 identifiers（ORCID 以外）も保存する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_or_create_author_persists_structured_identifiers(pool: SqlitePool) {
+        let mut tx = pool.begin().await.unwrap();
+        let input = AuthorInput {
+            name: "Grace Hopper".to_string(),
+            identifiers: vec![
+                AuthorIdentifierInput { scheme: "scopus".into(), value: "12345".into(), url: None },
+                AuthorIdentifierInput { scheme: "researcherid".into(), value: "A-1".into(), url: None },
+            ],
+            ..Default::default()
+        };
+        let created = get_or_create_author(&mut tx, &input).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // 返り値にも DB にも両方の identifier が入っている。
+        let mut schemes: Vec<&str> = created.identifiers.iter().map(|i| i.scheme.as_str()).collect();
+        schemes.sort();
+        assert_eq!(schemes, vec!["researcherid", "scopus"]);
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM author_identifiers WHERE author_id = ?",
+        )
+        .bind(created.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    /// CR-005: 既存の同名著者（ORCID 無し）と、別 ORCID を持つ同名の別人を統合しない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_or_create_author_does_not_merge_homonym_with_new_orcid(pool: SqlitePool) {
+        // 既存 "John Smith"（ORCID 無し）。
+        let mut tx = pool.begin().await.unwrap();
+        let existing = get_or_create_author(&mut tx, &input("John Smith"))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // 同名だが ORCID を持つ別人。氏名だけで統合してはならず、新規作成される。
+        let mut tx = pool.begin().await.unwrap();
+        let other = get_or_create_author(
+            &mut tx,
+            &input_with_orcid("John Smith", "0000-0002-1825-0097"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        assert_ne!(existing.id, other.id, "別 ORCID の同名は別著者にすべき");
+        assert_eq!(other.orcid.as_deref(), Some("0000-0002-1825-0097"), "新 ORCID が保存される");
+    }
+
+    /// CR-005 補足: 既存に同 ORCID があれば別表記でも従来どおり統合する（退行防止）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_or_create_author_still_merges_on_matching_orcid(pool: SqlitePool) {
+        let mut tx = pool.begin().await.unwrap();
+        let first = get_or_create_author(
+            &mut tx,
+            &input_with_orcid("Jane Doe", "0000-0001-2345-6789"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let second = get_or_create_author(
+            &mut tx,
+            &input_with_orcid("J. Doe", "0000-0001-2345-6789"),
         )
         .await
         .unwrap();

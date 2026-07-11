@@ -4,6 +4,7 @@
 //! 中途半端なファイルが残らない。`%PDF-` マジックバイトで検証するため、
 //! ペイウォールが返す HTML やエラーページは添付されない。
 
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -11,35 +12,147 @@ use sqlx::SqlitePool;
 
 use crate::models::Attachment;
 
+/// リダイレクトを手動で追う際の上限。
+const MAX_REDIRECTS: usize = 5;
+
+/// SSRF 対策（CR-003）: このアドレスへは接続させない。
+/// loopback / private / link-local / unspecified / CGNAT / multicast などを弾く。
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                // CGNAT 100.64.0.0/10（is_shared は unstable なので手動判定）
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+                // 0.0.0.0/8
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            // IPv4-mapped (::ffff:a.b.c.d) は埋め込み IPv4 で再判定する。
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ip(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            // unique local fc00::/7
+            (seg[0] & 0xfe00) == 0xfc00
+                // link-local fe80::/10
+                || (seg[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// ホスト名を解決し、公開 IP に紐づく単一の `SocketAddr` を返す。
+/// 解決結果に禁止アドレスが 1 つでも含まれれば拒否する（split-horizon / rebinding 対策）。
+/// 返した addr へ接続を固定（`.resolve()` でピン留め）することで TOCTOU も避ける。
+async fn resolve_public_addr(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+) -> Result<SocketAddr, String> {
+    let host_owned = host.to_string();
+    let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
+        (host_owned.as_str(), port)
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>())
+    })
+    .await
+    .map_err(|e| format!("dns resolution failed: {e}"))?
+    .map_err(|e| format!("dns resolution failed: {e}"))?;
+
+    if addrs.is_empty() {
+        return Err("could not resolve host".to_string());
+    }
+    if !allow_private {
+        if let Some(bad) = addrs.iter().find(|a| is_forbidden_ip(a.ip())) {
+            return Err(format!("refusing to fetch from non-public address {}", bad.ip()));
+        }
+    }
+    Ok(addrs[0])
+}
+
 /// ダウンロードの上限。Content-Length は詐称できるため実読で判定する。
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadCaps {
     pub max_bytes: u64,
     pub timeout: Duration,
+    /// SSRF ガード（CR-003）を無効化して private/loopback へも接続を許すか。
+    /// 本番は必ず false。ローカル fixture サーバーを使うテストでのみ true にする。
+    pub allow_private_hosts: bool,
 }
 
 impl Default for DownloadCaps {
     fn default() -> Self {
-        DownloadCaps { max_bytes: 50 * 1024 * 1024, timeout: Duration::from_secs(30) }
+        DownloadCaps {
+            max_bytes: 50 * 1024 * 1024,
+            timeout: Duration::from_secs(30),
+            allow_private_hosts: false,
+        }
     }
 }
 
 /// PDF をメモリへダウンロードして検証する。
 /// 返り値は `(バイト列, Content-Disposition のファイル名)`。
 pub async fn fetch_pdf(url: &str, caps: DownloadCaps) -> Result<(Vec<u8>, Option<String>), String> {
-    let client = reqwest::Client::builder()
-        .user_agent("LumenCite/0.1 (mailto:support@lumencite.app)")
-        .timeout(caps.timeout)
-        .build()
-        .map_err(|e| e.to_string())?;
+    // SSRF 対策（CR-003）: リダイレクトを自動追尾せず、各ホップで
+    // scheme（http/https のみ）と解決先 IP（公開アドレスのみ）を検証してから接続する。
+    let mut current = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
 
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("download failed: {e}"))?;
+    let resp = 'follow: {
+        for _ in 0..=MAX_REDIRECTS {
+            if !matches!(current.scheme(), "http" | "https") {
+                return Err("only http and https URLs are allowed".to_string());
+            }
+            let host = current
+                .host_str()
+                .ok_or_else(|| "URL has no host".to_string())?
+                .to_string();
+            let port = current
+                .port_or_known_default()
+                .ok_or_else(|| "URL has no port".to_string())?;
+            // 解決先を検証し、その addr に接続を固定する。
+            let addr = resolve_public_addr(&host, port, caps.allow_private_hosts).await?;
+
+            let client = reqwest::Client::builder()
+                .user_agent("LumenCite/0.1 (mailto:support@lumencite.app)")
+                .timeout(caps.timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve(&host, addr)
+                .build()
+                .map_err(|e| e.to_string())?;
+
+            let resp = client
+                .get(current.clone())
+                .send()
+                .await
+                .map_err(|e| format!("download failed: {e}"))?;
+
+            if resp.status().is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| "redirect without Location".to_string())?;
+                // 相対 Location を現在 URL 基準で解決し、次ホップとして再検証する。
+                current = current
+                    .join(location)
+                    .map_err(|e| format!("invalid redirect target: {e}"))?;
+                continue;
+            }
+
+            break 'follow resp
+                .error_for_status()
+                .map_err(|e| format!("download failed: {e}"))?;
+        }
+        return Err("too many redirects".to_string());
+    };
 
     let cd_name = resp
         .headers()
@@ -83,8 +196,13 @@ pub async fn download_and_attach(
     std::fs::create_dir_all(&entry_dir).map_err(|e| e.to_string())?;
 
     let file_name = suggested_file_name(url, cd_name.as_deref());
-    let dest = unique_dest(&entry_dir, &file_name);
-    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+    // 名前を原子的に予約してから書き込む（CR-008）。
+    let (mut file, dest) = create_unique_file(&entry_dir, &file_name).map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+    }
+    drop(file);
 
     let dest_name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
     let rel_path = format!("attachments/{}/{}", entry_id, dest_name);
@@ -162,28 +280,38 @@ fn sanitize_file_name(name: &str) -> String {
     cleaned.chars().take(120).collect()
 }
 
-/// `dir` 内で未使用のファイル名を返す（既存なら `_1`, `_2`… を付ける）。
-pub(crate) fn unique_dest(dir: &Path, file_name: &str) -> PathBuf {
-    let candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
+/// `dir` 内で未使用のファイル名を **原子的に予約**し、作成済みの空ファイルとパスを返す（CR-008）。
+/// `create_new`（O_CREAT|O_EXCL）で名前を確保するため、並行追加で `exists()` チェックが
+/// すり抜けて同名を上書き（1 ファイルを 2 行が共有 / 片方消失）することがない。
+pub(crate) fn create_unique_file(
+    dir: &Path,
+    file_name: &str,
+) -> std::io::Result<(std::fs::File, PathBuf)> {
+    fn try_create(p: &Path) -> std::io::Result<Option<std::fs::File>> {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(p) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    let first = dir.join(file_name);
+    if let Some(f) = try_create(&first)? {
+        return Ok((f, first));
     }
     let (stem, ext) = match file_name.rsplit_once('.') {
         Some((s, e)) => (s.to_string(), format!(".{e}")),
         None => (file_name.to_string(), String::new()),
     };
-    for i in 1..1000 {
-        let next = dir.join(format!("{stem}_{i}{ext}"));
-        if !next.exists() {
-            return next;
+    for i in 1..10000 {
+        let cand = dir.join(format!("{stem}_{i}{ext}"));
+        if let Some(f) = try_create(&cand)? {
+            return Ok((f, cand));
         }
     }
-    dir.join(format!(
-        "{stem}_{}{ext}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not find a free attachment file name",
     ))
 }
 
@@ -215,6 +343,72 @@ mod tests {
         assert_eq!(suggested_file_name("https://ex.com/x", Some(".hidden")), "hidden.pdf");
     }
 
+    // ── SSRF ガード（CR-003） ──────────────────────────────────────────────
+
+    #[test]
+    fn forbidden_ip_classifies_private_and_public() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let bad = [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),   // loopback
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),    // private
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), // private
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)), // link-local
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),     // unspecified/0/8
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),  // CGNAT
+            IpAddr::V6(Ipv6Addr::LOCALHOST),           // ::1
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), // link-local
+            IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)), // unique local
+        ];
+        for ip in bad {
+            assert!(is_forbidden_ip(ip), "{ip} should be forbidden");
+        }
+        let good = [
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0, 0, 0, 1)),
+        ];
+        for ip in good {
+            assert!(!is_forbidden_ip(ip), "{ip} should be allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_pdf_rejects_non_http_scheme() {
+        let err = fetch_pdf("file:///etc/passwd", DownloadCaps::default()).await.unwrap_err();
+        assert!(err.contains("http"), "{err}");
+        let err = fetch_pdf("ftp://example.com/x.pdf", DownloadCaps::default()).await.unwrap_err();
+        assert!(err.contains("http"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_pdf_rejects_loopback_without_flag() {
+        // ガード有効（既定）なら loopback への接続は解決段階で拒否される。
+        let err = fetch_pdf("http://127.0.0.1:9/x.pdf", DownloadCaps::default()).await.unwrap_err();
+        assert!(err.contains("non-public"), "{err}");
+    }
+
+    // ── 原子的な名前予約（CR-008） ────────────────────────────────────────
+
+    #[test]
+    fn create_unique_file_reserves_distinct_names() {
+        let dir = temp_app_dir("uniq");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (_f1, p1) = create_unique_file(&dir, "paper.pdf").unwrap();
+        let (_f2, p2) = create_unique_file(&dir, "paper.pdf").unwrap();
+        let (_f3, p3) = create_unique_file(&dir, "paper.pdf").unwrap();
+
+        // 3 回とも別パスが予約され、全て実在する。
+        assert_ne!(p1, p2);
+        assert_ne!(p2, p3);
+        assert_ne!(p1, p3);
+        assert!(p1.exists() && p2.exists() && p3.exists());
+        assert_eq!(p1.file_name().unwrap(), "paper.pdf");
+        assert_eq!(p2.file_name().unwrap(), "paper_1.pdf");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn content_disposition_parsing() {
         assert_eq!(
@@ -242,6 +436,11 @@ mod tests {
         format!("http://127.0.0.1:{port}/fixture.pdf")
     }
 
+    /// ローカル fixture サーバー（loopback）へ接続するため SSRF ガードを外した caps。
+    fn test_caps() -> DownloadCaps {
+        DownloadCaps { allow_private_hosts: true, ..Default::default() }
+    }
+
     async fn make_entry(pool: &SqlitePool) -> i64 {
         create_entry(pool, &EntryInput {
             title: "Paper".to_string(),
@@ -265,7 +464,7 @@ mod tests {
         let url = serve_once(b"%PDF-1.4 fake pdf body".to_vec());
         let dir = temp_app_dir("ok");
 
-        let att = download_and_attach(&pool, &dir, entry_id, &url, DownloadCaps::default())
+        let att = download_and_attach(&pool, &dir, entry_id, &url, test_caps())
             .await
             .unwrap();
 
@@ -290,14 +489,14 @@ mod tests {
 
         // HTML（ペイウォール等）→ マジックバイトで拒否
         let url = serve_once(b"<!doctype html><html>login please</html>".to_vec());
-        let err = download_and_attach(&pool, &dir, entry_id, &url, DownloadCaps::default())
+        let err = download_and_attach(&pool, &dir, entry_id, &url, test_caps())
             .await
             .unwrap_err();
         assert!(err.contains("not a PDF"), "{err}");
 
         // 上限超過 → 拒否
         let url = serve_once([b"%PDF-".to_vec(), vec![0u8; 4096]].concat());
-        let caps = DownloadCaps { max_bytes: 1024, ..Default::default() };
+        let caps = DownloadCaps { max_bytes: 1024, ..test_caps() };
         let err = download_and_attach(&pool, &dir, entry_id, &url, caps).await.unwrap_err();
         assert!(err.contains("limit"), "{err}");
 

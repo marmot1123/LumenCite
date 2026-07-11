@@ -110,7 +110,7 @@ async fn fulltext_search(
         .and_then(|v| v.as_str())
         .ok_or_else(|| ToolError::InvalidArguments("missing required argument: query".to_string()))?;
 
-    let mut hits = fulltext::search_fulltext(ctx.pool, query, None, None).await?;
+    let mut hits = fulltext::search_fulltext(ctx.pool, query, None, None, None).await?;
 
     // Scope filtering: when mode is "entries", keep only hits whose entry_id is in scope.
     if ctx.scope_mode == "entries" {
@@ -159,6 +159,9 @@ async fn get_entry_tool(
             }
         },
     };
+
+    // チャットのスコープ外 entry は読ませない（CR-024）。
+    ctx.ensure_entry_in_scope(entry_id)?;
 
     let detail = match entries::get_entry(ctx.pool, entry_id).await {
         Ok(d) => d,
@@ -377,7 +380,7 @@ mod tests {
 
         let s = try_execute(&ctx, &call).await.unwrap().unwrap();
         assert!(s.contains("1 hits"), "scope should exclude e2, got: {s}");
-        let parsed: serde_json::Value = serde_json::from_str(s.splitn(2, '\n').nth(1).unwrap()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(s.split_once('\n').unwrap().1).unwrap();
         assert_eq!(parsed["hits"][0]["entry_id"], e1.id);
     }
 

@@ -23,6 +23,8 @@ interface PdfPaneProps {
   mode: PdfMode;
   highlights: Highlight[];
   entryId: number;
+  /** 現在表示中の添付 PDF（CR-015）。新規ハイライトに紐付ける */
+  attachmentId: number | null;
   onCreateHighlight: (input: HighlightInput) => void;
 }
 
@@ -40,7 +42,7 @@ const PICKER_CHIPS: { id: HighlightColor; color: string }[] = [
 
 export function PdfPane({
   doc, loading, error, zoom, currentPage, onCurrentPageChange, scrollToPageKey,
-  mode, highlights, entryId, onCreateHighlight,
+  mode, highlights, entryId, attachmentId, onCreateHighlight,
 }: PdfPaneProps) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -97,6 +99,7 @@ export function PdfPane({
     if (!draft) return;
     onCreateHighlight({
       entry_id: entryId,
+      attachment_id: attachmentId,
       page: draft.page,
       x: draft.x,
       y: draft.y,

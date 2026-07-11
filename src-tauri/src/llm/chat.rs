@@ -129,6 +129,14 @@ pub async fn run_chat_loop(
                 .await?
         };
 
+        // --- 停止の再確認（CR-010, fail-closed） ---
+        // is_cancelled はループ頭でしか見ていなかったため、ストリーミング中に停止しても
+        // その後の永続化・承認登録・tool 実行まで進んでいた。ストリーム完了直後にもう一度
+        // 確認し、停止済みなら書き込み系 tool を一切実行せずに抜ける。
+        if host.is_cancelled() {
+            break;
+        }
+
         // --- assistant メッセージを永続化 + 会話に追加 ---
         let tool_calls_json = if turn.tool_calls.is_empty() {
             None
@@ -167,6 +175,12 @@ pub async fn run_chat_loop(
 
         // --- 各ツール呼び出しを承認チェック → 実行 → 結果を会話に追加 ---
         for call in &turn.tool_calls {
+            // 承認登録・実行の直前でも停止を再確認する（CR-010, fail-closed）。
+            // 複数 tool のうち途中で停止した場合、残りを実行しない。停止後に承認待ちへ
+            // 登録して永久待機になるのも防ぐ。
+            if host.is_cancelled() {
+                break;
+            }
             let auto = tools::approval::should_auto_approve(&call.tool_name, params.whitelist);
             host.on_tool_proposed(call, !auto).await;
 
@@ -284,6 +298,8 @@ mod tests {
         persisted: Vec<(i64, Role)>,
         approvals: VecDeque<bool>,
         cancelled: bool,
+        /// true なら delta 受信時点で cancelled を立てる（ストリーミング中の停止を模す）。
+        cancel_on_delta: bool,
         db_mutations: usize,
     }
 
@@ -291,6 +307,9 @@ mod tests {
     impl ChatLoopHost for RecordingHost {
         fn on_delta(&mut self, text: &str) {
             self.deltas.push(text.to_string());
+            if self.cancel_on_delta {
+                self.cancelled = true;
+            }
         }
         async fn on_tool_proposed(&mut self, call: &ToolCallSpec, needs_approval: bool) {
             self.proposed.push((call.tool_name.clone(), needs_approval));
@@ -324,6 +343,24 @@ mod tests {
     fn tool_turn(call_id: &str, tool: &str, args: serde_json::Value) -> ChatTurnResult {
         ChatTurnResult {
             text: String::new(),
+            tool_calls: vec![ToolCallSpec {
+                call_id: call_id.to_string(),
+                tool_name: tool.to_string(),
+                arguments: args,
+            }],
+            stop_reason: StopReason::ToolUse,
+        }
+    }
+
+    /// text と tool_call を両方持つターン（ストリーミング中停止のテスト用）。
+    fn text_and_tool_turn(
+        text: &str,
+        call_id: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> ChatTurnResult {
+        ChatTurnResult {
+            text: text.to_string(),
             tool_calls: vec![ToolCallSpec {
                 call_id: call_id.to_string(),
                 tool_name: tool.to_string(),
@@ -414,6 +451,44 @@ mod tests {
         run(&pool, session_id, &provider, &mut host, "tag it").await;
 
         assert_eq!(host.db_mutations, 1, "successful write tool must notify");
+    }
+
+    /// CR-010: ストリーミング中に停止したら、そのターンの書き込み系 tool を実行しない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn cancel_during_stream_skips_write_tool(pool: SqlitePool) {
+        let session_id = make_session(&pool).await;
+        let entry = crate::db::entries::create_entry(
+            &pool,
+            &crate::models::EntryInput {
+                title: "Paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // text（ストリーム）と add_tag を同一ターンで返す。
+        let provider = MockProvider::new(vec![text_and_tool_turn(
+            "tagging now",
+            "c1",
+            "add_tag",
+            serde_json::json!({"entry_id": entry.id, "tag_name": "ml"}),
+        )]);
+        // delta 受信＝ストリーミング中に停止が押されたことを模す。
+        let mut host = RecordingHost { cancel_on_delta: true, ..Default::default() };
+        run(&pool, session_id, &provider, &mut host, "tag it").await;
+
+        assert_eq!(host.db_mutations, 0, "停止後に write tool を実行してはならない");
+        assert!(host.executed.is_empty(), "tool は一切実行されない");
+        // タグも付いていないこと。
+        let tag_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM entry_tags WHERE entry_id = ?")
+                .bind(entry.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tag_count, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -29,6 +29,16 @@ i18n
     },
   });
 
+// HTML の lang 属性を実際の言語に同期する（CR-038）。index.html は lang="en" 固定で、
+// 日本語表示でも en のままだった（スクリーンリーダーの読み・ハイフネーションが不正確）。
+function syncHtmlLang(lng: string) {
+  if (typeof document !== "undefined") {
+    document.documentElement.lang = lng.startsWith("ja") ? "ja" : "en";
+  }
+}
+i18n.on("languageChanged", syncHtmlLang);
+i18n.on("initialized", () => syncHtmlLang(i18n.language));
+
 export default i18n;
 
 declare module "i18next" {

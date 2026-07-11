@@ -66,22 +66,32 @@ pub async fn get_attachment_with_path(
     })
 }
 
-/// 添付レコードを削除し、削除されたファイルの相対パスを返す。ファイル本体の削除は呼び出し側で行う。
-pub async fn delete_attachment(
+/// 添付レコードと全文索引（fulltext）を **単一トランザクションで**削除する（CR-008）。
+/// これまでは fulltext 削除 → attachments 削除が別クエリで、index 削除失敗を握りつぶすと
+/// orphan なテキストが残り得た。まとめて原子的に消し、ファイル本体の削除だけ呼び出し側の
+/// best-effort に残す。
+pub async fn delete_attachment_with_fulltext(
     pool: &SqlitePool,
     id: i64,
 ) -> Result<AttachmentWithPath, sqlx::Error> {
     let att = get_attachment_with_path(pool, id).await?;
 
+    let mut tx = pool.begin().await?;
+    // fulltext は attachments への FK を持たないため明示削除（cascade では拾えない）。
+    sqlx::query("DELETE FROM fulltext WHERE attachment_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     let rows = sqlx::query("DELETE FROM attachments WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
-
     if rows == 0 {
+        // tx は drop でロールバックされる（fulltext 削除も巻き戻る）。
         return Err(sqlx::Error::RowNotFound);
     }
+    tx.commit().await?;
     Ok(att)
 }
 
@@ -123,6 +133,43 @@ mod tests {
         assert_eq!(att.entry_id, entry_id);
         assert_eq!(att.file_name, "paper.pdf");
         assert_eq!(att.mime_type, "application/pdf");
+    }
+
+    /// CR-008: file_path は UNIQUE。同じパスを 2 度登録できない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn add_attachment_rejects_duplicate_path(pool: SqlitePool) {
+        let entry_id = make_entry(&pool, "Paper").await;
+        add_attachment(&pool, entry_id, "attachments/1/paper.pdf", "paper.pdf", "application/pdf")
+            .await
+            .unwrap();
+        let dup = add_attachment(
+            &pool, entry_id, "attachments/1/paper.pdf", "paper.pdf", "application/pdf",
+        )
+        .await;
+        assert!(dup.is_err(), "重複 file_path は UNIQUE 制約で拒否される");
+    }
+
+    /// CR-008: 添付削除は fulltext と attachments 行を原子的に消す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn delete_with_fulltext_removes_both(pool: SqlitePool) {
+        let entry_id = make_entry(&pool, "Paper").await;
+        let att = add_attachment(
+            &pool, entry_id, "attachments/1/p.pdf", "p.pdf", "application/pdf",
+        )
+        .await
+        .unwrap();
+        crate::db::fulltext::index_attachment(&pool, att.id, &[(1, "hello world".to_string())])
+            .await
+            .unwrap();
+
+        delete_attachment_with_fulltext(&pool, att.id).await.unwrap();
+
+        let att_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attachments WHERE id = ?")
+            .bind(att.id).fetch_one(&pool).await.unwrap();
+        let ft_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
+            .bind(att.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(att_rows, 0);
+        assert_eq!(ft_rows, 0, "orphan な全文索引が残ってはいけない");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -169,7 +216,7 @@ mod tests {
         .await
         .unwrap();
 
-        let removed = delete_attachment(&pool, att.id).await.unwrap();
+        let removed = delete_attachment_with_fulltext(&pool, att.id).await.unwrap();
         assert_eq!(removed.file_path, "attachments/1/p.pdf");
 
         let result = get_attachment(&pool, att.id).await;
@@ -178,7 +225,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn delete_attachment_not_found_returns_error(pool: SqlitePool) {
-        let result = delete_attachment(&pool, 9999).await;
+        let result = delete_attachment_with_fulltext(&pool, 9999).await;
         assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
     }
 

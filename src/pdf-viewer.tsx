@@ -2,6 +2,9 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import i18n from "./i18n";
 import { PdfViewer } from "./components/PdfViewer";
+// side-effect import: テーマ（light/dark/accent）を適用し、メインウィンドウでの変更を
+// storage イベントで同期する（CR-037: 以前は別ウィンドウがテーマ未適用だった）。
+import "./hooks/useTheme";
 import "./index.css";
 
 const params = new URLSearchParams(window.location.search);

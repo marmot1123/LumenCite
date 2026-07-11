@@ -604,6 +604,7 @@
     "discard": "破棄",
     "regenerate": "再生成",
     "close": "閉じる",
+    "saveError": "保存に失敗しました",
     "noApiKey": "API キーが設定されていません",
     "noApiKeyHelp": "設定画面で API キーを登録してください。",
     "openSettings": "設定を開く",
@@ -734,7 +735,8 @@
       "whitelistDesc": "書き換え系ツールを自動実行するか都度確認するか。読み取り系は常に自動、delete と MCP write は常に確認（ここでは変更不可）です。",
       "auto": "自動",
       "confirm": "都度確認",
-      "whitelistNote": "変更は以降のツール呼び出しに適用されます。"
+      "whitelistNote": "変更は以降のツール呼び出しに適用されます。",
+      "whitelistSaveError": "保存に失敗しました。変更は元に戻しました"
     },
     "appearance": {
       "language": "言語",
@@ -817,9 +819,9 @@
       "backupNowError": "バックアップに失敗しました: {{error}}",
       "openBackupFolder": "バックアップフォルダを開く",
       "export": "エクスポート",
-      "exportDesc": "全エントリをファイルに書き出します。",
+      "exportDesc": "エントリのデータをファイルに書き出します。これらはメタデータのエクスポートで、PDF 添付・ハイライト・チャット履歴・設定は含まれず、再インポートによる復元もできません。完全なコピーが必要な場合は「今すぐバックアップ」（データベース）＋添付フォルダを使ってください。",
       "exportBibtex": "BibTeX で全件エクスポート",
-      "exportJson": "JSON で全件エクスポート",
+      "exportJson": "エントリのメタデータを JSON でエクスポート",
       "exportMarkdown": "Markdown（ノート＋要約）でエクスポート",
       "exportDone": "{{path}} に書き出しました",
       "exportCancelled": "キャンセルしました",

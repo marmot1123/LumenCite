@@ -15,8 +15,6 @@ const OVERRIDABLE_TOOLS: { name: string; defaultAuto: boolean }[] = [
   { name: "update_entry", defaultAuto: false },
 ];
 
-const WHITELIST_KEY = "chat.tool_whitelist";
-
 export function ChatSettingsTab() {
   const { t } = useTranslation();
   return (
@@ -77,14 +75,12 @@ function McpServers() {
   };
   useEffect(reload, []);
 
-  // 既存サーバーの再起動（env 修正後など）。add_mcp_server は同 config を保存し直して
-  // start を走らせる。成否に関わらず backend が status を更新するので reload で反映する。
+  // 既存サーバーの再起動。env の秘密値はフロントに返さない（CR-012）ため、id だけを渡して
+  // backend が保存済み config（暗号化 env）を復号して起動する。成否に関わらず reload で反映。
   const retry = async (s: McpServerInfo) => {
     setBusy(true);
     try {
-      await invoke("add_mcp_server", {
-        config: { id: s.id, command: s.command, args: s.args, env: s.env },
-      });
+      await invoke("restart_mcp_server", { id: s.id });
     } catch { /* status は backend 側で更新済み */ }
     finally { setBusy(false); reload(); }
   };
@@ -464,20 +460,26 @@ function ClipperSettings() {
 function ToolWhitelist() {
   const { t } = useTranslation();
   const [overrides, setOverrides] = useState<Record<string, boolean>>({});
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
-    invoke<string | null>("get_setting", { key: WHITELIST_KEY })
-      .then((json) => {
-        if (!json) return;
-        try { setOverrides(JSON.parse(json)); } catch { /* ignore */ }
-      })
+    // 検証付きの用途別コマンド（CR-002）。汎用 get_setting は廃止。
+    invoke<Record<string, boolean>>("get_tool_whitelist")
+      .then((map) => setOverrides(map ?? {}))
       .catch(() => {});
   }, []);
 
   const setAuto = (tool: string, auto: boolean) => {
+    const prev = overrides;
     const next = { ...overrides, [tool]: auto };
     setOverrides(next);
-    void invoke("set_setting", { key: WHITELIST_KEY, value: JSON.stringify(next) }).catch(console.error);
+    setSaveError(null);
+    void invoke("set_tool_whitelist", { overrides: next }).catch((e) => {
+      console.error(e);
+      // 保存失敗時は表示を元に戻し、エラーを明示する（サイレント失敗を避ける）。
+      setOverrides(prev);
+      setSaveError(String(e));
+    });
   };
 
   return (
@@ -497,6 +499,11 @@ function ToolWhitelist() {
           );
         })}
       </div>
+      {saveError && (
+        <div style={{ fontSize: 11, color: "var(--danger, #d33)", marginTop: 8, lineHeight: 1.5 }}>
+          {t("settings.chat.whitelistSaveError")}: {saveError}
+        </div>
+      )}
       <div style={{ fontSize: 11, color: "var(--text-faint)", marginTop: 8, lineHeight: 1.5 }}>
         {t("settings.chat.whitelistNote")}
       </div>

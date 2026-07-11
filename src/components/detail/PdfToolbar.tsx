@@ -49,11 +49,11 @@ type ModeTitleKey =
   | "detail.toolbar.modeNote"
   | "detail.toolbar.modePen";
 
+// note / pen モードは未実装（テキストレイヤーは select/highlight のみ対話可能）なので
+// 実装するまでツールバーから隠す（CR-028）。PdfMode 型・ショートカットは将来のため残さない。
 const MODES: { id: PdfMode; iconName: Parameters<typeof Icon>[0]["name"] | null; titleKey: ModeTitleKey }[] = [
   { id: "select",    iconName: null,          titleKey: "detail.toolbar.modeSelect" },
   { id: "highlight", iconName: "highlighter", titleKey: "detail.toolbar.modeHighlight" },
-  { id: "note",      iconName: "info",        titleKey: "detail.toolbar.modeNote" },
-  { id: "pen",       iconName: "ext",         titleKey: "detail.toolbar.modePen" },
 ];
 
 export function PdfToolbar({

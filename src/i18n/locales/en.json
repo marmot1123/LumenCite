@@ -604,6 +604,7 @@
     "discard": "Discard",
     "regenerate": "Regenerate",
     "close": "Close",
+    "saveError": "Failed to save",
     "noApiKey": "API key is not configured",
     "noApiKeyHelp": "Please register an API key in Settings.",
     "openSettings": "Open Settings",
@@ -734,7 +735,8 @@
       "whitelistDesc": "Which write tools run automatically vs. ask each time. Reads are always automatic; delete and MCP writes always ask and can't be changed here.",
       "auto": "Automatic",
       "confirm": "Ask each time",
-      "whitelistNote": "Changes apply to new tool calls."
+      "whitelistNote": "Changes apply to new tool calls.",
+      "whitelistSaveError": "Failed to save; the change was reverted"
     },
     "appearance": {
       "language": "Language",
@@ -817,9 +819,9 @@
       "backupNowError": "Backup failed: {{error}}",
       "openBackupFolder": "Open backup folder",
       "export": "Export",
-      "exportDesc": "Write all entries to a file.",
+      "exportDesc": "Write entry data to a file. These are metadata exports — they do not include PDF attachments, highlights, chat history, or settings, and can't be re-imported to restore. For a full copy, use \"Back up now\" (database) plus the attachments folder.",
       "exportBibtex": "Export all as BibTeX",
-      "exportJson": "Export all as JSON",
+      "exportJson": "Export entry metadata as JSON",
       "exportMarkdown": "Export notes + summaries as Markdown",
       "exportDone": "Wrote to {{path}}",
       "exportCancelled": "Cancelled",

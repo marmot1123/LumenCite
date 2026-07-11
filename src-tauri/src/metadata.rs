@@ -11,9 +11,14 @@ pub async fn fetch_by_doi(doi: &str) -> Result<EntryInput, String> {
         .trim_start_matches("http://doi.org/")
         .trim_start_matches("doi:");
 
-    let url = format!("https://api.crossref.org/works/{}", doi);
+    // DOI は接尾辞に括弧や記号を含み得るため URL エンコードする（CR-020）。DOI 構造の
+    // `/` は保持し、path で危険な文字だけを percent-encode する。
+    let url = format!("https://api.crossref.org/works/{}", encode_doi_path(doi));
     let client = reqwest::Client::builder()
         .user_agent("LumenCite/0.1 (mailto:support@lumencite.app)")
+        // connect / 全体タイムアウト（CR-033）。呼び出し側の tokio timeout とは別に client 側でも張る。
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -190,11 +195,22 @@ fn normalize_orcid(raw: &str) -> String {
 
 pub async fn fetch_by_arxiv(arxiv_id: &str) -> Result<EntryInput, String> {
     let id = normalize_arxiv_id(arxiv_id);
-    let url = format!("https://export.arxiv.org/api/query?id_list={}", id);
+    let url = format!("https://export.arxiv.org/api/query?id_list={}", encode_doi_path(&id));
 
-    let text = reqwest::get(&url)
+    // タイムアウト付き client + HTTP ステータス検証（CR-020/CR-033）。
+    let client = reqwest::Client::builder()
+        .user_agent("LumenCite/0.1 (mailto:support@lumencite.app)")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let text = client
+        .get(&url)
+        .send()
         .await
         .map_err(|e| format!("ネットワークエラー: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("arXiv: HTTP エラー: {}", e))?
         .text()
         .await
         .map_err(|e| format!("レスポンス解析エラー: {}", e))?;
@@ -337,20 +353,96 @@ fn strip_html_tags(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// arXiv ID を正準化する（CR-019）。
+///
+/// - `arXiv:` / `arxiv:` プレフィックスを剥がす（大小無視）
+/// - 末尾の版番号 `vN` を除去する（新形式 `2301.00001v5` / 旧形式 `hep-th/9901001v2` の両方）
+/// - **旧形式のカテゴリ（スラッシュより前）は保持する**（`math.GT/0309136` を
+///   `0309136` に潰さない。URL 構築と重複検出の両方で必要）
 pub(crate) fn normalize_arxiv_id(id: &str) -> String {
     let id = id.trim();
-    if let Some(pos) = id.rfind('/') {
-        let rest = &id[pos + 1..];
-        // strip version suffix like v5
-        return rest
-            .find('v')
-            .map_or(rest, |v| &rest[..v])
-            .to_string();
+    let id = id
+        .strip_prefix("arXiv:")
+        .or_else(|| id.strip_prefix("arxiv:"))
+        .unwrap_or(id)
+        .trim();
+    strip_arxiv_version(id).to_string()
+}
+
+/// 末尾の版番号 `vN`（`v` + 1 桁以上の数字）を取り除く。無ければそのまま。
+fn strip_arxiv_version(s: &str) -> &str {
+    if let Some(vpos) = s.rfind('v') {
+        let after = &s[vpos + 1..];
+        if !after.is_empty() && after.bytes().all(|b| b.is_ascii_digit()) {
+            return &s[..vpos];
+        }
     }
-    if let Some(s) = id.strip_prefix("arXiv:").or_else(|| id.strip_prefix("arxiv:")) {
-        return s.to_string();
+    s
+}
+
+/// DOI を URL path 用に percent-encode する（CR-020）。unreserved 文字と DOI 構造の
+/// `/` `.` `-` `_` `~` `(` `)` `:` は保持し、それ以外（空白・`#`・`?`・`<>` 等）を encode する。
+fn encode_doi_path(doi: &str) -> String {
+    let mut out = String::with_capacity(doi.len());
+    for b in doi.trim().bytes() {
+        match b {
+            b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'0'..=b'9'
+            | b'/'
+            | b'.'
+            | b'-'
+            | b'_'
+            | b'~'
+            | b'('
+            | b')'
+            | b':' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
     }
-    id.to_string()
+    out
+}
+
+/// XML/Atom の実体参照を復号する（CR-020）。arXiv は `&amp;` 等をエスケープしたまま返すため、
+/// substring 抽出後に復号しないとタイトル・抄録に `&amp;` がそのまま残る。
+fn decode_xml_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < s.len() {
+        if bytes[i] == b'&' {
+            if let Some(semi) = s[i + 1..].find(';') {
+                let entity = &s[i + 1..i + 1 + semi];
+                let decoded = match entity {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    _ => {
+                        // 数値参照 &#DDD; / &#xHHH;
+                        if let Some(num) = entity.strip_prefix("#x").or_else(|| entity.strip_prefix("#X")) {
+                            u32::from_str_radix(num, 16).ok().and_then(char::from_u32)
+                        } else if let Some(num) = entity.strip_prefix('#') {
+                            num.parse::<u32>().ok().and_then(char::from_u32)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(c) = decoded {
+                    out.push(c);
+                    i += 1 + semi + 1;
+                    continue;
+                }
+            }
+        }
+        // 実体でなければ 1 文字（UTF-8 幅）そのまま。
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn extract_first_xml_text(xml: &str, tag: &str) -> Option<String> {
@@ -358,7 +450,7 @@ fn extract_first_xml_text(xml: &str, tag: &str) -> Option<String> {
     let close = format!("</{}>", tag);
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)?;
-    Some(xml[start..start + end].to_string())
+    Some(decode_xml_entities(&xml[start..start + end]))
 }
 
 fn extract_all_xml_text(xml: &str, tag: &str) -> Vec<String> {
@@ -369,7 +461,7 @@ fn extract_all_xml_text(xml: &str, tag: &str) -> Vec<String> {
     while let Some(s) = xml[pos..].find(&open) {
         let cs = pos + s + open.len();
         if let Some(e) = xml[cs..].find(&close) {
-            results.push(xml[cs..cs + e].trim().to_string());
+            results.push(decode_xml_entities(xml[cs..cs + e].trim()));
             pos = cs + e + close.len();
         } else {
             break;
@@ -382,6 +474,55 @@ fn extract_all_xml_text(xml: &str, tag: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── CR-020: DOI encode / XML entity decode ──────────────────────────────
+
+    #[test]
+    fn encode_doi_path_encodes_specials_keeps_slash() {
+        assert_eq!(encode_doi_path("10.1000/xyz"), "10.1000/xyz");
+        // 括弧・空白・記号を encode、`/` `.` は保持。
+        assert_eq!(encode_doi_path("10.1000/(foo bar)"), "10.1000/(foo%20bar)");
+        assert_eq!(encode_doi_path("10.1/a#b?c"), "10.1/a%23b%3Fc");
+    }
+
+    #[test]
+    fn decode_xml_entities_handles_named_and_numeric() {
+        assert_eq!(decode_xml_entities("Fish &amp; Chips"), "Fish & Chips");
+        assert_eq!(decode_xml_entities("a &lt;b&gt; c"), "a <b> c");
+        assert_eq!(decode_xml_entities("quote &quot;x&quot;"), "quote \"x\"");
+        assert_eq!(decode_xml_entities("&#65;&#x42;C"), "ABC");
+        // 未知/壊れた実体はそのまま残す。
+        assert_eq!(decode_xml_entities("a & b"), "a & b");
+        assert_eq!(decode_xml_entities("100% &unknown;"), "100% &unknown;");
+    }
+
+    #[test]
+    fn extract_xml_text_decodes_entities() {
+        let xml = "<title>Cats &amp; Dogs &#38; More</title>";
+        assert_eq!(extract_first_xml_text(xml, "title").as_deref(), Some("Cats & Dogs & More"));
+    }
+
+    // ── normalize_arxiv_id（CR-019） ─────────────────────────────────────────
+
+    #[test]
+    fn normalize_arxiv_strips_version_new_format() {
+        assert_eq!(normalize_arxiv_id("2301.00001v5"), "2301.00001");
+        assert_eq!(normalize_arxiv_id("2301.00001"), "2301.00001");
+    }
+
+    #[test]
+    fn normalize_arxiv_strips_prefix() {
+        assert_eq!(normalize_arxiv_id("arXiv:2301.00001v2"), "2301.00001");
+        assert_eq!(normalize_arxiv_id("  arxiv:2301.00001 "), "2301.00001");
+    }
+
+    #[test]
+    fn normalize_arxiv_preserves_old_format_category() {
+        // 旧形式のカテゴリを潰さない（以前は 0309136 に消えていた）。
+        assert_eq!(normalize_arxiv_id("math.GT/0309136"), "math.GT/0309136");
+        assert_eq!(normalize_arxiv_id("hep-th/9901001v2"), "hep-th/9901001");
+        assert_eq!(normalize_arxiv_id("arXiv:cond-mat/0102536v1"), "cond-mat/0102536");
+    }
 
     // ── crossref_to_input ────────────────────────────────────────────────────
 

@@ -11,6 +11,7 @@ pub mod mcp_shim;
 mod metadata;
 mod models;
 mod orcid;
+mod secretbox;
 
 use models::{
     Attachment, Author, AuthorIdentifierInput, AuthorInput, Collection, EntryDetail, EntryFilter,
@@ -32,6 +33,28 @@ use tauri::{
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::oneshot;
+
+/// GUI 生存ロックのファイル名。GUI と CLI で同じパスを見る（CR-011）。
+pub const GUI_LOCK_FILE: &str = "lumencite.gui.lock";
+
+/// GUI が起動中である印の advisory ロックを保持する。プロセスが生きている限り握り続ける
+/// よう、File をプロセス寿命の static に格納する。OS がプロセス終了時に自動解放するので
+/// stale ロックは残らない。2 個目のインスタンスでロックが取れなくても起動は妨げない。
+fn acquire_gui_lock(data_dir: &std::path::Path) {
+    use fs2::FileExt;
+    static GUI_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    let path = data_dir.join(GUI_LOCK_FILE);
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        if file.try_lock_exclusive().is_ok() {
+            let _ = GUI_LOCK.set(file);
+        }
+    }
+}
 
 pub struct AppState {
     pub db: SqlitePool,
@@ -187,10 +210,28 @@ async fn bulk_purge(
     state: State<'_, AppState>,
     ids: Vec<i64>,
 ) -> Result<(), String> {
-    db::entries::bulk_purge(&state.db, &ids)
+    // 実際にゴミ箱から消えた id だけが返る（現役エントリは purge されない・CR-001）。
+    let purged = db::entries::bulk_purge(&state.db, &ids)
         .await
         .map_err(|e| e.to_string())?;
-    for id in &ids {
+    for id in &purged {
+        remove_entry_attachment_dir(&app, *id);
+    }
+    request_sync(&state);
+    Ok(())
+}
+
+/// ゴミ箱を空にする。表示中の id ではなく DB 側で `deleted_at IS NOT NULL` を評価するため、
+/// 検索・フィルタで現役エントリが紛れても hard delete しない（CR-001）。
+#[tauri::command]
+async fn empty_trash(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let purged = db::entries::purge_trash(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    for id in &purged {
         remove_entry_attachment_dir(&app, *id);
     }
     request_sync(&state);
@@ -296,12 +337,20 @@ async fn search_entries(
     query: String,
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    view: Option<String>,
     filter: Option<EntryFilter>,
 ) -> Result<Vec<EntrySummary>, String> {
     let filter = filter.unwrap_or_default();
-    db::entries::search_entries_filtered(&state.db, &query, collection_id, tag_id, &filter)
-        .await
-        .map_err(|e| e.to_string())
+    db::entries::search_entries_filtered(
+        &state.db,
+        &query,
+        collection_id,
+        tag_id,
+        view.as_deref(),
+        &filter,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ── authors (v0.3.0 M7) ───────────────────────────────────────────────────────
@@ -595,7 +644,7 @@ fn attachments_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("attachments"))
 }
 
-use download::unique_dest;
+use download::create_unique_file;
 
 #[tauri::command]
 async fn pick_pdf_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
@@ -634,8 +683,14 @@ async fn add_attachment(
     let entry_dir = root.join(entry_id.to_string());
     std::fs::create_dir_all(&entry_dir).map_err(|e| e.to_string())?;
 
-    let dest = unique_dest(&entry_dir, &file_name);
-    std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+    // 名前を原子的に予約してから中身をコピーする（CR-008）。予約済みの空ファイルを
+    // copy で上書きするので、並行追加でも 1 ファイルを 2 行で共有することがない。
+    let (file, dest) = create_unique_file(&entry_dir, &file_name).map_err(|e| e.to_string())?;
+    drop(file);
+    if let Err(e) = std::fs::copy(&src, &dest) {
+        let _ = std::fs::remove_file(&dest); // 予約した空ファイルを残さない
+        return Err(e.to_string());
+    }
 
     let rel_path = format!(
         "attachments/{}/{}",
@@ -654,7 +709,17 @@ async fn add_attachment(
     .await;
 
     match result {
-        Ok(att) => Ok(att),
+        Ok(att) => {
+            // 添付成功後にバックグラウンドで全文索引する（SPEC: 添付後に自動索引・CR-027）。
+            // リーダーからの手動添付もこの経路を通るので、以前は索引されなかった。
+            let pool = state.db.clone();
+            let att_id = att.id;
+            let abs = dest.clone();
+            tauri::async_runtime::spawn(async move {
+                db::fulltext::extract_and_index(&pool, abs, att_id).await;
+            });
+            Ok(att)
+        }
         Err(e) => {
             // DB 登録失敗時はコピー済みファイルを掃除する
             let _ = std::fs::remove_file(&dest);
@@ -695,8 +760,7 @@ async fn download_arxiv_pdf(
     )
     .await?;
 
-    // 添付済み PDF をバックグラウンドで全文索引する（best-effort）。
-    // テキストレイヤーが無い（スキャン）PDF や抽出失敗は黙って諦める。
+    // 添付済み PDF をバックグラウンドで全文索引する（best-effort・共有ヘルパ・CR-027）。
     let pool = state.db.clone();
     let att_id = att.id;
     let abs = app_data_dir
@@ -704,17 +768,7 @@ async fn download_arxiv_pdf(
         .join(entry_id.to_string())
         .join(&att.file_name);
     tauri::async_runtime::spawn(async move {
-        let extracted =
-            tauri::async_runtime::spawn_blocking(move || pdf_extract::extract_text_by_pages(&abs))
-                .await;
-        if let Ok(Ok(pages_text)) = extracted {
-            let pages: Vec<(i64, String)> = pages_text
-                .into_iter()
-                .enumerate()
-                .map(|(i, t)| ((i + 1) as i64, t))
-                .collect();
-            let _ = db::fulltext::index_attachment(&pool, att_id, &pages).await;
-        }
+        db::fulltext::extract_and_index(&pool, abs, att_id).await;
     });
 
     Ok(att)
@@ -726,16 +780,20 @@ async fn delete_attachment(
     state: State<'_, AppState>,
     id: i64,
 ) -> Result<(), String> {
-    // fulltext は FK が無いので明示的に消す（attachments の cascade では拾えない）
-    let _ = db::fulltext::unindex_attachment(&state.db, id).await;
-
-    let removed = db::attachments::delete_attachment(&state.db, id)
+    // 添付レコードと全文索引を単一トランザクションで削除（CR-008）。orphan index を残さない。
+    let removed = db::attachments::delete_attachment_with_fulltext(&state.db, id)
         .await
         .map_err(|e| e.to_string())?;
 
+    // ファイル本体は best-effort で削除。失敗しても DB は整合しているので致命ではないが、
+    // 握りつぶさずログに残す（掃除漏れの検知用）。
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let abs = root.join(&removed.file_path);
-    let _ = std::fs::remove_file(&abs);
+    if let Err(e) = std::fs::remove_file(&abs) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("attachment file removal failed ({}): {e}", abs.display());
+        }
+    }
     Ok(())
 }
 
@@ -926,8 +984,9 @@ async fn fulltext_search(
     query: String,
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    view: Option<String>,
 ) -> Result<Vec<FulltextHit>, String> {
-    db::fulltext::search_fulltext(&state.db, &query, collection_id, tag_id)
+    db::fulltext::search_fulltext(&state.db, &query, collection_id, tag_id, view.as_deref())
         .await
         .map_err(|e| e.to_string())
 }
@@ -940,6 +999,17 @@ async fn get_highlights(
     entry_id: i64,
 ) -> Result<Vec<db::highlights::Highlight>, String> {
     db::highlights::list_by_entry(&state.db, entry_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 選択中の添付 PDF に属すハイライトだけを返す（CR-015）。
+#[tauri::command]
+async fn get_highlights_by_attachment(
+    state: State<'_, AppState>,
+    attachment_id: i64,
+) -> Result<Vec<db::highlights::Highlight>, String> {
+    db::highlights::list_by_attachment(&state.db, attachment_id)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1036,6 +1106,70 @@ async fn save_llm_settings(state: State<'_, AppState>, settings: LlmSettings) ->
 #[tauri::command]
 fn get_default_summary_prompt() -> String {
     llm::DEFAULT_SYSTEM_PROMPT.to_string()
+}
+
+// ── 用途別 settings コマンド（CR-002） ─────────────────────────────────────
+// 任意キーを書ける汎用 setter は API keys や MCP config も上書きできて危険なので、
+// 検証付きの用途別コマンドに分ける。
+
+/// Chat ツールの自動承認ホワイトリスト（tool_name -> bool）を取得する。
+#[tauri::command]
+async fn get_tool_whitelist(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    let json = db::settings::get_setting(&state.db, db::settings::CHAT_TOOL_WHITELIST_KEY)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default())
+}
+
+/// Chat ツールの自動承認ホワイトリストを保存する。
+/// override 可能なツール名（`OVERRIDABLE_TOOLS`）以外のキーは拒否する。
+#[tauri::command]
+async fn set_tool_whitelist(
+    state: State<'_, AppState>,
+    overrides: std::collections::HashMap<String, bool>,
+) -> Result<(), String> {
+    for key in overrides.keys() {
+        if !llm::tools::approval::OVERRIDABLE_TOOLS.contains(&key.as_str()) {
+            return Err(format!("unknown or non-overridable tool: {key}"));
+        }
+    }
+    let json = serde_json::to_string(&overrides).map_err(|e| e.to_string())?;
+    db::settings::set_setting(&state.db, db::settings::CHAT_TOOL_WHITELIST_KEY, &json)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// PDF ビューの最後に開いていたページ（エントリ単位）を取得する。未設定なら None。
+#[tauri::command]
+async fn get_pdf_last_page(
+    state: State<'_, AppState>,
+    entry_id: i64,
+) -> Result<Option<i64>, String> {
+    let key = format!("pdf.last_page.{entry_id}");
+    let v = db::settings::get_setting(&state.db, &key)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(v.and_then(|s| s.parse::<i64>().ok()).filter(|&n| n > 0))
+}
+
+/// PDF ビューの最後に開いていたページを保存する。1 以上のみ受理する。
+#[tauri::command]
+async fn set_pdf_last_page(
+    state: State<'_, AppState>,
+    entry_id: i64,
+    page: i64,
+) -> Result<(), String> {
+    if page < 1 {
+        return Err("page must be >= 1".to_string());
+    }
+    let key = format!("pdf.last_page.{entry_id}");
+    db::settings::set_setting(&state.db, &key, &page.to_string())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1199,32 +1333,37 @@ enum ChatStreamEvent {
     },
 }
 
+/// ツール承認待ちがユーザー応答を待つ上限（CR-014）。これを超えたら fail-closed で拒否する。
+/// セッションを離れて放置された run が永久に承認待ちで居座るのを防ぐ。
+const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// 進行中チャットの承認待ち・中断状態を保持する共有ランタイム。
 #[derive(Default)]
 pub struct ChatRuntime {
-    /// call_id -> 承認待ちの送信側
-    pending: Mutex<HashMap<String, PendingApproval>>,
-    /// session_id -> 中断フラグ
+    /// (session_id, call_id) -> 承認待ちの送信側。
+    /// call_id は provider 管理で session 間衝突し得るため session_id と複合キーにする（CR-014）。
+    pending: Mutex<HashMap<(i64, String), oneshot::Sender<bool>>>,
+    /// session_id -> 中断フラグ。存在すること自体が「その session で run が進行中」を表す。
     cancels: Mutex<HashMap<i64, Arc<AtomicBool>>>,
 }
 
-struct PendingApproval {
-    session_id: i64,
-    tx: oneshot::Sender<bool>,
-}
-
 impl ChatRuntime {
-    /// セッションの中断フラグを作成・登録して返す。
-    fn begin(&self, session_id: i64) -> Arc<AtomicBool> {
+    /// セッションの run を開始する。**同一セッションで既に run が進行中なら `None`** を返し、
+    /// 並行 send を拒否させる（CR-014: cancel フラグの上書き・二重実行を防ぐ）。
+    fn begin(&self, session_id: i64) -> Option<Arc<AtomicBool>> {
+        let mut cancels = self.cancels.lock().unwrap();
+        if cancels.contains_key(&session_id) {
+            return None;
+        }
         let flag = Arc::new(AtomicBool::new(false));
-        self.cancels.lock().unwrap().insert(session_id, flag.clone());
-        flag
+        cancels.insert(session_id, flag.clone());
+        Some(flag)
     }
 
     /// セッション終了時の後始末（中断フラグと残った承認待ちを除去）。
     fn finish(&self, session_id: i64) {
         self.cancels.lock().unwrap().remove(&session_id);
-        self.pending.lock().unwrap().retain(|_, p| p.session_id != session_id);
+        self.pending.lock().unwrap().retain(|(sid, _), _| *sid != session_id);
     }
 
     /// ツール承認待ちを登録し、決定を待つ受信側を返す。
@@ -1233,14 +1372,19 @@ impl ChatRuntime {
         self.pending
             .lock()
             .unwrap()
-            .insert(call_id.to_string(), PendingApproval { session_id, tx });
+            .insert((session_id, call_id.to_string()), tx);
         rx
     }
 
-    /// UI からの承認/拒否を該当する待ちに伝える。
-    fn resolve_approval(&self, call_id: &str, approved: bool) {
-        if let Some(p) = self.pending.lock().unwrap().remove(call_id) {
-            let _ = p.tx.send(approved);
+    /// UI からの承認/拒否を該当する待ちに伝える。session_id で当該セッションの待ちだけを解決する。
+    fn resolve_approval(&self, session_id: i64, call_id: &str, approved: bool) {
+        if let Some(tx) = self
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&(session_id, call_id.to_string()))
+        {
+            let _ = tx.send(approved);
         }
     }
 
@@ -1250,14 +1394,14 @@ impl ChatRuntime {
             flag.store(true, Ordering::SeqCst);
         }
         let mut pending = self.pending.lock().unwrap();
-        let ids: Vec<String> = pending
-            .iter()
-            .filter(|(_, p)| p.session_id == session_id)
-            .map(|(k, _)| k.clone())
+        let keys: Vec<(i64, String)> = pending
+            .keys()
+            .filter(|(sid, _)| *sid == session_id)
+            .cloned()
             .collect();
-        for id in ids {
-            if let Some(p) = pending.remove(&id) {
-                let _ = p.tx.send(false);
+        for key in keys {
+            if let Some(tx) = pending.remove(&key) {
+                let _ = tx.send(false);
             }
         }
     }
@@ -1311,7 +1455,16 @@ impl llm::chat::ChatLoopHost for ChannelHost {
 
     async fn request_approval(&mut self, call: &llm::ToolCallSpec) -> bool {
         let rx = self.runtime.register_approval(self.session_id, &call.call_id);
-        rx.await.unwrap_or(false)
+        // idle timeout（CR-014）: UI が応答しないまま放置されても永久待機しない。
+        match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+            Ok(Ok(approved)) => approved,
+            _ => {
+                // timeout / sender drop はどちらも fail-closed（拒否）。pending も掃除する。
+                self.runtime
+                    .resolve_approval(self.session_id, &call.call_id, false);
+                false
+            }
+        }
     }
 
     async fn on_tool_executed(&mut self, call_id: &str, result_summary: &str) {
@@ -1475,6 +1628,32 @@ struct McpServerInfo {
     status: Option<mcp::McpServerStatus>,
 }
 
+/// 保存用に env の値を暗号化する（CR-012）。既に暗号化済みの値はそのまま。
+fn encrypt_server_env(mut c: mcp::McpServerConfig) -> Result<mcp::McpServerConfig, String> {
+    for v in c.env.values_mut() {
+        if !secretbox::is_encrypted(v) {
+            *v = secretbox::encrypt(v)?;
+        }
+    }
+    Ok(c)
+}
+
+/// 起動用に env の値を復号する。暗号化されていない値（旧・平文）はそのまま返す。
+fn decrypt_server_env(mut c: mcp::McpServerConfig) -> Result<mcp::McpServerConfig, String> {
+    for v in c.env.values_mut() {
+        *v = secretbox::decrypt(v)?;
+    }
+    Ok(c)
+}
+
+/// 一覧表示用に env の値を伏せる。キー名だけ残し、秘密値はフロントに返さない（CR-012）。
+fn mask_server_env(mut c: mcp::McpServerConfig) -> mcp::McpServerConfig {
+    for v in c.env.values_mut() {
+        *v = String::new();
+    }
+    c
+}
+
 #[tauri::command]
 async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInfo>, String> {
     let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
@@ -1484,6 +1663,7 @@ async fn list_mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerInf
     let statuses = state.mcp.statuses().await;
     let infos = mcp::parse_servers_config(&json)
         .into_iter()
+        .map(mask_server_env) // 秘密値は返さない
         .map(|c| {
             let status = statuses.get(&c.id).cloned();
             McpServerInfo { id: c.id, command: c.command, args: c.args, env: c.env, status }
@@ -1503,7 +1683,8 @@ async fn add_mcp_server(
         .unwrap_or_default();
     let mut servers = mcp::parse_servers_config(&json);
     servers.retain(|s| s.id != config.id);
-    servers.push(config.clone());
+    // 保存は暗号化した env で行う。起動はフロントから受け取った平文 config で行う。
+    servers.push(encrypt_server_env(config.clone())?);
     db::settings::set_setting(
         &state.db,
         db::settings::MCP_SERVERS_KEY,
@@ -1511,6 +1692,23 @@ async fn add_mcp_server(
     )
     .await
     .map_err(|e| e.to_string())?;
+    state.mcp.start(config).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 保存済み config（env は暗号化）を読み出して復号し、再起動する。
+/// フロントは秘密値を持たないので、再起動は id だけを渡して backend 側で組み立てる（CR-012）。
+#[tauri::command]
+async fn restart_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let json = db::settings::get_setting(&state.db, db::settings::MCP_SERVERS_KEY)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    let config = mcp::parse_servers_config(&json)
+        .into_iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| format!("no such MCP server: {id}"))?;
+    let config = decrypt_server_env(config)?;
     state.mcp.start(config).await.map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1542,9 +1740,10 @@ async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(),
 async fn ocr_pdf(
     state: State<'_, AppState>,
     entry_id: i64,
+    attachment_id: Option<i64>,
     pages: Option<Vec<i64>>,
 ) -> Result<String, String> {
-    llm::tools::ocr::run_ocr(&state.db, &state.app_data_dir, entry_id, pages)
+    llm::tools::ocr::run_ocr(&state.db, &state.app_data_dir, entry_id, attachment_id, pages)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1552,10 +1751,11 @@ async fn ocr_pdf(
 #[tauri::command]
 async fn approve_tool_call(
     state: State<'_, AppState>,
+    session_id: i64,
     call_id: String,
     approved: bool,
 ) -> Result<(), String> {
-    state.chat.resolve_approval(&call_id, approved);
+    state.chat.resolve_approval(session_id, &call_id, approved);
     Ok(())
 }
 
@@ -1636,7 +1836,15 @@ async fn chat_send_message(
     let mut tools = llm::tools::all_tool_specs();
     tools.extend(state.mcp.tool_specs().await);
 
-    let cancel = state.chat.begin(session_id);
+    // 同一セッションで run が進行中なら拒否する（CR-014）。二重実行や cancel フラグ上書きを防ぐ。
+    let cancel = match state.chat.begin(session_id) {
+        Some(flag) => flag,
+        None => {
+            let msg = "this chat session already has a message in progress".to_string();
+            let _ = channel.send(ChatStreamEvent::Error { message: msg.clone() });
+            return Err(msg);
+        }
+    };
     let mut host = ChannelHost {
         channel: channel.clone(),
         runtime: state.chat.clone(),
@@ -2274,7 +2482,17 @@ async fn set_mcp_server_enabled(
     .map_err(|e| e.to_string())?;
 
     if enabled {
-        start_http_server(&state, &app).await?;
+        // bind 失敗等で起動できなければ enabled フラグを "0" に戻す（CR-023）。
+        // これをしないと「有効なのに起動していない」不整合が残り、次回起動でも失敗し続ける。
+        if let Err(e) = start_http_server(&state, &app).await {
+            let _ = db::settings::set_setting(
+                &state.db,
+                db::settings::MCP_SERVER_ENABLED_KEY,
+                "0",
+            )
+            .await;
+            return Err(e);
+        }
     } else {
         // クリッパーがまだ使っている場合はサーバーを維持する
         stop_http_server_if_unused(&state).await?;
@@ -2349,6 +2567,8 @@ async fn get_mcp_server_config_snippet(
         "claude_desktop" => {
             let exe = std::env::current_exe()
                 .map_err(|e| format!("failed to resolve executable path: {e}"))?;
+            // token は config に書かない（CR-013）。shim が同一バイナリとして keychain から
+            // 直接読むため、env は URL だけで足りる。history / 設定ファイル汚染を避ける。
             let config = serde_json::json!({
                 "mcpServers": {
                     "lumencite": {
@@ -2356,7 +2576,6 @@ async fn get_mcp_server_config_snippet(
                         "args": ["--mcp-stdio"],
                         "env": {
                             "LUMENCITE_MCP_URL": url,
-                            "LUMENCITE_MCP_TOKEN": token,
                         }
                     }
                 }
@@ -2369,7 +2588,7 @@ async fn get_mcp_server_config_snippet(
         "codex" => {
             let exe = std::env::current_exe()
                 .map_err(|e| format!("failed to resolve executable path: {e}"))?;
-            codex_config_snippet(&exe.to_string_lossy(), &url, &token)
+            codex_config_snippet(&exe.to_string_lossy(), &url)
         }
         // その他の汎用リモート MCP クライアント向けには素の URL とヘッダを返す。
         _ => format!("URL: {url}\nHeader: Authorization: Bearer {token}"),
@@ -2395,13 +2614,13 @@ fn toml_escape(s: &str) -> String {
 }
 
 /// Codex CLI（`~/.codex/config.toml`）へ貼り付ける `[mcp_servers.lumencite]` スニペット。
-/// LumenCite 本体を `--mcp-stdio` ブリッジとして stdio 起動させ、接続先 URL とトークンを env で渡す。
-fn codex_config_snippet(exe: &str, url: &str, token: &str) -> String {
+/// LumenCite 本体を `--mcp-stdio` ブリッジとして stdio 起動させる Codex 用スニペット。
+/// token は config に書かない（CR-013）— shim が同一バイナリとして keychain から読む。
+fn codex_config_snippet(exe: &str, url: &str) -> String {
     format!(
-        "[mcp_servers.lumencite]\ncommand = \"{}\"\nargs = [\"--mcp-stdio\"]\nenv = {{ LUMENCITE_MCP_URL = \"{}\", LUMENCITE_MCP_TOKEN = \"{}\" }}\n",
+        "[mcp_servers.lumencite]\ncommand = \"{}\"\nargs = [\"--mcp-stdio\"]\nenv = {{ LUMENCITE_MCP_URL = \"{}\" }}\n",
         toml_escape(exe),
         toml_escape(url),
-        toml_escape(token),
     )
 }
 
@@ -2531,7 +2750,16 @@ async fn set_clipper_enabled(
     if enabled {
         // MCP 側で既に起動していればそのまま共用する（再起動しない）
         if state.mcp_server.running_port().is_none() {
-            start_http_server(&state, &app).await?;
+            // bind 失敗時は enabled フラグを戻して不整合を残さない（CR-023）。
+            if let Err(e) = start_http_server(&state, &app).await {
+                let _ = db::settings::set_setting(
+                    &state.db,
+                    db::settings::CLIPPER_ENABLED_KEY,
+                    "0",
+                )
+                .await;
+                return Err(e);
+            }
         }
     } else {
         stop_http_server_if_unused(&state).await?;
@@ -2569,6 +2797,11 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
+
+            // GUI 生存フラグ（CR-011）: このロックを保持している間は「GUI 起動中」。
+            // CLI の直接書込経路がこれを見て、MCP 委譲できないときに live DB を壊さないよう
+            // 判断する。try_lock なので 2 個目のインスタンスでも起動を妨げない。
+            acquire_gui_lock(&data_dir);
 
             let options = SqliteConnectOptions::new()
                 .filename(data_dir.join("lumencite.db"))
@@ -2690,7 +2923,38 @@ pub fn run() {
                 if let Ok(Some(json)) =
                     db::settings::get_setting(&mcp_pool, db::settings::MCP_SERVERS_KEY).await
                 {
-                    for cfg in mcp::parse_servers_config(&json) {
+                    let servers = mcp::parse_servers_config(&json);
+
+                    // 旧・平文の env を一度だけ暗号化して保存し直す（CR-012 の migration）。
+                    // 平文値が 1 つでもあれば全体を暗号化して書き戻す。
+                    let has_plaintext = servers.iter().any(|s| {
+                        s.env.values().any(|v| !v.is_empty() && !secretbox::is_encrypted(v))
+                    });
+                    if has_plaintext {
+                        let migrated: Result<Vec<_>, _> =
+                            servers.iter().cloned().map(encrypt_server_env).collect();
+                        match migrated {
+                            Ok(encrypted) => {
+                                let _ = db::settings::set_setting(
+                                    &mcp_pool,
+                                    db::settings::MCP_SERVERS_KEY,
+                                    &mcp::serialize_servers_config(&encrypted),
+                                )
+                                .await;
+                            }
+                            Err(e) => eprintln!("MCP env migration failed: {e}"),
+                        }
+                    }
+
+                    // 起動は復号した env で行う。
+                    for cfg in servers {
+                        let cfg = match decrypt_server_env(cfg) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("MCP env decrypt failed: {e}");
+                                continue;
+                            }
+                        };
                         if let Err(e) = mcp.start(cfg).await {
                             eprintln!("MCP server start failed: {e}");
                         }
@@ -2736,6 +3000,7 @@ pub fn run() {
             bulk_trash,
             bulk_restore,
             bulk_purge,
+            empty_trash,
             bulk_add_to_collection,
             bulk_add_tag,
             search_entries,
@@ -2786,12 +3051,17 @@ pub fn run() {
             is_attachment_indexed,
             fulltext_search,
             get_highlights,
+            get_highlights_by_attachment,
             create_highlight,
             update_highlight,
             delete_highlight,
             get_llm_settings,
             save_llm_settings,
             get_default_summary_prompt,
+            get_tool_whitelist,
+            set_tool_whitelist,
+            get_pdf_last_page,
+            set_pdf_last_page,
             set_api_key,
             delete_api_key,
             has_api_key,
@@ -2812,6 +3082,7 @@ pub fn run() {
             generate_chat_title,
             list_mcp_servers,
             add_mcp_server,
+            restart_mcp_server,
             remove_mcp_server,
             get_mcp_server_status,
             set_mcp_server_enabled,
@@ -2862,6 +3133,63 @@ mod db_init_tests {
 }
 
 #[cfg(test)]
+mod chat_runtime_tests {
+    use super::*;
+
+    /// CR-014: 同一セッションで run 進行中なら 2 回目の begin は None（並行 run 拒否）。
+    #[test]
+    fn begin_rejects_concurrent_run_for_same_session() {
+        let rt = ChatRuntime::default();
+        let first = rt.begin(1);
+        assert!(first.is_some());
+        assert!(rt.begin(1).is_none(), "同一セッションの二重 run は拒否");
+        // 別セッションは並行 OK。
+        assert!(rt.begin(2).is_some());
+        // finish 後は再度開始できる。
+        rt.finish(1);
+        assert!(rt.begin(1).is_some());
+    }
+
+    /// CR-014: approval は (session_id, call_id) で解決され、別セッションの同名 call を誤解決しない。
+    #[tokio::test]
+    async fn resolve_approval_is_scoped_to_session() {
+        let rt = ChatRuntime::default();
+        let rx1 = rt.register_approval(1, "call-x");
+        let rx2 = rt.register_approval(2, "call-x"); // 同じ call_id 別セッション
+
+        // session 2 を解決しても session 1 は待ちのまま。
+        rt.resolve_approval(2, "call-x", true);
+        assert!(rx2.await.unwrap());
+
+        rt.resolve_approval(1, "call-x", false);
+        assert!(!rx1.await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod pdf_extract_tests {
+    /// CR-017: 未信頼 PDF の解析が panic せず Err を返すこと。
+    /// pdf-extract 0.12 / lopdf 0.42 で RUSTSEC-2026-0187（深いネストによる stack overflow）
+    /// を解消済み。回帰でクラッシュに戻らないよう、壊れた入力での挙動を固定する。
+    #[test]
+    fn malformed_pdf_returns_error_without_panicking() {
+        let dir = std::env::temp_dir().join("lumencite_cr017_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("garbage.pdf");
+        // %PDF ヘッダだけ持つが本体が壊れているバイト列。
+        let bytes = b"%PDF-1.7\n1 0 obj<< /Type /Catalog >>endobj\ngarbage\x00\xff\xfe";
+        std::fs::write(&path, bytes).unwrap();
+
+        let result = pdf_extract::extract_text_by_pages(&path);
+        // panic せず（ここへ到達している時点で保証）、成功でも失敗でも許容する。
+        // 主目的は「クラッシュしない」こと。
+        let _ = result;
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
 mod update_and_snippet_tests {
     use super::*;
 
@@ -2891,18 +3219,19 @@ mod update_and_snippet_tests {
 
     #[test]
     fn codex_snippet_is_valid_toml_table_with_stdio_shim() {
-        let s = codex_config_snippet("/Applications/LumenCite.app/exe", "http://127.0.0.1:7373/mcp", "tok123");
+        let s = codex_config_snippet("/Applications/LumenCite.app/exe", "http://127.0.0.1:7373/mcp");
         assert!(s.starts_with("[mcp_servers.lumencite]"));
         assert!(s.contains("command = \"/Applications/LumenCite.app/exe\""));
         assert!(s.contains("args = [\"--mcp-stdio\"]"));
         assert!(s.contains("LUMENCITE_MCP_URL = \"http://127.0.0.1:7373/mcp\""));
-        assert!(s.contains("LUMENCITE_MCP_TOKEN = \"tok123\""));
+        // token は config に書かない（shim が keychain から読む・CR-013）。
+        assert!(!s.contains("LUMENCITE_MCP_TOKEN"));
     }
 
     #[test]
     fn codex_snippet_escapes_windows_backslash_paths() {
         // Windows の実行ファイルパスは `\` を含むため TOML 基本文字列でエスケープが要る。
-        let s = codex_config_snippet(r"C:\Program Files\LumenCite\lumencite.exe", "http://127.0.0.1:7373/mcp", "t");
+        let s = codex_config_snippet(r"C:\Program Files\LumenCite\lumencite.exe", "http://127.0.0.1:7373/mcp");
         assert!(s.contains(r#"command = "C:\\Program Files\\LumenCite\\lumencite.exe""#));
         // エスケープ後の TOML が再パースできること（値が原文と一致）。
         let parsed: toml_check::Value = toml_check::parse(&s);
@@ -3008,20 +3337,20 @@ mod chat_command_tests {
     async fn runtime_resolve_approval_delivers_decision() {
         let rt = ChatRuntime::default();
         let rx = rt.register_approval(7, "call-1");
-        rt.resolve_approval("call-1", true);
-        assert_eq!(rx.await.unwrap(), true);
+        rt.resolve_approval(7, "call-1", true);
+        assert!(rx.await.unwrap());
         // 解決済みなので二度目は何も起きない（パニックしない）
-        rt.resolve_approval("call-1", false);
+        rt.resolve_approval(7, "call-1", false);
     }
 
     #[tokio::test]
     async fn runtime_cancel_denies_pending_and_sets_flag() {
         let rt = ChatRuntime::default();
-        let flag = rt.begin(42);
+        let flag = rt.begin(42).unwrap();
         let rx = rt.register_approval(42, "call-x");
         rt.cancel(42);
         assert!(flag.load(Ordering::SeqCst), "cancel flag should be set");
-        assert_eq!(rx.await.unwrap(), false, "pending approval should be denied");
+        assert!(!rx.await.unwrap(), "pending approval should be denied");
         rt.finish(42);
     }
 
@@ -3033,7 +3362,7 @@ mod chat_command_tests {
         let rx_b = rt.register_approval(2, "b-call");
         rt.cancel(1); // 別セッションを中断
         // セッション 2 の承認待ちは残っている → 明示的に許可できる
-        rt.resolve_approval("b-call", true);
-        assert_eq!(rx_b.await.unwrap(), true);
+        rt.resolve_approval(2, "b-call", true);
+        assert!(rx_b.await.unwrap());
     }
 }

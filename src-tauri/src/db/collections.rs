@@ -8,7 +8,7 @@ pub async fn get_collections(pool: &SqlitePool) -> Result<Vec<Collection>, sqlx:
     .fetch_all(pool)
     .await?;
 
-    let mut all: Vec<Collection> = rows
+    let nodes: Vec<Collection> = rows
         .iter()
         .map(|r| Collection {
             id: r.get("id"),
@@ -18,25 +18,60 @@ pub async fn get_collections(pool: &SqlitePool) -> Result<Vec<Collection>, sqlx:
         })
         .collect();
 
-    // build tree: attach children to their parents
-    let ids: Vec<i64> = all.iter().map(|c| c.id).collect();
-    for &child_id in &ids {
-        let child_idx = all.iter().position(|c| c.id == child_id).unwrap();
-        let parent_id = all[child_idx].parent_id;
-        if let Some(pid) = parent_id {
-            // temporarily remove child, then push into parent
-            let child = all.remove(child_idx);
-            if let Some(parent_idx) = all.iter().position(|c| c.id == pid) {
-                all[parent_idx].children.push(child);
-            } else {
-                // parent not found (shouldn't happen), put back as root
-                all.push(child);
+    Ok(build_tree(nodes))
+}
+
+/// 隣接リストから再帰的に階層ツリーを構築する（CR-007）。
+///
+/// 旧実装は `all` を破壊的に畳み込みながら親を線形探索していたため、孫（3 階層以上）が
+/// 「親が先に入れ子化されると top-level から親を見つけられず」ツリーから消えていた。
+/// 消えるかどうかは名前順（＝処理順）に依存した。ここでは id→子 id の隣接リストを作って
+/// ルートから再帰し、深さと名前順に依存せず全ノードを保持する。親が存在しない孤児は
+/// ルート扱いにし、循環は訪問済み集合で防ぐ。入力の名前順は保持する。
+fn build_tree(nodes: Vec<Collection>) -> Vec<Collection> {
+    use std::collections::{HashMap, HashSet};
+
+    let all_ids: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+    let mut children_of: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut roots: Vec<i64> = Vec::new();
+    let mut by_id: HashMap<i64, Collection> = HashMap::new();
+
+    for n in nodes {
+        match n.parent_id {
+            Some(pid) if all_ids.contains(&pid) => {
+                children_of.entry(pid).or_default().push(n.id);
             }
+            // parent_id が None、または存在しない親を指す孤児はルートとして残す。
+            _ => roots.push(n.id),
         }
+        by_id.insert(n.id, n);
     }
 
-    // keep only root collections (those without parent_id)
-    Ok(all.into_iter().filter(|c| c.parent_id.is_none()).collect())
+    fn build(
+        id: i64,
+        by_id: &mut HashMap<i64, Collection>,
+        children_of: &HashMap<i64, Vec<i64>>,
+        visiting: &mut HashSet<i64>,
+    ) -> Option<Collection> {
+        if !visiting.insert(id) {
+            return None; // 循環ガード
+        }
+        let mut node = by_id.remove(&id)?;
+        if let Some(kids) = children_of.get(&id) {
+            for &kid in kids {
+                if let Some(child) = build(kid, by_id, children_of, visiting) {
+                    node.children.push(child);
+                }
+            }
+        }
+        Some(node)
+    }
+
+    let mut visiting = HashSet::new();
+    roots
+        .into_iter()
+        .filter_map(|id| build(id, &mut by_id, &children_of, &mut visiting))
+        .collect()
 }
 
 pub async fn create_collection(
@@ -133,6 +168,45 @@ mod tests {
     use super::*;
     use crate::db::entries::create_entry;
     use crate::models::EntryInput;
+
+    fn node(id: i64, name: &str, parent: Option<i64>) -> Collection {
+        Collection { id, name: name.to_string(), parent_id: parent, children: vec![] }
+    }
+
+    /// CR-007: 3 階層のツリーが、入力（名前）順の並びに関係なく全ノード保持される。
+    #[test]
+    fn build_tree_keeps_three_levels_regardless_of_order() {
+        // A(root) > B > C
+        let a = node(1, "A", None);
+        let b = node(2, "B", Some(1));
+        let c = node(3, "C", Some(2));
+
+        // 入力順の全順列で同じツリーになること（旧実装は順序依存で孫が消えた）。
+        let orders: Vec<Vec<Collection>> = vec![
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![a.clone(), c.clone(), b.clone()],
+            vec![c.clone(), b.clone(), a.clone()],
+            vec![b.clone(), c.clone(), a.clone()],
+        ];
+        for order in orders {
+            let tree = build_tree(order);
+            assert_eq!(tree.len(), 1, "root は 1 つ");
+            assert_eq!(tree[0].id, 1);
+            assert_eq!(tree[0].children.len(), 1);
+            assert_eq!(tree[0].children[0].id, 2, "B は A の子");
+            assert_eq!(tree[0].children[0].children.len(), 1);
+            assert_eq!(tree[0].children[0].children[0].id, 3, "C は B の子（消えない）");
+        }
+    }
+
+    /// 親が存在しない孤児はルート扱いにする（消さない）。
+    #[test]
+    fn build_tree_treats_orphan_as_root() {
+        let orphan = node(5, "Orphan", Some(999)); // 親 999 は存在しない
+        let tree = build_tree(vec![orphan]);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, 5);
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn create_collection_returns_collection(pool: SqlitePool) {

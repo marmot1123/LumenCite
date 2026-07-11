@@ -906,6 +906,12 @@ fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
         {
             Ok(att) => {
                 eprintln!("clipper: attached {} to entry {}", att.file_name, job.entry_id);
+                // 添付後に全文索引する（クリッパー経路も自動索引・CR-027）。
+                let abs = app_data_dir
+                    .join("attachments")
+                    .join(job.entry_id.to_string())
+                    .join(&att.file_name);
+                crate::db::fulltext::extract_and_index(&pool, abs, att.id).await;
                 if let Some(app) = &app {
                     let _ = app.emit("entries-changed", ());
                 }

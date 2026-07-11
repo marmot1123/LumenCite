@@ -22,6 +22,8 @@ export function SummarySheet({ entry, onClose, onSavedToNotes, onOpenSettings }:
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [generationKey, setGenerationKey] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const channelRef = useRef<Channel<SummaryStreamEvent> | null>(null);
 
   // 生成キックオフ: マウント時と「再生成」時
@@ -88,7 +90,9 @@ export function SummarySheet({ entry, onClose, onSavedToNotes, onOpenSettings }:
   }, [entry.id, generationKey]);
 
   const handleSave = async () => {
-    if (!text.trim() || !model) return;
+    if (!text.trim() || !model || saving) return;
+    setSaving(true);
+    setSaveError(null);
     try {
       // entries.summary にも保存（履歴・モデル名・日時を保持）
       await invoke("save_entry_summary", { id: entry.id, summary: text, model });
@@ -99,13 +103,21 @@ export function SummarySheet({ entry, onClose, onSavedToNotes, onOpenSettings }:
       const newNotes = entry.notes && entry.notes.trim().length > 0
         ? `${entry.notes}\n\n---\n\n${block}`
         : block;
+      // 保存失敗は握りつぶさずユーザーに見せる（CR-034）。成功時のみ親が閉じる。
       await onSavedToNotes(newNotes);
     } catch (e) {
-      console.error(e);
+      const msg = typeof e === "string" ? e : (e as Error)?.message ?? String(e);
+      setSaveError(msg);
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleRegenerate = () => setGenerationKey(k => k + 1);
+  // 生成中の再実行を禁止する（重複した有料リクエストの並走を防ぐ・CR-034）。
+  const handleRegenerate = () => {
+    if (status === "loading" || status === "streaming") return;
+    setGenerationKey(k => k + 1);
+  };
 
   return (
     <div
@@ -204,8 +216,13 @@ export function SummarySheet({ entry, onClose, onSavedToNotes, onOpenSettings }:
 
         <div style={{
           padding: "12px 18px", borderTop: "1px solid var(--border)",
-          display: "flex", justifyContent: "flex-end", gap: 6,
+          display: "flex", justifyContent: "flex-end", gap: 6, alignItems: "center",
         }}>
+          {saveError && (
+            <span style={{ marginRight: "auto", fontSize: 11.5, color: "var(--danger-strong)" }}>
+              {t("summary.saveError")}: {saveError}
+            </span>
+          )}
           <button
             onClick={onClose}
             style={{
@@ -229,11 +246,13 @@ export function SummarySheet({ entry, onClose, onSavedToNotes, onOpenSettings }:
           {status === "done" && (
             <button
               onClick={handleSave}
+              disabled={saving}
               style={{
                 padding: "6px 12px", borderRadius: 5,
                 border: "1px solid var(--border-strong)",
                 background: "var(--accent-strong)", color: "white",
-                fontSize: 12, fontWeight: 500, cursor: "pointer",
+                fontSize: 12, fontWeight: 500, cursor: saving ? "default" : "pointer",
+                opacity: saving ? 0.6 : 1,
               }}
             >{t("summary.save")}</button>
           )}

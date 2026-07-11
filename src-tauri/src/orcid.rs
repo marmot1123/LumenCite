@@ -27,6 +27,9 @@ pub async fn fetch_by_orcid(orcid_raw: &str) -> Result<AuthorInput, String> {
     let url = format!("https://pub.orcid.org/v3.0/{}/person", id);
     let client = reqwest::Client::builder()
         .user_agent("LumenCite/0.3 (mailto:support@lumencite.app)")
+        // connect / 全体タイムアウト（CR-033）。無応答ホストで無限に待たない。
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -492,7 +495,7 @@ mod tests {
         assert_eq!(by_scheme.get("researcher_id").unwrap().value, "A-1234-2015");
         assert_eq!(by_scheme.get("loop").unwrap().value, "999");
         // 未知タイプも小文字 snake_case で取り込まれる
-        assert!(by_scheme.get("some_new_service").is_some());
+        assert!(by_scheme.contains_key("some_new_service"));
     }
 
     #[test]

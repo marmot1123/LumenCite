@@ -512,7 +512,6 @@ function BibtexTab({ onOpenBibtexSync }: { onOpenBibtexSync: () => void }) {
 function UpdatesTab() {
   const { t } = useTranslation();
   const appVersion = useAppVersion();
-  const [channel, setChannel] = useState<"stable" | "beta">("stable");
   const [status, setStatus] = useState<
     "idle" | "checking" | "up_to_date" | "available" | "notify" | "downloading" | "installing" | "error"
   >("idle");
@@ -661,16 +660,8 @@ function UpdatesTab() {
         )}
       </Section>
 
-      <Section title={t("settings.updates.channel")}>
-        <Segmented<"stable" | "beta">
-          value={channel}
-          onChange={setChannel}
-          options={[
-            { id: "stable", label: t("settings.updates.channelStable") },
-            { id: "beta",   label: t("settings.updates.channelBeta") },
-          ]}
-        />
-      </Section>
+      {/* 更新チャンネル（stable/beta）は配信側が未対応で、トグルしても効果が無かったため
+          実装まで非表示にする（CR-028）。 */}
     </>
   );
 }

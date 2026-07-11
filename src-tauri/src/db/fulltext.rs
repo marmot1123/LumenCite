@@ -61,6 +61,22 @@ pub async fn update_attachment_pages(
     Ok(())
 }
 
+/// PDF を抽出して全文索引に取り込む（添付成功後の自動索引・CR-027）。best-effort。
+/// テキストレイヤーが無い / 抽出失敗（スキャン PDF 等）は黙って諦める（OCR で後追い可能）。
+/// 全経路（手動添付・arXiv 取得・クリッパー）が同じ post-attach 索引を通るよう共有する。
+pub async fn extract_and_index(pool: &SqlitePool, abs_path: std::path::PathBuf, attachment_id: i64) {
+    let extracted =
+        tokio::task::spawn_blocking(move || pdf_extract::extract_text_by_pages(&abs_path)).await;
+    if let Ok(Ok(pages_text)) = extracted {
+        let pages: Vec<(i64, String)> = pages_text
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| ((i + 1) as i64, t))
+            .collect();
+        let _ = index_attachment(pool, attachment_id, &pages).await;
+    }
+}
+
 pub async fn unindex_attachment(
     pool: &SqlitePool,
     attachment_id: i64,
@@ -157,6 +173,7 @@ pub async fn search_fulltext(
     query: &str,
     collection_id: Option<i64>,
     tag_id: Option<i64>,
+    view: Option<&str>,
 ) -> Result<Vec<FulltextHit>, sqlx::Error> {
     let tokens: Vec<&str> = query.split_whitespace().collect();
     if tokens.is_empty() {
@@ -195,9 +212,16 @@ pub async fn search_fulltext(
         sql.push_str("fulltext MATCH ?");
     }
 
-    sql.push_str(
-        " AND a.entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
-    );
+    // view スコープ（CR-001）。trash ビュー時はゴミ箱内、それ以外は現役のみ。
+    if matches!(view, Some("trash")) {
+        sql.push_str(
+            " AND a.entry_id IN (SELECT id FROM entries WHERE deleted_at IS NOT NULL)",
+        );
+    } else {
+        sql.push_str(
+            " AND a.entry_id IN (SELECT id FROM entries WHERE deleted_at IS NULL)",
+        );
+    }
 
     if collection_id.is_some() {
         sql.push_str(
@@ -320,10 +344,11 @@ mod tests {
         .await
         .unwrap();
 
+        // file_path は UNIQUE（CR-008）なので entry.id を含めて一意にする。
         let att = add_attachment(
             pool,
             entry.id,
-            "attachments/x/p.pdf",
+            &format!("attachments/{}/p.pdf", entry.id),
             "p.pdf",
             "application/pdf",
         )
@@ -345,7 +370,7 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = search_fulltext(&pool, "transformer", None, None).await.unwrap();
+        let hits = search_fulltext(&pool, "transformer", None, None, None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].attachment_id, att_id);
         assert_eq!(hits[0].page, 1);
@@ -368,7 +393,7 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = search_fulltext(&pool, "attention", None, None).await.unwrap();
+        let hits = search_fulltext(&pool, "attention", None, None, None).await.unwrap();
         let pages: Vec<i64> = hits.iter().map(|h| h.page).collect();
         assert!(pages.contains(&1));
         assert!(pages.contains(&2));
@@ -386,8 +411,8 @@ mod tests {
             .await
             .unwrap();
 
-        let stale = search_fulltext(&pool, "old", None, None).await.unwrap();
-        let fresh = search_fulltext(&pool, "fresh", None, None).await.unwrap();
+        let stale = search_fulltext(&pool, "old", None, None, None).await.unwrap();
+        let fresh = search_fulltext(&pool, "fresh", None, None, None).await.unwrap();
         assert!(stale.is_empty());
         assert_eq!(fresh.len(), 1);
     }
@@ -412,9 +437,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(search_fulltext(&pool, "original", None, None).await.unwrap().len(), 2);
-        assert_eq!(search_fulltext(&pool, "replaced", None, None).await.unwrap().len(), 1);
-        assert!(search_fulltext(&pool, "two original", None, None).await.unwrap().is_empty());
+        assert_eq!(search_fulltext(&pool, "original", None, None, None).await.unwrap().len(), 2);
+        assert_eq!(search_fulltext(&pool, "replaced", None, None, None).await.unwrap().len(), 1);
+        assert!(search_fulltext(&pool, "two original", None, None, None).await.unwrap().is_empty());
 
         // 空文字列に差し替えた場合はそのページの行が消える（再OCRで空だったケース）
         update_attachment_pages(&pool, att_id, &[(3, "".to_string())]).await.unwrap();
@@ -454,7 +479,7 @@ mod tests {
 
         unindex_attachment(&pool, att_id).await.unwrap();
 
-        let hits = search_fulltext(&pool, "needle", None, None).await.unwrap();
+        let hits = search_fulltext(&pool, "needle", None, None, None).await.unwrap();
         assert!(hits.is_empty());
         assert!(!is_indexed(&pool, att_id).await.unwrap());
     }
@@ -485,7 +510,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn empty_query_returns_empty(pool: SqlitePool) {
-        let hits = search_fulltext(&pool, "  ", None, None).await.unwrap();
+        let hits = search_fulltext(&pool, "  ", None, None, None).await.unwrap();
         assert!(hits.is_empty());
     }
 
@@ -514,7 +539,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = search_fulltext(&pool, "transformer", Some(col_id), None)
+        let hits = search_fulltext(&pool, "transformer", Some(col_id), None, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -532,7 +557,7 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = search_fulltext(&pool, "深層学習", None, None).await.unwrap();
+        let hits = search_fulltext(&pool, "深層学習", None, None, None).await.unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -559,8 +584,8 @@ mod tests {
 
         crate::db::entries::delete_entry(&pool, entry_id).await.unwrap();
 
-        let hits_a = search_fulltext(&pool, "alpha", None, None).await.unwrap();
-        let hits_b = search_fulltext(&pool, "beta", None, None).await.unwrap();
+        let hits_a = search_fulltext(&pool, "alpha", None, None, None).await.unwrap();
+        let hits_b = search_fulltext(&pool, "beta", None, None, None).await.unwrap();
         assert!(hits_a.is_empty());
         assert!(hits_b.is_empty());
     }
@@ -580,7 +605,7 @@ mod tests {
         .unwrap();
 
         // 短いトークン → LIKE フォールバック。`_` はリテラル扱いであること。
-        let hits = search_fulltext(&pool, "a_", None, None).await.unwrap();
+        let hits = search_fulltext(&pool, "a_", None, None, None).await.unwrap();
         assert_eq!(hits.len(), 1, "`_` must not act as a wildcard");
         assert_eq!(hits[0].page, 1);
     }
@@ -592,7 +617,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = search_fulltext(&pool, "AI", None, None).await.unwrap();
+        let hits = search_fulltext(&pool, "AI", None, None, None).await.unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -609,7 +634,7 @@ mod tests {
         assert!(ids.contains(&unindexed));
         assert!(!ids.contains(&indexed));
         // file_path も返る。
-        assert!(missing.iter().any(|(_, p)| p == "attachments/x/p.pdf"));
+        assert!(missing.iter().any(|(_, p)| p.ends_with("/p.pdf")));
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -149,7 +149,28 @@ pub fn serialize_servers_config(servers: &[McpServerConfig]) -> String {
 }
 
 fn prefixed_tool_name(server_id: &str, tool: &str) -> String {
-    format!("{TOOL_PREFIX}{server_id}_{tool}")
+    sanitize_tool_name(&format!("{TOOL_PREFIX}{server_id}_{tool}"))
+}
+
+/// OpenAI / Anthropic の tool 名制約（`^[a-zA-Z0-9_-]+$`・最大 64 文字）に収める（CR-035）。
+/// server_id や tool にドット・スラッシュ・空白等が含まれると provider 側で拒否されるため、
+/// 許可外文字を `_` に置換し、長すぎる名前を丸める。置換後は全て ASCII 1 バイトなので
+/// バイト truncate で境界割れは起きない。
+fn sanitize_tool_name(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.len() > 64 {
+        s.truncate(64);
+    }
+    s
 }
 
 fn build_request(id: i64, method: &str, params: Value) -> Value {
@@ -373,8 +394,11 @@ impl McpManager {
     /// 起動中の全サーバーのツール定義（プレフィックス済み）。
     pub async fn tool_specs(&self) -> Vec<ToolSpec> {
         let servers = self.servers.lock().await;
-        servers
-            .values()
+        // server_id 昇順で決定的に並べる（HashMap 反復順に依存しない・CR-035）。
+        let mut handles: Vec<_> = servers.values().collect();
+        handles.sort_by(|a, b| a.config.id.cmp(&b.config.id));
+        handles
+            .into_iter()
             .flat_map(|h| h.tools.iter().map(|(_, spec)| spec.clone()))
             .collect()
     }
@@ -394,7 +418,11 @@ impl McpManager {
         // 呼び出しまで全て塞がってしまう。
         let target = {
             let servers = self.servers.lock().await;
-            servers.values().find_map(|handle| {
+            // server_id 昇順で決定的に解決する。万一名前が衝突しても常に同じサーバーへ
+            // ルーティングされる（HashMap 反復順依存を排除・CR-035）。
+            let mut handles: Vec<_> = servers.values().collect();
+            handles.sort_by(|a, b| a.config.id.cmp(&b.config.id));
+            handles.into_iter().find_map(|handle| {
                 handle
                     .tools
                     .iter()
@@ -420,6 +448,28 @@ impl McpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_tool_name_enforces_provider_charset_and_length() {
+        // ドット・スラッシュ・空白・コロンは `_` に。英数字と `_ -` は保持。
+        assert_eq!(sanitize_tool_name("mcp_obsidian_append.note"), "mcp_obsidian_append_note");
+        assert_eq!(sanitize_tool_name("mcp_gh_create/issue now"), "mcp_gh_create_issue_now");
+        assert_eq!(sanitize_tool_name("mcp_a-b_c"), "mcp_a-b_c");
+        // 64 文字に丸める。
+        let long = format!("mcp_{}", "x".repeat(200));
+        assert_eq!(sanitize_tool_name(&long).len(), 64);
+        // 結果は provider の許可文字のみ。
+        assert!(sanitize_tool_name("mcp_✓_tool")
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+    }
+
+    #[test]
+    fn prefixed_tool_name_is_provider_valid() {
+        let name = prefixed_tool_name("my.server", "do:thing");
+        assert!(name.starts_with("mcp_"));
+        assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+    }
 
     #[test]
     fn parse_claude_desktop_format() {

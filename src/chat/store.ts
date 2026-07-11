@@ -191,8 +191,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   approveToolCall: async (callId, approved) => {
     set((s) => applyApproval(s, callId, approved));
+    // 承認は実行中セッションのものを解決する（CR-014: (session_id, call_id) 複合キー）。
+    const sid = get().streamingSessionId ?? get().activeSessionId;
+    if (sid == null) return;
     try {
-      await invoke("approve_tool_call", { callId, approved });
+      await invoke("approve_tool_call", { sessionId: sid, callId, approved });
     } catch (e) {
       set({ error: String(e) });
     }
