@@ -880,12 +880,52 @@ pub async fn bulk_trash(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Erro
     Ok(())
 }
 
+/// 与えた（通常はゴミ箱内の）エントリを untrash したとき、現役エントリと識別子が
+/// 衝突する相手 id を返す（CR-019）。dedup は現役同士の識別子重複を作らせない不変条件を
+/// 保つので、restore で現役に同一 DOI/arXiv/ISBN を復活させるのは禁止する。best-effort の
+/// partial UNIQUE 索引が張られていれば DB でも弾かれるが、張れていない場合でも不変条件を
+/// 守るため、事前にここで検出する。
+async fn live_identifier_conflict<'e, E>(exec: E, id: i64) -> Result<Option<i64>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query_scalar(
+        "SELECT e2.id FROM entries e1
+         JOIN entries e2
+           ON e2.id != e1.id
+          AND e2.deleted_at IS NULL
+          AND (
+                (e1.doi_canonical   IS NOT NULL AND e2.doi_canonical   = e1.doi_canonical)
+             OR (e1.arxiv_canonical IS NOT NULL AND e2.arxiv_canonical = e1.arxiv_canonical)
+             OR (e1.isbn_canonical  IS NOT NULL AND e2.isbn_canonical  = e1.isbn_canonical)
+          )
+         WHERE e1.id = ?
+         ORDER BY e2.id ASC
+         LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(exec)
+    .await
+}
+
+fn restore_conflict_error(id: i64, conflict: i64) -> sqlx::Error {
+    sqlx::Error::Protocol(format!(
+        "restore aborted (id={id}): 現役エントリ (id={conflict}) と同一の識別子です。\
+         先に一方を統合または削除してください（CR-019）。"
+    ))
+}
+
 pub async fn bulk_restore(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Error> {
     if ids.is_empty() {
         return Ok(());
     }
     let mut tx = pool.begin().await?;
     for id in ids {
+        // tx 内で 1 件ずつ復活させるので、直前に復活したバッチ内の行も現役として見え、
+        // バッチ内の重複同士も検出できる。
+        if let Some(conflict) = live_identifier_conflict(&mut *tx, *id).await? {
+            return Err(restore_conflict_error(*id, conflict));
+        }
         sqlx::query(
             "UPDATE entries
              SET deleted_at = NULL, updated_at = datetime('now')
@@ -1280,6 +1320,11 @@ pub async fn trash_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> 
 }
 
 pub async fn restore_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> {
+    // 現役エントリと識別子が衝突するなら復活させない（CR-019）。
+    if let Some(conflict) = live_identifier_conflict(pool, id).await? {
+        return Err(restore_conflict_error(id, conflict));
+    }
+
     let rows = sqlx::query(
         "UPDATE entries
          SET deleted_at = NULL, updated_at = datetime('now')
@@ -2538,6 +2583,73 @@ mod tests {
             ..Default::default()
         }).await.unwrap();
         assert_ne!(second.id, first.id);
+    }
+
+    /// CR-019: ゴミ箱の同一識別子を現役へ restore すると、現役の相手と衝突するので拒否する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn restore_entry_rejected_on_live_identifier_conflict(pool: SqlitePool) {
+        // A を作って trash → B（同一 arXiv）を現役で作成（trash 中は dedup 対象外なので作れる）。
+        let a = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        trash_entry(&pool, a.id).await.unwrap();
+        let _b = create_entry(&pool, &EntryInput {
+            title: "B".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        // A を restore すると B と衝突するのでエラー。
+        let err = restore_entry(&pool, a.id).await.unwrap_err();
+        assert!(err.to_string().contains("識別子"), "明示的な衝突メッセージ: {err}");
+
+        // A は依然ゴミ箱のまま。
+        let still_trashed: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM entries WHERE id = ? AND deleted_at IS NOT NULL")
+                .bind(a.id).fetch_optional(&pool).await.unwrap();
+        assert_eq!(still_trashed, Some(a.id));
+    }
+
+    /// CR-019: 衝突相手がいなければ restore は通る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn restore_entry_succeeds_without_conflict(pool: SqlitePool) {
+        let a = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        trash_entry(&pool, a.id).await.unwrap();
+
+        restore_entry(&pool, a.id).await.unwrap();
+        let live: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM entries WHERE id = ? AND deleted_at IS NULL")
+                .bind(a.id).fetch_optional(&pool).await.unwrap();
+        assert_eq!(live, Some(a.id));
+    }
+
+    /// CR-019: バッチ復活で同一識別子が 2 件含まれると衝突として弾く。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn bulk_restore_rejects_intra_batch_identifier_conflict(pool: SqlitePool) {
+        // 直接 INSERT で「両方 trash 済み・同一 canonical」を作る。
+        let a = sqlx::query("INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical, deleted_at)
+                             VALUES ('A','article','2301.00001','2301.00001', datetime('now'))")
+            .execute(&pool).await.unwrap().last_insert_rowid();
+        let b = sqlx::query("INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical, deleted_at)
+                             VALUES ('B','article','2301.00001','2301.00001', datetime('now'))")
+            .execute(&pool).await.unwrap().last_insert_rowid();
+
+        let err = bulk_restore(&pool, &[a, b]).await.unwrap_err();
+        assert!(err.to_string().contains("識別子"), "{err}");
+
+        // tx はロールバックされ、両方ともゴミ箱のまま。
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(live, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
