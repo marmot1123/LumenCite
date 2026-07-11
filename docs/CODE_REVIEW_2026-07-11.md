@@ -306,3 +306,28 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 レビューで追加したファイル: `docs/CODE_REVIEW_2026-07-11.md`。
 
 上記のとおり実装コードを修正済み（ブランチ `fix/code-review-2026-07-11`・36 コミット）。
+
+## 11. フォローアップ修正（`fix/code-review-2026-07-11-followup`）
+
+§10 で ◐（一部対応）だった項目の残タスクを追って対応した。**1 件 = 1 コミット**、
+`cargo test`（505 passed）/ `cargo clippy -- -D warnings` / `pnpm build` すべて green。
+
+| ID | 対応内容 |
+|---|---|
+| CR-038 | API_SPEC の drift 修正（`abstract`→`abstract_`、実在しない updater command 削除）※docs のみ |
+| CR-034 | Summary sheet を閉じた/再生成した際に backend の LLM リクエストを実際に中断（`cancel_summary` + `SummaryRuntime`） |
+| CR-028 | command palette を backend 全文献検索に / パレットの library 依存アクションは library へ遷移 / Header の「download」を実動作（別窓表示）に改名 |
+| CR-006 | `author_ids` を尊重（既存著者 ID を直接リンク）/ 一覧・詳細 DTO に `Author.identifiers` を反映 |
+| CR-033 | OpenAI/Anthropic の SSE error event を検出して失敗扱い / 終端マーカー（finish_reason・[DONE]・message_stop）不在の truncation を成功扱いにしない |
+| CR-026 | 厳格 CSP を導入（production `csp` + Vite 用 `devCsp`）。**要実機検証**: `pnpm build` は CSP を評価しない。`pnpm tauri dev` と本番バンドルで PDF/数式/Markdown/パレット/設定を確認すること |
+| CR-023 | MCP/clipper HTTP server を上限付き並列化（head-of-line blocking 解消）/ clip の重複判定→作成を `CLIP_APPLY_LOCK` で直列化 |
+| CR-022 | chat `set_scope` を単一 tx 化 / export は消えたエントリをスキップ / backup を `BACKUP_LOCK` で直列化 |
+| CR-008 | 添付削除を rename-to-trash + 永続 retry queue（`attachment_trash` モジュール・起動時 sweep）で堅牢化 |
+
+**引き続き別 PR に切り出す 2 件（大規模・要実機検証）:**
+- **CR-019**: 識別子の canonical 列 + partial UNIQUE + 既存行 dedup migration。UNIQUE 作成は
+  既存 DB に重複があると migration が失敗して起動不能になり得るうえ、arXiv 正規化は SQL で
+  表現できず Rust の backfill/dedup 手順が要る。実データに対する実行時検証が必須。
+- **CR-018**: 完全 backup/restore（archive + 添付本体 + import）。restore はライブ DB の
+  差し替え + 再起動を伴い、実機検証なしに配信するのは危険。既存の `VACUUM INTO` は DB 全体は
+  取得済み（添付本体と restore 経路のみが不足）。
