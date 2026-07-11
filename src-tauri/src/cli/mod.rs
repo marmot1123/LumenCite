@@ -56,7 +56,7 @@ pub fn is_cli_invocation(args: &[String]) -> bool {
 #[command(
     name = "lumencite",
     bin_name = "lumencite",
-    about = "Query your LumenCite reference library from the terminal (read-only).",
+    about = "Query and edit your LumenCite reference library from the terminal.",
     version
 )]
 struct Cli {
