@@ -270,19 +270,45 @@ async fn insert_author(
     .await?;
     let id = result.last_insert_rowid();
 
-    // orcid を authors 列に書いたら、author_identifiers にも同じ値を併記する
-    // （v0.3.0 の互換運用）。UNIQUE 違反は他著者と衝突した場合のみで、その時は
-    // ORCID 照合で先にヒットしているはず → 通常は起きない。
-    if let Some(o) = orcid.as_deref() {
+    // 構造化 identifiers（scopus / researcherid 等）も保存する（CR-006）。以前はここで
+    // ORCID しか書かず、新規作成時に ORCID 以外の identifier が失われていた。
+    let mut wrote_orcid_via_identifiers = false;
+    for ident in &input.identifiers {
+        let scheme = ident.scheme.trim();
+        let value = ident.value.trim();
+        if scheme.is_empty() || value.is_empty() {
+            continue;
+        }
         sqlx::query(
-            "INSERT INTO author_identifiers (author_id, scheme, value)
-             VALUES (?, 'orcid', ?)
+            "INSERT INTO author_identifiers (author_id, scheme, value, url)
+             VALUES (?, ?, ?, ?)
              ON CONFLICT DO NOTHING",
         )
         .bind(id)
-        .bind(o)
+        .bind(scheme)
+        .bind(value)
+        .bind(ident.url.as_deref().map(str::trim).filter(|s| !s.is_empty()))
         .execute(&mut **tx)
         .await?;
+        if scheme == "orcid" {
+            wrote_orcid_via_identifiers = true;
+        }
+    }
+
+    // orcid を authors 列に書いたら、author_identifiers にも同じ値を併記する
+    // （v0.3.0 の互換運用）。identifiers 経由で既に書かれていれば重複させない。
+    if !wrote_orcid_via_identifiers {
+        if let Some(o) = orcid.as_deref() {
+            sqlx::query(
+                "INSERT INTO author_identifiers (author_id, scheme, value)
+                 VALUES (?, 'orcid', ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .bind(o)
+            .execute(&mut **tx)
+            .await?;
+        }
     }
 
     // 挿入後に再フェッチして DEFAULT / generated 値を含む正しい Author を返す
@@ -704,6 +730,36 @@ mod tests {
         tx.commit().await.unwrap();
 
         assert_eq!(first.id, second.id);
+    }
+
+    /// CR-006: 新規作成時に構造化 identifiers（ORCID 以外）も保存する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_or_create_author_persists_structured_identifiers(pool: SqlitePool) {
+        let mut tx = pool.begin().await.unwrap();
+        let input = AuthorInput {
+            name: "Grace Hopper".to_string(),
+            identifiers: vec![
+                AuthorIdentifierInput { scheme: "scopus".into(), value: "12345".into(), url: None },
+                AuthorIdentifierInput { scheme: "researcherid".into(), value: "A-1".into(), url: None },
+            ],
+            ..Default::default()
+        };
+        let created = get_or_create_author(&mut tx, &input).await.unwrap();
+        tx.commit().await.unwrap();
+
+        // 返り値にも DB にも両方の identifier が入っている。
+        let mut schemes: Vec<&str> = created.identifiers.iter().map(|i| i.scheme.as_str()).collect();
+        schemes.sort();
+        assert_eq!(schemes, vec!["researcherid", "scopus"]);
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM author_identifiers WHERE author_id = ?",
+        )
+        .bind(created.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
     }
 
     /// CR-005: 既存の同名著者（ORCID 無し）と、別 ORCID を持つ同名の別人を統合しない。
