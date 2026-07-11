@@ -82,17 +82,22 @@ export function Header({ entry, onBack, onToggleStar, onSummarize, onChat, onOcr
           <span>{ocrBusy ? t("detail.header.ocrRunning") : t("detail.header.ocr")}</span>
         </HeaderBtn>
       )}
-      <HeaderBtn onClick={onDownload} title={t("detail.header.download")}>
-        <Icon name="download" size={13} color="var(--text-mute)" />
-      </HeaderBtn>
+      {/* ハンドラが渡されたときだけ表示する（未配線のボタンを出さない・CR-028）。 */}
+      {onDownload && (
+        <HeaderBtn onClick={onDownload} title={t("detail.header.download")}>
+          <Icon name="download" size={13} color="var(--text-mute)" />
+        </HeaderBtn>
+      )}
       {onPrint && (
         <HeaderBtn onClick={onPrint} title={t("detail.header.print")}>
           <Icon name="printer" size={13} color="var(--text-mute)" />
         </HeaderBtn>
       )}
-      <HeaderBtn onClick={onMore} title={t("detail.header.more")}>
-        <span style={{ fontSize: 14, lineHeight: 1, color: "var(--text-mute)" }}>⋯</span>
-      </HeaderBtn>
+      {onMore && (
+        <HeaderBtn onClick={onMore} title={t("detail.header.more")}>
+          <span style={{ fontSize: 14, lineHeight: 1, color: "var(--text-mute)" }}>⋯</span>
+        </HeaderBtn>
+      )}
     </header>
   );
 }

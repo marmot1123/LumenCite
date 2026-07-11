@@ -318,7 +318,7 @@ export function DetailView({
         return;
       }
       if ((e.key === "h" || e.key === "H") && !editable) { setMode("highlight"); return; }
-      if ((e.key === "n" || e.key === "N") && !editable) { setMode("note"); return; }
+      // note/pen モードは未実装のためショートカットも無効化（CR-028）。
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
