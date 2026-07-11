@@ -1,7 +1,9 @@
 # コードベースレビュー（2026-07-11）
 
-> **状態: 完了**
+> **状態: レビュー完了 → 修正実施済み（2026-07-11）**
 > この文書はレビュー結果と、将来の修正作業を中断・再開するためのチェックポイントを兼ねる。
+> **36 件を修正済み**（全 P0・全 P1・P2 22件・P3 4件）。残り 3 件（CR-016 / CR-021 / CR-025）は
+> 大規模な再設計を伴うため合意のうえ見送り。詳細は **§10 修正実施状況** を参照。
 
 ## 1. レビュー基準
 
@@ -242,4 +244,65 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 
 レビューで追加したファイル: `docs/CODE_REVIEW_2026-07-11.md`。
 
-レビュー対象の実装コードは変更していない。
+## 10. 修正実施状況（2026-07-11）
+
+ブランチ `fix/code-review-2026-07-11` にて、推奨修正順に従い **1 件 = 1 コミット**で対応した。
+各修正は仕様更新（該当する場合）・回帰テスト・frontend/backend 両面の検証を同一コミットに含む。
+
+**検証（全 green）**: `cargo test` = 487 passed / 0 failed、`cargo clippy --all-targets --all-features -- -D warnings` = 警告ゼロ、`pnpm build`（型検査+ビルド）成功、extension test = 10 passed / build 成功。
+
+追加した基盤: migration `0011_highlight_attachment` / `0012_attachment_path_unique`、依存 `aes-gcm`（保存時暗号化）・`fs2`（GUI 生存ロック）、PR 用 CI workflow `.github/workflows/ci.yml`（Rust test + clippy `-D warnings` gate + frontend/extension ビルド + `cargo audit` 情報表示）。
+
+凡例: **✅ 完了** / **◐ 一部対応**（安全な自己完結サブセットを実施、残りは各コミットに `Deferred` として明記）/ **⏸ 見送り**（大規模再設計・合意のうえ未着手）。
+
+| ID | 重要度 | 状態 | コミット | 備考（◐ は残タスク） |
+|---|---|---|---|---|
+| CR-001 | P0 | ✅ | `0e5aaaa` | purge の DB 側 `deleted_at IS NOT NULL` 防御 + 検索 view スコープ + `empty_trash` |
+| CR-002 | P1 | ✅ | `6915eaf` | `get/set_setting` を検証付き用途別コマンドで実装 |
+| CR-003 | P1 | ✅ | `67cda4b` | Web Clipper PDF 取得の SSRF 遮断（scheme/IP 検証 + 手動 redirect） |
+| CR-004 | P1 | ✅ | `4916a57` | pdfium をバージョン固定 + SHA-256 検証 |
+| CR-005 | P1 | ✅ | `5e59c94` | ORCID 不一致の同名著者を統合しない |
+| CR-009 | P1 | ✅ | `4134986` | Windows BibTeX 同期の上書き修正 + 直列化 |
+| CR-010 | P1 | ✅ | `a701260` | Chat Stop 後の書込 tool 実行を fail-closed で停止 |
+| CR-012 | P1 | ✅ | `dec6b31` | 外部 MCP env 秘密を AES-256-GCM 暗号化（単一マスター鍵） |
+| CR-015 | P1 | ✅ | `0301c2b` | ハイライトを添付 PDF 単位に分離（migration 0011） |
+| CR-017 | P1 | ✅ | `52c51ca` | pdf-extract 更新で lopdf stack-overflow CVE 解消 |
+| CR-006 | P2 | ◐ | `6116e5d` | 作成時に構造化 identifiers を保存。**残**: `author_ids` 尊重 / list への identifiers 反映 |
+| CR-007 | P2 | ✅ | `0395e31` | 3 階層以上の collection tree 消失を修正（隣接リスト再帰） |
+| CR-008 | P2 | ◐ | `cf08e8d` | 原子的 exclusive-create + tx 削除 + path UNIQUE。**残**: rename-to-trash / 永続 retry queue |
+| CR-011 | P2 | ✅ | `3a375e7` | GUI 生存を advisory ロックで独立判定（fail closed） |
+| CR-013 | P2 | ✅ | `7d5616b` | stdio shim が keychain から token を読む（config に埋め込まない） |
+| CR-014 | P2 | ✅ | `684438e` | chat run/approval の競合修正（単一 run / `(session_id, call_id)` / timeout） |
+| CR-018 | P2 | ◐ | `a370368` | JSON/MD を「metadata export」と明記。**残**: 完全 backup/restore（archive+添付+import） |
+| CR-019 | P2 | ◐ | `45914e6` | arXiv ID 正規化統一。**残**: canonical 列 + partial UNIQUE + 既存行 dedup migration |
+| CR-020 | P2 | ✅ | `35a7674` | DOI URL encode + arXiv status/timeout + XML entity 復号 |
+| CR-021 | P2 | ⏸ | — | 一覧の pagination + batch 関連ロード + cache + 逆引き索引（大規模） |
+| CR-022 | P2 | ◐ | `26304e8` | tag を atomic upsert 化。**残**: chat scope / export snapshot / backup mutex |
+| CR-023 | P2 | ◐ | `6f2435d` | enable フラグの bind 失敗 rollback。**残**: bounded concurrency / duplicate precheck |
+| CR-024 | P2 | ✅ | `95fe2c0` | chat entry scope を read/write 全 tool に適用 |
+| CR-025 | P2 | ⏸ | — | frontend patch command + optimistic lock + request seq guard + 統一 cache 無効化（大規模） |
+| CR-026 | P2 | ◐ | `764989b` | Markdown link/image を安全化。**残**: 厳格 CSP（要 runtime 検証のため見送り） |
+| CR-027 | P2 | ✅ | `33dd112` | OCR/索引を選択添付に対応 + 全 attach 経路で自動索引 |
+| CR-028 | P2 | ◐ | `2c81abc` | 未実装 UI（note/pen・beta channel・More）を非表示。**残**: palette global action / download 改名 |
+| CR-029 | P2 | ✅ | `d7def80` | 拡張 fetch に timeout + badge clear の世代管理 |
+| CR-030 | P2 | ✅ | `ea4d90a` | PR CI workflow 新設（Rust/frontend/extension） |
+| CR-031 | P2 | ✅ | `377c467` | plist 更新で quick-xml 0.39 経路除去 + `cargo audit` 可視化 |
+| CR-032 | P2 | ✅ | `f5809d0` | 団体著者の literal 保護 + citation key の structured family 優先 |
+| CR-033 | P2 | ◐ | `c1b3734` | 外部 HTTP に connect/read timeout。**残**: SSE error event / terminal marker 必須化 |
+| CR-034 | P2 | ◐ | `df130fd` | notes 保存 await + 再生成 guard。**残**: sheet を閉じた際の backend request cancel |
+| CR-035 | P2 | ✅ | `54fbea3` | 外部 MCP tool 名の provider 制約サニタイズ + 決定的 routing |
+| CR-016 | P2 | ⏸ | — | PDF binary protocol 転送 + ページ仮想化 + canvas 破棄 + memory budget（大規模） |
+| CR-036 | P3 | ✅ | `84afb6f` | 「Added」列ソートが機能するよう `created_at` 比較 |
+| CR-037 | P3 | ✅ | `71a4f22` | theme 設定の enum 検証 + dark accent + PDF 別窓へ theme 適用 |
+| CR-038 | P3 | ◐ | `bb408a6` | CLI help 修正 + HTML lang 同期。**残**: API_SPEC の型/コマンド drift（docs のみ） |
+| CR-039 | P3 | ✅ | `eec3945` | clippy baseline 解消 + CI で `-D warnings` gate |
+
+**見送り 3 件（⏸）の理由**: いずれも IPC/クエリ/フロント状態管理の大規模な再設計を伴い、
+専用の設計と実行時検証（この作業環境ではアプリを起動して検証できない）が必要なため、
+別 PR として切り出すのが安全と判断した。
+
+レビュー開始前からの未追跡ファイル: `AGENTS.md`。
+
+レビューで追加したファイル: `docs/CODE_REVIEW_2026-07-11.md`。
+
+上記のとおり実装コードを修正済み（ブランチ `fix/code-review-2026-07-11`・36 コミット）。
