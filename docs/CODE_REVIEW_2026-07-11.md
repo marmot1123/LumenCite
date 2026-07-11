@@ -273,7 +273,7 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 | CR-011 | P2 | ✅ | `3a375e7` | GUI 生存を advisory ロックで独立判定（fail closed） |
 | CR-013 | P2 | ✅ | `7d5616b` | stdio shim が keychain から token を読む（config に埋め込まない） |
 | CR-014 | P2 | ✅ | `684438e` | chat run/approval の競合修正（単一 run / `(session_id, call_id)` / timeout） |
-| CR-018 | P2 | ◐ | `a370368` | JSON/MD を「metadata export」と明記。**残**: 完全 backup/restore（archive+添付+import） |
+| CR-018 | P2 | ◐→✅ | `a370368` ＋ §13 | JSON/MD を「metadata export」と明記（`a370368`）＋ backup を DB＋添付本体の `.zip` 完全バックアップへ拡張（§13・別 PR）。**残**: 自動 restore/import（別途・要実機検証） |
 | CR-019 | P2 | ✅ | `45914e6` ＋ §12 | arXiv ID 正規化統一（`45914e6`）＋ canonical 列 + 全経路 dedup + 起動時 best-effort partial UNIQUE + restore 衝突ガード（§12・別 PR） |
 | CR-020 | P2 | ✅ | `35a7674` | DOI URL encode + arXiv status/timeout + XML entity 復号 |
 | CR-021 | P2 | ⏸ | — | 一覧の pagination + batch 関連ロード + cache + 逆引き索引（大規模） |
@@ -324,10 +324,9 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 | CR-022 | chat `set_scope` を単一 tx 化 / export は消えたエントリをスキップ / backup を `BACKUP_LOCK` で直列化 |
 | CR-008 | 添付削除を rename-to-trash + 永続 retry queue（`attachment_trash` モジュール・起動時 sweep）で堅牢化 |
 
-**引き続き別 PR に切り出す 1 件（大規模・要実機検証）:**
-- **CR-018**: 完全 backup/restore（archive + 添付本体 + import）。restore はライブ DB の
-  差し替え + 再起動を伴い、実機検証なしに配信するのは危険。既存の `VACUUM INTO` は DB 全体は
-  取得済み（添付本体と restore 経路のみが不足）。
+**別 PR で対応（CR-019 は §12、CR-018 のバックアップ側は §13）:**
+- **CR-018**: バックアップ側（archive + 添付本体）を §13 で実装。**restore/import は引き続き別途**。
+  restore はライブ DB の差し替え + 再起動を伴い、実機検証なしに配信するのは危険。
 
 ## 12. CR-019 完了（別 PR `fix/cr-019-identifier-canonical`）
 
@@ -349,3 +348,29 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 - **要実機検証**: 実 DB（未索引 27 件を含む）で ①起動時 backfill が既存行の canonical を埋める
   ②現役重複が無ければ UNIQUE が張られる ③重複があればスキップ（起動継続）を確認すること。
   ユニットテストは `#[sqlx::test]` で網羅済み。
+
+## 13. CR-018 バックアップ拡張（別 PR `fix/cr-018-backup-attachments`）
+
+§11 で別 PR に切り出していた CR-018 のうち、**バックアップ側（完全アーカイブ + 添付本体）**を
+実装した。方針＝**安全な subset を先行**（backend のみ・`#[sqlx::test]` で検証可能）、
+**restore/import は別途**（ライブ DB 差し替え + 再起動を伴い危険・要実機検証）。
+
+- **アーカイブ化**: `backup::run_backup` を DB-only の `.db` コピーから、DB ＋ 添付本体を束ねた
+  単一 `.zip`（`lumencite-YYYYMMDD-HHmmss.zip`）へ拡張。内部レイアウトは `db.sqlite`
+  （`VACUUM INTO` のクリーンコピー＝highlights/chat/settings/fulltext 込み）＋
+  `attachments/<entry_id>/<file_name>`。deflate 圧縮。依存 `zip`（`default-features = false`,
+  `features = ["deflate"]`）を追加。
+- **VACUUM の扱い**: `VACUUM INTO` は既存ファイルに書けないため、一時ファイル
+  `.vacuum-<stem>.db.tmp`（`lumencite-` 前缀を避け一覧・prune に拾われない）へ吐き出してから
+  zip に格納し、成功・失敗いずれでも掃除する。途中失敗時は壊れかけの `.zip` も削除。
+- **世代管理**: `list_backups` / `prune_old_backups` の対象判定を `is_backup_file`（`.zip` と
+  旧 `.db` の両対応）へ統一。既存の `.db` バックアップも引き続き一覧・14 世代保持の対象。
+  `BACKUP_LOCK`（CR-022）で自動・手動バックアップを直列化する既存の仕組みはそのまま流用。
+- **UI での範囲明示**: 設定 → データの backup 説明文（i18n `settings.data.backupDesc`・ja/en）を
+  「DB ＋ 添付本体の `.zip` 完全バックアップ／復元は手動展開」と明記。SPEC / API_SPEC も更新。
+- **restore/import は未実装**: `.zip` を展開して `db.sqlite` と `attachments/` を手動配置する運用。
+  自動復元はライブ pool を閉じて DB を差し替え、アプリ再起動が要る（危険）ため将来課題。
+- **テスト**: `backup_bundles_db_and_attachments`（db.sqlite ＋ ネスト添付の同梱・バイト一致・
+  一時ファイル残存なし）／`backup_without_attachments_dir_succeeds`（添付ディレクトリ無しでも成功）
+  ／既存の同秒連続・並行テストは `.zip` 拡張子アサートを追加。`cargo test` / clippy `-D warnings`
+  / `pnpm build` green。

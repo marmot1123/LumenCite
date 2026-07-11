@@ -813,7 +813,7 @@
     "data": {
       "title": "Data",
       "backup": "Backup",
-      "backupDesc": "The SQLite database is backed up to <app data>/backups/ at startup and every 24 hours (14 generations kept).",
+      "backupDesc": "A full .zip backup of the database and attachment files is saved to <app data>/backups/ at startup and every 24 hours (14 generations kept). Restore is currently manual: unzip and place the files.",
       "backupNow": "Backup now",
       "backupNowDone": "Backup created: {{path}}",
       "backupNowError": "Backup failed: {{error}}",

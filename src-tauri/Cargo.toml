@@ -50,6 +50,9 @@ aes-gcm = "0.10"
 # GUI 生存判定用の advisory ロック（CR-011）。GUI が保持し、CLI 書込経路が存在確認する。
 # プロセス終了時に OS が自動解放するため stale ロックが残らない。
 fs2 = "0.4"
+# 完全バックアップ（DB + 添付本体）を単一 .zip に束ねる（CR-018）。
+# 圧縮方式は deflate のみ有効化して依存を最小化する（aes/bzip2/zstd 等は不要）。
+zip = { version = "2", default-features = false, features = ["deflate"] }
 futures-util = "0.3"
 eventsource-stream = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
