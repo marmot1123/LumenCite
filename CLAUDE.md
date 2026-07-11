@@ -45,6 +45,15 @@ Run tests with:
 cargo test
 ```
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request (and push to `main`):
+
+- **rust**: `cargo test` and `cargo clippy --all-targets --all-features -- -D warnings` (a **hard gate** — any clippy warning fails CI), plus a non-blocking `cargo audit`.
+- **frontend**: `pnpm build` (tsc + vite) and the extension's `test` + `build`.
+
+Because clippy runs with `-D warnings`, keep the baseline clean. **Before pushing, run `rustup update stable` then `cargo clippy --all-targets --all-features -- -D warnings` locally** — CI's stable toolchain can be newer than your local one and flag lints you'd otherwise miss (this has caused CI-only failures). Prefer clippy's suggested fix over `#[allow(...)]`.
+
 ## Architecture
 
 The project follows the standard Tauri 2 layout:
