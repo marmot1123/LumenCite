@@ -94,7 +94,7 @@ fn prune_old_backups(backups_dir: &Path, keep: usize) -> std::io::Result<()> {
         .collect();
 
     // 新しい順にソートし、keep 件を超えたものを削除
-    paths.sort_by(|a, b| b.1.cmp(&a.1));
+    paths.sort_by_key(|p| std::cmp::Reverse(p.1));
     for (path, _) in paths.into_iter().skip(keep) {
         let _ = fs::remove_file(path);
     }
