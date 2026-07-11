@@ -281,11 +281,12 @@ type McpServerInfo = McpServerConfig & {
 |---------|------|--------|
 | `get_entries` | `collection_id?: i64, tag_id?: i64, view?: "starred"\|"unfiled"\|"trash", filter?: EntryFilter` | `Vec<EntrySummary>` |
 | `get_entry` | `id: i64` | `Result<EntryDetail>` |
-| `create_entry` | `input: EntryInput` | `Result<EntryDetail>` |
+| `create_entry` | `input: EntryInput` | `Result<EntryDetail>` — DOI/arXiv/ISBN が現役エントリと重複する場合は**新規作成せず既存を返す**（CR-019・全経路で冪等） |
 | `update_entry` | `id: i64, input: EntryInput` | `Result<EntryDetail>` |
 | `set_starred` | `id: i64, starred: bool` | `Result<()>` |
 | `trash_entry` | `id: i64` | `Result<()>` — ソフト削除（`deleted_at` をセット） |
-| `restore_entry` | `id: i64` | `Result<()>` — ゴミ箱から復元 |
+| `restore_entry` | `id: i64` | `Result<()>` — ゴミ箱から復元。復元後に現役エントリと識別子（DOI/arXiv/ISBN）が衝突する場合は `Err`（CR-019） |
+| `find_duplicate_entry` | `doi?: String, arxiv_id?: String, isbn?: String` | `Result<Option<i64>>` — 現役エントリのうち canonical 一致する最小 id。UI が作成前に事前チェックする |
 | `delete_entry` | `id: i64` | `Result<()>` — ハード削除（永久）。通常 UI からは `trash_entry` を経由。 |
 | `fetch_metadata_by_doi` | `doi: String` | `Result<EntryInput>` |
 | `fetch_metadata_by_arxiv` | `arxiv_id: String` | `Result<EntryInput>` |
@@ -294,6 +295,8 @@ type McpServerInfo = McpServerConfig & {
 | `resolve_citation_key` | `entry_id: i64` | `Result<String>` — `.bib` 同期（ゴミ箱を除く全件書き出し）で実際に割り当てられる cite key。`export_bibtex(None)` と同じ並び・衝突回避を再現。詳細ビューの表示/コピー用 |
 
 `create_entry` / `update_entry` の `EntryInput.citation_key` はサニタイズ後 `entries.citation_key` に保存する（空なら NULL = 自動）。既存の固定キーと重複する非 NULL 値は UNIQUE 制約で拒否される（`Result` の `Err`）。UI は保存前に `is_citation_key_available` で検証する。生成・重複回避の規則は `DATA_MODEL.md` の `citation_key` 節を参照。
+
+`create_entry` は識別子（DOI/arXiv/ISBN）の正準値で現役エントリの重複を判定し、一致すれば新規作成せず既存エントリを返す（clipper だけでなく UI/import/LLM の全経路で有効・CR-019）。正規化規則と DB レベルの部分 UNIQUE 制約（best-effort）は `DATA_MODEL.md` の「識別子の canonical 化と重複防止」節を参照。
 
 `get_entries` の `view` は特殊ビュー専用フィルタ。`collection_id` / `tag_id` と組み合わせる場合は `view` は無視され、コレクション/タグの所属で絞られる（いずれも `deleted_at IS NULL` を満たすもののみ）。`search_entries` / `fulltext_search` も同じ `view` を受け取り、`view = "trash"` のときはゴミ箱内（`deleted_at IS NOT NULL`）を、それ以外（省略含む）は現役（`deleted_at IS NULL`）を対象に検索する（CR-001）。これによりゴミ箱ビューでの検索結果に現役エントリが紛れ込まない。
 

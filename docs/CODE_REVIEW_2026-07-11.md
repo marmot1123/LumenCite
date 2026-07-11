@@ -274,7 +274,7 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 | CR-013 | P2 | ✅ | `7d5616b` | stdio shim が keychain から token を読む（config に埋め込まない） |
 | CR-014 | P2 | ✅ | `684438e` | chat run/approval の競合修正（単一 run / `(session_id, call_id)` / timeout） |
 | CR-018 | P2 | ◐ | `a370368` | JSON/MD を「metadata export」と明記。**残**: 完全 backup/restore（archive+添付+import） |
-| CR-019 | P2 | ◐ | `45914e6` | arXiv ID 正規化統一。**残**: canonical 列 + partial UNIQUE + 既存行 dedup migration |
+| CR-019 | P2 | ✅ | `45914e6` ＋ §12 | arXiv ID 正規化統一（`45914e6`）＋ canonical 列 + 全経路 dedup + 起動時 best-effort partial UNIQUE + restore 衝突ガード（§12・別 PR） |
 | CR-020 | P2 | ✅ | `35a7674` | DOI URL encode + arXiv status/timeout + XML entity 復号 |
 | CR-021 | P2 | ⏸ | — | 一覧の pagination + batch 関連ロード + cache + 逆引き索引（大規模） |
 | CR-022 | P2 | ◐ | `26304e8` | tag を atomic upsert 化。**残**: chat scope / export snapshot / backup mutex |
@@ -324,10 +324,28 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 | CR-022 | chat `set_scope` を単一 tx 化 / export は消えたエントリをスキップ / backup を `BACKUP_LOCK` で直列化 |
 | CR-008 | 添付削除を rename-to-trash + 永続 retry queue（`attachment_trash` モジュール・起動時 sweep）で堅牢化 |
 
-**引き続き別 PR に切り出す 2 件（大規模・要実機検証）:**
-- **CR-019**: 識別子の canonical 列 + partial UNIQUE + 既存行 dedup migration。UNIQUE 作成は
-  既存 DB に重複があると migration が失敗して起動不能になり得るうえ、arXiv 正規化は SQL で
-  表現できず Rust の backfill/dedup 手順が要る。実データに対する実行時検証が必須。
+**引き続き別 PR に切り出す 1 件（大規模・要実機検証）:**
 - **CR-018**: 完全 backup/restore（archive + 添付本体 + import）。restore はライブ DB の
   差し替え + 再起動を伴い、実機検証なしに配信するのは危険。既存の `VACUUM INTO` は DB 全体は
   取得済み（添付本体と restore 経路のみが不足）。
+
+## 12. CR-019 完了（別 PR `fix/cr-019-identifier-canonical`）
+
+§11 で別 PR に切り出していた CR-019（識別子の canonical 列 + partial UNIQUE + dedup）を
+実装した。方針＝**best-effort uniqueness（brick 回避）**＋**create_entry の全経路 dedup（既存を返す）**。
+
+- **migration 0013**: `entries` に `doi_canonical` / `arxiv_canonical` / `isbn_canonical` 列＋
+  非 UNIQUE 部分索引を追加。backfill と UNIQUE 作成は migration では行わない（既存重複で brick
+  するため）。
+- **正規化の単一ソース**: `canonical_{doi,arxiv,isbn}()`（Rust）に一元化。`find_duplicate_entry`
+  は canonical 列を直接比較する形に書き換え、stored 側が arXiv 版番号を剥がさない非対称性を解消。
+- **全経路 dedup**: `create_entry` が UI/import/LLM/clipper の全経路で現役の同一識別子を検出したら
+  既存を返す（冪等）。`update_entry` は canonical 列を同期。
+- **起動時 backfill + best-effort UNIQUE**: `backfill_canonical_identifiers`（NULL 行のみ・冪等）＋
+  `try_create_identifier_unique_indexes`（重複が無い識別子だけ partial UNIQUE を張り、残るものは
+  警告ログでスキップ）。`rebuild_authors_fts_once` と同じ起動時 spawn パターン。
+- **restore 衝突ガード**: `restore_entry`/`bulk_restore` は untrash で現役と識別子衝突する場合に
+  明示エラーで拒否（`bulk_restore` は tx 内チェックでバッチ内重複も検出しロールバック）。
+- **要実機検証**: 実 DB（未索引 27 件を含む）で ①起動時 backfill が既存行の canonical を埋める
+  ②現役重複が無ければ UNIQUE が張られる ③重複があればスキップ（起動継続）を確認すること。
+  ユニットテストは `#[sqlx::test]` で網羅済み。
