@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Command } from "cmdk";
 import { useTranslation } from "react-i18next";
 import { useTheme } from "../hooks/useTheme";
@@ -28,16 +29,39 @@ export function CommandPalette({
   const { setTheme } = useTheme();
   const { setLanguage } = useLanguage();
   const [search, setSearch] = useState("");
+  const [entryResults, setEntryResults] = useState<EntrySummary[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
   // open のたびに検索文字列をリセット + 入力にフォーカス
   useEffect(() => {
     if (!open) return;
     setSearch("");
+    setEntryResults([]);
     // 次フレームで focus（マウント直後だと取りこぼすことがある）
     const id = requestAnimationFrame(() => inputRef.current?.focus());
     return () => cancelAnimationFrame(id);
   }, [open]);
+
+  // 文献検索は backend で全ライブラリを対象にする（CR-028）。
+  // 従来は props で渡された読み込み済みの先頭40件だけが対象で、大きな
+  // ライブラリでは開いている一覧に無い文献へ palette から辿れなかった。
+  useEffect(() => {
+    if (!open) return;
+    const q = search.trim();
+    if (!q) { setEntryResults([]); return; }
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const res = await invoke<EntrySummary[]>("search_entries", { query: q });
+          if (!cancelled) setEntryResults(res.slice(0, 40));
+        } catch {
+          if (!cancelled) setEntryResults([]);
+        }
+      })();
+    }, 160);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [open, search]);
 
   // Esc で閉じる
   useEffect(() => {
@@ -57,8 +81,9 @@ export function CommandPalette({
     requestAnimationFrame(fn);
   };
 
-  // タイトル / 著者 / タグから検索（cmdk のデフォルト fuzzy match に渡す value にまとめる）
-  const entryMatches = entries.slice(0, 40);
+  // 検索文字列がある時は backend 全文献検索の結果、空の時は読み込み済みの最近エントリ。
+  const query = search.trim();
+  const entryMatches = query ? entryResults : entries.slice(0, 40);
 
   return (
     <div className="lc-cmdk-overlay" onClick={onClose}>
@@ -134,7 +159,10 @@ export function CommandPalette({
                 const authors = e.authors.map(a => a.name).join(" ");
                 const tagsText = e.tags.map(t => t.name).join(" ");
                 const yearText = e.year ? String(e.year) : "";
-                const value = `${e.title} ${authors} ${tagsText} ${yearText}`;
+                // backend が abstract/識別子などタイトルに含まれない箇所でヒットさせても
+                // cmdk のローカル fuzzy filter で消えないよう、検索語を value に含める。
+                // 末尾に id を付けて value を一意にする（cmdk は value を同一性に使う）。
+                const value = `${query} ${e.title} ${authors} ${tagsText} ${yearText} ${e.id}`;
                 return (
                   <Command.Item
                     key={e.id}

@@ -154,7 +154,7 @@
       "ocrRunning": "OCR 実行中…",
       "ocrDone": "OCR 完了: {{summary}}",
       "ocrError": "OCR 失敗: {{error}}",
-      "download": "ダウンロード",
+      "openInWindow": "別ウィンドウで開く",
       "print": "印刷",
       "more": "その他",
       "starOn": "お気に入りを外す",

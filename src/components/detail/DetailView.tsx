@@ -349,7 +349,7 @@ export function DetailView({
         onChat={onChat}
         onOcr={activeAttachment ? handleOcr : undefined}
         ocrBusy={ocrBusy}
-        onDownload={activeAttachment ? () => onOpenInWindow?.(activeAttachment.id) : undefined}
+        onOpenInWindow={activeAttachment ? () => onOpenInWindow?.(activeAttachment.id) : undefined}
         onPrint={activeAttachment ? handlePrint : undefined}
       />
       {ocrMsg && (

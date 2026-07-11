@@ -154,7 +154,7 @@
       "ocrRunning": "Running OCR…",
       "ocrDone": "OCR complete: {{summary}}",
       "ocrError": "OCR failed: {{error}}",
-      "download": "Download",
+      "openInWindow": "Open in a separate window",
       "print": "Print",
       "more": "More",
       "starOn": "Remove from favorites",

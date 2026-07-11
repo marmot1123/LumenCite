@@ -800,12 +800,12 @@ export default function App() {
         entries={entries}
         onSelectEntry={selectSingle}
         onOpenDetail={(id) => { selectSingle(id); setScreen("detail"); }}
-        onNewEntry={() => setShowAdd(true)}
+        onNewEntry={() => { setScreen("library"); setShowAdd(true); }}
         onOpenChat={() => setScreen("chat")}
         onOpenSettings={() => setShowSettings(true)}
-        onOpenBibtexSync={() => setShowBibtexSync(true)}
+        onOpenBibtexSync={() => { setScreen("library"); setShowBibtexSync(true); }}
         onSyncBibtexNow={() => { void invoke("sync_bibtex_now"); }}
-        onSelectView={setSelectedView}
+        onSelectView={(view) => { setScreen("library"); setSelectedView(view); }}
       />
     </>
   );
