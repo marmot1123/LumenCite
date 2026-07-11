@@ -18,16 +18,19 @@ pub async fn create_tag(pool: &SqlitePool, name: &str) -> Result<Tag, sqlx::Erro
 }
 
 /// 名前でタグを取得し、無ければ作成する（チャットツール・Webクリッパー共用）。
+///
+/// **atomic upsert（CR-022）**: 以前は SELECT → INSERT の check-then-write で、同名タグの
+/// 並行作成が UNIQUE 制約違反（tags.name UNIQUE）になり得た。ON CONFLICT + RETURNING で
+/// 1 文にまとめ、既存でも新規でも常にその行を返す。
 pub async fn get_or_create_tag(pool: &SqlitePool, name: &str) -> Result<Tag, sqlx::Error> {
-    if let Some(existing) =
-        sqlx::query_as::<_, Tag>("SELECT id, name FROM tags WHERE name = ?")
-            .bind(name)
-            .fetch_optional(pool)
-            .await?
-    {
-        return Ok(existing);
-    }
-    create_tag(pool, name).await
+    sqlx::query_as::<_, Tag>(
+        "INSERT INTO tags (name) VALUES (?)
+         ON CONFLICT(name) DO UPDATE SET name = excluded.name
+         RETURNING id, name",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
 }
 
 pub async fn delete_tag(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> {
