@@ -2482,7 +2482,17 @@ async fn set_mcp_server_enabled(
     .map_err(|e| e.to_string())?;
 
     if enabled {
-        start_http_server(&state, &app).await?;
+        // bind 失敗等で起動できなければ enabled フラグを "0" に戻す（CR-023）。
+        // これをしないと「有効なのに起動していない」不整合が残り、次回起動でも失敗し続ける。
+        if let Err(e) = start_http_server(&state, &app).await {
+            let _ = db::settings::set_setting(
+                &state.db,
+                db::settings::MCP_SERVER_ENABLED_KEY,
+                "0",
+            )
+            .await;
+            return Err(e);
+        }
     } else {
         // クリッパーがまだ使っている場合はサーバーを維持する
         stop_http_server_if_unused(&state).await?;
@@ -2740,7 +2750,16 @@ async fn set_clipper_enabled(
     if enabled {
         // MCP 側で既に起動していればそのまま共用する（再起動しない）
         if state.mcp_server.running_port().is_none() {
-            start_http_server(&state, &app).await?;
+            // bind 失敗時は enabled フラグを戻して不整合を残さない（CR-023）。
+            if let Err(e) = start_http_server(&state, &app).await {
+                let _ = db::settings::set_setting(
+                    &state.db,
+                    db::settings::CLIPPER_ENABLED_KEY,
+                    "0",
+                )
+                .await;
+                return Err(e);
+            }
         }
     } else {
         stop_http_server_if_unused(&state).await?;
