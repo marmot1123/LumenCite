@@ -50,12 +50,12 @@
   - 詳細は `DATA_MODEL.md` の `citation_key` 節 / `API_SPEC.md` 参照
 
 ### データ保全 / 配布
-- **自動バックアップ**: アプリ起動時 + 1日1回、SQLite DB を `<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.db` にコピー。`VACUUM INTO` を使用、14世代まで保持。**添付ファイル本体（`attachments/`）は DB バックアップに含まれない**ので、完全コピーには添付フォルダも別途保全する（CR-018）
+- **自動バックアップ（CR-018: 添付本体込み）**: アプリ起動時 + 1日1回、`<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.zip` に**完全バックアップ**を作成。アーカイブは `db.sqlite`（`VACUUM INTO` によるクリーンコピー。highlights/chat/settings/fulltext 込み）＋ `attachments/<entry_id>/<file_name>`（添付本体）を deflate 圧縮で束ねる。14世代まで保持（旧 `.db` バックアップも世代管理・一覧の対象）
+- **復元（restore/import）は未実装**: アーカイブからの自動復元はライブ DB 差し替え＋再起動を伴い実機検証が要るため将来課題。現状は `.zip` を展開して `db.sqlite` と `attachments/` を手動配置する運用
 - **手動エクスポート**（CR-018 で範囲を明確化）: いずれも**エントリのメタデータ書き出し**であり、PDF 添付・ハイライト・チャット履歴・設定は含まず、再インポートによる復元もできない。
   - JSON: エントリのメタデータ（`EntryDetail[]`）
   - BibTeX: 引用情報（既存）
   - Markdown: ノート＋要約
-  - 完全バックアップ／復元（versioned archive + 添付 + import 往復）は将来課題
 - **Tauri auto-updater**: `tauri-plugin-updater` 経由。署名鍵で検証、GitHub Releases の `latest.json` を参照
 - **コード署名**:
   - macOS: Developer ID Application + notarization（v0.1.0 配布前に必須）
