@@ -359,13 +359,31 @@ pub async fn create_entry(
     pool: &SqlitePool,
     input: &EntryInput,
 ) -> Result<EntryDetail, sqlx::Error> {
+    // 全経路（UI 追加 / import / LLM / clipper）で識別子の重複を作らせない（CR-019）。
+    // 同一 DOI/arXiv/ISBN の現役エントリが既にあれば新規作成せず既存を返す（clipper の
+    // apply_clip と同じ冪等挙動）。ゴミ箱内は対象外なので、trash 済みと同一識別子の新規は作れる。
+    if let Some(existing_id) = find_duplicate_entry(
+        pool,
+        input.doi.as_deref(),
+        input.arxiv_id.as_deref(),
+        input.isbn.as_deref(),
+    )
+    .await?
+    {
+        return get_entry(pool, existing_id).await;
+    }
+
     let mut tx = pool.begin().await?;
 
     let citation_key = input.citation_key.as_deref().and_then(sanitize_citation_key);
+    let doi_canonical = input.doi.as_deref().and_then(canonical_doi);
+    let arxiv_canonical = input.arxiv_id.as_deref().and_then(canonical_arxiv);
+    let isbn_canonical = input.isbn.as_deref().and_then(canonical_isbn);
 
     let result = sqlx::query(
-        "INSERT INTO entries (title, year, entry_type, citation_key, doi, isbn, arxiv_id, url, abstract, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO entries (title, year, entry_type, citation_key, doi, isbn, arxiv_id, url, abstract, notes,
+                              doi_canonical, arxiv_canonical, isbn_canonical)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&input.title)
     .bind(input.year)
@@ -377,6 +395,9 @@ pub async fn create_entry(
     .bind(&input.url)
     .bind(&input.abstract_)
     .bind(&input.notes)
+    .bind(&doi_canonical)
+    .bind(&arxiv_canonical)
+    .bind(&isbn_canonical)
     .execute(&mut *tx)
     .await?;
 
@@ -707,11 +728,16 @@ pub async fn update_entry(
     let mut tx = pool.begin().await?;
 
     let citation_key = input.citation_key.as_deref().and_then(sanitize_citation_key);
+    // canonical 列も raw 識別子と同期させる（CR-019）。
+    let doi_canonical = input.doi.as_deref().and_then(canonical_doi);
+    let arxiv_canonical = input.arxiv_id.as_deref().and_then(canonical_arxiv);
+    let isbn_canonical = input.isbn.as_deref().and_then(canonical_isbn);
 
     let rows_affected = sqlx::query(
         "UPDATE entries
          SET title = ?, year = ?, entry_type = ?, citation_key = ?, doi = ?, isbn = ?, arxiv_id = ?,
-             url = ?, abstract = ?, notes = ?, updated_at = datetime('now')
+             url = ?, abstract = ?, notes = ?, updated_at = datetime('now'),
+             doi_canonical = ?, arxiv_canonical = ?, isbn_canonical = ?
          WHERE id = ?",
     )
     .bind(&input.title)
@@ -724,6 +750,9 @@ pub async fn update_entry(
     .bind(&input.url)
     .bind(&input.abstract_)
     .bind(&input.notes)
+    .bind(&doi_canonical)
+    .bind(&arxiv_canonical)
+    .bind(&isbn_canonical)
     .bind(id)
     .execute(&mut *tx)
     .await?
@@ -851,12 +880,52 @@ pub async fn bulk_trash(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Erro
     Ok(())
 }
 
+/// 与えた（通常はゴミ箱内の）エントリを untrash したとき、現役エントリと識別子が
+/// 衝突する相手 id を返す（CR-019）。dedup は現役同士の識別子重複を作らせない不変条件を
+/// 保つので、restore で現役に同一 DOI/arXiv/ISBN を復活させるのは禁止する。best-effort の
+/// partial UNIQUE 索引が張られていれば DB でも弾かれるが、張れていない場合でも不変条件を
+/// 守るため、事前にここで検出する。
+async fn live_identifier_conflict<'e, E>(exec: E, id: i64) -> Result<Option<i64>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    sqlx::query_scalar(
+        "SELECT e2.id FROM entries e1
+         JOIN entries e2
+           ON e2.id != e1.id
+          AND e2.deleted_at IS NULL
+          AND (
+                (e1.doi_canonical   IS NOT NULL AND e2.doi_canonical   = e1.doi_canonical)
+             OR (e1.arxiv_canonical IS NOT NULL AND e2.arxiv_canonical = e1.arxiv_canonical)
+             OR (e1.isbn_canonical  IS NOT NULL AND e2.isbn_canonical  = e1.isbn_canonical)
+          )
+         WHERE e1.id = ?
+         ORDER BY e2.id ASC
+         LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(exec)
+    .await
+}
+
+fn restore_conflict_error(id: i64, conflict: i64) -> sqlx::Error {
+    sqlx::Error::Protocol(format!(
+        "restore aborted (id={id}): 現役エントリ (id={conflict}) と同一の識別子です。\
+         先に一方を統合または削除してください（CR-019）。"
+    ))
+}
+
 pub async fn bulk_restore(pool: &SqlitePool, ids: &[i64]) -> Result<(), sqlx::Error> {
     if ids.is_empty() {
         return Ok(());
     }
     let mut tx = pool.begin().await?;
     for id in ids {
+        // tx 内で 1 件ずつ復活させるので、直前に復活したバッチ内の行も現役として見え、
+        // バッチ内の重複同士も検出できる。
+        if let Some(conflict) = live_identifier_conflict(&mut *tx, *id).await? {
+            return Err(restore_conflict_error(*id, conflict));
+        }
         sqlx::query(
             "UPDATE entries
              SET deleted_at = NULL, updated_at = datetime('now')
@@ -992,6 +1061,43 @@ fn normalize_isbn(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_uppercase()
 }
 
+// ── 識別子の canonical 化（CR-019） ────────────────────────────────────────────
+//
+// DOI / arXiv / ISBN の正準値を **単一のソース**（この Rust 関数群）で定義する。
+// `entries.{doi,arxiv_id,isbn}_canonical` 列への書込・重複判定・起動時 backfill の
+// すべてがこれらを経由する。SQL 側で LOWER/REPLACE を書いて非対称に揃える旧方式
+// （stored 側が arXiv の版番号・prefix を剥がさず dedup をすり抜けた）を廃する。
+
+/// DOI の正準値。`https://doi.org/` `http://doi.org/` `doi:` の prefix を剥がし、
+/// trim して小文字化する。空になれば `None`。
+pub(crate) fn canonical_doi(s: &str) -> Option<String> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("https://doi.org/")
+        .or_else(|| t.strip_prefix("http://doi.org/"))
+        .or_else(|| t.strip_prefix("https://dx.doi.org/"))
+        .or_else(|| t.strip_prefix("http://dx.doi.org/"))
+        .or_else(|| t.strip_prefix("doi:"))
+        .or_else(|| t.strip_prefix("DOI:"))
+        .unwrap_or(t)
+        .trim();
+    let t = t.to_lowercase();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+/// arXiv ID の正準値。[`crate::metadata::normalize_arxiv_id`]（prefix / 版番号を除去し
+/// 旧形式カテゴリは保持）に委ね、小文字化する。空になれば `None`。
+pub(crate) fn canonical_arxiv(s: &str) -> Option<String> {
+    let t = crate::metadata::normalize_arxiv_id(s).to_lowercase();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+/// ISBN の正準値。[`normalize_isbn`]（英数字のみ・大文字化）に委ね、空なら `None`。
+pub(crate) fn canonical_isbn(s: &str) -> Option<String> {
+    let t = normalize_isbn(s);
+    if t.is_empty() { None } else { Some(t) }
+}
+
 /// BibTeX エントリキーとして安全な文字（英数字と `_ : - . / +`）のみを残す。
 /// トリム後に空になった場合は `None`（= 自動生成扱い）を返す。
 pub fn sanitize_citation_key(raw: &str) -> Option<String> {
@@ -1044,28 +1150,25 @@ pub async fn find_duplicate_entry(
     arxiv_id: Option<&str>,
     isbn: Option<&str>,
 ) -> Result<Option<i64>, sqlx::Error> {
-    let doi_norm = doi.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
-    // arXiv は prefix / 版番号 / 旧形式カテゴリを canonical 化してから比較する（CR-019）。
-    // stored 側は SQL の LOWER で揃えるので、正準化後も lowercase して合わせる。
-    let arxiv_norm = arxiv_id
-        .map(|s| crate::metadata::normalize_arxiv_id(s).to_lowercase())
-        .filter(|s| !s.is_empty());
-    let isbn_norm = isbn.map(normalize_isbn).filter(|s| !s.is_empty());
+    // 入力・stored の双方を Rust の canonical_*() で揃えて比較する（CR-019）。
+    // stored 側は entries.{doi,arxiv,isbn}_canonical 列（書込時と起動時 backfill で
+    // 常に canonical に保たれる）を直接引くので、旧方式の非対称性が無くなる。
+    let doi_norm = doi.and_then(canonical_doi);
+    let arxiv_norm = arxiv_id.and_then(canonical_arxiv);
+    let isbn_norm = isbn.and_then(canonical_isbn);
 
     if doi_norm.is_none() && arxiv_norm.is_none() && isbn_norm.is_none() {
         return Ok(None);
     }
 
-    // 値が None の引数は NULL を bind し、SQL 側で `? IS NOT NULL AND ...` で
-    // 弾く。`REPLACE(...)` で ISBN のハイフン／空白を除去してから比較する。
+    // 値が None の引数は NULL を bind し、SQL 側で `? IS NOT NULL AND ...` で弾く。
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT id FROM entries
          WHERE deleted_at IS NULL
            AND (
-                (?1 IS NOT NULL AND doi IS NOT NULL AND LOWER(doi) = ?1)
-             OR (?2 IS NOT NULL AND arxiv_id IS NOT NULL AND LOWER(arxiv_id) = ?2)
-             OR (?3 IS NOT NULL AND isbn IS NOT NULL
-                   AND UPPER(REPLACE(REPLACE(REPLACE(isbn, '-', ''), ' ', ''), char(9), '')) = ?3)
+                (?1 IS NOT NULL AND doi_canonical   = ?1)
+             OR (?2 IS NOT NULL AND arxiv_canonical = ?2)
+             OR (?3 IS NOT NULL AND isbn_canonical  = ?3)
            )
          ORDER BY id ASC
          LIMIT 1",
@@ -1077,6 +1180,102 @@ pub async fn find_duplicate_entry(
     .await?;
 
     Ok(row.map(|(id,)| id))
+}
+
+/// canonical 列（`doi/arxiv/isbn_canonical`）を持つ 3 つの識別子。列名・非UNIQUE索引名・
+/// best-effort UNIQUE 索引名を 1 か所で対応づける。
+const CANONICAL_IDENTIFIERS: &[(&str, &str)] = &[
+    ("doi", "doi_canonical"),
+    ("arxiv", "arxiv_canonical"),
+    ("isbn", "isbn_canonical"),
+];
+
+/// 既存行の canonical 列を Rust の canonical_*() で埋める（CR-019・migration 0013 の後段）。
+///
+/// migration は arXiv の版番号除去などを SQL で表現できないため列を足すだけにしてあり、
+/// 実際の backfill はここで行う。canonical が未設定（NULL）で raw 識別子がある行だけを
+/// 対象にするので、埋め終われば以降の起動では対象 0 件の no-op になり冪等。
+/// 更新した行数を返す。
+pub async fn backfill_canonical_identifiers(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    // (id, doi, arxiv_id, isbn) の生識別子行。
+    type RawIdentifierRow = (i64, Option<String>, Option<String>, Option<String>);
+    // backfill が必要な行（raw があるのに canonical が NULL）だけを引く。
+    let rows: Vec<RawIdentifierRow> = sqlx::query_as(
+        "SELECT id, doi, arxiv_id, isbn FROM entries
+         WHERE (doi      IS NOT NULL AND doi_canonical   IS NULL)
+            OR (arxiv_id IS NOT NULL AND arxiv_canonical IS NULL)
+            OR (isbn     IS NOT NULL AND isbn_canonical  IS NULL)",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut updated = 0u64;
+    for (id, doi, arxiv, isbn) in rows {
+        let doi_c = doi.as_deref().and_then(canonical_doi);
+        let arxiv_c = arxiv.as_deref().and_then(canonical_arxiv);
+        let isbn_c = isbn.as_deref().and_then(canonical_isbn);
+        let n = sqlx::query(
+            "UPDATE entries SET doi_canonical = ?, arxiv_canonical = ?, isbn_canonical = ? WHERE id = ?",
+        )
+        .bind(&doi_c)
+        .bind(&arxiv_c)
+        .bind(&isbn_c)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        updated += n;
+    }
+    tx.commit().await?;
+    Ok(updated)
+}
+
+/// best-effort で識別子の partial UNIQUE 索引を張る（CR-019）。
+///
+/// 既存 DB に重複があると `CREATE UNIQUE INDEX` は失敗する。migration 内で張ると
+/// 起動不能（brick）になるため、起動時にここで **重複が無い識別子だけ** UNIQUE を張る。
+/// 重複が残る識別子は索引を張らず（既存の非UNIQUE索引のまま）、警告としてスキップ扱い。
+///
+/// 部分索引の条件は `deleted_at IS NULL`（= dedup が対象とする現役エントリのみ）に揃える。
+/// これによりゴミ箱内の重複や trash↔現役の共存では制約が働かず、restore 側の衝突ガード
+/// （[`restore_entry`]）と合わせて一貫する。作成できた canonical 列名の一覧を返す。
+pub async fn try_create_identifier_unique_indexes(
+    pool: &SqlitePool,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut created = Vec::new();
+    for (short, col) in CANONICAL_IDENTIFIERS {
+        // 現役エントリの中に同一 canonical 値が 2 件以上あるか。
+        let has_dup: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(
+                 SELECT 1 FROM entries
+                 WHERE deleted_at IS NULL AND {col} IS NOT NULL
+                 GROUP BY {col} HAVING COUNT(*) > 1
+             )"
+        ))
+        .fetch_one(pool)
+        .await?;
+
+        if has_dup {
+            eprintln!(
+                "CR-019: {col} に現役の重複があるため UNIQUE 索引をスキップ（非UNIQUE索引のまま）"
+            );
+            continue;
+        }
+
+        sqlx::query(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_{short}_canonical_unique
+                 ON entries({col}) WHERE {col} IS NOT NULL AND deleted_at IS NULL"
+        ))
+        .execute(pool)
+        .await?;
+        created.push((*col).to_string());
+    }
+    Ok(created)
 }
 
 pub async fn set_starred(pool: &SqlitePool, id: i64, starred: bool) -> Result<(), sqlx::Error> {
@@ -1121,6 +1320,11 @@ pub async fn trash_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> 
 }
 
 pub async fn restore_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error> {
+    // 現役エントリと識別子が衝突するなら復活させない（CR-019）。
+    if let Some(conflict) = live_identifier_conflict(pool, id).await? {
+        return Err(restore_conflict_error(id, conflict));
+    }
+
     let rows = sqlx::query(
         "UPDATE entries
          SET deleted_at = NULL, updated_at = datetime('now')
@@ -2064,6 +2268,31 @@ mod tests {
         assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
     }
 
+    // ── canonical_* helpers（CR-019） ─────────────────────────────────────────
+
+    #[test]
+    fn canonical_doi_strips_url_prefix_and_lowercases() {
+        assert_eq!(canonical_doi("10.1234/Example").as_deref(), Some("10.1234/example"));
+        assert_eq!(canonical_doi("https://doi.org/10.1234/Example").as_deref(), Some("10.1234/example"));
+        assert_eq!(canonical_doi("http://dx.doi.org/10.1234/EX").as_deref(), Some("10.1234/ex"));
+        assert_eq!(canonical_doi(" doi:10.1234/EX ").as_deref(), Some("10.1234/ex"));
+        assert_eq!(canonical_doi("  "), None);
+    }
+
+    #[test]
+    fn canonical_arxiv_strips_version_prefix_and_lowercases() {
+        assert_eq!(canonical_arxiv("arXiv:2301.00001v5").as_deref(), Some("2301.00001"));
+        assert_eq!(canonical_arxiv("hep-th/9901001v2").as_deref(), Some("hep-th/9901001"));
+        assert_eq!(canonical_arxiv(""), None);
+    }
+
+    #[test]
+    fn canonical_isbn_strips_hyphens_and_uppercases() {
+        assert_eq!(canonical_isbn("978-0-387-31073-2").as_deref(), Some("9780387310732"));
+        assert_eq!(canonical_isbn("0-306-40615-x").as_deref(), Some("030640615X"));
+        assert_eq!(canonical_isbn(" - - "), None);
+    }
+
     // ── find_duplicate_entry ──────────────────────────────────────────────────
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2146,6 +2375,281 @@ mod tests {
 
         let hit = find_duplicate_entry(&pool, None, None, None).await.unwrap();
         assert_eq!(hit, None);
+    }
+
+    /// CR-019: stored 側が非正準（版番号付き arXiv）でも canonical 列経由でヒットする。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn find_duplicate_entry_matches_stored_noncanonical_arxiv(pool: SqlitePool) {
+        let existing = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("arXiv:2301.00001v2".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let hit = find_duplicate_entry(&pool, None, Some("2301.00001"), None).await.unwrap();
+        assert_eq!(hit, Some(existing.id));
+    }
+
+    /// CR-019: create_entry は全経路で dedup する。同一 DOI の再作成は既存を返し、行を増やさない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_dedups_by_doi_and_returns_existing(pool: SqlitePool) {
+        let first = create_entry(&pool, &EntryInput {
+            title: "First".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/Example".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        // 表記違い（大小・URL prefix）でも同一とみなし、既存 id を返す。
+        let second = create_entry(&pool, &EntryInput {
+            title: "Second (should not be created)".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("https://doi.org/10.1234/EXAMPLE".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        assert_eq!(second.id, first.id, "既存エントリを返すべき");
+        assert_eq!(second.title, "First", "新規作成せず既存の内容を返す");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1, "行は増えない");
+    }
+
+    /// CR-019: canonical 列は作成時に埋まる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_populates_canonical_columns(pool: SqlitePool) {
+        let e = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/AbC".to_string()),
+            arxiv_id: Some("arXiv:2301.00001v3".to_string()),
+            isbn: Some("978-0-387-31073-2".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let (doi_c, arxiv_c, isbn_c): (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT doi_canonical, arxiv_canonical, isbn_canonical FROM entries WHERE id = ?")
+                .bind(e.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(doi_c.as_deref(), Some("10.1234/abc"));
+        assert_eq!(arxiv_c.as_deref(), Some("2301.00001"));
+        assert_eq!(isbn_c.as_deref(), Some("9780387310732"));
+    }
+
+    /// CR-019: update_entry で識別子を変えると canonical 列も追随する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn update_entry_syncs_canonical_columns(pool: SqlitePool) {
+        let e = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/old".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        update_entry(&pool, e.id, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("https://doi.org/10.9999/NEW".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let doi_c: Option<String> =
+            sqlx::query_scalar("SELECT doi_canonical FROM entries WHERE id = ?")
+                .bind(e.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(doi_c.as_deref(), Some("10.9999/new"));
+    }
+
+    /// CR-019: ゴミ箱内の同一識別子とは重複扱いしないので、新規作成できる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_allows_duplicate_of_trashed(pool: SqlitePool) {
+        let first = create_entry(&pool, &EntryInput {
+            title: "First".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/example".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        trash_entry(&pool, first.id).await.unwrap();
+
+        let second = create_entry(&pool, &EntryInput {
+            title: "Second".to_string(),
+            entry_type: "article".to_string(),
+            doi: Some("10.1234/example".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        assert_ne!(second.id, first.id, "ゴミ箱内とは重複扱いしないので新規作成される");
+    }
+
+    /// 生の identifier を直接 INSERT する（legacy 行や重複を意図的に作るテスト用。
+    /// create_entry は dedup してしまうので使えない）。canonical 列は指定値で埋める。
+    async fn insert_raw_entry(
+        pool: &SqlitePool,
+        title: &str,
+        arxiv_id: Option<&str>,
+        arxiv_canonical: Option<&str>,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical)
+             VALUES (?, 'article', ?, ?)",
+        )
+        .bind(title)
+        .bind(arxiv_id)
+        .bind(arxiv_canonical)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    // ── backfill_canonical_identifiers / try_create_identifier_unique_indexes（CR-019） ──
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn backfill_fills_canonical_and_is_idempotent(pool: SqlitePool) {
+        // canonical 未設定の legacy 行を用意する。
+        let id = insert_raw_entry(&pool, "A", Some("arXiv:2301.00001v7"), None).await;
+
+        let n = backfill_canonical_identifiers(&pool).await.unwrap();
+        assert_eq!(n, 1);
+        let c: Option<String> =
+            sqlx::query_scalar("SELECT arxiv_canonical FROM entries WHERE id = ?")
+                .bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(c.as_deref(), Some("2301.00001"));
+
+        // 2 回目は対象 0 件。
+        let n2 = backfill_canonical_identifiers(&pool).await.unwrap();
+        assert_eq!(n2, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unique_index_created_on_clean_db_blocks_direct_duplicate(pool: SqlitePool) {
+        create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        let created = try_create_identifier_unique_indexes(&pool).await.unwrap();
+        assert!(created.contains(&"arxiv_canonical".to_string()));
+
+        // dedup を迂回して直接同一 canonical を入れると UNIQUE 制約で弾かれる。
+        let err = sqlx::query(
+            "INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical)
+             VALUES ('dup', 'article', '2301.00001', '2301.00001')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(err.is_err(), "partial UNIQUE が二重登録を弾くべき");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unique_index_skipped_when_existing_duplicate(pool: SqlitePool) {
+        // 現役の重複を 2 件（直接 INSERT で作る）。
+        insert_raw_entry(&pool, "A", Some("2301.00001"), Some("2301.00001")).await;
+        insert_raw_entry(&pool, "B", Some("2301.00001"), Some("2301.00001")).await;
+
+        let created = try_create_identifier_unique_indexes(&pool).await.unwrap();
+        assert!(!created.contains(&"arxiv_canonical".to_string()), "重複ありでは張らない");
+
+        // 索引が無いので 3 件目の直接 INSERT も通る（brick せず既存も壊さない）。
+        let ok = sqlx::query(
+            "INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical)
+             VALUES ('C', 'article', '2301.00001', '2301.00001')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(ok.is_ok());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unique_index_allows_trashed_and_live_same_identifier(pool: SqlitePool) {
+        let first = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        trash_entry(&pool, first.id).await.unwrap();
+
+        // 索引を張る（現役は 0 件なので張れる）。
+        try_create_identifier_unique_indexes(&pool).await.unwrap();
+
+        // ゴミ箱の同一識別子があっても現役を新規作成できる（部分索引が deleted_at IS NULL 限定）。
+        let second = create_entry(&pool, &EntryInput {
+            title: "B".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    /// CR-019: ゴミ箱の同一識別子を現役へ restore すると、現役の相手と衝突するので拒否する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn restore_entry_rejected_on_live_identifier_conflict(pool: SqlitePool) {
+        // A を作って trash → B（同一 arXiv）を現役で作成（trash 中は dedup 対象外なので作れる）。
+        let a = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        trash_entry(&pool, a.id).await.unwrap();
+        let _b = create_entry(&pool, &EntryInput {
+            title: "B".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+
+        // A を restore すると B と衝突するのでエラー。
+        let err = restore_entry(&pool, a.id).await.unwrap_err();
+        assert!(err.to_string().contains("識別子"), "明示的な衝突メッセージ: {err}");
+
+        // A は依然ゴミ箱のまま。
+        let still_trashed: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM entries WHERE id = ? AND deleted_at IS NOT NULL")
+                .bind(a.id).fetch_optional(&pool).await.unwrap();
+        assert_eq!(still_trashed, Some(a.id));
+    }
+
+    /// CR-019: 衝突相手がいなければ restore は通る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn restore_entry_succeeds_without_conflict(pool: SqlitePool) {
+        let a = create_entry(&pool, &EntryInput {
+            title: "A".to_string(),
+            entry_type: "article".to_string(),
+            arxiv_id: Some("2301.00001".to_string()),
+            ..Default::default()
+        }).await.unwrap();
+        trash_entry(&pool, a.id).await.unwrap();
+
+        restore_entry(&pool, a.id).await.unwrap();
+        let live: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM entries WHERE id = ? AND deleted_at IS NULL")
+                .bind(a.id).fetch_optional(&pool).await.unwrap();
+        assert_eq!(live, Some(a.id));
+    }
+
+    /// CR-019: バッチ復活で同一識別子が 2 件含まれると衝突として弾く。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn bulk_restore_rejects_intra_batch_identifier_conflict(pool: SqlitePool) {
+        // 直接 INSERT で「両方 trash 済み・同一 canonical」を作る。
+        let a = sqlx::query("INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical, deleted_at)
+                             VALUES ('A','article','2301.00001','2301.00001', datetime('now'))")
+            .execute(&pool).await.unwrap().last_insert_rowid();
+        let b = sqlx::query("INSERT INTO entries (title, entry_type, arxiv_id, arxiv_canonical, deleted_at)
+                             VALUES ('B','article','2301.00001','2301.00001', datetime('now'))")
+            .execute(&pool).await.unwrap().last_insert_rowid();
+
+        let err = bulk_restore(&pool, &[a, b]).await.unwrap_err();
+        assert!(err.to_string().contains("識別子"), "{err}");
+
+        // tx はロールバックされ、両方ともゴミ箱のまま。
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(live, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]

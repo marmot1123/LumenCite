@@ -11,9 +11,12 @@
 | `title` | TEXT NOT NULL | |
 | `year` | INTEGER | |
 | `entry_type` | TEXT NOT NULL | 種別キー（制約なしの自由 TEXT）。既存 6 種 `article` `book` `inproceedings` `thesis` `webpage` `misc` は BibTeX 由来。v0.4.0 で Zotero アイテムタイプを追加: `preprint` `bookSection` `report` `magazineArticle` `newspaperArticle` `encyclopediaArticle` `dictionaryEntry` `manuscript` `presentation` `patent` `standard` `dataset` `computerProgram`。一覧は `src/types.ts` の `EntryType` が正 |
-| `doi` | TEXT | |
-| `isbn` | TEXT | |
-| `arxiv_id` | TEXT | `2301.00001` 形式 |
+| `doi` | TEXT | 入力そのまま（表示用）。重複判定は `doi_canonical` を使う |
+| `isbn` | TEXT | 入力そのまま（表示用）。重複判定は `isbn_canonical` を使う |
+| `arxiv_id` | TEXT | `2301.00001` 形式。入力そのまま（表示用）。重複判定は `arxiv_canonical` を使う |
+| `doi_canonical` | TEXT | DOI の正準値（`doi.org`/`doi:` prefix 除去＋小文字化）。`migrations/0013`・CR-019 |
+| `arxiv_canonical` | TEXT | arXiv の正準値（prefix/版番号除去・旧形式カテゴリ保持・小文字化）。`migrations/0013`・CR-019 |
+| `isbn_canonical` | TEXT | ISBN の正準値（英数字のみ・大文字化）。`migrations/0013`・CR-019 |
 | `url` | TEXT | |
 | `abstract` | TEXT | |
 | `notes` | TEXT | |
@@ -37,6 +40,16 @@ LaTeX の `\cite{...}` で参照されるキー。LaTeX 連携が安定するよ
 - **自動生成（NULL のとき）**: エクスポート時に `第一著者の姓 + 年`（著者なしはタイトル先頭語、年なしは `nd`）から生成し、**同一 `.bib` ファイル内**で重複したら接尾辞 `a` / `b` / `c` …（26 を超えたら `aa` `ab` …）を付与して一意化する。ピン留め済みキーは予約済みとして衝突を避ける。
 - **インポート**: 元 `.bib` の cite key をサニタイズして `citation_key` に保持する。既存キー（および同一インポート内で先に確定したキー）と衝突する場合は接尾辞 `a` / `b` / `c` … で一意化する。
 - **手動編集の衝突**: ユーザーが入力した固定キーが既存と重複する場合は UNIQUE 制約違反として保存を拒否する（自動の a/b/c は付けない）。UI は保存前に `is_citation_key_available` で事前チェックする。
+
+#### 識別子の canonical 化と重複防止 — migration 0013（CR-019）
+
+DOI / arXiv / ISBN は表記揺れ（大小・`doi.org` prefix・arXiv の版番号 `vN` や `arXiv:` prefix・ISBN のハイフン）が多く、同一文献が二重登録されやすい。これを防ぐため正準値を専用列 `*_canonical` に持つ。
+
+- **正規化の単一ソース**: `db::entries::canonical_{doi,arxiv,isbn}()`（Rust）。書込（`create_entry`/`update_entry`）・重複判定（`find_duplicate_entry`）・起動時 backfill のすべてがこれを経由する。SQL 側で `LOWER`/`REPLACE` を書いて非対称に揃える旧方式は廃止（stored 側が arXiv の版番号を剥がさず dedup をすり抜けていた）。
+- **全経路 dedup**: `create_entry` は UI 追加 / import / LLM / clipper のいずれの経路でも、現役エントリに同一 canonical があれば新規作成せず既存を返す（冪等）。ゴミ箱内（`deleted_at IS NOT NULL`）は対象外。
+- **DB 制約（best-effort）**: `CREATE UNIQUE INDEX ... ON entries(<col>) WHERE <col> IS NOT NULL AND deleted_at IS NULL` の部分インデックスで現役エントリの一意性を DB でも保証する。ただし**既存 DB に重複があると `CREATE UNIQUE INDEX` が失敗して起動不能（brick）になる**ため、migration では張らず、起動時に `try_create_identifier_unique_indexes` が**重複が無い識別子だけ**張る（重複が残るものは非 UNIQUE 索引のままにして警告ログ）。
+- **backfill**: 既存行の canonical 埋めは arXiv の版番号除去などを SQL で表現できないため、migration 0013 は列と非 UNIQUE 部分索引だけを作り、実際の埋めは起動時 `backfill_canonical_identifiers`（canonical が NULL の行だけ対象・冪等）で行う。
+- **restore との一貫性**: 部分索引・dedup とも「現役（`deleted_at IS NULL`）のみ」を対象にするため、ゴミ箱の文献と現役が同一識別子を持つことは許容する。`restore_entry`/`bulk_restore` は untrash 前に現役の衝突相手を検出したら明示エラーで復活を拒否し、不変条件を守る。
 
 ---
 
