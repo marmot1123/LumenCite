@@ -1,3 +1,4 @@
+mod attachment_trash;
 mod backup;
 mod bibtex;
 pub mod cli;
@@ -33,6 +34,7 @@ use tauri::{
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::oneshot;
+use tokio::sync::Notify;
 
 /// GUI 生存ロックのファイル名。GUI と CLI で同じパスを見る（CR-011）。
 pub const GUI_LOCK_FILE: &str = "lumencite.gui.lock";
@@ -62,6 +64,8 @@ pub struct AppState {
     pub sync_tx: UnboundedSender<()>,
     /// 進行中チャットの承認待ち・中断状態を保持する共有ランタイム。
     pub chat: Arc<ChatRuntime>,
+    /// 進行中の要約生成を中断するための共有ランタイム（sheet close / 再生成・CR-034）。
+    pub summary: Arc<SummaryRuntime>,
     /// 外部 MCP サーバーのクライアント（Chat ツールへマージ）。
     pub mcp: Arc<mcp::McpManager>,
     /// LumenCite 自身を MCP サーバーとして公開する際の起動/停止マネージャ。
@@ -324,11 +328,17 @@ async fn delete_entry(
 }
 
 /// hard delete 後に添付の実ファイル（attachments/<entry_id>/）を削除する。
-/// DB 削除成功後に呼ぶ。ファイル側の失敗は無視する。
+/// DB 削除成功後に呼ぶ。rename-to-trash + sweep で堅牢化し、消せなくても
+/// 孤立ディレクトリを残さない（永続 retry queue・CR-008）。
 fn remove_entry_attachment_dir(app: &tauri::AppHandle, entry_id: i64) {
-    if let Ok(root) = attachments_root(app) {
-        let _ = std::fs::remove_dir_all(root.join(entry_id.to_string()));
+    let Ok(app_data) = app.path().app_data_dir() else {
+        return;
+    };
+    let dir = app_data.join("attachments").join(entry_id.to_string());
+    if let Err(e) = attachment_trash::move_to_trash(&app_data, &dir) {
+        eprintln!("attachment dir trash failed ({}): {e}", dir.display());
     }
+    attachment_trash::sweep_trash(&app_data);
 }
 
 #[tauri::command]
@@ -785,15 +795,14 @@ async fn delete_attachment(
         .await
         .map_err(|e| e.to_string())?;
 
-    // ファイル本体は best-effort で削除。失敗しても DB は整合しているので致命ではないが、
-    // 握りつぶさずログに残す（掃除漏れの検知用）。
+    // ファイル本体は rename-to-trash で退避してから sweep する（CR-008）。
+    // ロック中でも rename は成功しやすく、消せなくても trash が永続 retry queue になる。
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let abs = root.join(&removed.file_path);
-    if let Err(e) = std::fs::remove_file(&abs) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("attachment file removal failed ({}): {e}", abs.display());
-        }
+    if let Err(e) = attachment_trash::move_to_trash(&root, &abs) {
+        eprintln!("attachment trash failed ({}): {e}", abs.display());
     }
+    attachment_trash::sweep_trash(&root);
     Ok(())
 }
 
@@ -1260,8 +1269,13 @@ async fn generate_summary(
 
     let _ = channel.send(SummaryStreamEvent::Start { model: settings.model.clone() });
 
+    // 要約 run を登録し、sheet close / 再生成時に中断できるようにする（CR-034）。
+    // LLM future を cancel シグナルと race させ、中断時は future を drop して
+    // 進行中の有料 HTTP リクエストを実際に停止する。
+    let cancel = state.summary.begin(entry_id);
+
     let ch_for_delta = channel.clone();
-    let result = llm::generate_summary(
+    let llm_fut = llm::generate_summary(
         &settings.provider,
         &settings.model,
         &api_key,
@@ -1271,20 +1285,36 @@ async fn generate_summary(
         move |delta| {
             let _ = ch_for_delta.send(SummaryStreamEvent::Delta { text: delta.to_string() });
         },
-    )
-    .await;
+    );
+
+    let result = tokio::select! {
+        r = llm_fut => Some(r),
+        _ = cancel.notified() => None, // 中断: llm_fut を drop して接続を閉じる
+    };
+
+    state.summary.finish(entry_id, &cancel);
 
     match result {
-        Ok(full_text) => {
+        // 中断された（ユーザーが sheet を閉じた/再生成した）。受信側は既に無いので通知不要。
+        None => Ok(()),
+        Some(Ok(full_text)) => {
             let _ = channel.send(SummaryStreamEvent::Done { full_text });
             Ok(())
         }
-        Err(e) => {
+        Some(Err(e)) => {
             let msg = e.to_string();
             let _ = channel.send(SummaryStreamEvent::Error { message: msg.clone() });
             Err(msg)
         }
     }
+}
+
+/// 進行中の要約生成を中断する（sheet を閉じる/再生成する際にフロントから呼ぶ・CR-034）。
+/// 対応する run が無ければ何もしない（no-op）。
+#[tauri::command]
+async fn cancel_summary(state: State<'_, AppState>, entry_id: i64) -> Result<(), String> {
+    state.summary.cancel(entry_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1403,6 +1433,47 @@ impl ChatRuntime {
             if let Some(tx) = pending.remove(&key) {
                 let _ = tx.send(false);
             }
+        }
+    }
+}
+
+/// 進行中の要約生成 run を中断可能にする共有ランタイム（CR-034）。
+/// sheet を閉じる/再生成する際に、backend で走っている有料 LLM リクエストを
+/// 実際に停止する（future を drop して HTTP 接続を閉じる）。
+#[derive(Default)]
+pub struct SummaryRuntime {
+    /// entry_id -> 中断シグナル。存在すること自体が「その entry で要約 run が進行中」を表す。
+    cancels: Mutex<HashMap<i64, Arc<Notify>>>,
+}
+
+impl SummaryRuntime {
+    /// エントリの要約 run を登録し、中断シグナル用の `Notify` を返す。
+    /// 同一エントリの既存 run があれば中断する（再生成時の二重リクエスト防止）。
+    fn begin(&self, entry_id: i64) -> Arc<Notify> {
+        let mut cancels = self.cancels.lock().unwrap();
+        if let Some(prev) = cancels.get(&entry_id) {
+            prev.notify_one();
+        }
+        let notify = Arc::new(Notify::new());
+        cancels.insert(entry_id, notify.clone());
+        notify
+    }
+
+    /// run 終了時の後始末。`begin` が別 run で置き換えていた場合は削除しない
+    /// （ポインタ同一性で自分の登録だけを消す）。
+    fn finish(&self, entry_id: i64, notify: &Arc<Notify>) {
+        let mut cancels = self.cancels.lock().unwrap();
+        if let Some(cur) = cancels.get(&entry_id) {
+            if Arc::ptr_eq(cur, notify) {
+                cancels.remove(&entry_id);
+            }
+        }
+    }
+
+    /// 進行中の要約 run を中断する（sheet close / regenerate から呼ばれる）。
+    fn cancel(&self, entry_id: i64) {
+        if let Some(notify) = self.cancels.lock().unwrap().get(&entry_id) {
+            notify.notify_one();
         }
     }
 }
@@ -2870,9 +2941,20 @@ pub fn run() {
                 db: pool.clone(),
                 sync_tx,
                 chat: Arc::new(ChatRuntime::default()),
+                summary: Arc::new(SummaryRuntime::default()),
                 mcp: mcp.clone(),
                 mcp_server: mcp_server.clone(),
                 app_data_dir: data_dir.clone(),
+            });
+
+            // 起動時に添付 trash を sweep する（前回の削除でロック等により消せず
+            // 残った孤立ファイル/ディレクトリを回収する・CR-008 永続 retry queue）。
+            let trash_dir = data_dir.clone();
+            std::thread::spawn(move || {
+                let n = attachment_trash::sweep_trash(&trash_dir);
+                if n > 0 {
+                    eprintln!("attachment trash: swept {n} leftover item(s) at startup");
+                }
             });
 
             // MCP サーバー公開 or Web クリッパーのどちらかが有効なら共用 HTTP サーバーを起動する。
@@ -3067,6 +3149,7 @@ pub fn run() {
             has_api_key,
             test_llm_connection,
             generate_summary,
+            cancel_summary,
             save_entry_summary,
             list_chat_sessions,
             create_chat_session,
@@ -3163,6 +3246,34 @@ mod chat_runtime_tests {
 
         rt.resolve_approval(1, "call-x", false);
         assert!(!rx1.await.unwrap());
+    }
+
+    /// CR-034: cancel は進行中の要約 run に届き、`notified()` を即時解決する。
+    #[tokio::test]
+    async fn summary_cancel_signals_running_run() {
+        let rt = SummaryRuntime::default();
+        let cancel = rt.begin(42);
+        // cancel を先に呼んでも notify_one は permit を蓄えるので notified() は返る。
+        rt.cancel(42);
+        // 待ちがハングしないこと（permit を消費して即時に返る）。
+        cancel.notified().await;
+        rt.finish(42, &cancel);
+    }
+
+    /// CR-034: 同一エントリの begin は前 run を中断し、
+    /// 古い run の finish は新しい登録を消さない（ポインタ同一性で判定）。
+    #[test]
+    fn summary_begin_supersedes_and_finish_is_scoped() {
+        let rt = SummaryRuntime::default();
+        let first = rt.begin(7);
+        let second = rt.begin(7); // first を中断し置き換える
+        assert!(!Arc::ptr_eq(&first, &second));
+        // 古い run の finish は new(second) の登録を消さない。
+        rt.finish(7, &first);
+        assert!(rt.cancels.lock().unwrap().contains_key(&7));
+        // 現行 run の finish は消す。
+        rt.finish(7, &second);
+        assert!(!rt.cancels.lock().unwrap().contains_key(&7));
     }
 }
 

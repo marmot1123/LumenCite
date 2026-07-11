@@ -275,7 +275,14 @@ pub async fn export_bibtex(
 
     let mut entries = Vec::with_capacity(ids.len());
     for id in ids {
-        entries.push(get_entry(pool, id).await.map_err(|e| e.to_string())?);
+        match get_entry(pool, id).await {
+            Ok(entry) => entries.push(entry),
+            // id 一覧取得後に別経路（chat / MCP / 手動）でエントリが削除されると
+            // get_entry は RowNotFound を返す。export 全体を落とさず該当 1 件だけ
+            // スキップし、一貫した .bib を返す（CR-022）。
+            Err(sqlx::Error::RowNotFound) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
     }
 
     // 出力オプションは pool から直接読む。これにより export / save / sync / MCP の
@@ -896,6 +903,24 @@ mod tests {
         assert_eq!(entries[0].title, "Attention Is All You Need");
         assert_eq!(entries[0].authors.len(), 3);
         assert_eq!(entries[0].authors[0].name, "Ashish Vaswani");
+    }
+
+    /// CR-022: export 対象 id 一覧の取得後にエントリが消えても（RowNotFound）、
+    /// export 全体を失敗させず該当分だけスキップする。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_skips_entries_that_vanished(pool: sqlx::SqlitePool) {
+        let e = create_entry(&pool, &EntryInput {
+            title: "Real Paper".to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["Alice Smith".to_string()],
+            year: Some(2024),
+            ..Default::default()
+        }).await.unwrap();
+
+        // 実在 id と存在しない id を混ぜて export。落ちずに実在分だけ出る。
+        let out = export_bibtex(&pool, Some(vec![e.id, 999_999])).await.unwrap();
+        assert!(out.contains("Real Paper"), "実在エントリは出力される");
+        assert_eq!(out.matches("@article").count(), 1, "消えた id はスキップ: {out}");
     }
 
     #[sqlx::test(migrations = "./migrations")]

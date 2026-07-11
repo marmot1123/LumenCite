@@ -277,10 +277,18 @@ pub async fn apply_clip(
     Ok(ClipResult::Created { entry_id: entry.id, title: entry.title })
 }
 
+/// クリップの「重複判定 → 作成」を直列化するプロセス全体で共有のロック（CR-023）。
+/// [`apply_clip`] は check-then-create なので、同一識別子の同時 clip が並行すると
+/// どちらも重複なしと判定して二重作成し得る。DB は 1 つなのでモジュール static で足りる。
+/// メタデータ取得（低速・ネットワーク）はロックの外で行い head-of-line blocking を避ける。
+static CLIP_APPLY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// クリップ 1 件の処理: メタデータ解決 → DB 適用 → 応答 JSON の組み立て。
 pub async fn handle_clip(pool: &SqlitePool, req: &ClipRequest) -> ClipOutcome {
     let input = resolve_entry_input(req).await;
 
+    // 重複判定と作成を直列化する（同時 clip の二重作成防止・CR-023）。
+    let _clip_guard = CLIP_APPLY_LOCK.lock().await;
     match apply_clip(pool, input, req).await {
         Ok(ClipResult::Created { entry_id, title }) => {
             let pdf_job = derive_pdf_url(req).map(|url| PdfJob { entry_id, url });

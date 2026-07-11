@@ -86,7 +86,12 @@ export function SummarySheet({ entry, onClose, onSavedToNotes, onOpenSettings }:
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      // 進行中の backend 要約リクエストを中断する（sheet close / 再生成・CR-034）。
+      // 既に完了/未開始なら backend 側で no-op。
+      invoke("cancel_summary", { entryId: entry.id }).catch(() => {});
+    };
   }, [entry.id, generationKey]);
 
   const handleSave = async () => {

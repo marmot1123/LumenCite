@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::db::authors::{author_inputs_from, get_or_create_author};
+use crate::db::authors::{attach_identifiers, link_entry_authors};
 use crate::models::{
     Attachment, Author, Collection, EntryDetail, EntryFilter, EntryInput, EntryRelation,
     EntrySummary, SidebarCounts, Tag, TagMatch,
@@ -299,7 +299,7 @@ async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::
     .fetch_one(pool)
     .await?;
 
-    let authors: Vec<Author> = sqlx::query_as(
+    let mut authors: Vec<Author> = sqlx::query_as(
         "SELECT a.id, a.name,
                 a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
                 a.name_original, a.given_name_original, a.family_name_original, a.original_script,
@@ -315,6 +315,7 @@ async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::
     .bind(id)
     .fetch_all(pool)
     .await?;
+    attach_identifiers(pool, &mut authors).await?;
 
     let tags: Vec<Tag> = sqlx::query_as(
         "SELECT t.id, t.name FROM tags t
@@ -381,17 +382,7 @@ pub async fn create_entry(
 
     let entry_id = result.last_insert_rowid();
 
-    for (pos, ai) in author_inputs_from(input).into_iter().enumerate() {
-        let author = get_or_create_author(&mut tx, &ai).await?;
-        sqlx::query(
-            "INSERT INTO entry_authors (entry_id, author_id, position) VALUES (?, ?, ?)",
-        )
-        .bind(entry_id)
-        .bind(author.id)
-        .bind(pos as i64)
-        .execute(&mut *tx)
-        .await?;
-    }
+    link_entry_authors(&mut tx, entry_id, input).await?;
 
     for tag_id in &input.tag_ids {
         sqlx::query("INSERT INTO entry_tags (entry_id, tag_id) VALUES (?, ?)")
@@ -430,7 +421,7 @@ async fn load_entry_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, 
     .fetch_one(pool)
     .await?;
 
-    let authors: Vec<Author> = sqlx::query_as(
+    let mut authors: Vec<Author> = sqlx::query_as(
         "SELECT a.id, a.name,
                 a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
                 a.name_original, a.given_name_original, a.family_name_original, a.original_script,
@@ -446,6 +437,7 @@ async fn load_entry_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, 
     .bind(id)
     .fetch_all(pool)
     .await?;
+    attach_identifiers(pool, &mut authors).await?;
 
     let tags: Vec<Tag> = sqlx::query_as(
         "SELECT t.id, t.name FROM tags t
@@ -498,7 +490,7 @@ pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::
     .await?
     .ok_or(sqlx::Error::RowNotFound)?;
 
-    let authors: Vec<Author> = sqlx::query_as(
+    let mut authors: Vec<Author> = sqlx::query_as(
         "SELECT a.id, a.name,
                 a.given_name, a.middle_name, a.family_name, a.suffix, a.name_particle,
                 a.name_original, a.given_name_original, a.family_name_original, a.original_script,
@@ -514,6 +506,7 @@ pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::
     .bind(id)
     .fetch_all(pool)
     .await?;
+    attach_identifiers(pool, &mut authors).await?;
 
     let tags: Vec<Tag> = sqlx::query_as(
         "SELECT t.id, t.name FROM tags t
@@ -745,17 +738,7 @@ pub async fn update_entry(
         .execute(&mut *tx)
         .await?;
 
-    for (pos, ai) in author_inputs_from(input).into_iter().enumerate() {
-        let author = get_or_create_author(&mut tx, &ai).await?;
-        sqlx::query(
-            "INSERT INTO entry_authors (entry_id, author_id, position) VALUES (?, ?, ?)",
-        )
-        .bind(id)
-        .bind(author.id)
-        .bind(pos as i64)
-        .execute(&mut *tx)
-        .await?;
-    }
+    link_entry_authors(&mut tx, id, input).await?;
 
     sqlx::query("DELETE FROM entry_tags WHERE entry_id = ?")
         .bind(id)
@@ -1266,6 +1249,71 @@ mod tests {
         let entry2 = create_entry(&pool, &input2).await.unwrap();
 
         assert_eq!(entry1.authors[0].id, entry2.authors[0].id);
+    }
+
+    /// CR-006: `author_ids` は既存著者を ID で直接リンクし、順序を保持する
+    /// （従来は完全に無視されていた）。存在しない ID は黙って除外する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn create_entry_honors_author_ids(pool: SqlitePool) {
+        // 先に 2 名を作成して ID を得る。
+        let seed = create_entry(&pool, &EntryInput {
+            title: "Seed".to_string(),
+            entry_type: "article".to_string(),
+            author_names: vec!["Alice Smith".to_string(), "Bob Jones".to_string()],
+            ..Default::default()
+        }).await.unwrap();
+        let alice = seed.authors[0].id;
+        let bob = seed.authors[1].id;
+
+        // author_ids で逆順にリンク（+ 存在しない ID 9999 は無視される）。
+        let entry = create_entry(&pool, &EntryInput {
+            title: "By IDs".to_string(),
+            entry_type: "article".to_string(),
+            author_ids: vec![bob, 9999, alice],
+            ..Default::default()
+        }).await.unwrap();
+
+        assert_eq!(entry.authors.len(), 2, "存在しない ID は除外される");
+        assert_eq!(entry.authors[0].id, bob, "author_ids の順序を保持する");
+        assert_eq!(entry.authors[1].id, alice);
+        // 新規著者を作っていないこと（既存を再利用）。
+        assert_eq!(entry.authors[0].name, "Bob Jones");
+    }
+
+    /// CR-006: 一覧/詳細の `Author.identifiers` に構造化 identifier が反映される
+    /// （従来は常に空だった）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn entry_loaders_populate_author_identifiers(pool: SqlitePool) {
+        use crate::models::{AuthorIdentifierInput, AuthorInput};
+        let created = create_entry(&pool, &EntryInput {
+            title: "With identifiers".to_string(),
+            entry_type: "article".to_string(),
+            authors: Some(vec![AuthorInput {
+                name: "Grace Hopper".to_string(),
+                orcid: Some("0000-0002-1825-0097".to_string()),
+                identifiers: vec![AuthorIdentifierInput {
+                    scheme: "scopus".to_string(),
+                    value: "12345".to_string(),
+                    url: None,
+                }],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }).await.unwrap();
+
+        // detail ローダー（create_entry の戻り = get_entry）
+        let ids: Vec<&str> = created.authors[0].identifiers.iter()
+            .map(|i| i.scheme.as_str()).collect();
+        assert!(ids.contains(&"scopus"), "detail に scopus が載る: {ids:?}");
+        assert!(ids.contains(&"orcid"), "orcid も author_identifiers に併記される");
+
+        // list ローダー（get_entries）
+        let list = get_entries(&pool, None, None, None).await.unwrap();
+        let row = list.iter().find(|e| e.id == created.id).unwrap();
+        assert!(
+            row.authors[0].identifiers.iter().any(|i| i.scheme == "scopus"),
+            "一覧サマリーにも identifiers が載る",
+        );
     }
 
     // ── citation_key ─────────────────────────────────────────────────────────

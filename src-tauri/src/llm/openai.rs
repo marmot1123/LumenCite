@@ -59,19 +59,17 @@ impl ChatProvider for OpenAiProvider {
             if data.is_empty() {
                 continue;
             }
-            if data == "[DONE]" {
-                break;
-            }
-            let parsed: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(delta) = acc.push_event(&parsed) {
+            // 1 SSE データを処理。error イベントは Err、terminal（[DONE]/finish_reason）で確定。
+            if let Some(delta) = acc.ingest(data)? {
                 on_delta(&delta);
+            }
+            if acc.is_terminal() {
+                break;
             }
         }
 
-        Ok(acc.finish())
+        // 正常な終端マーカーが来ないまま切断された場合は成功扱いにしない（CR-033）。
+        acc.into_result()
     }
 }
 
@@ -208,6 +206,8 @@ struct ChatAccumulator {
     /// index 順に並ぶ partial tool call
     calls: Vec<PartialToolCall>,
     stop_reason: Option<StopReason>,
+    /// 正常な終端（`[DONE]` か `finish_reason`）を観測したか（CR-033）。
+    saw_terminal: bool,
 }
 
 impl ChatAccumulator {
@@ -216,7 +216,49 @@ impl ChatAccumulator {
             text: String::new(),
             calls: Vec::new(),
             stop_reason: None,
+            saw_terminal: false,
         }
+    }
+
+    /// 1 件の SSE データ文字列を処理する（CR-033）。
+    /// - `[DONE]` / `finish_reason` を観測したら terminal を立てる。
+    /// - ストリーム内の `error` オブジェクトは成功扱いせず `Err` を返す。
+    /// - パース不能なデータは無視する（`Ok(None)`）。
+    ///
+    /// 戻り値はこのイベントで到着したテキスト delta（無ければ `None`）。
+    fn ingest(&mut self, data: &str) -> Result<Option<String>, LlmError> {
+        if data == "[DONE]" {
+            self.saw_terminal = true;
+            return Ok(None);
+        }
+        let parsed: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if let Some(msg) = sse_error_message(&parsed) {
+            return Err(LlmError::Stream(format!("provider stream error: {msg}")));
+        }
+        let delta = self.push_event(&parsed);
+        if self.stop_reason.is_some() {
+            self.saw_terminal = true;
+        }
+        Ok(delta)
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.saw_terminal
+    }
+
+    /// 終端マーカーを観測していれば結果を、していなければ truncation エラーを返す（CR-033）。
+    fn into_result(self) -> Result<ChatTurnResult, LlmError> {
+        if !self.saw_terminal {
+            return Err(LlmError::Stream(
+                "OpenAI stream ended without a terminal marker (finish_reason or [DONE]); \
+                 response may be truncated"
+                    .to_string(),
+            ));
+        }
+        Ok(self.finish())
     }
 
     /// イベントを 1 件処理し、このイベントで新たに到着したテキスト delta を返す
@@ -299,6 +341,47 @@ fn parse_arguments(s: &str) -> Value {
     serde_json::from_str(trimmed).unwrap_or_else(|_| json!({}))
 }
 
+/// SSE データ中の provider エラーオブジェクトを検出する（CR-033）。
+/// OpenAI はストリーム内で `{"error": {"message": ...}}` を送ることがあり、これを
+/// 黙って無視すると欠落・途中終了した応答を正常完了と誤認する。
+fn sse_error_message(parsed: &Value) -> Option<String> {
+    let err = parsed.get("error")?;
+    if err.is_null() {
+        return None;
+    }
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| err.to_string());
+    Some(msg)
+}
+
+/// 単発要約ストリームの 1 データを処理する（CR-033）。
+/// `[DONE]` で `*saw_done` を立て、error オブジェクトは `Err`。戻り値は本文 delta。
+fn summary_step(data: &str, saw_done: &mut bool) -> Result<Option<String>, LlmError> {
+    if data == "[DONE]" {
+        *saw_done = true;
+        return Ok(None);
+    }
+    let parsed: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if let Some(msg) = sse_error_message(&parsed) {
+        return Err(LlmError::Stream(format!("provider stream error: {msg}")));
+    }
+    let content = parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("delta"))
+        .and_then(|d| d.get("content"))
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    Ok(content)
+}
+
 fn map_finish_reason(reason: &str) -> StopReason {
     match reason {
         "tool_calls" => StopReason::ToolUse,
@@ -352,30 +435,25 @@ where
     }
 
     let mut full = String::new();
+    let mut saw_done = false;
     let mut stream = resp.bytes_stream().eventsource();
     while let Some(event) = stream.next().await {
         let event = event.map_err(|e| LlmError::Stream(e.to_string()))?;
         let data = event.data.trim();
         if data.is_empty() { continue; }
-        if data == "[DONE]" { break; }
-        let parsed: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Some(content) = parsed
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("delta"))
-            .and_then(|d| d.get("content"))
-            .and_then(|c| c.as_str())
-        {
-            if !content.is_empty() {
-                full.push_str(content);
-                on_delta(content);
-            }
+        if let Some(delta) = summary_step(data, &mut saw_done)? {
+            full.push_str(&delta);
+            on_delta(&delta);
         }
+        if saw_done { break; }
     }
 
+    // `[DONE]` 無しで切断されたら truncation とみなし成功扱いしない（CR-033）。
+    if !saw_done {
+        return Err(LlmError::Stream(
+            "OpenAI stream ended without [DONE]; response may be truncated".to_string(),
+        ));
+    }
     Ok(full)
 }
 
@@ -569,5 +647,69 @@ mod tests {
         assert_eq!(parse_arguments(""), json!({}));
         assert_eq!(parse_arguments("not json"), json!({}));
         assert_eq!(parse_arguments("{\"a\":1}"), json!({ "a": 1 }));
+    }
+
+    /// CR-033: `[DONE]` も `finish_reason` も来ないまま切断されたら成功扱いにしない。
+    #[test]
+    fn into_result_errs_when_stream_truncated() {
+        let mut acc = ChatAccumulator::new();
+        acc.ingest(&json!({ "choices": [{ "delta": { "content": "Hel" } }] }).to_string())
+            .unwrap();
+        // ここで EOF（terminal 未観測）。
+        assert!(!acc.is_terminal());
+        let err = acc.into_result().unwrap_err();
+        assert!(matches!(err, LlmError::Stream(_)), "truncation は Stream エラー: {err:?}");
+    }
+
+    /// CR-033: `finish_reason` を観測すれば `[DONE]` が無くても成功。
+    #[test]
+    fn into_result_ok_on_finish_reason_without_done() {
+        let mut acc = ChatAccumulator::new();
+        acc.ingest(&json!({ "choices": [{ "delta": { "content": "Hi" } }] }).to_string())
+            .unwrap();
+        acc.ingest(&json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }).to_string())
+            .unwrap();
+        assert!(acc.is_terminal());
+        let result = acc.into_result().unwrap();
+        assert_eq!(result.text, "Hi");
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+    }
+
+    /// CR-033: ストリーム内の error オブジェクトは `Err` として即座に浮上させる。
+    #[test]
+    fn ingest_surfaces_stream_error_object() {
+        let mut acc = ChatAccumulator::new();
+        let err = acc
+            .ingest(&json!({ "error": { "message": "rate limited", "type": "rate_limit_error" } }).to_string())
+            .unwrap_err();
+        match err {
+            LlmError::Stream(m) => assert!(m.contains("rate limited"), "message 透過: {m}"),
+            other => panic!("expected Stream error, got {other:?}"),
+        }
+    }
+
+    /// CR-033: 単発要約ストリームも同じ規約（error 検出 + [DONE] 必須）。
+    #[test]
+    fn summary_step_detects_error_and_terminal() {
+        let mut done = false;
+        // 通常 delta
+        let d = summary_step(
+            &json!({ "choices": [{ "delta": { "content": "x" } }] }).to_string(),
+            &mut done,
+        )
+        .unwrap();
+        assert_eq!(d.as_deref(), Some("x"));
+        assert!(!done);
+        // error
+        let err = summary_step(
+            &json!({ "error": { "message": "boom" } }).to_string(),
+            &mut done,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LlmError::Stream(_)));
+        // [DONE]
+        let none = summary_step("[DONE]", &mut done).unwrap();
+        assert!(none.is_none());
+        assert!(done);
     }
 }

@@ -10,7 +10,7 @@ interface HeaderProps {
   onChat?: () => void;
   onOcr?: () => void;
   ocrBusy?: boolean;
-  onDownload?: () => void;
+  onOpenInWindow?: () => void;
   onPrint?: () => void;
   onMore?: () => void;
 }
@@ -37,7 +37,7 @@ function HeaderBtn({ children, onClick, title, ariaLabel }: {
   );
 }
 
-export function Header({ entry, onBack, onToggleStar, onSummarize, onChat, onOcr, ocrBusy, onDownload, onPrint, onMore }: HeaderProps) {
+export function Header({ entry, onBack, onToggleStar, onSummarize, onChat, onOcr, ocrBusy, onOpenInWindow, onPrint, onMore }: HeaderProps) {
   const { t } = useTranslation();
   return (
     <header style={{
@@ -82,10 +82,12 @@ export function Header({ entry, onBack, onToggleStar, onSummarize, onChat, onOcr
           <span>{ocrBusy ? t("detail.header.ocrRunning") : t("detail.header.ocr")}</span>
         </HeaderBtn>
       )}
-      {/* ハンドラが渡されたときだけ表示する（未配線のボタンを出さない・CR-028）。 */}
-      {onDownload && (
-        <HeaderBtn onClick={onDownload} title={t("detail.header.download")}>
-          <Icon name="download" size={13} color="var(--text-mute)" />
+      {/* ハンドラが渡されたときだけ表示する（未配線のボタンを出さない・CR-028）。
+          実際の動作は PDF を別ウィンドウで開くこと（ダウンロードではない）なので、
+          ラベルとアイコンを実動作に合わせる（CR-028）。 */}
+      {onOpenInWindow && (
+        <HeaderBtn onClick={onOpenInWindow} title={t("detail.header.openInWindow")}>
+          <Icon name="ext" size={13} color="var(--text-mute)" />
         </HeaderBtn>
       )}
       {onPrint && (

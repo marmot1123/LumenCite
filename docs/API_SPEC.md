@@ -110,7 +110,7 @@ type EntryDetail = EntrySummary & {
   isbn?: string;
   arxiv_id?: string;
   url?: string;
-  abstract?: string;
+  abstract_?: string; // DB 列は `abstract` だが IPC/TS 境界では serde 既定の `abstract_`
   notes?: string;
   deleted_at?: string; // ゴミ箱内なら datetime 文字列
   extra_fields: Record<string, string>;
@@ -132,7 +132,7 @@ type EntryInput = {
   isbn?: string;
   arxiv_id?: string;
   url?: string;
-  abstract?: string;
+  abstract_?: string; // DB 列は `abstract` だが IPC/TS 境界では serde 既定の `abstract_`
   notes?: string;
   extra_fields?: Record<string, string>;
   author_ids?: number[];   // 既存著者のID（順序＝著者順）
@@ -184,6 +184,7 @@ type SummaryStreamEvent =
   | { kind: "done"; full_text: string }
   | { kind: "error"; message: string };
 
+// `@tauri-apps/plugin-updater` の `check()` が返す `Update` の投影（独自コマンドではない）
 type UpdateInfo = {
   version: string;
   date?: string;
@@ -511,6 +512,7 @@ type ImportResult = { imported: number; skipped: number };
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
 | `generate_summary` | `entry_id: i64, source: "abstract" \| "fulltext", channel: Channel<SummaryStreamEvent>` | `Result<()>` — ストリーミング送出。完了時にDB側 `entries.summary` も更新 |
+| `cancel_summary` | `entry_id: i64` | `Result<()>` — 進行中の要約生成を中断（sheet close / 再生成時にフロントが呼ぶ）。LLM future を drop して有料 HTTP リクエストを実際に停止。対応 run が無ければ no-op（CR-034） |
 | `get_llm_settings` | — | `LlmSettings` |
 | `save_llm_settings` | `settings: LlmSettings` | `Result<()>` |
 | `get_api_key` | `provider: "openai" \| "anthropic"` | `Result<Option<String>>` — OSキーチェーンから取得（マスク表示用） |
@@ -537,14 +539,10 @@ type BackupInfo = { path: string; created_at: string; size_bytes: number };
 
 ### アップデーター（v0.1.0 追加）
 
-`tauri-plugin-updater` のラッパー。
+アプリ内更新（DL + 検証 + 再起動）は `@tauri-apps/plugin-updater` の JS API（`check()` / `update.downloadAndInstall()`・`src/lib/updater.ts`）をフロントから直接呼ぶ。専用の Rust ラッパーコマンド（`check_for_updates` / `apply_update` / `get_updater_channel` / `set_updater_channel`）は存在しない。バックエンド側に独自コマンドとして存在するのは通知のみの経路 `check_latest_github_release` だけ。更新チャンネル切替（stable/beta）は未実装（UI も非表示）。
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `check_for_updates` | — | `Result<UpdateInfo>` |
-| `apply_update` | — | `Result<()>` — ダウンロード+検証+再起動 |
-| `get_updater_channel` | — | `"stable" \| "beta"` |
-| `set_updater_channel` | `channel: "stable" \| "beta"` | `Result<()>` |
 | `check_latest_github_release` | — | `Result<GithubReleaseInfo>` — **v0.5.0**: GitHub Releases API で最新 tag を取得し `env!("CARGO_PKG_VERSION")` と semver 比較（下記） |
 
 **`check_latest_github_release`（v0.5.0・通知のみの更新確認）:** `tauri-plugin-updater` とは独立した経路。`latest.json` は darwin エントリしか持たないため Windows/Linux では updater の `check()` が新版を見つけられない。この経路は GitHub API（`repos/marmot1123/LumenCite/releases/latest`）で全 OS 共通に新版有無を判定し、**DL/インストールはせず** `html_url`（Releases ページ）を返すだけなので updater 署名鍵も `latest.json` も不要で全 OS 安全。戻り値 `GithubReleaseInfo { current_version, latest_version, is_newer, html_url, body? }`。`is_newer` は tag（先頭 `v` 除去）と現行の semver 比較で、どちらか解釈不能なら `false`（誤って更新を促さない）。フロントの更新タブは updater `check()` と本コマンドを並行実行し、updater が `available` を返せば従来のアプリ内更新、そうでなく `is_newer` なら「Releases を開く」通知バナーを表示する。
@@ -579,7 +577,7 @@ agentic LLM Chat のセッション管理と会話ループ。`chat_send_message
 - `create_entry` / `update_entry`: 都度承認
 - `delete_*` / MCP の write 系: 常時確認（ホワイトリストで上書き不可）
 
-`create_entry` / `update_entry` は基本フィールド（`title` / `entry_type` / `year` / `abstract` / `doi` / `isbn` / `arxiv_id` / `url` / `notes` / `author_names` / `citation_key`）に加え、型固有フィールドを `extra_fields`（`{string: string}`）で受け付ける（`journal` / `volume` / `issue` / `number` / `pages` / `publisher` / `booktitle` / `address` / `edition` / `series` / `school` / `institution` / `organization` / `howpublished` など、`DATA_MODEL.md` の `entries.extra_fields` 参照）。`update_entry` では指定したキーのみ上書き/追加し、未指定の既存 `extra_fields` は保持する。
+`create_entry` / `update_entry` は基本フィールド（`title` / `entry_type` / `year` / `abstract_` / `doi` / `isbn` / `arxiv_id` / `url` / `notes` / `author_names` / `citation_key`）に加え、型固有フィールドを `extra_fields`（`{string: string}`）で受け付ける（`journal` / `volume` / `issue` / `number` / `pages` / `publisher` / `booktitle` / `address` / `edition` / `series` / `school` / `institution` / `organization` / `howpublished` など、`DATA_MODEL.md` の `entries.extra_fields` 参照）。`update_entry` では指定したキーのみ上書き/追加し、未指定の既存 `extra_fields` は保持する。
 
 `citation_key`（固定 cite key）の扱い:
 - `create_entry`: 省略/空文字なら自動生成（NULL 保存）。サニタイズ後に他エントリと重複する場合は実行前に検証で弾き、ツールはエラーを返す（LLM が別キーを選び直せるようメッセージを返す）。

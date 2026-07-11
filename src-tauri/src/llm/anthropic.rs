@@ -63,20 +63,17 @@ impl ChatProvider for AnthropicProvider {
             if data.is_empty() {
                 continue;
             }
-            let parsed: Value = match serde_json::from_str(data) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let outcome = acc.push_event(&parsed);
-            if let Some(delta) = outcome.delta {
+            // error イベントは Err、message_stop で terminal 確定（CR-033）。
+            if let Some(delta) = acc.ingest(data)? {
                 on_delta(&delta);
             }
-            if outcome.stop {
-                break; // message_stop
+            if acc.is_terminal() {
+                break;
             }
         }
 
-        Ok(acc.finish())
+        // message_stop を観測しないまま切断されたら成功扱いにしない（CR-033）。
+        acc.into_result()
     }
 }
 
@@ -234,6 +231,8 @@ struct ChatAccumulator {
     /// content block index -> partial tool call
     calls: Vec<Option<PartialToolCall>>,
     stop_reason: Option<StopReason>,
+    /// `message_stop` を観測したか（CR-033: 終端マーカーの必須化）。
+    saw_stop: bool,
 }
 
 impl ChatAccumulator {
@@ -242,7 +241,44 @@ impl ChatAccumulator {
             text: String::new(),
             calls: Vec::new(),
             stop_reason: None,
+            saw_stop: false,
         }
+    }
+
+    /// 1 件の SSE データ文字列を処理する（CR-033）。
+    /// - `type == "error"` の event は成功扱いせず `Err`。
+    /// - `message_stop` を観測したら terminal を立てる。
+    /// - パース不能なデータは無視する（`Ok(None)`）。
+    ///
+    /// 戻り値はこのイベントで到着したテキスト delta（無ければ `None`）。
+    fn ingest(&mut self, data: &str) -> Result<Option<String>, LlmError> {
+        let parsed: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if let Some(msg) = sse_error_message(&parsed) {
+            return Err(LlmError::Stream(format!("provider stream error: {msg}")));
+        }
+        let outcome = self.push_event(&parsed);
+        if outcome.stop {
+            self.saw_stop = true;
+        }
+        Ok(outcome.delta)
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.saw_stop
+    }
+
+    /// `message_stop` を観測していれば結果を、していなければ truncation エラーを返す（CR-033）。
+    fn into_result(self) -> Result<ChatTurnResult, LlmError> {
+        if !self.saw_stop {
+            return Err(LlmError::Stream(
+                "Anthropic stream ended without message_stop; response may be truncated"
+                    .to_string(),
+            ));
+        }
+        Ok(self.finish())
     }
 
     /// イベントを 1 件処理し、結果（テキスト delta と message_stop か否か）を返す。
@@ -373,6 +409,50 @@ fn parse_input(s: &str) -> Value {
     serde_json::from_str(trimmed).unwrap_or_else(|_| json!({}))
 }
 
+/// SSE データ中の provider エラーイベントを検出する（CR-033）。
+/// Anthropic は `{"type": "error", "error": {"type": ..., "message": ...}}` を
+/// ストリーム内で送ることがあり、無視すると途中終了を正常完了と誤認する。
+fn sse_error_message(parsed: &Value) -> Option<String> {
+    if parsed.get("type").and_then(|v| v.as_str()) != Some("error") {
+        return None;
+    }
+    let msg = parsed
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| parsed.to_string());
+    Some(msg)
+}
+
+/// 単発要約ストリームの 1 データを処理する（CR-033）。
+/// `message_stop` で `*saw_stop` を立て、error event は `Err`。戻り値は本文 delta。
+fn summary_step(data: &str, saw_stop: &mut bool) -> Result<Option<String>, LlmError> {
+    let parsed: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if let Some(msg) = sse_error_message(&parsed) {
+        return Err(LlmError::Stream(format!("provider stream error: {msg}")));
+    }
+    match parsed.get("type").and_then(|v| v.as_str()) {
+        Some("message_stop") => {
+            *saw_stop = true;
+            Ok(None)
+        }
+        Some("content_block_delta") => {
+            let text = parsed
+                .get("delta")
+                .and_then(|d| d.get("text"))
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            Ok(text)
+        }
+        _ => Ok(None),
+    }
+}
+
 fn map_stop_reason(reason: &str) -> StopReason {
     match reason {
         "tool_use" => StopReason::ToolUse,
@@ -426,33 +506,25 @@ where
     }
 
     let mut full = String::new();
+    let mut saw_stop = false;
     let mut stream = resp.bytes_stream().eventsource();
     while let Some(event) = stream.next().await {
         let event = event.map_err(|e| LlmError::Stream(e.to_string()))?;
         let data = event.data.trim();
         if data.is_empty() { continue; }
-        let parsed: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        // content_block_delta -> delta.text
-        if parsed.get("type").and_then(|v| v.as_str()) == Some("content_block_delta") {
-            if let Some(text) = parsed
-                .get("delta")
-                .and_then(|d| d.get("text"))
-                .and_then(|t| t.as_str())
-            {
-                if !text.is_empty() {
-                    full.push_str(text);
-                    on_delta(text);
-                }
-            }
+        if let Some(delta) = summary_step(data, &mut saw_stop)? {
+            full.push_str(&delta);
+            on_delta(&delta);
         }
-        if parsed.get("type").and_then(|v| v.as_str()) == Some("message_stop") {
-            break;
-        }
+        if saw_stop { break; }
     }
 
+    // message_stop 無しで切断されたら truncation とみなし成功扱いしない（CR-033）。
+    if !saw_stop {
+        return Err(LlmError::Stream(
+            "Anthropic stream ended without message_stop; response may be truncated".to_string(),
+        ));
+    }
     Ok(full)
 }
 
@@ -717,5 +789,73 @@ mod tests {
         assert_eq!(parse_input(""), json!({}));
         assert_eq!(parse_input("garbage"), json!({}));
         assert_eq!(parse_input("{\"a\":1}"), json!({ "a": 1 }));
+    }
+
+    /// CR-033: message_stop 無しで切断されたら成功扱いにしない。
+    #[test]
+    fn into_result_errs_when_stream_truncated() {
+        let mut acc = ChatAccumulator::new();
+        acc.ingest(&json!({ "type": "content_block_start", "index": 0,
+                            "content_block": { "type": "text" } }).to_string())
+            .unwrap();
+        acc.ingest(&json!({ "type": "content_block_delta", "index": 0,
+                            "delta": { "type": "text_delta", "text": "Hi" } }).to_string())
+            .unwrap();
+        // EOF（message_stop 未観測）。
+        assert!(!acc.is_terminal());
+        let err = acc.into_result().unwrap_err();
+        assert!(matches!(err, LlmError::Stream(_)), "truncation は Stream エラー: {err:?}");
+    }
+
+    /// CR-033: message_stop を観測すれば正常完了。
+    #[test]
+    fn into_result_ok_on_message_stop() {
+        let mut acc = ChatAccumulator::new();
+        acc.ingest(&json!({ "type": "content_block_delta", "index": 0,
+                            "delta": { "type": "text_delta", "text": "ok" } }).to_string())
+            .unwrap();
+        acc.ingest(&json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" } }).to_string())
+            .unwrap();
+        acc.ingest(&json!({ "type": "message_stop" }).to_string()).unwrap();
+        assert!(acc.is_terminal());
+        let result = acc.into_result().unwrap();
+        assert_eq!(result.text, "ok");
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+    }
+
+    /// CR-033: ストリーム内の error event は Err として即座に浮上させる。
+    #[test]
+    fn ingest_surfaces_stream_error_event() {
+        let mut acc = ChatAccumulator::new();
+        let err = acc
+            .ingest(&json!({ "type": "error",
+                             "error": { "type": "overloaded_error", "message": "overloaded" } }).to_string())
+            .unwrap_err();
+        match err {
+            LlmError::Stream(m) => assert!(m.contains("overloaded"), "message 透過: {m}"),
+            other => panic!("expected Stream error, got {other:?}"),
+        }
+    }
+
+    /// CR-033: 単発要約ストリームも同じ規約（error 検出 + message_stop 必須）。
+    #[test]
+    fn summary_step_detects_error_and_terminal() {
+        let mut stop = false;
+        let d = summary_step(
+            &json!({ "type": "content_block_delta", "delta": { "type": "text_delta", "text": "x" } }).to_string(),
+            &mut stop,
+        )
+        .unwrap();
+        assert_eq!(d.as_deref(), Some("x"));
+        assert!(!stop);
+        let err = summary_step(
+            &json!({ "type": "error", "error": { "message": "boom" } }).to_string(),
+            &mut stop,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LlmError::Stream(_)));
+        let none = summary_step(&json!({ "type": "message_stop" }).to_string(), &mut stop).unwrap();
+        assert!(none.is_none());
+        assert!(stop);
     }
 }
