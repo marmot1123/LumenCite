@@ -124,6 +124,63 @@ async fn load_identifiers(
     .await
 }
 
+/// entry の一覧/詳細ローダー向けに、読み込んだ著者リストへ identifiers を詰める（CR-006）。
+/// これまで entry のサマリー/詳細では `Author.identifiers` が常に空だった
+/// （著者 SELECT が `author_identifiers` テーブルを JOIN していなかったため）。
+pub(crate) async fn attach_identifiers(
+    pool: &SqlitePool,
+    authors: &mut [Author],
+) -> Result<(), sqlx::Error> {
+    for a in authors.iter_mut() {
+        a.identifiers = load_identifiers(pool, a.id).await?;
+    }
+    Ok(())
+}
+
+/// entry に著者をリンクする（create/update 共通）。優先順位:
+/// 1. `input.authors` (構造化) — `get_or_create_author` で名寄せして保存
+/// 2. `input.author_ids` (既存著者 ID・順序＝著者順) — 存在する ID を直接リンク（CR-006）
+/// 3. `input.author_names` — `get_or_create_author` で名寄せ
+///
+/// `entry_authors` は呼び出し側で事前に削除してある前提（update は総差し替え）。
+/// 従来 `author_ids` は完全に無視されていた。
+pub(crate) async fn link_entry_authors(
+    tx: &mut Transaction<'_, Sqlite>,
+    entry_id: i64,
+    input: &EntryInput,
+) -> Result<(), sqlx::Error> {
+    let author_ids: Vec<i64> = if input.authors.is_none() && !input.author_ids.is_empty() {
+        // 既存著者を ID で直接リンクする。存在しない ID は黙って無視する。
+        let mut resolved = Vec::with_capacity(input.author_ids.len());
+        for &aid in &input.author_ids {
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM authors WHERE id = ?")
+                .bind(aid)
+                .fetch_one(&mut **tx)
+                .await?;
+            if exists > 0 {
+                resolved.push(aid);
+            }
+        }
+        resolved
+    } else {
+        let mut resolved = Vec::new();
+        for ai in author_inputs_from(input) {
+            resolved.push(get_or_create_author(tx, &ai).await?.id);
+        }
+        resolved
+    };
+
+    for (pos, author_id) in author_ids.into_iter().enumerate() {
+        sqlx::query("INSERT INTO entry_authors (entry_id, author_id, position) VALUES (?, ?, ?)")
+            .bind(entry_id)
+            .bind(author_id)
+            .bind(pos as i64)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
+
 /// 入力された著者を ORCID → 正規化 name → INSERT の順で照合し、Author を返す。
 ///
 /// トランザクション内で呼ぶ前提（entry 作成/更新の一部）。identifiers のフィールドは
