@@ -1,12 +1,22 @@
 import { useSyncExternalStore } from "react";
 import type { ThemeMode, AccentName, Density, ResolvedTheme } from "../types";
 
-const ACCENTS: Record<AccentName, { strong: string; soft: string; ring: string }> = {
-  amber:  { strong: "oklch(0.62 0.14 65)",  soft: "oklch(0.95 0.04 70)",  ring: "oklch(0.7 0.13 65 / 0.25)" },
-  indigo: { strong: "oklch(0.52 0.16 270)", soft: "oklch(0.95 0.04 270)", ring: "oklch(0.6 0.15 270 / 0.25)" },
-  teal:   { strong: "oklch(0.55 0.10 195)", soft: "oklch(0.95 0.04 200)", ring: "oklch(0.62 0.10 200 / 0.25)" },
-  rose:   { strong: "oklch(0.58 0.16 15)",  soft: "oklch(0.95 0.04 15)",  ring: "oklch(0.65 0.15 15 / 0.25)" },
+// dark* は dark テーマ用の accent（CR-037）。以前は dark で amber 固定だったため、
+// accent を変えても暗色時に反映されなかった。各 accent の色相で強/弱を用意する。
+const ACCENTS: Record<
+  AccentName,
+  { strong: string; soft: string; ring: string; darkStrong: string; darkSoft: string }
+> = {
+  amber:  { strong: "oklch(0.62 0.14 65)",  soft: "oklch(0.95 0.04 70)",  ring: "oklch(0.7 0.13 65 / 0.25)",  darkStrong: "oklch(0.74 0.12 65)",  darkSoft: "oklch(0.36 0.05 65)" },
+  indigo: { strong: "oklch(0.52 0.16 270)", soft: "oklch(0.95 0.04 270)", ring: "oklch(0.6 0.15 270 / 0.25)", darkStrong: "oklch(0.70 0.14 270)", darkSoft: "oklch(0.34 0.06 270)" },
+  teal:   { strong: "oklch(0.55 0.10 195)", soft: "oklch(0.95 0.04 200)", ring: "oklch(0.62 0.10 200 / 0.25)", darkStrong: "oklch(0.72 0.10 195)", darkSoft: "oklch(0.34 0.05 195)" },
+  rose:   { strong: "oklch(0.58 0.16 15)",  soft: "oklch(0.95 0.04 15)",  ring: "oklch(0.65 0.15 15 / 0.25)",  darkStrong: "oklch(0.72 0.14 15)",  darkSoft: "oklch(0.35 0.06 15)" },
 };
+
+// localStorage 値の妥当性検証に使う許可リスト（CR-037）。
+const THEME_MODES: readonly ThemeMode[] = ["light", "dark", "auto"];
+const ACCENT_NAMES: readonly AccentName[] = ["amber", "indigo", "teal", "rose"];
+const DENSITIES: readonly Density[] = ["compact", "default", "comfortable"];
 
 const DARK_TOKENS: Record<string, string> = {
   "--bg": "oklch(0.27 0.004 80)", "--surface": "oklch(0.31 0.004 80)",
@@ -49,11 +59,13 @@ const LIGHT_TOKENS: Record<string, string> = {
 
 function applyTheme(resolved: ResolvedTheme, accent: AccentName) {
   const tokens = resolved === "dark" ? DARK_TOKENS : LIGHT_TOKENS;
-  const a = ACCENTS[accent];
+  // 万一 accent が不正でも落ちないよう既定 amber にフォールバック（CR-037）。
+  const a = ACCENTS[accent] ?? ACCENTS.amber;
   const v = document.documentElement.style;
   Object.entries(tokens).forEach(([k, val]) => v.setProperty(k, val));
-  v.setProperty("--accent-strong", resolved === "dark" ? "oklch(0.74 0.12 65)" : a.strong);
-  v.setProperty("--accent-soft", resolved === "dark" ? "oklch(0.36 0.05 65)" : a.soft);
+  // dark でも選択中 accent を反映する（CR-037）。
+  v.setProperty("--accent-strong", resolved === "dark" ? a.darkStrong : a.strong);
+  v.setProperty("--accent-soft", resolved === "dark" ? a.darkSoft : a.soft);
   v.setProperty("--accent-ring", a.ring);
   document.documentElement.dataset.theme = resolved;
 }
@@ -63,9 +75,18 @@ function readSystemTheme(): ResolvedTheme {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function ls<T>(key: string, fallback: T): T {
-  try { const v = localStorage.getItem(key); return v ? (JSON.parse(v) as T) : fallback; }
-  catch { return fallback; }
+// 許可リストで検証して読む（CR-037）。壊れた/未知の localStorage 値を弾いて既定へ。
+function lsEnum<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
+  try {
+    const v = localStorage.getItem(key);
+    if (!v) return fallback;
+    const parsed = JSON.parse(v);
+    return typeof parsed === "string" && (allowed as readonly string[]).includes(parsed)
+      ? (parsed as T)
+      : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 // テーマ状態はモジュールレベルの単一ストアで共有する。
@@ -80,9 +101,9 @@ type ThemeState = {
 };
 
 let state: ThemeState = {
-  theme: ls("lc-theme", "auto"),
-  accent: ls("lc-accent", "amber"),
-  density: ls("lc-density", "default"),
+  theme: lsEnum("lc-theme", THEME_MODES, "auto"),
+  accent: lsEnum("lc-accent", ACCENT_NAMES, "amber"),
+  density: lsEnum("lc-density", DENSITIES, "default"),
   systemTheme: readSystemTheme(),
 };
 
@@ -110,9 +131,9 @@ if (typeof window !== "undefined" && window.matchMedia) {
     .addEventListener("change", (e) => setState({ systemTheme: e.matches ? "dark" : "light" }));
   // 別ウィンドウ（PDF ビューワー）からの変更にも追従する
   window.addEventListener("storage", (e) => {
-    if (e.key === "lc-theme") setState({ theme: ls("lc-theme", "auto") });
-    if (e.key === "lc-accent") setState({ accent: ls("lc-accent", "amber") });
-    if (e.key === "lc-density") setState({ density: ls("lc-density", "default") });
+    if (e.key === "lc-theme") setState({ theme: lsEnum("lc-theme", THEME_MODES, "auto") });
+    if (e.key === "lc-accent") setState({ accent: lsEnum("lc-accent", ACCENT_NAMES, "amber") });
+    if (e.key === "lc-density") setState({ density: lsEnum("lc-density", DENSITIES, "default") });
   });
   // 初期適用（従来はマウント時 effect で行っていた）
   applyTheme(resolvedOf(state), state.accent);
