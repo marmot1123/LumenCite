@@ -17,11 +17,21 @@ pub struct BackupInfo {
     pub size_bytes: u64,
 }
 
+/// バックアップを直列化するプロセス全体で共有のロック（CR-022）。
+/// 自動バックアップ（起動時 + 24h タイマー）と手動実行（`run_backup_now`）が重なると、
+/// ①同一秒のファイル名選択が TOCTOU で衝突（VACUUM INTO が「already exists」で失敗）、
+/// ②`prune_old_backups` が別実行の作成中ファイルを消す、といった競合が起きる。
+/// DB は 1 つなのでモジュール static で足りる。
+static BACKUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn run_backup(
     pool: &SqlitePool,
     app_dir: &Path,
     keep: usize,
 ) -> Result<PathBuf, String> {
+    // ファイル名選択 → VACUUM INTO → prune を他のバックアップと直列化する（CR-022）。
+    let _guard = BACKUP_LOCK.lock().await;
+
     let backups_dir = app_dir.join("backups");
     fs::create_dir_all(&backups_dir).map_err(|e| e.to_string())?;
 
@@ -118,6 +128,29 @@ mod tests {
         assert_ne!(p1, p2);
         assert_ne!(p2, p3);
         assert!(p1.exists() && p2.exists() && p3.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CR-022: 同時実行でもロックで直列化され、全て成功して別ファイルになる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_backups_all_succeed_with_distinct_files(pool: SqlitePool) {
+        let dir = std::env::temp_dir().join(format!("lc-backup-conc-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // 4 本を同時に投げる。ロックが無ければ同一秒のファイル名衝突で失敗し得る。
+        let (r1, r2, r3, r4) = tokio::join!(
+            run_backup(&pool, &dir, 14),
+            run_backup(&pool, &dir, 14),
+            run_backup(&pool, &dir, 14),
+            run_backup(&pool, &dir, 14),
+        );
+        let paths = [r1.unwrap(), r2.unwrap(), r3.unwrap(), r4.unwrap()];
+        for p in &paths {
+            assert!(p.exists(), "{p:?} should exist");
+        }
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), 4, "全て別ファイル: {paths:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

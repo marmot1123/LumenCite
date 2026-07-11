@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 /// チャットセッション 1 行。`entry_count` は `chat_session_entries` の件数を毎回投影する。
 /// `tool_calls` / `tool_call_id` の構造化（`ToolCallSpec`）は上位層（agentic ループ / Tauri 層）で行い、
@@ -254,15 +254,15 @@ pub async fn append_message(
 }
 
 /// スコープ対象の entry 集合を入れ替える（全削除 → 再登録）。
-pub async fn set_session_entries(
-    pool: &SqlitePool,
+/// スコープ対象 entry を差し替える（呼び出し側 tx 内・CR-022）。`updated_at` は触らない。
+async fn replace_session_entries_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     session_id: i64,
     entry_ids: &[i64],
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM chat_session_entries WHERE session_id = ?")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     for entry_id in entry_ids {
         sqlx::query(
@@ -270,14 +270,9 @@ pub async fn set_session_entries(
         )
         .bind(session_id)
         .bind(entry_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
-    sqlx::query("UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?")
-        .bind(session_id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -306,18 +301,22 @@ pub async fn set_scope(
             "invalid scope_mode: {scope_mode}"
         )));
     }
+    // scope_mode の更新と対象 entry の差し替えを 1 トランザクションで行う（CR-022）。
+    // 従来は別々の文で、途中失敗すると scope_mode と entry 集合が食い違い得た。
+    let mut tx = pool.begin().await?;
     let rows = sqlx::query(
         "UPDATE chat_sessions SET scope_mode = ?, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(scope_mode)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if rows == 0 {
         return Err(sqlx::Error::RowNotFound);
     }
-    set_session_entries(pool, id, entry_ids).await?;
+    replace_session_entries_in_tx(&mut tx, id, entry_ids).await?;
+    tx.commit().await?;
     get_session(pool, id).await
 }
 
@@ -501,7 +500,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn set_session_entries_replaces_set(pool: SqlitePool) {
+    async fn set_scope_replaces_entry_set(pool: SqlitePool) {
         let e1 = make_entry(&pool, "A").await;
         let e2 = make_entry(&pool, "B").await;
         let e3 = make_entry(&pool, "C").await;
@@ -509,7 +508,7 @@ mod tests {
             .await
             .unwrap();
 
-        set_session_entries(&pool, s.id, &[e2, e3]).await.unwrap();
+        set_scope(&pool, s.id, "entries", &[e2, e3]).await.unwrap();
         let ids = get_session_entries(&pool, s.id).await.unwrap();
         assert_eq!(ids, vec![e2, e3]);
         assert_eq!(get_session(&pool, s.id).await.unwrap().entry_count, 2);
