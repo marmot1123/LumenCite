@@ -1030,6 +1030,47 @@ async fn build_missing_lcir(
     ingestion::build_missing_lcir(&state.db, &state.app_data_dir).await
 }
 
+/// LCIR（実験）: 旧い抽出器版で作られた LCIR を現行版へ再構築する（抽出ロジック更新後の後追い）。
+#[tauri::command]
+async fn rebuild_outdated_lcir(
+    state: State<'_, AppState>,
+) -> Result<ingestion::LcirBatchResult, String> {
+    ingestion::rebuild_outdated_lcir(&state.db, &state.app_data_dir).await
+}
+
+/// LCIR（実験・Phase 2）: ノード単位（段落・見出し・caption 等）の全文検索。ヒットは
+/// `node_kind`・`page`・（あれば）PDF 上の領域 `bbox` を返すので、該当ブロックを直接ハイライトできる。
+#[tauri::command]
+async fn search_lcir_nodes(
+    state: State<'_, AppState>,
+    query: String,
+    collection_id: Option<i64>,
+    tag_id: Option<i64>,
+    view: Option<String>,
+) -> Result<Vec<crate::models::NodeFtsHit>, String> {
+    db::document_nodes_fts::search_nodes(
+        &state.db,
+        &query,
+        collection_id,
+        tag_id,
+        view.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// LCIR（実験・Phase 2）: ノードの代表領域（`block` fragment 優先）を返す。node 検索ヒットを
+/// PDF 上でハイライトする際に、必要になったときだけ引くための軽量取得。
+#[tauri::command]
+async fn get_lcir_node_region(
+    state: State<'_, AppState>,
+    node_id: i64,
+) -> Result<Option<crate::models::SourceFragment>, String> {
+    db::source_fragments::primary_fragment_for_node(&state.db, node_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// LCIR（実験）フラグ `lcir.enabled` の現在値。
 #[tauri::command]
 async fn get_lcir_enabled(state: State<'_, AppState>) -> Result<bool, String> {
@@ -3351,6 +3392,9 @@ pub fn run() {
             build_lcir_for_attachment,
             get_lcir_document,
             build_missing_lcir,
+            rebuild_outdated_lcir,
+            search_lcir_nodes,
+            get_lcir_node_region,
             get_lcir_enabled,
             set_lcir_enabled,
         ])

@@ -1,0 +1,104 @@
+{
+  "schema": "https://lumencite.dev/schema/document-ir/0.1",
+  "schema_version": "0.1.0",
+  "version_id": 7,
+  "content_key": "struct123",
+  "source": {
+    "sha256": "deadbeef",
+    "mime_type": "application/pdf",
+    "extractor_name": "lumencite-pdfium",
+    "extractor_version": "0.2.0"
+  },
+  "coordinate_space": {
+    "space": "pdf_user_space",
+    "origin": "bottom_left",
+    "unit": "pt",
+    "y_axis": "up"
+  },
+  "nodes": [
+    {
+      "id": 1,
+      "kind": "document",
+      "ordinal": 0,
+      "origin": "pdf_text_layer"
+    },
+    {
+      "id": 2,
+      "kind": "page",
+      "ordinal": 0,
+      "parent_id": 1,
+      "plain_text": "1 Introduction Deep learning has advanced rapidly.",
+      "origin": "pdf_text_layer",
+      "source_fragments": [
+        {
+          "page": 1,
+          "bbox": { "x": 0.0, "y": 0.0, "width": 595.0, "height": 842.0 },
+          "fragment_type": "page"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "kind": "section",
+      "ordinal": 0,
+      "parent_id": 2,
+      "plain_text": "1 Introduction",
+      "origin": "layout_model",
+      "confidence": 0.75,
+      "payload": { "heading_level": 1, "section_number": "1" },
+      "source_fragments": [
+        {
+          "page": 1,
+          "bbox": { "x": 72.0, "y": 780.0, "width": 120.0, "height": 14.0 },
+          "fragment_type": "block"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "kind": "line",
+      "ordinal": 0,
+      "parent_id": 3,
+      "plain_text": "1 Introduction",
+      "origin": "pdf_text_layer",
+      "source_fragments": [
+        {
+          "page": 1,
+          "bbox": { "x": 72.0, "y": 780.0, "width": 120.0, "height": 14.0 },
+          "fragment_type": "line"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "kind": "paragraph",
+      "ordinal": 1,
+      "parent_id": 2,
+      "plain_text": "Deep learning has advanced rapidly.",
+      "origin": "layout_model",
+      "confidence": 0.6,
+      "source_fragments": [
+        {
+          "page": 1,
+          "bbox": { "x": 72.0, "y": 740.0, "width": 400.0, "height": 12.0 },
+          "fragment_type": "block"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "kind": "line",
+      "ordinal": 0,
+      "parent_id": 5,
+      "plain_text": "Deep learning has advanced rapidly.",
+      "origin": "pdf_text_layer",
+      "source_fragments": [
+        {
+          "page": 1,
+          "bbox": { "x": 72.0, "y": 740.0, "width": 400.0, "height": 12.0 },
+          "fragment_type": "line"
+        }
+      ]
+    }
+  ]
+}

@@ -45,6 +45,23 @@ where
     Ok(id)
 }
 
+/// ノードの代表領域（`block` fragment を優先、無ければ最初の 1 つ）。node-FTS ヒットの
+/// 「該当ブロックをハイライト」用。fragment が無ければ None。
+pub async fn primary_fragment_for_node(
+    pool: &SqlitePool,
+    node_id: i64,
+) -> Result<Option<SourceFragment>, sqlx::Error> {
+    sqlx::query_as::<_, SourceFragment>(
+        "SELECT * FROM source_fragments
+         WHERE node_id = ?
+         ORDER BY (fragment_type = 'block') DESC, page_number, reading_order, id
+         LIMIT 1",
+    )
+    .bind(node_id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// 1 バージョンの全 fragment（ページ→読み順で安定ソート）。read 面用。
 pub async fn fragments_for_version(
     pool: &SqlitePool,

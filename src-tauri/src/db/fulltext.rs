@@ -190,7 +190,7 @@ pub async fn entry_fulltext_page_count(
     Ok(row.get::<i64, _>("cnt"))
 }
 
-fn build_match_expr(tokens: &[&str]) -> String {
+pub(crate) fn build_match_expr(tokens: &[&str]) -> String {
     tokens
         .iter()
         .map(|t| format!("\"{}\"", t.replace('"', "")))
@@ -300,7 +300,8 @@ pub async fn search_fulltext(
     Ok(hits)
 }
 
-async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::Error> {
+/// エントリ要約を読む。全文検索系（`fulltext` / `document_nodes_fts`）のヒットで共有する。
+pub(crate) async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, title, year, entry_type, created_at, starred FROM entries WHERE id = ?",
     )

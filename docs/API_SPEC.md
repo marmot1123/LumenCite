@@ -480,6 +480,11 @@ type FulltextResult = {
 |---------|------|--------|
 | `build_lcir_for_attachment` | `attachment_id: i64` | `LcirBuildResult` |
 | `get_lcir_document` | `attachment_id: i64` | `LcirDocument \| null` |
+| `build_missing_lcir` | — | `LcirBatchResult` |
+| `rebuild_outdated_lcir` | — | `LcirBatchResult` |
+| `search_lcir_nodes` | `query, collection_id?, tag_id?, view?` | `NodeFtsHit[]` |
+| `get_lcir_node_region` | `node_id: i64` | `SourceFragment \| null` |
+| `get_lcir_enabled` / `set_lcir_enabled` | `—` / `enabled: bool` | `bool` / `()` |
 
 ```ts
 type LcirBuildResult = {
@@ -502,20 +507,34 @@ type LcirDocument = {
   coordinate_space: { space: string; origin: string; unit: string; y_axis: string };
   nodes: Array<{
     id: number;
-    kind: string;           // document / page / text_block / ...
+    kind: string;           // document / page / section / paragraph / figure_caption / line / ...
     ordinal: number;
     parent_id?: number;
     plain_text?: string;
-    origin?: string;
+    origin?: string;        // pdf_text_layer（原文由来） / layout_model（構造推定）
     confidence?: number;
+    payload?: unknown;      // 型固有属性。見出しは { heading_level, section_number }
     source_fragments: Array<{ page: number; bbox: { x: number; y: number; width: number; height: number }; fragment_type?: string }>;
   }>;
+};
+
+// ノード単位 FTS（Phase 2）のヒット。段落・見出し・caption 等のブロック粒度で当たる。
+type NodeFtsHit = {
+  entry: EntrySummary;
+  attachment_id: number;
+  node_id: number;
+  page: number;
+  node_kind: string;        // paragraph / section / figure_caption / ...
+  snippet: string;
+  bbox: { x: number; y: number; width: number; height: number } | null; // ブロック領域（ハイライト用）
 };
 ```
 
 - `build_lcir_for_attachment` は pdfium で抽出し `document_versions`/`document_nodes`/`source_fragments` を作る。`content_key`（= `sha256(source_sha256|extractor_name|extractor_version|config_hash)`）で冪等：同一 PDF+同一抽出器版なら再抽出せず reuse。新版採用時は同一添付の旧 completed を `superseded` にする。
-- 座標は既存 `highlights` と同一系（PDF user space・左下原点・pt）なので、将来「検索ヒット → PDF 該当領域ハイライト」に直結できる。
-- フラグ OFF なら両コマンドとも DB に一切書かず（`build` は `enabled:false`、`get` は `null`）、既存挙動は不変。
+- **Phase 2**: 抽出後に論理構造を認識し `document > page > block(段落/見出し/caption 等) > line` の木にする（`extractor_version` 0.1.0→0.2.0）。build 時に派生の `document_nodes_fts` も張り、`search_lcir_nodes` がブロック粒度で検索できる。ヒットの `bbox` で該当ブロックを直接ハイライトできる（`get_lcir_node_region` でも個別取得可）。
+- `rebuild_outdated_lcir` は旧抽出器版（例 0.1.0）で作った LCIR を現行版へ再構築する（`build_missing_lcir` は未構築のみ・こちらは版が古いものを対象）。
+- 座標は既存 `highlights` と同一系（PDF user space・左下原点・pt）。
+- フラグ OFF なら書き込み系は DB に一切書かず（`build`/バッチは `enabled:false`、`get` は `null`）、既存挙動は不変。`search_lcir_nodes` はフラグに関係なく空表を引くだけ。
 
 ### エントリ間の関連（relations）
 

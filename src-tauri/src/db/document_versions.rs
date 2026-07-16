@@ -163,6 +163,40 @@ pub async fn attachments_without_completed_lcir(
     .await
 }
 
+/// 完了 LCIR は在るが、現在の抽出器（`extractor_name`/`extractor_version`）では作られていない
+/// 添付を `(id, file_path)` で返す。抽出ロジックを上げた後（例 Phase 2 で 0.1.0→0.2.0）、既存
+/// コーパスを新版へ再構築するバッチ `rebuild_outdated_lcir` の対象集め。`build_lcir_for_attachment`
+/// は新 content_key で新版を作り旧 completed を supersede するので、これで漏れなく上げられる。
+pub async fn attachments_with_outdated_lcir(
+    pool: &SqlitePool,
+    extractor_name: &str,
+    extractor_version: &str,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String)>(
+        "SELECT a.id, a.file_path
+         FROM attachments a
+         JOIN entries e ON e.id = a.entry_id
+         WHERE e.deleted_at IS NULL
+           AND a.mime_type LIKE '%pdf%'
+           AND EXISTS (
+               SELECT 1 FROM document_versions dv
+               WHERE dv.attachment_id = a.id
+                 AND dv.extraction_status IN ('completed', 'completed_with_warnings')
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM document_versions dv2
+               WHERE dv2.attachment_id = a.id
+                 AND dv2.extraction_status IN ('completed', 'completed_with_warnings')
+                 AND dv2.extractor_name = ? AND dv2.extractor_version = ?
+           )
+         ORDER BY a.id",
+    )
+    .bind(extractor_name)
+    .bind(extractor_version)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +372,32 @@ mod tests {
         assert!(ids.contains(&pend));
         assert!(!ids.contains(&built));
         assert!(targets.iter().any(|(_, p)| p.ends_with("/p.pdf")));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn outdated_lists_only_stale_extractor_versions(pool: SqlitePool) {
+        // 現行版で構築済みの添付は対象外。旧版のみの添付が対象。未構築は対象外（missing の担当）。
+        let current = setup_attachment(&pool).await;
+        insert_version(&pool, &nv(current, "ck", ExtractionStatus::Completed))
+            .await
+            .unwrap();
+
+        let outdated = setup_attachment(&pool).await;
+        let mut old = nv(outdated, "old", ExtractionStatus::Completed);
+        old.extractor_version = "0.0.1";
+        insert_version(&pool, &old).await.unwrap();
+
+        setup_attachment(&pool).await; // 未構築（completed 無し）
+
+        let targets = attachments_with_outdated_lcir(
+            &pool,
+            schema::EXTRACTOR_NAME,
+            schema::EXTRACTOR_VERSION,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<i64> = targets.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![outdated], "現行版済み・未構築は除外し、旧版のみ拾う");
     }
 
     #[sqlx::test(migrations = "./migrations")]

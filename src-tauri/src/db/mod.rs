@@ -3,6 +3,7 @@ pub mod authors;
 pub mod chat;
 pub mod collections;
 pub mod document_nodes;
+pub mod document_nodes_fts;
 pub mod document_versions;
 pub mod entries;
 pub mod fulltext;
