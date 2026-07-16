@@ -69,6 +69,13 @@ pub const LLM_OCR_MODEL_KEY: &str = "llm.ocr_model";
 /// 値は "1"（再構築済み）のみで、未設定なら未実施扱い。
 pub const FTS_AUTHORS_V030_REBUILT_KEY: &str = "fts.authors_v030_rebuilt";
 
+/// PDF 全文の `fulltext` FTS5（trigram）逆索引を起動時に 1 回だけ再構築するフラグ。
+/// 一部の既存ライブラリで逆索引が malformed になっており（アプリ内蔵の古い SQLite の
+/// `integrity_check` では検出できないが、新しい SQLite では検出される）、全文検索が
+/// 不正になり得るため、`INSERT INTO fulltext(fulltext) VALUES('rebuild')` で内容から
+/// 索引を作り直す。値は "1"（再構築済み）のみで、未設定なら未実施扱い。
+pub const FTS_FULLTEXT_REBUILT_KEY: &str = "fts.fulltext_rebuilt";
+
 #[cfg(test)]
 mod tests {
     use super::*;

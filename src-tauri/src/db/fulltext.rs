@@ -88,6 +88,36 @@ pub async fn unindex_attachment(
     Ok(())
 }
 
+/// `fulltext` FTS5（trigram）の逆索引を起動時に 1 回だけ再構築する自己修復。
+///
+/// 一部の既存ライブラリでは `fulltext` の逆索引が malformed になっており、新しい
+/// SQLite では `PRAGMA integrity_check` が "malformed inverted index for FTS5 table
+/// main.fulltext" を返す（アプリ内蔵の古い SQLite では検出できないため素通りしていた）。
+/// これを放置すると全文検索が誤動作し得るので、`settings.fts.fulltext_rebuilt` が未セット
+/// なら FTS5 の `'rebuild'` コマンドで %_content から索引を作り直し、完了後にフラグを立てる。
+/// 2 回目以降は no-op。malformed でない健全な索引でも rebuild は安全（同じ索引を作り直すだけ）。
+///
+/// 戻り値: 実際に再構築が走ったら `true`、フラグ既設で skip したら `false`。
+/// `rebuild_authors_fts_once` と同じく起動時に background で呼ぶ。失敗時はフラグを立てず
+/// Err を返すので次回起動でリトライされる。
+pub async fn rebuild_fulltext_fts_once(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    use crate::db::settings;
+
+    if settings::get_setting(pool, settings::FTS_FULLTEXT_REBUILT_KEY)
+        .await?
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    sqlx::query("INSERT INTO fulltext(fulltext) VALUES('rebuild')")
+        .execute(pool)
+        .await?;
+
+    settings::set_setting(pool, settings::FTS_FULLTEXT_REBUILT_KEY, "1").await?;
+    Ok(true)
+}
+
 pub async fn is_indexed(pool: &SqlitePool, attachment_id: i64) -> Result<bool, sqlx::Error> {
     let row =
         sqlx::query("SELECT COUNT(*) AS cnt FROM fulltext WHERE attachment_id = ?")
@@ -375,6 +405,33 @@ mod tests {
         assert_eq!(hits[0].attachment_id, att_id);
         assert_eq!(hits[0].page, 1);
         assert!(hits[0].snippet.to_lowercase().contains("transformer"));
+    }
+
+    /// 自己修復は 1 回だけ走り（`true`）、2 回目以降は flag で skip（`false`）。
+    /// 再構築後も既存の索引内容は検索でき、FTS5 integrity-check を通る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn rebuild_fulltext_fts_once_is_idempotent_and_healthy(pool: SqlitePool) {
+        let (_, att_id) = setup_attachment(&pool, "Paper").await;
+        index_attachment(
+            &pool,
+            att_id,
+            &[(1, "Transformer architecture is described here.".to_string())],
+        )
+        .await
+        .unwrap();
+
+        let first = rebuild_fulltext_fts_once(&pool).await.unwrap();
+        assert!(first, "初回は再構築が走る");
+        let second = rebuild_fulltext_fts_once(&pool).await.unwrap();
+        assert!(!second, "2 回目は flag で skip");
+
+        // 再構築後も検索でき、FTS5 の integrity-check を通る。
+        let hits = search_fulltext(&pool, "transformer", None, None, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        sqlx::query("INSERT INTO fulltext(fulltext) VALUES('integrity-check')")
+            .execute(&pool)
+            .await
+            .expect("rebuild 後は FTS5 integrity-check を通る");
     }
 
     #[sqlx::test(migrations = "./migrations")]
