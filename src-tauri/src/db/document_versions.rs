@@ -141,6 +141,28 @@ pub async fn try_create_content_key_unique_index(pool: &SqlitePool) -> Result<bo
     Ok(true)
 }
 
+/// 完了 LCIR がまだ無い PDF 添付を `(id, file_path)` で返す（ゴミ箱のエントリは除外）。
+/// 「未構築の添付を一括 LCIR 化」バッチが対象を集める。`attachments_without_fulltext` の LCIR 版。
+pub async fn attachments_without_completed_lcir(
+    pool: &SqlitePool,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String)>(
+        "SELECT a.id, a.file_path
+         FROM attachments a
+         JOIN entries e ON e.id = a.entry_id
+         WHERE e.deleted_at IS NULL
+           AND a.mime_type LIKE '%pdf%'
+           AND NOT EXISTS (
+               SELECT 1 FROM document_versions dv
+               WHERE dv.attachment_id = a.id
+                 AND dv.extraction_status IN ('completed', 'completed_with_warnings')
+           )
+         ORDER BY a.id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +317,39 @@ mod tests {
         // 同一 (att, "a") の再挿入は UNIQUE 違反。
         let dup = insert_version(&pool, &nv(att, "a", ExtractionStatus::Completed)).await;
         assert!(dup.is_err());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn without_completed_lcir_lists_only_unbuilt(pool: SqlitePool) {
+        let built = setup_attachment(&pool).await;
+        let unbuilt = setup_attachment(&pool).await;
+        insert_version(&pool, &nv(built, "ck", ExtractionStatus::Completed))
+            .await
+            .unwrap();
+        // pending は「完了」ではないので未構築扱いで対象に残る。
+        let pend = setup_attachment(&pool).await;
+        insert_version(&pool, &nv(pend, "p", ExtractionStatus::Pending))
+            .await
+            .unwrap();
+
+        let targets = attachments_without_completed_lcir(&pool).await.unwrap();
+        let ids: Vec<i64> = targets.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&unbuilt));
+        assert!(ids.contains(&pend));
+        assert!(!ids.contains(&built));
+        assert!(targets.iter().any(|(_, p)| p.ends_with("/p.pdf")));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn without_completed_lcir_excludes_trashed(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let entry_id: i64 = sqlx::query_scalar("SELECT entry_id FROM attachments WHERE id = ?")
+            .bind(att)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        crate::db::entries::trash_entry(&pool, entry_id).await.unwrap();
+        let targets = attachments_without_completed_lcir(&pool).await.unwrap();
+        assert!(!targets.iter().any(|(id, _)| *id == att));
     }
 }

@@ -838,7 +838,16 @@
       "indexMissingBusy": "Indexing…",
       "indexMissingNone": "No unindexed PDFs.",
       "indexMissingDone": "Indexed {{indexed}} of {{total}} ({{needsOcr}} may need OCR, {{failed}} failed).",
-      "indexMissingError": "Bulk indexing failed: {{error}}"
+      "indexMissingError": "Bulk indexing failed: {{error}}",
+      "lcir": "LCIR (experimental machine-readable IR)",
+      "lcirDesc": "Experimental: parse PDFs into a typed node tree with coordinates. When enabled, pages, text blocks and coordinates are stored (existing full-text search is unchanged).",
+      "lcirEnable": "Enable LCIR",
+      "lcirBuild": "Build LCIR for all un-built PDFs",
+      "lcirBusy": "Building…",
+      "lcirNone": "No un-built PDFs.",
+      "lcirDisabled": "LCIR is disabled. Enable it first.",
+      "lcirDone": "Built {{built}} of {{total}} ({{failed}} failed).",
+      "lcirError": "Bulk build failed: {{error}}"
     },
     "about": {
       "appTitle": "LumenCite",

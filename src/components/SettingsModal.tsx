@@ -675,6 +675,10 @@ function DataTab() {
   // 復元の確認はアプリ内インライン UI で行う（WKWebView では window.confirm が
   // 描画されず素通りすることがあるため）。
   const [confirmRestore, setConfirmRestore] = useState(false);
+  const [lcirEnabled, setLcirEnabled] = useState(false);
+  useEffect(() => {
+    invoke<boolean>("get_lcir_enabled").then(setLcirEnabled).catch(() => {});
+  }, []);
 
   const errMsg = (e: unknown) =>
     typeof e === "string" ? e : (e as Error)?.message ?? String(e);
@@ -773,6 +777,41 @@ function DataTab() {
     }
   };
 
+  const toggleLcir = async (next: boolean) => {
+    try {
+      await invoke("set_lcir_enabled", { enabled: next });
+      setLcirEnabled(next);
+    } catch (e) {
+      setError(errMsg(e));
+    }
+  };
+
+  const handleBuildLcir = async () => {
+    setBusy("build_lcir");
+    setMessage(null);
+    setError(null);
+    try {
+      const r = await invoke<{
+        enabled: boolean;
+        total: number;
+        built: number;
+        reused: number;
+        failed: number;
+      }>("build_missing_lcir");
+      if (!r.enabled) {
+        setMessage(t("settings.data.lcirDisabled"));
+      } else if (r.total === 0) {
+        setMessage(t("settings.data.lcirNone"));
+      } else {
+        setMessage(t("settings.data.lcirDone", { total: r.total, built: r.built, failed: r.failed }));
+      }
+    } catch (e) {
+      setError(t("settings.data.lcirError", { error: errMsg(e) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <>
       <Section title={t("settings.data.backup")} description={t("settings.data.backupDesc")}>
@@ -831,6 +870,18 @@ function DataTab() {
         <SecondaryBtn onClick={handleIndexMissing} disabled={busy === "index_missing"}>
           {busy === "index_missing" ? t("settings.data.indexMissingBusy") : t("settings.data.indexMissing")}
         </SecondaryBtn>
+      </Section>
+
+      <Section title={t("settings.data.lcir")} description={t("settings.data.lcirDesc")}>
+        <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", cursor: "pointer" }}>
+          <input type="checkbox" checked={lcirEnabled} onChange={(e) => void toggleLcir(e.target.checked)} />
+          <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.data.lcirEnable")}</span>
+        </label>
+        <div style={{ marginTop: 6 }}>
+          <SecondaryBtn onClick={handleBuildLcir} disabled={!lcirEnabled || busy === "build_lcir"}>
+            {busy === "build_lcir" ? t("settings.data.lcirBusy") : t("settings.data.lcirBuild")}
+          </SecondaryBtn>
+        </div>
       </Section>
 
       {message && (
