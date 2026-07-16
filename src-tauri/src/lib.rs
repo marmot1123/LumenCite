@@ -12,6 +12,7 @@ pub mod mcp_shim;
 mod metadata;
 mod models;
 mod orcid;
+mod restore;
 mod secretbox;
 
 use models::{
@@ -2034,6 +2035,54 @@ fn open_backup_folder(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// バックアップ `.zip` を選ぶダイアログを開いてパスを返す（CR-018 復元用）。
+/// macOS の `~/Library` は隠しフォルダで手動では辿り着きにくいので、初期ディレクトリを
+/// バックアップフォルダに固定して開く。
+#[tauri::command]
+async fn pick_backup_archive(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let backups_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("backups");
+    // フォルダが無いと一部プラットフォームで set_directory が無視されるため作っておく。
+    let _ = std::fs::create_dir_all(&backups_dir);
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = app
+            .dialog()
+            .file()
+            .add_filter("LumenCite backup", &["zip"])
+            .set_directory(&backups_dir)
+            .blocking_pick_file();
+        Ok::<Option<String>, String>(
+            path.and_then(|p| p.into_path().ok()).map(|p| p.to_string_lossy().to_string()),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// バックアップアーカイブから復元をステージングする（CR-018）。
+/// 実際の DB 差し替えは次回起動時に行われるため、成功後にフロントがアプリを再起動する。
+/// 復元前に現行状態を自動で完全バックアップする（安全網）。
+#[tauri::command]
+async fn restore_from_archive(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let archive = PathBuf::from(&path);
+    let info = restore::stage_restore(&state.db, &dir, &archive).await?;
+    eprintln!(
+        "restore staged from {path}; safety backup at {:?}. Restart to apply.",
+        info.safety_backup
+    );
+    debug_assert!(restore::has_pending_restore(&dir));
+    Ok(())
+}
+
 #[tauri::command]
 async fn export_database_json(
     app: tauri::AppHandle,
@@ -2869,6 +2918,32 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
 
+            // CR-018: ステージ済みのバックアップ復元があれば、pool を開く前にここで適用する。
+            // ライブ pool がファイルを握っていない起動時に差し替えることで、
+            // オープン中ファイルの置換問題（特に Windows）を避ける。失敗時は自動で
+            // 元の状態へ巻き戻し、旧 DB のまま起動を続ける（ユーザーにはダイアログで通知）。
+            match restore::apply_pending_restore(&data_dir) {
+                Ok(Some(info)) => {
+                    eprintln!(
+                        "restore applied from staged backup (previous data kept at {:?})",
+                        info.pre_restore
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("restore apply failed (rolled back): {e}");
+                    let _ = rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_title("復元に失敗しました")
+                        .set_description(format!(
+                            "{e}\n\n元のデータのまま起動します。バックアップフォルダの \
+                             安全網バックアップ（復元直前に自動作成）から手動でやり直せます。"
+                        ))
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                }
+            }
+
             // GUI 生存フラグ（CR-011）: このロックを保持している間は「GUI 起動中」。
             // CLI の直接書込経路がこれを見て、MCP 委譲できないときに live DB を壊さないよう
             // 判断する。try_lock なので 2 個目のインスタンスでも起動を妨げない。
@@ -2920,6 +2995,13 @@ pub fn run() {
                     Ok(true) => eprintln!("entries_fts: rebuilt for v0.3.0 authors schema"),
                     Ok(false) => {}
                     Err(e) => eprintln!("entries_fts rebuild failed: {e}"),
+                }
+                // 既存ライブラリで malformed になり得る PDF 全文の fulltext FTS5 索引を
+                // 1 回だけ自己修復する（新しい SQLite でのみ検出される破損への対処）。
+                match db::fulltext::rebuild_fulltext_fts_once(&fts_pool).await {
+                    Ok(true) => eprintln!("fulltext_fts: rebuilt inverted index (self-heal)"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("fulltext_fts rebuild failed: {e}"),
                 }
             });
 
@@ -3201,6 +3283,8 @@ pub fn run() {
             run_backup_now,
             list_backups,
             open_backup_folder,
+            pick_backup_archive,
+            restore_from_archive,
             export_database_json,
             export_database_markdown,
         ])

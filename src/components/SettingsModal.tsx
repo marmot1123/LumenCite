@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { useTheme } from "../hooks/useTheme";
 import { useLanguage } from "../hooks/useLanguage";
 import { Icon } from "./icons";
@@ -671,6 +672,9 @@ function DataTab() {
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 復元の確認はアプリ内インライン UI で行う（WKWebView では window.confirm が
+  // 描画されず素通りすることがあるため）。
+  const [confirmRestore, setConfirmRestore] = useState(false);
 
   const errMsg = (e: unknown) =>
     typeof e === "string" ? e : (e as Error)?.message ?? String(e);
@@ -694,6 +698,32 @@ function DataTab() {
       await invoke("open_backup_folder");
     } catch (e) {
       setError(errMsg(e));
+    }
+  };
+
+  // インライン確認で「復元する」を押した後の本処理。
+  const handleRestoreConfirmed = async () => {
+    setConfirmRestore(false);
+    setMessage(null);
+    setError(null);
+    let path: string | null = null;
+    try {
+      path = await invoke<string | null>("pick_backup_archive");
+    } catch (e) {
+      setError(errMsg(e));
+      return;
+    }
+    if (!path) return; // ダイアログをキャンセル
+    setBusy("restore");
+    try {
+      // ステージング（検証 + 復元前の自動バックアップ）。実際の差し替えは再起動後。
+      await invoke("restore_from_archive", { path });
+      setMessage(t("settings.data.restoreStaged"));
+      // 反映のためアプリを再起動する。
+      await relaunch();
+    } catch (e) {
+      setError(t("settings.data.restoreError", { error: errMsg(e) }));
+      setBusy(null);
     }
   };
 
@@ -753,7 +783,34 @@ function DataTab() {
           <SecondaryBtn onClick={handleOpenFolder}>
             {t("settings.data.openBackupFolder")}
           </SecondaryBtn>
+          <SecondaryBtn
+            onClick={() => setConfirmRestore(true)}
+            disabled={busy === "restore" || confirmRestore}
+          >
+            {busy === "restore" ? t("common.loading") : t("settings.data.restore")}
+          </SecondaryBtn>
         </div>
+        <div style={{ fontSize: 11, color: "var(--text-mute)", marginTop: 6 }}>
+          {t("settings.data.restoreDesc")}
+        </div>
+        {confirmRestore && (
+          <div style={{
+            padding: "10px 12px", borderRadius: 6, marginTop: 8,
+            background: "var(--danger-bg)", border: "1px solid var(--danger-border)",
+          }}>
+            <div style={{ fontSize: 12, color: "var(--text)", lineHeight: 1.55, marginBottom: 8 }}>
+              {t("settings.data.restoreConfirm")}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <SecondaryBtn onClick={() => setConfirmRestore(false)}>
+                {t("common.cancel")}
+              </SecondaryBtn>
+              <SecondaryBtn onClick={handleRestoreConfirmed}>
+                {t("settings.data.restoreProceed")}
+              </SecondaryBtn>
+            </div>
+          </div>
+        )}
       </Section>
 
       <Section title={t("settings.data.export")} description={t("settings.data.exportDesc")}>

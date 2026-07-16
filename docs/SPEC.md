@@ -51,7 +51,7 @@
 
 ### データ保全 / 配布
 - **自動バックアップ（CR-018: 添付本体込み）**: アプリ起動時 + 1日1回、`<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.zip` に**完全バックアップ**を作成。アーカイブは `db.sqlite`（`VACUUM INTO` によるクリーンコピー。highlights/chat/settings/fulltext 込み）＋ `attachments/<entry_id>/<file_name>`（添付本体）を deflate 圧縮で束ねる。14世代まで保持（旧 `.db` バックアップも世代管理・一覧の対象）
-- **復元（restore/import）は未実装**: アーカイブからの自動復元はライブ DB 差し替え＋再起動を伴い実機検証が要るため将来課題。現状は `.zip` を展開して `db.sqlite` と `attachments/` を手動配置する運用
+- **復元（CR-018）**: 設定 → データの「復元」から backup `.zip` を選ぶと、①稼働中に検証（`db.sqlite`・`PRAGMA integrity_check`・スキーマ版）＋復元前の自動フルバックアップ → `pending-restore/` へ展開、②アプリ再起動、③起動時に pool を開く前へ現行 DB＋添付を `pre-restore/` へ退避してから staged を差し替え（失敗時は自動ロールバックして旧 DB のまま起動継続）。ライブ DB を握ったままの上書きを避ける「次回起動時適用」方式
 - **手動エクスポート**（CR-018 で範囲を明確化）: いずれも**エントリのメタデータ書き出し**であり、PDF 添付・ハイライト・チャット履歴・設定は含まず、再インポートによる復元もできない。
   - JSON: エントリのメタデータ（`EntryDetail[]`）
   - BibTeX: 引用情報（既存）

@@ -273,7 +273,7 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 | CR-011 | P2 | ✅ | `3a375e7` | GUI 生存を advisory ロックで独立判定（fail closed） |
 | CR-013 | P2 | ✅ | `7d5616b` | stdio shim が keychain から token を読む（config に埋め込まない） |
 | CR-014 | P2 | ✅ | `684438e` | chat run/approval の競合修正（単一 run / `(session_id, call_id)` / timeout） |
-| CR-018 | P2 | ◐→✅ | `a370368` ＋ §13 | JSON/MD を「metadata export」と明記（`a370368`）＋ backup を DB＋添付本体の `.zip` 完全バックアップへ拡張（§13・別 PR）。**残**: 自動 restore/import（別途・要実機検証） |
+| CR-018 | P2 | ✅ | `a370368` ＋ §13 ＋ §14 | JSON/MD を「metadata export」と明記（`a370368`）＋ backup を DB＋添付本体の `.zip` 完全バックアップへ拡張（§13）＋ 自動 restore/import を「次回起動時適用」方式で実装（§14） |
 | CR-019 | P2 | ✅ | `45914e6` ＋ §12 | arXiv ID 正規化統一（`45914e6`）＋ canonical 列 + 全経路 dedup + 起動時 best-effort partial UNIQUE + restore 衝突ガード（§12・別 PR） |
 | CR-020 | P2 | ✅ | `35a7674` | DOI URL encode + arXiv status/timeout + XML entity 復号 |
 | CR-021 | P2 | ⏸ | — | 一覧の pagination + batch 関連ロード + cache + 逆引き索引（大規模） |
@@ -349,7 +349,7 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
   ②現役重複が無ければ UNIQUE が張られる ③重複があればスキップ（起動継続）を確認すること。
   ユニットテストは `#[sqlx::test]` で網羅済み。
 
-## 13. CR-018 バックアップ拡張（別 PR `fix/cr-018-backup-attachments`）
+## 13. CR-018 バックアップ拡張（PR #44 `fix/cr-018-backup-attachments`・マージ済 `ee516db`）
 
 §11 で別 PR に切り出していた CR-018 のうち、**バックアップ側（完全アーカイブ + 添付本体）**を
 実装した。方針＝**安全な subset を先行**（backend のみ・`#[sqlx::test]` で検証可能）、
@@ -374,3 +374,77 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
   一時ファイル残存なし）／`backup_without_attachments_dir_succeeds`（添付ディレクトリ無しでも成功）
   ／既存の同秒連続・並行テストは `.zip` 拡張子アサートを追加。`cargo test` / clippy `-D warnings`
   / `pnpm build` green。
+
+### 13.1 残タスク: 自動 restore/import（→ §14 で実装完了）
+
+バックアップ側は上記で完了。**残っていた `.zip` からの自動復元は §14 で実装した**。
+以下は着手時の設計方針・調査メモ（実装は §14 を参照）:
+
+- **危険性の本質**: 復元はライブ `SqlitePool` を閉じ、DB ファイル（＋ `-wal`/`-shm`）と
+  `attachments/` を差し替え、アプリを再起動する。途中失敗で DB を壊すと回復不能になり得るため、
+  **現行 DB の退避 → 復元 → 検証 → 失敗時ロールバック**を原子的に近い形で組む必要がある。
+- **想定フロー案**: ①復元前に現行状態を自動で完全バックアップ（`run_backup` 流用・安全網）
+  → ②`.zip` を一時ディレクトリへ展開し `db.sqlite` の整合性検証（`PRAGMA integrity_check` /
+  スキーマ版・`user_version` 確認）→ ③pool を drop してファイル差し替え（差し替え前の現行 DB は
+  `.pre-restore` 等へ退避）→ ④`tauri-plugin-process` で再起動。途中失敗時は退避物から巻き戻す。
+- **スキーマ版整合**: 新しいアプリで古い `.zip` を復元した場合は起動時 migration が前進、
+  逆（古いアプリで新しい `.zip`）は拒否する。`user_version` / migration 履歴で判定する。
+- **UI**: `restore_from_archive(path)` コマンド＋設定 → データに「復元」ボタン（強い confirm・
+  「現行データは自動バックアップ後に置換される」明示）。`list_backups` の各世代からの復元も候補。
+- **既存資産**: DB 全体は既に `.zip` 内 `db.sqlite`（highlights/chat/settings/fulltext 込み）に
+  取得済み。添付は `attachments/<entry_id>/<file_name>`。復元は「展開して所定位置へ配置」なので
+  マッピングは自明。`BACKUP_LOCK` と同様に `RESTORE_LOCK` で直列化する。
+- **実機検証必須**: 単体テストでは pool drop → ファイル差し替え → 再起動の一連を再現しづらい。
+  `pnpm tauri dev` / 本番バンドルで、正常復元・破損 `.zip` 拒否・失敗時ロールバックを手で確認する。
+
+## 14. CR-018 自動 restore/import（実装完了）
+
+§13.1 で残していた「`.zip` からの自動復元」を実装した。設計方針は §13.1 の想定フローを踏襲しつつ、
+**ライブ pool を握ったまま DB を上書きする危険（特に Windows のオープン中ファイル置換不可）を避ける
+ため、「差し替えは次回起動時（pool を開く前）に行う」2 フェーズ方式**を採った。
+
+- **新モジュール `src-tauri/src/restore.rs`**:
+  - `stage_restore(pool, app_dir, archive)`（稼働中）: `RESTORE_LOCK` で直列化。`.zip` を検証
+    （`db.sqlite` の存在／`PRAGMA integrity_check == ok`／`_sqlx_migrations` の最大 version が
+    このアプリのコンパイル済み migration 最大以下＝**新しすぎるスキーマを拒否**）し、**復元前に
+    `backup::run_backup` で現行を自動フルバックアップ**（安全網）してから、内容を
+    `<app_dir>/pending-restore/` へ展開し `.ready` マーカーを置く。zip 展開は **zip-slip 対策**
+    （`..`・絶対パス・ドライブ接頭辞を拒否／`db.sqlite` と `attachments/` 配下のみ許可）。
+  - `apply_pending_restore(app_dir)`（**起動時・pool を開く前に呼ぶ**）: `.ready` があれば、現行
+    `lumencite.db`（＋ `-wal`/`-shm`）と `attachments/` を `<app_dir>/pre-restore/` へ退避し、staged を
+    所定位置へ `rename`（跨デバイス時は copy+delete フォールバック）。途中失敗時は退避物から
+    **自動ロールバック**して元の状態へ戻す。成功後は `pending-restore/` を消し（再起動ループ防止）、
+    `pre-restore/`（旧データ）は 1 世代残す。マーカー無し＝未完了残骸は掃除して no-op。
+- **`lib.rs`**:
+  - `setup` の先頭（`app_data_dir` 作成直後・pool 生成前）で `apply_pending_restore` を呼ぶ。失敗
+    （ロールバック済み）時は rfd で警告ダイアログを出し、旧 DB のまま起動を続ける。
+  - コマンド `pick_backup_archive`（`.zip` 選択ダイアログ）＋ `restore_from_archive(path)`
+    （staging 実行）。両者を invoke_handler に登録。
+- **フロント `src/components/SettingsModal.tsx`**: 設定 → データの Backup 節に「復元…」ボタンを追加。
+  強い確認 → `pick_backup_archive` → `restore_from_archive` → `@tauri-apps/plugin-process` の
+  `relaunch()` で再起動。i18n（ja/en）に `restore*` キー追加。`backupDesc` の「手動展開」記述を撤回。
+- **テスト（`restore.rs`・`#[sqlx::test]` 5 件）**: stage→apply の DB＋添付置換とバイト整合／
+  旧データの `pre-restore` 退避と旧 WAL 消去／マーカー無し no-op／非 zip 拒否／新しすぎるスキーマ拒否／
+  zip-slip 遮断。`cargo test` = 527 passed、`clippy -- -D warnings` 警告ゼロ、`pnpm build` green。
+- **実機検証状況**: **①正常復元は実機で確認済み**（クリーン再起動後に別ライブラリへ入れ替わることを確認）。
+  残る②破損/新スキーマ `.zip` の拒否③apply 途中失敗時のロールバック④本番バンドルでの `relaunch()`
+  シームレス動作は手動確認を保留（いずれもユニットテスト済みなので手動は補助的）。
+- **実機検証で判明した dev の癖**: `pnpm tauri dev` では `relaunch()` 後に Vite dev server
+  （localhost:1420）が再起動に追随せず落ちるため、復元自体は成功していてもウィンドウが真っ白になる。
+  DB レベルの差し替えは完了しているので、dev を完全終了して再実行すれば復元後のライブラリが見える。
+  本番バンドル（埋め込みアセット）ではこの現象は起きない。
+
+### 14.1 付随修正: `fulltext` FTS5 索引の起動時セルフヒール
+
+復元の実機検証中に、**一部の既存ライブラリで PDF 全文の `fulltext` FTS5（trigram）逆索引が
+malformed**（新しい SQLite 3.51 の `PRAGMA integrity_check` が
+"malformed inverted index for FTS5 table main.fulltext" を返す）になっていることが判明した。
+復元・バックアップが原因ではなく既存の破損で、`VACUUM INTO` はそれを忠実にコピーするだけ。
+アプリ内蔵の古い SQLite（sqlx bundled）では `integrity_check` が検出しないため素通りしていた。
+
+対処として、`rebuild_authors_fts_once` と同じ起動時 background・フラグ方式の
+**`db::fulltext::rebuild_fulltext_fts_once`** を追加した。`settings.fts.fulltext_rebuilt` が
+未セットなら `INSERT INTO fulltext(fulltext) VALUES('rebuild')` で %_content から逆索引を
+1 回だけ作り直し、フラグを立てる（2 回目以降 no-op・健全な索引でも安全）。
+`INSERT INTO fulltext(fulltext) VALUES('rebuild')` により `integrity_check = ok` まで
+修復できることを実 DB のコピーで確認済み。テスト `rebuild_fulltext_fts_once_is_idempotent_and_healthy`。
