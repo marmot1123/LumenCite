@@ -838,7 +838,16 @@
       "indexMissingBusy": "索引中…",
       "indexMissingNone": "未索引の PDF はありません。",
       "indexMissingDone": "{{total}} 件中 {{indexed}} 件を索引しました（OCR 候補 {{needsOcr}} 件・失敗 {{failed}} 件）。",
-      "indexMissingError": "一括索引に失敗しました: {{error}}"
+      "indexMissingError": "一括索引に失敗しました: {{error}}",
+      "lcir": "LCIR（実験・機械可読中間形式）",
+      "lcirDesc": "PDF を型付きノード木＋座標付きで解析する実験機能。有効化するとページ・テキストブロック・座標を保存します（既存の全文検索は不変）。",
+      "lcirEnable": "LCIR を有効にする",
+      "lcirBuild": "未構築の PDF を一括で LCIR 化",
+      "lcirBusy": "構築中…",
+      "lcirNone": "未構築の PDF はありません。",
+      "lcirDisabled": "LCIR が無効です。先に有効化してください。",
+      "lcirDone": "{{total}} 件中 {{built}} 件を構築しました（失敗 {{failed}} 件）。",
+      "lcirError": "一括構築に失敗しました: {{error}}"
     },
     "about": {
       "appTitle": "LumenCite",

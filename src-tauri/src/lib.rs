@@ -1022,6 +1022,32 @@ async fn get_lcir_document(
     ingestion::load_lcir_document(&state.db, attachment_id).await
 }
 
+/// LCIR（実験）: 完了 LCIR がまだ無い PDF 添付を一括構築する（過去分の後追い）。
+#[tauri::command]
+async fn build_missing_lcir(
+    state: State<'_, AppState>,
+) -> Result<ingestion::LcirBatchResult, String> {
+    ingestion::build_missing_lcir(&state.db, &state.app_data_dir).await
+}
+
+/// LCIR（実験）フラグ `lcir.enabled` の現在値。
+#[tauri::command]
+async fn get_lcir_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(ingestion::lcir_enabled(&state.db).await)
+}
+
+/// LCIR（実験）フラグ `lcir.enabled` を設定する。
+#[tauri::command]
+async fn set_lcir_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    db::settings::set_setting(
+        &state.db,
+        db::settings::LCIR_ENABLED_KEY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 // ── highlights ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -3324,6 +3350,9 @@ pub fn run() {
             export_database_markdown,
             build_lcir_for_attachment,
             get_lcir_document,
+            build_missing_lcir,
+            get_lcir_enabled,
+            set_lcir_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -34,6 +34,16 @@ pub struct LcirBuildResult {
     pub message: String,
 }
 
+/// `build_missing_lcir`（一括バックフィル）の結果サマリ。
+#[derive(Debug, serde::Serialize)]
+pub struct LcirBatchResult {
+    pub enabled: bool,
+    pub total: i64,
+    pub built: i64,
+    pub reused: i64,
+    pub failed: i64,
+}
+
 /// 添付 1 件の LCIR を pdfium 抽出で構築する。
 ///
 /// content_key で冪等: この添付に同一 content_key の completed があれば再抽出せず reuse。
@@ -276,6 +286,43 @@ pub async fn build_lcir_for_attachment(
     })
 }
 
+/// 完了 LCIR がまだ無い PDF 添付を洗い出し、順に構築する（過去分・失敗分の後追い）。
+/// フラグ OFF なら `enabled: false` で即返す。既存 `index_missing_attachments` の LCIR 版。
+pub async fn build_missing_lcir(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+) -> Result<LcirBatchResult, String> {
+    if !lcir_enabled(pool).await {
+        return Ok(LcirBatchResult {
+            enabled: false,
+            total: 0,
+            built: 0,
+            reused: 0,
+            failed: 0,
+        });
+    }
+    let targets = document_versions::attachments_without_completed_lcir(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let total = targets.len() as i64;
+    let (mut built, mut reused, mut failed) = (0i64, 0i64, 0i64);
+    for (att_id, _path) in targets {
+        match build_lcir_for_attachment(pool, app_data_dir, att_id).await {
+            Ok(r) if r.built => built += 1,
+            Ok(r) if r.reused => reused += 1,
+            Ok(_) => {}
+            Err(_) => failed += 1,
+        }
+    }
+    Ok(LcirBatchResult {
+        enabled: true,
+        total,
+        built,
+        reused,
+        failed,
+    })
+}
+
 /// LCIR の page ノードの `plain_text` から `fulltext`(FTS5) を再生成する。
 ///
 /// Phase 1「FTS5 を削除しても LCIR から再構築できる」の実証。既存の post-attach 索引は
@@ -407,6 +454,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0, "flag OFF は LCIR 表に一切書かない");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_missing_is_disabled_when_flag_off(pool: SqlitePool) {
+        setup_attachment(&pool).await;
+        let r = build_missing_lcir(&pool, Path::new("/nonexistent"))
+            .await
+            .unwrap();
+        assert!(!r.enabled);
+        assert_eq!(r.total, 0);
+    }
+
+    /// フラグ ON でも、完了 LCIR がある添付だけなら対象 0 で pdfium を呼ばない（CI 安全）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_missing_skips_already_built(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        document_versions::insert_version(
+            &pool,
+            &NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck",
+                schema_version: document_ir::schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: document_ir::schema::EXTRACTOR_NAME,
+                extractor_version: document_ir::schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let r = build_missing_lcir(&pool, Path::new("/nonexistent"))
+            .await
+            .unwrap();
+        assert!(r.enabled);
+        assert_eq!(r.total, 0, "完了済み添付のみなら対象 0（抽出は走らない）");
     }
 
     #[sqlx::test(migrations = "./migrations")]
