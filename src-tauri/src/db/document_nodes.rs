@@ -72,6 +72,32 @@ pub async fn page_nodes_for_version(
     .await
 }
 
+/// node-FTS（Phase 2）に載せるブロックノードを `(node_id, node_kind, plain_text, page)` で返す。
+///
+/// 索引対象 = 本文を持つ論理ブロック（段落・見出し・caption・参考文献項目 等）。骨格ノード
+/// （`document`/`page`/`line`）は除外する（`page` は既存 `fulltext` がページ粒度で担当、`line` は
+/// 細かすぎて親ブロックが代表する）。page は代表 fragment の最小ページ番号（無ければ 0）。
+pub async fn indexable_nodes_for_version(
+    pool: &SqlitePool,
+    version_id: i64,
+) -> Result<Vec<(i64, String, String, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, String, String, i64)>(
+        "SELECT dn.id, dn.node_kind, dn.plain_text,
+                COALESCE(
+                    (SELECT MIN(sf.page_number) FROM source_fragments sf WHERE sf.node_id = dn.id),
+                    0
+                ) AS page
+         FROM document_nodes dn
+         WHERE dn.document_version_id = ?
+           AND dn.plain_text IS NOT NULL AND TRIM(dn.plain_text) != ''
+           AND dn.node_kind NOT IN ('document', 'page', 'line')
+         ORDER BY dn.id",
+    )
+    .bind(version_id)
+    .fetch_all(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -245,6 +245,21 @@ pub struct FulltextHit {
     pub snippet: String,
 }
 
+/// LCIR ノード単位 FTS（Phase 2）のヒット。ページ粒度の `FulltextHit` と違い、段落・見出し・
+/// caption 等の**ブロック粒度**で当たり、`node_kind` と（あれば）PDF 上の領域 `bbox` を返すので
+/// 「検索ヒット → PDF 該当ブロックをハイライト」に直結できる。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct NodeFtsHit {
+    pub entry: EntrySummary,
+    pub attachment_id: i64,
+    pub node_id: i64,
+    pub page: i64,
+    pub node_kind: String,
+    pub snippet: String,
+    /// ブロックの統合領域（PDF user space・左下原点・pt）。fragment が無ければ None。
+    pub bbox: Option<crate::document_ir::BBox>,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct Collection {
     pub id: i64,

@@ -6,16 +6,39 @@
 use super::source::{BBox, CoordinateSpace};
 use serde::{Deserialize, Serialize};
 
-/// 文書ノードの型。第一段は document/page/text_block/line/unknown_block。
-/// 後続フェーズで section/paragraph/theorem/… を variant 追加する（DB は自由 TEXT なので
-/// migration 不要）。認識に確信が持てないブロックは誤った型を確定せず `UnknownBlock` にする。
+/// 文書ノードの型。
+///
+/// - **第一段（Phase 1）**: document/page/text_block/line/unknown_block。
+/// - **Phase 2（論理構造）**: heading/section/subsection/abstract/paragraph/list/list_item/
+///   figure_caption/table_caption/footnote/citation/bibliography/bibliography_entry/
+///   code_block/front_matter。
+///
+/// DB は自由 TEXT なので variant 追加に migration は要らない。認識に確信が持てないブロックは
+/// 誤った型を確定せず `UnknownBlock` にする（roadmap「欠損を許容」）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
+    // Phase 1: 構造の骨格。
     Document,
     Page,
     TextBlock,
     Line,
     UnknownBlock,
+    // Phase 2: 論理構造。
+    FrontMatter,
+    Abstract,
+    Section,
+    Subsection,
+    Heading,
+    Paragraph,
+    List,
+    ListItem,
+    FigureCaption,
+    TableCaption,
+    Footnote,
+    Citation,
+    Bibliography,
+    BibliographyEntry,
+    CodeBlock,
 }
 
 impl NodeKind {
@@ -26,6 +49,21 @@ impl NodeKind {
             NodeKind::TextBlock => "text_block",
             NodeKind::Line => "line",
             NodeKind::UnknownBlock => "unknown_block",
+            NodeKind::FrontMatter => "front_matter",
+            NodeKind::Abstract => "abstract",
+            NodeKind::Section => "section",
+            NodeKind::Subsection => "subsection",
+            NodeKind::Heading => "heading",
+            NodeKind::Paragraph => "paragraph",
+            NodeKind::List => "list",
+            NodeKind::ListItem => "list_item",
+            NodeKind::FigureCaption => "figure_caption",
+            NodeKind::TableCaption => "table_caption",
+            NodeKind::Footnote => "footnote",
+            NodeKind::Citation => "citation",
+            NodeKind::Bibliography => "bibliography",
+            NodeKind::BibliographyEntry => "bibliography_entry",
+            NodeKind::CodeBlock => "code_block",
         }
     }
 
@@ -37,6 +75,21 @@ impl NodeKind {
             "page" => NodeKind::Page,
             "text_block" => NodeKind::TextBlock,
             "line" => NodeKind::Line,
+            "front_matter" => NodeKind::FrontMatter,
+            "abstract" => NodeKind::Abstract,
+            "section" => NodeKind::Section,
+            "subsection" => NodeKind::Subsection,
+            "heading" => NodeKind::Heading,
+            "paragraph" => NodeKind::Paragraph,
+            "list" => NodeKind::List,
+            "list_item" => NodeKind::ListItem,
+            "figure_caption" => NodeKind::FigureCaption,
+            "table_caption" => NodeKind::TableCaption,
+            "footnote" => NodeKind::Footnote,
+            "citation" => NodeKind::Citation,
+            "bibliography" => NodeKind::Bibliography,
+            "bibliography_entry" => NodeKind::BibliographyEntry,
+            "code_block" => NodeKind::CodeBlock,
             _ => NodeKind::UnknownBlock,
         }
     }
@@ -133,6 +186,10 @@ pub struct LcirNode {
     pub origin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
+    /// 型固有の属性（Phase 2 の見出しは `heading_level`/`section_number` 等）。DB の
+    /// `payload_json` を透過的にパースしたもの。無ければ省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_fragments: Vec<LcirFragment>,
 }
@@ -161,11 +218,29 @@ mod tests {
             NodeKind::TextBlock,
             NodeKind::Line,
             NodeKind::UnknownBlock,
+            NodeKind::FrontMatter,
+            NodeKind::Abstract,
+            NodeKind::Section,
+            NodeKind::Subsection,
+            NodeKind::Heading,
+            NodeKind::Paragraph,
+            NodeKind::List,
+            NodeKind::ListItem,
+            NodeKind::FigureCaption,
+            NodeKind::TableCaption,
+            NodeKind::Footnote,
+            NodeKind::Citation,
+            NodeKind::Bibliography,
+            NodeKind::BibliographyEntry,
+            NodeKind::CodeBlock,
         ] {
             assert_eq!(NodeKind::from_db(k.as_str()), k);
         }
-        // 未知種別は UnknownBlock にフォールバック。
-        assert_eq!(NodeKind::from_db("theorem"), NodeKind::UnknownBlock);
+        // Phase 2 の snake_case が期待どおり（DB 列・LCIR JSON と 1:1）。
+        assert_eq!(NodeKind::FigureCaption.as_str(), "figure_caption");
+        assert_eq!(NodeKind::BibliographyEntry.as_str(), "bibliography_entry");
+        // Phase 3+ の未知種別（数式等）は UnknownBlock にフォールバック。
+        assert_eq!(NodeKind::from_db("display_math"), NodeKind::UnknownBlock);
     }
 
     #[test]
@@ -203,6 +278,7 @@ mod tests {
                 plain_text: Some("hi".to_string()),
                 origin: Some("pdf_text_layer".to_string()),
                 confidence: None,
+                payload: None,
                 source_fragments: vec![LcirFragment {
                     page: 1,
                     bbox: BBox::new(0.0, 0.0, 595.0, 842.0),

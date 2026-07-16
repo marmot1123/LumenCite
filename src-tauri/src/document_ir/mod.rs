@@ -124,6 +124,7 @@ mod tests {
                     plain_text: None,
                     origin: Some("pdf_text_layer".to_string()),
                     confidence: None,
+                    payload: None,
                     source_fragments: vec![],
                 },
                 LcirNode {
@@ -134,6 +135,7 @@ mod tests {
                     plain_text: Some("Hello world".to_string()),
                     origin: Some("pdf_text_layer".to_string()),
                     confidence: None,
+                    payload: None,
                     source_fragments: vec![LcirFragment {
                         page: 1,
                         bbox: BBox::new(0.0, 0.0, 595.0, 842.0),
@@ -146,5 +148,107 @@ mod tests {
             serde_json::from_str(include_str!("testdata/minimal_lcir.json")).unwrap();
         assert_eq!(built, fixture, "手組みの LCIR が golden fixture と一致する");
         assert!(validation::validate(&built).is_ok());
+    }
+
+    /// Phase 2 Golden: document > page > (section|paragraph) > line の構造化ツリーが、
+    /// コミット済み fixture と一致し validation を通る。見出しの payload（heading_level/
+    /// section_number）と confidence が派生ビューに載ることも固定する。
+    #[test]
+    fn golden_structured_document_matches_fixture() {
+        let page_frag = |ft: &str, bbox: BBox| LcirFragment {
+            page: 1,
+            bbox,
+            fragment_type: Some(ft.to_string()),
+        };
+        let heading_bbox = BBox::new(72.0, 780.0, 120.0, 14.0);
+        let para_bbox = BBox::new(72.0, 740.0, 400.0, 12.0);
+        let built = LcirDocument {
+            schema: schema::SCHEMA_URI.to_string(),
+            schema_version: schema::SCHEMA_VERSION.to_string(),
+            version_id: 7,
+            content_key: "struct123".to_string(),
+            source: LcirSource {
+                sha256: "deadbeef".to_string(),
+                mime_type: "application/pdf".to_string(),
+                extractor_name: schema::EXTRACTOR_NAME.to_string(),
+                extractor_version: schema::EXTRACTOR_VERSION.to_string(),
+            },
+            coordinate_space: CoordinateSpace::default(),
+            nodes: vec![
+                LcirNode {
+                    id: 1,
+                    kind: "document".to_string(),
+                    ordinal: 0,
+                    parent_id: None,
+                    plain_text: None,
+                    origin: Some("pdf_text_layer".to_string()),
+                    confidence: None,
+                    payload: None,
+                    source_fragments: vec![],
+                },
+                LcirNode {
+                    id: 2,
+                    kind: "page".to_string(),
+                    ordinal: 0,
+                    parent_id: Some(1),
+                    plain_text: Some("1 Introduction Deep learning has advanced rapidly.".to_string()),
+                    origin: Some("pdf_text_layer".to_string()),
+                    confidence: None,
+                    payload: None,
+                    source_fragments: vec![page_frag("page", BBox::new(0.0, 0.0, 595.0, 842.0))],
+                },
+                LcirNode {
+                    id: 3,
+                    kind: "section".to_string(),
+                    ordinal: 0,
+                    parent_id: Some(2),
+                    plain_text: Some("1 Introduction".to_string()),
+                    origin: Some("layout_model".to_string()),
+                    confidence: Some(0.75),
+                    payload: Some(serde_json::json!({"heading_level": 1, "section_number": "1"})),
+                    source_fragments: vec![page_frag("block", heading_bbox)],
+                },
+                LcirNode {
+                    id: 4,
+                    kind: "line".to_string(),
+                    ordinal: 0,
+                    parent_id: Some(3),
+                    plain_text: Some("1 Introduction".to_string()),
+                    origin: Some("pdf_text_layer".to_string()),
+                    confidence: None,
+                    payload: None,
+                    source_fragments: vec![page_frag("line", heading_bbox)],
+                },
+                LcirNode {
+                    id: 5,
+                    kind: "paragraph".to_string(),
+                    ordinal: 1,
+                    parent_id: Some(2),
+                    plain_text: Some("Deep learning has advanced rapidly.".to_string()),
+                    origin: Some("layout_model".to_string()),
+                    confidence: Some(0.6),
+                    payload: None,
+                    source_fragments: vec![page_frag("block", para_bbox)],
+                },
+                LcirNode {
+                    id: 6,
+                    kind: "line".to_string(),
+                    ordinal: 0,
+                    parent_id: Some(5),
+                    plain_text: Some("Deep learning has advanced rapidly.".to_string()),
+                    origin: Some("pdf_text_layer".to_string()),
+                    confidence: None,
+                    payload: None,
+                    source_fragments: vec![page_frag("line", para_bbox)],
+                },
+            ],
+        };
+        let fixture: LcirDocument =
+            serde_json::from_str(include_str!("testdata/structured_lcir.json")).unwrap();
+        assert_eq!(built, fixture, "構造化 LCIR が golden fixture と一致する");
+        assert!(validation::validate(&built).is_ok());
+        // 見出しの payload が派生ビューから読める。
+        let section = built.nodes.iter().find(|n| n.kind == "section").unwrap();
+        assert_eq!(section.payload.as_ref().unwrap()["section_number"], "1");
     }
 }

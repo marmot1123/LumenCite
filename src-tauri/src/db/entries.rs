@@ -1002,6 +1002,15 @@ async fn purge_one(
     .bind(id)
     .execute(&mut **tx)
     .await?;
+    // LCIR ノード単位 FTS も attachments への FK が無いのでここで消す（fulltext と同型）。
+    sqlx::query(
+        "DELETE FROM document_nodes_fts WHERE attachment_id IN (
+            SELECT id FROM attachments WHERE entry_id = ?
+        )",
+    )
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
     sqlx::query("DELETE FROM entries WHERE id = ?")
         .bind(id)
         .execute(&mut **tx)
@@ -1353,6 +1362,15 @@ pub async fn delete_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error>
     // 呼び出し元（Tauri コマンド / チャットツール / MCP）すべてで漏れなく効く。
     sqlx::query(
         "DELETE FROM fulltext WHERE attachment_id IN (
+            SELECT id FROM attachments WHERE entry_id = ?
+        )",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    // LCIR ノード単位 FTS も同様に FK 無しなのでここで消す。
+    sqlx::query(
+        "DELETE FROM document_nodes_fts WHERE attachment_id IN (
             SELECT id FROM attachments WHERE entry_id = ?
         )",
     )

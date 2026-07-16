@@ -79,6 +79,7 @@ mod tests {
             plain_text: None,
             origin: None,
             confidence: None,
+            payload: None,
             source_fragments: vec![],
         }
     }

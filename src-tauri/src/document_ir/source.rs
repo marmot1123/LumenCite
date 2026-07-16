@@ -45,9 +45,11 @@ impl Default for CoordinateSpace {
 }
 
 /// source_fragment の種別（DB の fragment_type 列）。
+/// `Block` は Phase 2 の論理ブロック（段落・見出し・caption 等）の統合領域。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentType {
     Page,
+    Block,
     TextBlock,
     Line,
 }
@@ -56,6 +58,7 @@ impl FragmentType {
     pub fn as_str(self) -> &'static str {
         match self {
             FragmentType::Page => "page",
+            FragmentType::Block => "block",
             FragmentType::TextBlock => "text_block",
             FragmentType::Line => "line",
         }
