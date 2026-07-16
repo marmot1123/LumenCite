@@ -63,6 +63,8 @@ async-trait = "0.1"
 pdfium-render = { version = "0.8", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
+# LCIR: 原ファイルの SHA-256（provenance の source_sha256 / 再現用 content_key）。
+sha2 = "0.10"
 # v0.3.0: 著者名寄せの NFKC 正規化（漢字・全角・半角・合成済み/分解済み等価化）
 unicode-normalization = "0.1"
 # MCP サーバー（Phase 1）: localhost にバインドする軽量 HTTP サーバー。

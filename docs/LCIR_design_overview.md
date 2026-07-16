@@ -1,0 +1,335 @@
+# LCIR 設計概観 — LumenCite Document Intermediate Representation
+
+## この文書の位置づけ
+
+`docs/LumenCite_machine_readable_document_roadmap.md`（別 LLM 生成・汎用的な理想像）を、**LumenCite の実コード規約に接地し、設計判断を確定した「決定版」**に落とす文書。ロードマップが提示する全10フェーズを俯瞰し、着手前の全体合意を取るためのもの。
+
+- ロードマップ = 何を目指すか（vision・汎用）。
+- **本書 = LumenCite で実際にどう作るか（接地・確定）。**
+- 実装が進むにつれ `docs/DATA_MODEL.md`（新テーブル）・`docs/API_SPEC.md`（新コマンド）へ反映していく。
+
+**LCIR = LumenCite Document Intermediate Representation**。論文全文を「ページ単位のプレーン文字列」ではなく、**型付きノードの木 + PDF 座標 + 出典(provenance) + 信頼度**として保存する内部中間形式。FTS5 は LCIR からの派生索引として位置づけ直す。
+
+---
+
+## 1. なぜやるか
+
+現状の全文パイプライン（`src-tauri/src/db/fulltext.rs`）は、`pdf_extract::extract_text_by_pages` が返す**ページ単位のプレーン文字列**を、単一の FTS5 仮想表 `fulltext(content, attachment_id, page)` に格納しているだけ。全文検索には十分だが、次を一切保持しない。
+
+- 節・段落・定理・証明・数式・図・表などの論理構造
+- 数式の構文/意味構造
+- PDF 上の位置（bbox）と抽出結果の対応
+- OCR・数式認識・構造認識の信頼度
+- 抽出器・変換器のバージョン（再処理可能性）
+- 図中の軸・系列・ノード・エッジなどの意味情報
+
+LCIR はこれらを失わずに保存する基盤を作る。**最優先は高度な意味理解ではなく、「原資料・位置・構造・由来・信頼度を失わずに保存できる基盤」を先に作ること。** その基盤があれば、数式認識・図解析・記号解決・LLM・知識グラフの技術が今後改善したときにも、既存文献を再処理しながら継続的に進化させられる。
+
+---
+
+## 2. 三層モデルと LumenCite 現状の対応
+
+| 層 | 役割 | LumenCite での実体 |
+|----|------|--------------------|
+| **原資料層** | PDF・TeX・JATS・HTML・補助ファイル。正本その1 | `attachments`（ファイル本体はアプリデータ dir・DB は相対パスのみ） |
+| **正規化文書層（LCIR）** | 構造・数式・図・出典・信頼度を保持。正本その2 | **新規**: `document_versions` / `document_nodes` / `source_fragments` ほか |
+| **派生索引層** | 再生成可能な検索用データ | 既存 `fulltext`(FTS5) / 将来 `document_nodes_fts` / ベクトル / 数式索引 |
+
+**原資料層と LCIR を正本とし、FTS5 やベクトル埋め込みは再生成可能な派生データとして扱う。** 既存 `highlights`（PDF ハイライト・PDF ポイント左下原点座標系）と `fulltext` は LCIR と同じ座標系・ページ番号規約を共有する（後述）。
+
+---
+
+## 3. フェーズ → 増分マッピング
+
+ロードマップの10フェーズを、LumenCite の実装増分（≒ PR 群 / Milestone）に対応づける。**依存**は先行して完了が必要なフェーズ、**規模**は S/M/L/XL の目安。
+
+| Phase | 内容 | Milestone | 依存 | 規模 | 状態 |
+|-------|------|-----------|------|------|------|
+| 0 設計準備 | 境界確定・ADR・0.1 schema・座標系・ID 規則・実験フラグ | 本書 | — | S | 本書で確定 |
+| **1 ページ/ブロック/出典** | `document_versions`/`document_nodes`/`source_fragments`・PDF 座標・provenance・派生 FTS 再生成 | **A** | 0 | M | **★今回実装** |
+| 2 論理構造 | 見出し/段落/参考文献/caption/footnote 認識・ノード単位 FTS | B | 1 | M | 予定 |
+| 3 数式表層 | inline/display math・LaTeX・Presentation MathML・数式検索文字列 | C | 1,2 | L | 予定 |
+| 4 TeX/JATS/HTML 取込 | arXiv TeX・JATS・複数表現の優先順位・source 切替 | D | 1 | L | 予定 |
+| 5 定理/定義/証明 | theorem-like 環境・proof・定理間参照 | E | 2 | M | 予定 |
+| 6 記号/参照グラフ | `symbols`/`symbol_occurrences`・`node_relations`・スコープ | E | 2,3 | L | 予定 |
+| 7 数式意味表現 | 数式 AST・Content MathML・OpenMath・α 正規化・部分式検索 | — | 3,6 | XL | 予定 |
+| 8 図表機械可読化 | `assets`/`node_assets`・図切出/SVG/OCR・表セル・plot | F | 1,2 | XL | 予定 |
+| 9 外部エクスポート | LCIR JSON/JATS/TEI/Markdown/HTML 出力 | — | 1-8 | M | 予定 |
+| 10 LLM/エージェント | ノードチャンク・provenance 付き回答・embedding 再生成 | — | 2-8 | L | 予定 |
+
+**推奨実装順序**（ロードマップ §11 を LumenCite に合わせて）: 1 → 2 → 3(表層) → 4 → 5 → 6 → 8 → 7(意味) → 9 → 10。Content MathML・OpenMath・図の意味解析は重要だが**最初から完全実装を目指さない**。まず原資料・位置・構造・由来を失わない基盤（Phase 1）を作る。
+
+---
+
+## 4. 設計判断（ADR） — ロードマップ §17「重要な判断事項」への回答
+
+着手前に確定した10論点。以降の実装はこの決定に従う。
+
+| # | 論点 | 決定 | 理由 |
+|---|------|------|------|
+| 1 | LCIR 主ストレージ（正規化テーブル vs JSON blob） | **正規化テーブル + `payload_json`/`metadata_json` 逃がし列** | 既存 DB は 100% 正規化 sqlx。JSON blob を主状態にする表は存在しない。JSON 列は未モデル化の型固有属性用に残し、後続フェーズで再 migration 不要にする |
+| 2 | ノード ID（UUID vs 内容由来安定 ID） | **INTEGER PK + 派生 `content_key TEXT`** | `uuid` は非依存。全表 `INTEGER PRIMARY KEY` / `last_insert_rowid()` / `i64` / FK 規約を維持。「同一 PDF → 同一 version」の再現性は row id ではなく `content_key` で満たす（`doi_canonical` の canonical 列前例と同型） |
+| 3 | バイナリアセット（BLOB vs FS） | **ファイルシステム + 相対パス**（Phase 8 で使用・第一段は未使用） | `attachments` の既存前例（BLOB 不使用・DB は相対パス + SHA-256 参照） |
+| 4 | PDF 座標系の統一規則 | **PDF user space・左下原点・y 上・単位 pt・rotation = ページ `/Rotate` 度** | pdfium ネイティブ空間。無損失。既存 `highlights` と一致し PDF ビューアがそのまま消費できる |
+| 5 | version 差分管理 vs 完全スナップショット | **完全スナップショット** | 単純・再現可能。差分マージの複雑さを持ち込まない |
+| 6 | 抽出ジョブのキュー実装 | **当面はキューを作らない**（`spawn` + `spawn_blocking`。第一段はフラグ ON 時に添付後 background build） | 既存に耐久ジョブキューは無く（近いのは debounce mpsc `run_sync_task`）、実験段階で新機構を持ち込まない。Phase 8+ で必要になれば導入 |
+| 7 | ユーザー修正と再抽出のマージ | **上書きせず新しい provenance として保存**（第一段は未実装・seam のみ） | ロードマップ 4.3/Phase 7 の原則。`parent_version_id` + `origin='user_edited'` で表現する余地を残す |
+| 8 | TeX/JATS/PDF の対応付け粒度 | **抽出器ごとに別 `document_version` として併存**（Phase 4） | 一本化せず由来の異なる表現を残す。`extractor_name` + `content_key` が識別子 |
+| 9 | Rust 型 vs JSON Schema の一次仕様 | **Rust 型（`document_ir/`）を一次仕様**。JSON Schema/JSON は export・テスト・交換用の派生 | 既存は serde 構造体が単一ソース。`sqlx::FromRow` と共用できる |
+| 10 | LCIR 公開仕様化の時期 | **当面は内部仕様**。Phase 9（外部エクスポート）到達後に公開を検討 | まず内部で安定させる。`schema_version` は最初から持たせ将来公開に備える |
+| — | 実験フラグ | **settings `lcir.enabled`（"1" 規約）** | `mcp_server.enabled` / `clipper.enabled` の既存前例。Cargo feature は存在しない。OFF で既存挙動 byte-for-byte 不変 |
+| — | 抽出器（座標問題） | **pdfium-render を LCIR 抽出器に採用し最初から bbox 取得**（ユーザー選択） | pdfium は既に依存（OCR で使用中）。座標が無い `pdf-extract` では Phase 1 完了条件「検索ヒット → PDF 領域ハイライト」に到達不能。pdfium の text bounds は `highlights` と同じ空間に直行する |
+
+---
+
+## 5. LCIR データモデル
+
+### 5.1 保存戦略
+
+- **主ストレージ = SQLite 正規化テーブル。** アプリが join / フィルタする属性（kind・ordinal・parent・page・座標・provenance・status）は実カラム。
+- **`payload_json` / `metadata_json` = 逃がし列。** 型固有・未モデル化の属性（節番号・数式番号・スタイル・座標系記述子など）は JSON で持ち、後続フェーズのスキーマ変更を避ける。
+- **LCIR JSON = 派生。** デバッグ・エクスポート・テスト・交換のために SQLite から JSON を生成できるようにするが、正本は SQLite。
+
+### 5.2 第一段（Milestone A / migration `0014`）で作る3テーブル
+
+残り6テーブルは後続フェーズの `0015+` で追加する。FK 先の `document_versions` / `document_nodes` は 0014 で先に用意されるため、後続追加は無改変で載る。
+
+#### `document_versions` — 添付ごとの抽出/変換結果 1 回分
+
+provenance と再現性の正本。1 添付に複数バージョン（再抽出・別抽出器）が併存しうる。
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `id` | INTEGER PK | AUTOINCREMENT |
+| `attachment_id` | INTEGER FK → attachments | ON DELETE CASCADE |
+| `content_key` | TEXT NOT NULL | `sha256(source_sha256 \| extractor_name \| extractor_version \| config_hash)`。**再現可能な内容由来 ID**（row id は SQLite 採番で再現不能なため）。起動時 best-effort UNIQUE |
+| `schema_version` | TEXT NOT NULL | `document_ir::SCHEMA_VERSION`（例 `0.1.0`） |
+| `source_sha256` | TEXT NOT NULL | 原ファイル本体の SHA-256。`attachments` に列が無く抽出時に計算 |
+| `source_mime_type` | TEXT NOT NULL | `application/pdf` 等 |
+| `extractor_name` | TEXT NOT NULL | 例 `lumencite-pdfium`。将来 TeX/JATS 抽出器は別名で併存 |
+| `extractor_version` | TEXT NOT NULL | **抽出ロジックの semver（手動 const）**。supersede 判定基準。pdfium クレート版とは別 |
+| `config_hash` | TEXT NOT NULL DEFAULT '' | 抽出設定のハッシュ（既定設定は空） |
+| `parent_version_id` | INTEGER FK → document_versions | supersede チェーン（再抽出・source 切替） |
+| `extraction_status` | TEXT NOT NULL | `pending`/`processing`/`completed`/`completed_with_warnings`/`failed`/`superseded` |
+| `warnings_json` | TEXT | 抽出失敗・警告ログ（Phase 1 完了条件） |
+| `metadata_json` | TEXT | 座標系記述子・ページ数・pdfium/クレート版・計測値 |
+| `created_at` | TEXT NOT NULL | `datetime('now')` |
+
+#### `document_nodes` — 文書の型付きノード木
+
+第一段のノード型: `document` / `page` / `text_block` / `line` / `unknown_block`。
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `id` | INTEGER PK | AUTOINCREMENT |
+| `document_version_id` | INTEGER FK → document_versions | ON DELETE CASCADE |
+| `parent_id` | INTEGER FK → document_nodes | ON DELETE CASCADE。ルートは NULL |
+| `node_kind` | TEXT NOT NULL | `NodeKind` の snake_case。未知は `unknown_block` |
+| `ordinal` | INTEGER NOT NULL | 同一親内の読み順 |
+| `plain_text` | TEXT | `page` ノードはページ全文（= FTS 再生成元） |
+| `language` | TEXT | 言語コード（任意） |
+| `confidence` | REAL | 構造認識信頼度（0–1・任意） |
+| `origin` | TEXT | `Origin`（`pdf_text_layer` 等） |
+| `payload_json` | TEXT | 型固有（`page_width_pt`/`page_height_pt`/`rotation_deg` 等） |
+| `created_at` | TEXT NOT NULL | `datetime('now')` |
+
+#### `source_fragments` — ノード ↔ PDF 領域
+
+座標は `highlights` と同一系（PDF user space・左下原点・pt）。1 段落/証明が複数ページ・複数領域にまたがる場合は複数行を持つ。
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `id` | INTEGER PK | AUTOINCREMENT |
+| `node_id` | INTEGER FK → document_nodes | ON DELETE CASCADE |
+| `page_number` | INTEGER NOT NULL | 1 始まり（`fulltext.page` / `highlights.page` と同じ） |
+| `x` / `y` / `width` / `height` | REAL NOT NULL | バウンディング（PDF pt・左下原点） |
+| `rotation` | REAL NOT NULL DEFAULT 0 | ページ `/Rotate`（0/90/180/270） |
+| `reading_order` | INTEGER | 読み順（任意） |
+| `fragment_type` | TEXT | `page` / `text_block` / `line` |
+
+**ロードマップ DDL からの適応**: TEXT-UUID PK → `INTEGER PK AUTOINCREMENT`／`content_key`・`config_hash`・`warnings_json` を追加／`datetime('now')` 既定／全子 FK に `ON DELETE CASCADE`（実表なので FK 可能。`fulltext` の手動クリーンアップより堅牢で、添付削除で LCIR 木ごとカスケード消去される）。
+
+### 5.3 後続フェーズで追加するテーブル（forward sketch）
+
+| テーブル | 内容 | Phase | migration |
+|----------|------|-------|-----------|
+| `math_expressions` | 数式の複数表現（LaTeX/Presentation MathML/Content MathML/OpenMath/AST/正規化文字列/`semantic_status`/信頼度） | 3/7 | 0015+ |
+| `assets` | 図・画像・SVG・表データ（SHA-256 + 相対パス参照） | 8 | 0015+ |
+| `node_assets` | ノード ↔ アセット（`role`: original/page_crop/vector/thumbnail/ocr_source/plot_data/…） | 8 | 0015+ |
+| `node_relations` | ノード間の型付き関係（cites/refers_to_equation/defines_symbol/proves/caption_of/…） | 6 | 0015+ |
+| `symbols` | 記号定義（surface_form/normalized_form/description/symbol_type/scope/semantic_json） | 6 | 0015+ |
+| `symbol_occurrences` | 数式・本文中の記号出現 → 定義への関連付け | 6 | 0015+ |
+
+### 5.4 ノード型の全体像（フェーズ別）
+
+| Phase | 追加ノード型 |
+|-------|-------------|
+| 1 | `document` `page` `text_block` `line` `unknown_block` |
+| 2 | `abstract` `front_matter` `section` `subsection` `heading` `paragraph` `list` `list_item` `figure_caption` `table_caption` `footnote` `citation` `bibliography` `bibliography_entry` `code_block` |
+| 3 | `inline_math` `display_math` `equation_group` |
+| 5 | `definition` `theorem` `lemma` `proposition` `corollary` `remark` `example` `proof` |
+| 8 | `figure` `table` |
+
+`node_kind` は制約なし TEXT + `NodeKind` enum（`Other`/from_str フォールバック付き）。後続フェーズの型追加は enum の variant 追加のみで migration 不要。**認識に確信が持てないブロックは、誤った型を確定するより `unknown_block` + 信頼度で残す。**
+
+### 5.5 LCIR JSON 概念例（派生ビュー）
+
+SQLite が正本だが、export/デバッグ/テスト用に次の JSON を生成できるようにする（ロードマップ §6 を LumenCite 形に）。
+
+```json
+{
+  "schema": "https://lumencite.dev/schema/document-ir/0.1",
+  "schema_version": "0.1.0",
+  "version_id": 42,
+  "content_key": "…sha256…",
+  "source": {
+    "sha256": "…",
+    "mime_type": "application/pdf",
+    "extractor": { "name": "lumencite-pdfium", "version": "0.1.0" }
+  },
+  "coordinate_space": { "space": "pdf_user_space", "origin": "bottom_left", "unit": "pt", "y_axis": "up" },
+  "nodes": [
+    { "id": 1, "kind": "document", "ordinal": 0, "children": [2] },
+    { "id": 2, "kind": "page", "ordinal": 0,
+      "payload": { "page_width_pt": 595.3, "page_height_pt": 841.9, "rotation_deg": 0 },
+      "plain_text": "…page 1 full text…",
+      "source_fragments": [ { "page": 1, "bbox": [0, 0, 595.3, 841.9], "fragment_type": "page" } ] }
+  ]
+}
+```
+
+---
+
+## 6. 座標系仕様
+
+- **保存空間 = PDF user space（左下原点・y 上・単位 pt・rotation = ページ `/Rotate` 度）。** 既存 `highlights`（DATA_MODEL.md「`pdf.js` の座標系（PDF ポイント、左下原点）」）と一致。抽出時に無損失、PDF ビューアがそのまま消費できる。
+- `document_version.metadata_json` に `CoordinateSpace {"space":"pdf_user_space","origin":"bottom_left","unit":"pt","y_axis":"up"}` を記録（将来の top-left/pixel 系 layout model と混同しないため）。
+- `page` ノード `payload_json` に `{page_width_pt, page_height_pt, rotation_deg}`（pdfium の `page.width()/height()/rotation()`）。
+- **各 `page` ノードには常にページ全面（MediaBox）の `source_fragment` を1つ付与。** text_block 分割が失敗しても page 粒度に degrade し情報を失わない（ロードマップ 4.5「欠損を許容」）。
+- **要検証**: 非ゼロ `/Rotate` ページで pdfium の text bounds が回転前/後どちらで返るか。raw bounds + `rotation_deg` の両方を保存し、消費側で合成する。テストコーパスに回転ページ PDF を必ず含める（Coordinate Test）。
+
+---
+
+## 7. provenance と再現性（content_key）
+
+- **`source_sha256`**: `attachments` に SHA-256 列は無いので抽出時にファイルから計算（`document_ir::sha256_file`・ストリーム・小文字 hex）。
+- **`extractor_version`**: `document_ir/schema.rs` の const。**抽出ロジックの semver で supersede トリガ**。pdfium クレート版・アプリ版は `metadata_json` に詳細として。
+- **`content_key`** = `sha256("lcir-content-key-v1\n" | source_sha256 | "\n" | extractor_name | "\n" | extractor_version | "\n" | config_hash)`。
+- **冪等**: build 時に `content_key` を先に計算し `find_by_content_key`。`completed` 行があれば**再抽出せず reuse**。version/バイトが変われば別 `content_key` → 新行を作り旧行を `superseded`・新行 `parent_version_id` で連結。
+- **best-effort UNIQUE**: `try_create_content_key_unique_index` は `db/entries.rs` の `try_create_identifier_unique_indexes`（CR-019）を踏襲。重複が無い時だけ `UNIQUE INDEX ON document_versions(content_key)` を張り、あれば skip + 警告ログ（既存 DB に重複があっても起動不能=brick にしない）。起動フックの既存 best-effort index 作成群の隣で呼ぶ。
+
+これにより Phase 0 完了条件「**同一 PDF から同一の文書バージョン ID（= content_key）を再現できる**」を満たす。row id は再現不能であることを明示的にドキュメント化する。
+
+---
+
+## 8. FTS5 との共存戦略
+
+FTS5 は正本ではなく LCIR から生成される検索インデックス、というのが最終形。ただし移行はロードマップ §12 に従い**段階的**に行う。
+
+- **第一段は並走(A)**: 既存 `fulltext` は今まで通り `pdf_extract` → `db::fulltext::index_attachment` で生成し続ける。LCIR は pdfium で**追加の side-build**。フラグ ON でも**検索挙動は変わらない**（実験トグルとして必須）。→ フラグ ON 時は同一 PDF を 2 回抽出（pdf-extract=検索用 / pdfium=LCIR 用）。実験期間の対価として許容。
+- **派生化(B) への seam**: `ingestion::regenerate_page_fts_from_lcir(pool, version_id)` を第一段で実装・単体テストする（Phase 1 完了条件「FTS5 を削除しても LCIR から再構築できる」を証明）。ただし既定ソースにはしない。将来 (B) 化は post-attach で `index_attachment(pages)` を `regenerate_page_fts_from_lcir(version_id)` に差し替える1行で、ロードマップ §12 の「新旧品質を比較してから既定化」の後に行う。
+- **ページ FTS(§7.1) と意味 FTS(§7.2)**: 第一段はページ単位（既存 `fulltext` 互換）。Phase 2 で `document_nodes_fts`（段落/定理/証明/caption 単位）を追加し `regenerate_node_fts_from_lcir` 兄弟を作る。
+
+---
+
+## 9. 既存データの移行方針（ロードマップ §12）
+
+既存 FTS5 データを破壊的に変更しない。
+
+1. 既存添付ごとに `document_versions` を作成（lazy: `build_missing_lcir` コマンドで明示実行。起動時 pdfium 一括掃引はしない）。
+2. pdfium 再抽出で `page` / `text_block` ノードを生成（既存 `fulltext` は座標を持たないため、そのまま LCIR 化はできず**再抽出可能な PDF のみ**座標付き LCIR を得る）。
+3. 既存 `fulltext` は legacy index として維持。
+4. LCIR 由来の新インデックスを並行運用し検索品質を比較。
+5. 十分な互換性が確認できたら新インデックスを既定化。
+6. legacy index は再生成可能になった時点で削除候補。
+
+`build_missing_lcir` は既存 `index_missing_attachments`（ユーザー起動バッチ）と同型で、`completed` バージョンが無い添付を走査する。
+
+---
+
+## 10. モジュール構成（目標ツリー）
+
+既存 `db/` 一表一ファイル規約 + ロードマップ §18 ツリーを LumenCite に合わせる。**★ = 第一段で作成**、他は予約（後続フェーズで作成）。
+
+```text
+src-tauri/src/
+  document_ir/            # DB 非依存の純型（一次仕様）
+    mod.rs      ★  # 再エクスポート・content_key()・sha256_file()
+    schema.rs   ★  # SCHEMA_URI/VERSION・EXTRACTOR_NAME/VERSION const
+    node.rs     ★  # NodeKind/Origin/ExtractionStatus enum・ノード DTO
+    source.rs   ★  # BBox・CoordinateSpace
+    validation.rs ★ # LCIR JSON 最小 validation
+    relation.rs / math.rs / figure.rs / symbol.rs   # 予約（Phase 3/6/8）
+  ingestion/
+    mod.rs      ★  # post_attach・build_lcir_for_attachment・regenerate_page_fts_from_lcir・lcir_enabled
+    pdf/
+      mod.rs    ★  # extract_document(path) -> ExtractedDocument（pdfium・spawn_blocking 下）
+      pdfium.rs ★  # bind_pdfium() 集約（ocr.rs から移設して共用）
+    tex/ jats/ tei/ html/                            # 予約（Phase 4）
+  db/                     # 既存 storage 層（一表一ファイル）
+    document_versions.rs ★
+    document_nodes.rs    ★
+    source_fragments.rs  ★
+  indexing/ export/ jobs/                            # 予約（Phase 2/9/8）
+```
+
+- DTO は `src-tauri/src/models.rs`（snake_case・`rename_all` 無し・`sqlx::FromRow`）。
+- `lib.rs` 冒頭に `mod document_ir;` `mod ingestion;` を追加。
+- `bind_pdfium()` は現在 `src-tauri/src/llm/tools/ocr.rs` にある。`ingestion/pdf/pdfium.rs` に集約し `ocr.rs` から呼ぶ（binding を一箇所に）。
+
+---
+
+## 11. 非目標（初期段階でやらないこと）
+
+ロードマップ §16 を明示的に採用する。
+
+- あらゆる PDF の完全な論理構造復元
+- すべての数式の意味の自動確定（`AB` が数の積か行列積か作用素積か関数適用かは文脈なしに確定不能。意味表現には必ず `semantic_status` + `confidence` を付ける）
+- すべての図から元データを完全復元
+- 任意の TeX マクロの完全展開
+- JATS/TEI/OpenMath への完全な可逆変換
+- **AI 推定結果を人手確認なしで真実として扱うこと**
+- 一つの万能フォーマットへの統一
+
+### AI 推定と原文由来の区別
+
+各データに `origin`（`publisher_source`/`tex_source`/`pdf_text_layer`/`ocr`/`layout_model`/`math_recognition`/`llm_inference`/`user_edited`）と `confidence` を付け、**原文由来と推定を常に区別する**。ユーザー修正は既存を上書きせず新しい provenance として保存する（Phase 7・seam のみ第一段で用意）。
+
+---
+
+## 12. テスト戦略（要点）
+
+- **Golden File Test**: 同一入力から生成される LCIR JSON を固定し差分検査（抽出器更新時に改善か回帰かを判定）。第一段は in-memory 構築 → serialize → `src-tauri/tests/fixtures/lcir/*.json` と byte 比較（pdfium 不要で CI 実行可能）。
+- **Schema Validation**: すべての LCIR JSON を検証（欠損フィールドで fail）。
+- **再現性**: `content_key` 決定性（同一 → 同一 / version 変更 → 別 / sha 変更 → 別）、DB 冪等（2 回 build で `completed` 1 行）。
+- **FTS 再構築**: page ノード → `regenerate_page_fts_from_lcir` → `search_fulltext` がヒット。
+- **フラグ OFF 不変**: フラグ未設定で `build_lcir_for_attachment` が `document_versions` を 0 行、既存 `fulltext` テスト全 green。
+- **Coordinate Test**: 検索結果/ノードから PDF 上の正しい領域をハイライトできる（回転ページ含むテストコーパス）。
+- **pdfium 依存テストは `#[ignore]` gate**（headless CI に native lib 保証なし・手動/`just` 対象）。
+- テストコーパス: 1 段組・2 段組・数式多・図多・表多・スキャン PDF・日本語論文・複数ページ定理/証明・Appendix・Supplementary。
+
+CI の clippy `-D warnings` は hard gate。push 前に `rustup update stable` → ローカルで clippy を回す。
+
+---
+
+## 13. 最終到達像
+
+LumenCite の内部構造を、単なる PDF 全文データベースではなく次の性質を持つ研究文書基盤にする。
+
+- 元資料へ常に戻れる / 抽出結果を再現できる / PDF 上の位置を失わない
+- 数式を複数表現で保持 / 定理・証明・定義・図・表を独立オブジェクトとして扱える
+- 記号の定義と使用関係を追跡 / AI 推定と原文由来を区別
+- FTS5・ベクトル検索・数式検索を再生成できる
+- JATS/TEI/MathML/OpenMath 等の標準と接続できる
+- 将来の LLM や研究エージェントが利用しやすく、人間にとっても検証可能
+
+**最優先は高度な意味理解を一度に実現することではなく、原資料・位置・構造・由来・信頼度を失わずに保存できる基盤を先に作ること。**
+
+---
+
+## 関連ドキュメント
+
+- `docs/LumenCite_machine_readable_document_roadmap.md` — 元ロードマップ（vision）
+- `docs/DATA_MODEL.md` — 既存 DB スキーマ（第一段実装時に新3表を追記）
+- `docs/API_SPEC.md` — Tauri コマンド仕様（第一段実装時に新コマンドを追記）
+- `docs/SPEC.md` — 機能要件・フェーズ

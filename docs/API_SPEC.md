@@ -472,6 +472,51 @@ type FulltextResult = {
 
 将来 `fulltext_search`（PDF ページ単位）を実装する際は、結果型を `Vec<SearchHit>` に拡張する形で `search_entries` 内に統合する想定。
 
+### LCIR（機械可読中間形式）— 実験 / `lcir.enabled`
+
+論文全文を型付きノード木 + PDF 座標 + provenance で保存する中間表現。設計は `docs/LCIR_design_overview.md`、スキーマは `DATA_MODEL.md`「LCIR 関連テーブル」。settings `lcir.enabled = "1"` のときだけ動く追加の side-build（既存 `fulltext` 検索は不変）。
+
+| コマンド | 引数 | 戻り値 |
+|---------|------|--------|
+| `build_lcir_for_attachment` | `attachment_id: i64` | `LcirBuildResult` |
+| `get_lcir_document` | `attachment_id: i64` | `LcirDocument \| null` |
+
+```ts
+type LcirBuildResult = {
+  enabled: boolean;      // lcir.enabled が off なら false（何もしない）
+  built: boolean;        // 新規に構築したか
+  reused: boolean;       // 同一 content_key の既存を再利用したか（冪等）
+  version_id: number | null;
+  content_key: string | null;
+  page_count: number;
+  message: string;
+};
+
+// PDF 座標付きの木（正本は SQLite、これはその JSON 派生ビュー）
+type LcirDocument = {
+  schema: string;
+  schema_version: string;
+  version_id: number;
+  content_key: string;
+  source: { sha256: string; mime_type: string; extractor_name: string; extractor_version: string };
+  coordinate_space: { space: string; origin: string; unit: string; y_axis: string };
+  nodes: Array<{
+    id: number;
+    kind: string;           // document / page / text_block / ...
+    ordinal: number;
+    parent_id?: number;
+    plain_text?: string;
+    origin?: string;
+    confidence?: number;
+    source_fragments: Array<{ page: number; bbox: { x: number; y: number; width: number; height: number }; fragment_type?: string }>;
+  }>;
+};
+```
+
+- `build_lcir_for_attachment` は pdfium で抽出し `document_versions`/`document_nodes`/`source_fragments` を作る。`content_key`（= `sha256(source_sha256|extractor_name|extractor_version|config_hash)`）で冪等：同一 PDF+同一抽出器版なら再抽出せず reuse。新版採用時は同一添付の旧 completed を `superseded` にする。
+- 座標は既存 `highlights` と同一系（PDF user space・左下原点・pt）なので、将来「検索ヒット → PDF 該当領域ハイライト」に直結できる。
+- フラグ OFF なら両コマンドとも DB に一切書かず（`build` は `enabled:false`、`get` は `null`）、既存挙動は不変。
+
 ### エントリ間の関連（relations）
 
 | コマンド | 引数 | 戻り値 |
