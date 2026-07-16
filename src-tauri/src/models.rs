@@ -116,6 +116,58 @@ pub struct Attachment {
     pub created_at: String,
 }
 
+// ---- LCIR (LumenCite Document Intermediate Representation) の行 DTO（migration 0014） ----
+
+/// 添付ごとの抽出/変換結果 1 回分（provenance の正本）。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct DocumentVersion {
+    pub id: i64,
+    pub attachment_id: i64,
+    pub content_key: String,
+    pub schema_version: String,
+    pub source_sha256: String,
+    pub source_mime_type: String,
+    pub extractor_name: String,
+    pub extractor_version: String,
+    pub config_hash: String,
+    pub parent_version_id: Option<i64>,
+    pub extraction_status: String,
+    pub warnings_json: Option<String>,
+    pub metadata_json: Option<String>,
+    pub created_at: String,
+}
+
+/// 文書の型付きノード。`node_kind` は `document_ir::NodeKind` の snake_case。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct DocumentNode {
+    pub id: i64,
+    pub document_version_id: i64,
+    pub parent_id: Option<i64>,
+    pub node_kind: String,
+    pub ordinal: i64,
+    pub plain_text: Option<String>,
+    pub language: Option<String>,
+    pub confidence: Option<f64>,
+    pub origin: Option<String>,
+    pub payload_json: Option<String>,
+    pub created_at: String,
+}
+
+/// ノード ↔ PDF 領域。座標は `highlights` と同一系（PDF pt・左下原点）。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct SourceFragment {
+    pub id: i64,
+    pub node_id: i64,
+    pub page_number: i64,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub rotation: f64,
+    pub reading_order: Option<i64>,
+    pub fragment_type: Option<String>,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct EntrySummary {
     pub id: i64,

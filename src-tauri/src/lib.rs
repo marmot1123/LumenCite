@@ -3,6 +3,8 @@ mod backup;
 mod bibtex;
 pub mod cli;
 mod db;
+pub mod document_ir;
+pub mod ingestion;
 mod download;
 mod keychain;
 mod llm;
@@ -999,6 +1001,25 @@ async fn fulltext_search(
     db::fulltext::search_fulltext(&state.db, &query, collection_id, tag_id, view.as_deref())
         .await
         .map_err(|e| e.to_string())
+}
+
+/// LCIR（実験・機械可読中間形式）: 添付 1 件を pdfium 抽出して document_versions/nodes/
+/// source_fragments を構築する。フラグ `lcir.enabled` が OFF なら何もしない。
+#[tauri::command]
+async fn build_lcir_for_attachment(
+    state: State<'_, AppState>,
+    attachment_id: i64,
+) -> Result<ingestion::LcirBuildResult, String> {
+    ingestion::build_lcir_for_attachment(&state.db, &state.app_data_dir, attachment_id).await
+}
+
+/// LCIR（実験）: 添付の最新 LCIR を木 + PDF 座標付きの JSON 派生ビューで返す（read 面）。
+#[tauri::command]
+async fn get_lcir_document(
+    state: State<'_, AppState>,
+    attachment_id: i64,
+) -> Result<Option<document_ir::LcirDocument>, String> {
+    ingestion::load_lcir_document(&state.db, attachment_id).await
 }
 
 // ── highlights ──────────────────────────────────────────────────────────────
@@ -3025,6 +3046,20 @@ pub fn run() {
                 }
             });
 
+            // LCIR（実験・機械可読中間形式）: 既存 DB に重複が無ければ document_versions に
+            // (attachment_id, content_key) の UNIQUE 索引を best-effort で張る（brick 回避）。
+            // 失敗しても起動は止めず log だけ残す（次回起動で再試行・冪等）。
+            let lcir_pool = pool.clone();
+            tauri::async_runtime::spawn(async move {
+                match db::document_versions::try_create_content_key_unique_index(&lcir_pool).await {
+                    Ok(true) => eprintln!(
+                        "LCIR: created UNIQUE index on document_versions(attachment_id, content_key)"
+                    ),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("LCIR content_key unique index failed: {e}"),
+                }
+            });
+
             // BibTeX 自動同期のコーディネーター。各ミューテーションが sync_tx.send() で
             // 通知し、受信タスクが debounce して書き出す。
             let (sync_tx, sync_rx) = unbounded_channel::<()>();
@@ -3287,6 +3322,8 @@ pub fn run() {
             restore_from_archive,
             export_database_json,
             export_database_markdown,
+            build_lcir_for_attachment,
+            get_lcir_document,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

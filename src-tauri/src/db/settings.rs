@@ -76,6 +76,10 @@ pub const FTS_AUTHORS_V030_REBUILT_KEY: &str = "fts.authors_v030_rebuilt";
 /// 索引を作り直す。値は "1"（再構築済み）のみで、未設定なら未実施扱い。
 pub const FTS_FULLTEXT_REBUILT_KEY: &str = "fts.fulltext_rebuilt";
 
+/// LCIR（機械可読中間形式）の実験フラグ（"1" で有効・既定 off）。ON の間だけ pdfium 抽出で
+/// document_versions/nodes/source_fragments を追加構築する。OFF なら既存挙動は byte-for-byte 不変。
+pub const LCIR_ENABLED_KEY: &str = "lcir.enabled";
+
 #[cfg(test)]
 mod tests {
     use super::*;
