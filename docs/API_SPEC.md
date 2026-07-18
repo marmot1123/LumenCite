@@ -544,6 +544,7 @@ type NodeFtsHit = {
 - `rebuild_outdated_lcir` は旧抽出器版（例 0.1.0）で作った LCIR を現行版へ再構築する（`build_missing_lcir` は未構築のみ・こちらは版が古いものを対象）。
 - 座標は既存 `highlights` と同一系（PDF user space・左下原点・pt）。
 - フラグ OFF なら書き込み系は DB に一切書かず（`build`/バッチは `enabled:false`、`get` は `null`）、既存挙動は不変。`search_lcir_nodes` はフラグに関係なく空表を引くだけ。
+- **外部 LLM 向け（MCP サーバー・Phase 3.5）**: 上記 LCIR を MCP read ツール `get_document_structure`（節アウトライン＋カウント＋abstract）／`get_document_blocks`（構造タグ付きブロック・`kinds`/`page` フィルタ・数式は表層のみ）／`search_document_nodes`（ブロック粒度検索＋`bbox`）として公開する（`docs/SPEC.md`「MCP サーバー公開」）。未構築エントリは `has_lcir:false`。
 
 ### エントリ間の関連（relations）
 
