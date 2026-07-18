@@ -8,6 +8,7 @@ pub mod document_versions;
 pub mod entries;
 pub mod fulltext;
 pub mod highlights;
+pub mod math_expressions;
 pub mod mcp_audit;
 pub mod settings;
 pub mod source_fragments;

@@ -514,6 +514,14 @@ type LcirDocument = {
     origin?: string;        // pdf_text_layer（原文由来） / layout_model（構造推定）
     confidence?: number;
     payload?: unknown;      // 型固有属性。見出しは { heading_level, section_number }
+    math?: {                // 数式表層（Phase 3・inline_math/display_math のみ）
+      display_mode: string;           // inline / display
+      equation_label?: string;        // "(2.1)" 等
+      normalized_text?: string;       // 検索用の正規化線形文字列（PDF 表層）
+      latex?: string; presentation_mathml?: string; content_mathml?: string; openmath?: string; // 後続フェーズ
+      semantic_status: string;        // PDF 由来は surface_only
+      confidence?: number; origin?: string;
+    };
     source_fragments: Array<{ page: number; bbox: { x: number; y: number; width: number; height: number }; fragment_type?: string }>;
   }>;
 };
@@ -532,6 +540,7 @@ type NodeFtsHit = {
 
 - `build_lcir_for_attachment` は pdfium で抽出し `document_versions`/`document_nodes`/`source_fragments` を作る。`content_key`（= `sha256(source_sha256|extractor_name|extractor_version|config_hash)`）で冪等：同一 PDF+同一抽出器版なら再抽出せず reuse。新版採用時は同一添付の旧 completed を `superseded` にする。
 - **Phase 2**: 抽出後に論理構造を認識し `document > page > block(段落/見出し/caption 等) > line` の木にする（`extractor_version` 0.1.0→0.2.0）。build 時に派生の `document_nodes_fts` も張り、`search_lcir_nodes` がブロック粒度で検索できる。ヒットの `bbox` で該当ブロックを直接ハイライトできる（`get_lcir_node_region` でも個別取得可）。
+- **Phase 3**: 独立した数式を `display_math` ノードとして認識し `math_expressions`（表層）を作る（`extractor_version` 0.2.0→0.3.0）。PDF 由来は `semantic_status='surface_only'`・`normalized_text` のみ埋め、LaTeX/MathML は Phase 4（TeX）以降。`get_lcir_document` の該当ノードに `math` が付く。制御文字（pdfium のグリフ化け）は除去する。
 - `rebuild_outdated_lcir` は旧抽出器版（例 0.1.0）で作った LCIR を現行版へ再構築する（`build_missing_lcir` は未構築のみ・こちらは版が古いものを対象）。
 - 座標は既存 `highlights` と同一系（PDF user space・左下原点・pt）。
 - フラグ OFF なら書き込み系は DB に一切書かず（`build`/バッチは `enabled:false`、`get` は `null`）、既存挙動は不変。`search_lcir_nodes` はフラグに関係なく空表を引くだけ。

@@ -4,11 +4,13 @@
 //! `document_nodes` / `source_fragments`）で、`LcirDocument` はその派生ビュー。
 //! ここは pdfium にも sqlx にも依存しないので CI で完全にテストできる。
 
+pub mod math;
 pub mod node;
 pub mod schema;
 pub mod source;
 pub mod validation;
 
+pub use math::{LcirMath, MathDisplayMode, MathSemanticStatus};
 pub use node::{
     ExtractionStatus, LcirDocument, LcirFragment, LcirNode, LcirSource, NodeKind, Origin,
 };
@@ -125,6 +127,7 @@ mod tests {
                     origin: Some("pdf_text_layer".to_string()),
                     confidence: None,
                     payload: None,
+                    math: None,
                     source_fragments: vec![],
                 },
                 LcirNode {
@@ -136,6 +139,7 @@ mod tests {
                     origin: Some("pdf_text_layer".to_string()),
                     confidence: None,
                     payload: None,
+                    math: None,
                     source_fragments: vec![LcirFragment {
                         page: 1,
                         bbox: BBox::new(0.0, 0.0, 595.0, 842.0),
@@ -184,6 +188,7 @@ mod tests {
                     origin: Some("pdf_text_layer".to_string()),
                     confidence: None,
                     payload: None,
+                    math: None,
                     source_fragments: vec![],
                 },
                 LcirNode {
@@ -195,6 +200,7 @@ mod tests {
                     origin: Some("pdf_text_layer".to_string()),
                     confidence: None,
                     payload: None,
+                    math: None,
                     source_fragments: vec![page_frag("page", BBox::new(0.0, 0.0, 595.0, 842.0))],
                 },
                 LcirNode {
@@ -206,6 +212,7 @@ mod tests {
                     origin: Some("layout_model".to_string()),
                     confidence: Some(0.75),
                     payload: Some(serde_json::json!({"heading_level": 1, "section_number": "1"})),
+                    math: None,
                     source_fragments: vec![page_frag("block", heading_bbox)],
                 },
                 LcirNode {
@@ -217,6 +224,7 @@ mod tests {
                     origin: Some("pdf_text_layer".to_string()),
                     confidence: None,
                     payload: None,
+                    math: None,
                     source_fragments: vec![page_frag("line", heading_bbox)],
                 },
                 LcirNode {
@@ -228,6 +236,7 @@ mod tests {
                     origin: Some("layout_model".to_string()),
                     confidence: Some(0.6),
                     payload: None,
+                    math: None,
                     source_fragments: vec![page_frag("block", para_bbox)],
                 },
                 LcirNode {
@@ -239,6 +248,7 @@ mod tests {
                     origin: Some("pdf_text_layer".to_string()),
                     confidence: None,
                     payload: None,
+                    math: None,
                     source_fragments: vec![page_frag("line", para_bbox)],
                 },
             ],

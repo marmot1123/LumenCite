@@ -15,4 +15,6 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 /// - `0.1.0`: Phase 1。page + text_block(セグメント) の平坦木。
 /// - `0.2.0`: Phase 2。論理構造認識で `page > block(段落/見出し/caption 等) > line` の木にする
 ///   （`ingestion::structure`）。出力が変わるので旧 0.1.0 版は再構築時に supersede される。
-pub const EXTRACTOR_VERSION: &str = "0.2.0";
+/// - `0.3.0`: Phase 3。display 数式を認識して `display_math` ノード + `math_expressions`(表層)を
+///   作り、制御文字を除去する。出力が変わるので旧版は再構築時に supersede される。
+pub const EXTRACTOR_VERSION: &str = "0.3.0";

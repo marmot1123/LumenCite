@@ -36,6 +36,8 @@ pub struct StructuredBlock {
     pub heading_level: Option<i64>,
     /// 節番号（"3.2" 等）。番号付き見出しのみ。
     pub section_number: Option<String>,
+    /// 数式番号（"(2.1)" 等）。display_math のみ・検出できたとき。
+    pub equation_label: Option<String>,
     /// 構成する行（読み順）。各行は node_kind=line の子ノードになる。
     pub lines: Vec<StructuredLine>,
 }
@@ -252,18 +254,45 @@ fn classify_block(
             confidence,
             heading_level,
             section_number,
+            equation_label: None,
             lines,
         })
     };
 
-    // 1. 見出し（参考文献モードでは番号付き見出しを無効化 = "1. Author…" の誤検出回避）。
+    let in_bibliography = matches!(state.mode, Mode::Bibliography);
+
+    // 1. caption（参考文献モードでは "Figure" は稀なのでスキップ）。行頭ラベルが最優先。
+    if !in_bibliography {
+        if let Some(cap_kind) = detect_caption(first) {
+            return mk(cap_kind, 0.75, None, None, lines);
+        }
+    }
+
+    // 2. display 数式。見出しより先に見て、大フォントの数式を見出しに誤判定させない
+    //    （Phase 3。意味は取らず表層のみ＝呼び出し側で semantic_status='surface_only'）。
+    if !in_bibliography {
+        if let Some((confidence, equation_label)) = detect_display_math(&text, lines.len()) {
+            return Some(StructuredBlock {
+                kind: NodeKind::DisplayMath,
+                text: text.clone(),
+                bbox,
+                confidence,
+                heading_level: None,
+                section_number: None,
+                equation_label,
+                lines,
+            });
+        }
+    }
+
+    // 3. 見出し（参考文献モードでは番号付き見出しを無効化 = "1. Author…" の誤検出回避）。
     if let Some(h) = detect_heading(
         first,
         lines.len(),
         word_count,
         block_median_h,
         page_median_h,
-        matches!(state.mode, Mode::Bibliography),
+        in_bibliography,
     ) {
         state.mode = match h.keyword {
             Some("abstract") => Mode::Abstract,
@@ -273,14 +302,7 @@ fn classify_block(
         return mk(h.kind, h.confidence, h.level, h.section_number, lines);
     }
 
-    // 2. caption（参考文献モードでは "Figure" は稀なのでスキップ）。
-    if !matches!(state.mode, Mode::Bibliography) {
-        if let Some(cap_kind) = detect_caption(first) {
-            return mk(cap_kind, 0.75, None, None, lines);
-        }
-    }
-
-    // 3. モードに応じた本文分類。
+    // 4. モードに応じた本文分類。
     match state.mode {
         Mode::Abstract => mk(NodeKind::Abstract, 0.7, None, None, lines),
         Mode::Bibliography => mk(NodeKind::BibliographyEntry, 0.5, None, None, lines),
@@ -498,6 +520,74 @@ fn alpha_ratio(t: &str) -> f64 {
     alpha as f64 / non_ws as f64
 }
 
+/// 強い数式シグナル文字（関係・演算子・量化子・集合・矢印・黒板太字 等）。
+/// **ASCII ルックアライク（'-' ハイフン, 'x', '*')は含めない**。pdfium は数式のマイナスを
+/// U+2212 '−'、乗算を '·'/'×' で出すので、散文のハイフンや変数 x と区別できる。'=' '<' '>' '+' は
+/// 学術散文では稀なので含める（isolation + alpha_ratio ガードと併せて誤検出を抑える）。
+const MATH_STRONG: &[char] = &[
+    '=', '≠', '≈', '≃', '≅', '≡', '≤', '≥', '≪', '≫', '<', '>', '≺', '≻',
+    '+', '−', '±', '∓', '×', '÷', '·', '⋅', '∗', '∘', '⊗', '⊕', '⊙', '⊘',
+    '∑', '∏', '∫', '∬', '∮', '√', '∛', '∞', '∂', '∇', '∝', '∆', '∈', '∉',
+    '∋', '⊂', '⊆', '⊃', '⊇', '⊄', '∪', '∩', '∖', '∅', '∀', '∃', '∄', '∴', '∵',
+    '→', '↦', '↔', '⇒', '⇔', '⟨', '⟩', '‖', '⌊', '⌋', '⌈', '⌉', '∧', '∨', '¬',
+    'ℝ', 'ℂ', 'ℤ', 'ℕ', 'ℚ', 'ℍ', 'ℋ', 'ℓ', '℘', '′', '″', '⊤', '⊥', '⊢', '⊨',
+];
+
+fn strong_math_count(t: &str) -> usize {
+    t.chars().filter(|c| MATH_STRONG.contains(c)).count()
+}
+
+/// 独立した display 数式か（Phase 3・表層のみ）。ブロックが短く、数式記号を持ち、散文優位でない
+/// ときに `(信頼度, 数式番号)` を返す。演算子の無い（記号が飛んだ）式は拾えない＝欠損を許容。
+fn detect_display_math(text: &str, line_count: usize) -> Option<(f64, Option<String>)> {
+    if line_count > 3 {
+        return None;
+    }
+    let strong = strong_math_count(text);
+    if strong == 0 {
+        return None;
+    }
+    let ratio = alpha_ratio(text);
+    // 散文優位（英字が 7 割以上）は、記号がいくつ混じっても数式にしない。
+    if ratio >= 0.7 {
+        return None;
+    }
+    let label = extract_equation_label(text);
+    // 記号 2 個以上 / 英字が半分未満 / 数式番号つき、のいずれかで数式とみなす。
+    if strong >= 2 || ratio < 0.6 || label.is_some() {
+        let confidence = (0.5 + 0.05 * strong as f64).min(0.75);
+        Some((confidence, label))
+    } else {
+        None
+    }
+}
+
+/// 行末の数式番号 "(2)" / "(2.1)" / "(A.1)" を取り出す。式の一部の "(U0U0)" 等は弾く。
+fn extract_equation_label(text: &str) -> Option<String> {
+    let t = text.trim_end();
+    if !t.ends_with(')') {
+        return None;
+    }
+    let open = t.rfind('(')?;
+    let inner = &t[open + 1..t.len() - 1];
+    if inner.is_empty() || inner.chars().count() > 10 {
+        return None;
+    }
+    // 純数値（"2" / "2.1"）または付録式（"A.1" = 大文字 + '.' + 数字）だけを数式番号とみなす。
+    let pure_numeric = inner.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && inner.chars().any(|c| c.is_ascii_digit());
+    let bytes = inner.as_bytes();
+    let appendix = inner.len() >= 3
+        && bytes[0].is_ascii_uppercase()
+        && bytes[1] == b'.'
+        && bytes[2].is_ascii_digit();
+    if pure_numeric || appendix {
+        Some(format!("({inner})"))
+    } else {
+        None
+    }
+}
+
 // ---- 小物ユーティリティ ----
 
 fn union_bbox(a: BBox, b: BBox) -> BBox {
@@ -508,8 +598,14 @@ fn union_bbox(a: BBox, b: BBox) -> BBox {
     BBox::new(x, y, right - x, top - y)
 }
 
+/// 空白を 1 個に正規化しつつ、非空白の制御文字を落とす。pdfium はマップできない数式グリフを
+/// C0 制御文字（\u{2} 等）で吐くことがあり、そのままだと検索や表層文字列を汚すため除去する。
 fn normalize_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    s.split_whitespace()
+        .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 中央値（空なら 0.0）。呼び出し側の Vec を破壊的にソートする。
@@ -755,6 +851,58 @@ mod tests {
         let p = page(vec![seg("104 A. Suzuki", 72.0, 795.0, 120.0, 10.0, 0)]);
         let blocks = recognize(&p);
         assert_eq!(blocks[0].kind, NodeKind::UnknownBlock);
+    }
+
+    #[test]
+    fn detect_display_math_catches_symbol_heavy_lines() {
+        // 演算子・集合記号が複数 → 数式。
+        assert!(detect_display_math("−ik·x ψ(x), ψ ∈ H", 1).is_some());
+        assert!(detect_display_math("|x| ψ(x) 2C2 < ∞", 1).is_some());
+        // 記号は少ないが英字が半分未満 → 数式。
+        assert!(detect_display_math("U − t U 0tU 0 = S2 C2", 1).is_some());
+    }
+
+    #[test]
+    fn detect_display_math_rejects_prose_and_symbolless() {
+        // 散文（英字 7 割以上）は記号が混じっても数式にしない。
+        assert!(detect_display_math("The value of x = y holds in this case", 1).is_none());
+        // 演算子が飛んで英字だけになった式は拾えない（欠損を許容）。
+        assert!(detect_display_math("λj (k)t U", 1).is_none());
+        // 長すぎるブロック（4 行以上）は display 数式ではない。
+        assert!(detect_display_math("a = b ∈ C", 4).is_none());
+    }
+
+    #[test]
+    fn equation_label_only_matches_real_numbers() {
+        assert_eq!(extract_equation_label("U = S2 C2 (2.1)"), Some("(2.1)".to_string()));
+        assert_eq!(extract_equation_label("x + y (12)"), Some("(12)".to_string()));
+        assert_eq!(extract_equation_label("f(x) (A.1)"), Some("(A.1)".to_string()));
+        // 式の一部の丸括弧は数式番号ではない。
+        assert_eq!(extract_equation_label("U − t U ac(U0U0)"), None);
+        assert_eq!(extract_equation_label("g(x, y)"), None);
+    }
+
+    #[test]
+    fn display_math_block_is_recognized_with_label() {
+        let p = build_page(&[
+            ("some body text before the equation here", 10.0, 0.0),
+            ("more body text on the second line now", 10.0, G),
+            ("and a third body line to anchor median", 10.0, G),
+            ("U − t U 0 = S2 C2 S1 C1 (2.1)", 10.0, H),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[0].kind, NodeKind::Paragraph);
+        assert_eq!(blocks[1].kind, NodeKind::DisplayMath);
+        assert_eq!(blocks[1].equation_label.as_deref(), Some("(2.1)"));
+        assert!(blocks[1].confidence >= 0.5);
+    }
+
+    #[test]
+    fn normalize_ws_strips_control_glyphs() {
+        // pdfium が吐く制御文字（\u{2} 等）は落として空白正規化する。
+        let p = page(vec![seg("ψ(x)\u{2} = 2C2\u{15}", 72.0, 400.0, 120.0, 10.0, 0)]);
+        let lines = group_lines(&p);
+        assert_eq!(lines[0].text, "ψ(x) = 2C2");
     }
 
     #[test]
