@@ -183,6 +183,76 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
         }
     }));
 
+    // LCIR（機械可読中間形式）の read ツール（Phase 3.5）。実験フラグ lcir.enabled で
+    // 構築された論文だけが対象。未構築なら has_lcir=false を返す（get_fulltext に退避可能）。
+    tools.push(json!({
+        "name": "get_document_structure",
+        "description": "Return the recovered logical structure (LCIR) of a paper's PDF — its \
+            section outline, block-type counts, and abstract — by entry_id or citation_key. Unlike \
+            get_fulltext (flat page text), this exposes headings/sections with their numbers and \
+            reports how many paragraphs, display equations, captions and bibliography entries were \
+            found. Structure is heuristically recovered from the PDF text layer, so it is \
+            approximate. Returns {has_lcir, page_count, outline:[{kind, section_number, level, \
+            text, page}], counts, abstract}. If has_lcir is false the PDF has no built LCIR (enable \
+            and build it in the app) — fall back to get_fulltext. Then use get_document_blocks to \
+            read the structured text or equations, and search_document_nodes to locate content.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry_id": { "type": "integer", "description": "Entry id." },
+                "citation_key": { "type": "string", "description": "Citation key (as in \\cite{}); alternative to entry_id." }
+            }
+        }
+    }));
+    tools.push(json!({
+        "name": "get_document_blocks",
+        "description": "Read a paper's content as structure-tagged blocks (LCIR) in reading order — \
+            paragraphs, headings, captions and display equations — by entry_id or citation_key. \
+            Better than get_fulltext for structured reading: multi-column layout is de-interleaved \
+            and each block carries its kind and page. Filter with `kinds` (e.g. [\"display_math\"] \
+            to list just the equations with their labels and surface text, or [\"section\", \
+            \"paragraph\"] to read prose). Math is SURFACE ONLY — a cleaned Unicode linear form, \
+            NOT LaTeX/MathML, since it is recovered from the PDF — so treat equations as \
+            approximate. Long documents are paginated: pass block_start (from a previous next_block) \
+            or raise max_chars. Returns {has_lcir, total_blocks, returned, block_start, truncated, \
+            next_block, blocks:[{index, kind, page, section_number?, equation_label?, text}]}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry_id": { "type": "integer", "description": "Entry id." },
+                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
+                "kinds": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict to these block kinds (e.g. [\"display_math\"], [\"section\",\"paragraph\"]). Omit for all content blocks."
+                },
+                "page": { "type": "integer", "description": "Restrict to a single 1-based PDF page." },
+                "block_start": { "type": "integer", "description": "0-based index into the (filtered) block list to start from, for continuing a long read (default 0)." },
+                "max_chars": { "type": "integer", "description": "Max characters of block text to return this call (default 24000)." }
+            }
+        }
+    }));
+    tools.push(json!({
+        "name": "search_document_nodes",
+        "description": "Search the library at BLOCK granularity (paragraph / heading / caption / \
+            display equation) using the LCIR node index — finer than fulltext_search, which is page \
+            granularity. Each hit reports the entry, node_kind, page, a snippet, and the PDF \
+            bounding box (bbox = [x, y, width, height] in PDF points, bottom-left origin) so the \
+            exact block can be located/highlighted. Use this to pinpoint where a concept, term or \
+            equation appears across papers. Only covers papers whose LCIR has been built. Returns \
+            {count, results:[{entry_id, title, year, node_kind, page, snippet, bbox}]}. Short or \
+            CJK queries fall back to substring matching.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search query (space-separated terms are ANDed)." },
+                "collection_id": { "type": "integer", "description": "Restrict to a collection id." },
+                "tag_id": { "type": "integer", "description": "Restrict to a tag id." }
+            },
+            "required": ["query"]
+        }
+    }));
+
     // write 系（Phase 2・ゲート有効時のみ）。`mutate` の定義を流用し、許可リスト
     // （`WRITE_TOOLS`）に絞る。delete_entry はリストに無いので公開されない。
     if write_on {
@@ -355,6 +425,9 @@ async fn exec_tool(
         "export_bibtex" => exec_export_bibtex(pool, &args).await,
         "find_entries_by_citation_keys" => exec_find_entries_by_citation_keys(pool, &args).await,
         "get_fulltext" => exec_get_fulltext(pool, &args).await,
+        "get_document_structure" => exec_get_document_structure(pool, &args).await,
+        "get_document_blocks" => exec_get_document_blocks(pool, &args).await,
+        "search_document_nodes" => exec_search_document_nodes(pool, &args).await,
         // それ以外（delete_entry / ocr_* / 無効化中の write 等）は非公開。
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
@@ -535,6 +608,255 @@ async fn exec_get_fulltext(pool: &SqlitePool, args: &Value) -> Result<String, To
         "text": text.trim_end(),
     }))
     .unwrap_or_default())
+}
+
+// ─── LCIR（機械可読中間形式）read ツール（Phase 3.5） ────────────────────────
+
+/// entry_id 優先・無ければ citation_key から逆引き（get_fulltext と同じ規約）。
+async fn resolve_entry_id(pool: &SqlitePool, args: &Value) -> Result<i64, ToolError> {
+    if let Some(id) = args.get("entry_id").and_then(|v| v.as_i64()) {
+        return Ok(id);
+    }
+    if let Some(key) = args.get("citation_key").and_then(|v| v.as_str()) {
+        return match crate::bibtex::find_entry_id_by_citation_key(pool, key).await {
+            Ok(Some(id)) => Ok(id),
+            Ok(None) => Err(ToolError::InvalidArguments(format!(
+                "no entry found for citation key '{key}'"
+            ))),
+            Err(e) => Err(ToolError::Execution(e)),
+        };
+    }
+    Err(ToolError::InvalidArguments(
+        "provide entry_id (integer) or citation_key (string)".to_string(),
+    ))
+}
+
+/// エントリの、LCIR が構築済みの最初の PDF 添付を `(attachment_id, LcirDocument)` で読む。
+async fn load_entry_lcir(
+    pool: &SqlitePool,
+    entry_id: i64,
+) -> Result<Option<(i64, crate::document_ir::LcirDocument)>, ToolError> {
+    let att_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT a.id FROM attachments a
+         WHERE a.entry_id = ?
+           AND EXISTS (
+               SELECT 1 FROM document_versions dv
+               WHERE dv.attachment_id = a.id
+                 AND dv.extraction_status IN ('completed', 'completed_with_warnings')
+           )
+         ORDER BY a.id",
+    )
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await?;
+    for att in att_ids {
+        if let Some(doc) = crate::ingestion::load_lcir_document(pool, att)
+            .await
+            .map_err(ToolError::Execution)?
+        {
+            return Ok(Some((att, doc)));
+        }
+    }
+    Ok(None)
+}
+
+/// 本文つき論理ブロック（骨格の document/page/line は除く）。
+fn is_content_block(kind: &str) -> bool {
+    !matches!(kind, "document" | "page" | "line")
+}
+
+/// ノードの代表ページ（最初の source_fragment）。
+fn node_page(n: &crate::document_ir::LcirNode) -> Option<i64> {
+    n.source_fragments.first().map(|f| f.page)
+}
+
+fn no_lcir_response(entry_id: i64) -> String {
+    serde_json::to_string(&json!({
+        "entry_id": entry_id,
+        "has_lcir": false,
+        "message": "no built LCIR for this entry's PDF (enable and build LCIR in the app, \
+            or the entry has no attached PDF). Fall back to get_fulltext for flat page text."
+    }))
+    .unwrap_or_default()
+}
+
+async fn exec_get_document_structure(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    let entry_id = resolve_entry_id(pool, args).await?;
+    let (attachment_id, doc) = match load_entry_lcir(pool, entry_id).await? {
+        Some(x) => x,
+        None => return Ok(no_lcir_response(entry_id)),
+    };
+
+    let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut outline: Vec<Value> = Vec::new();
+    let mut abstract_parts: Vec<String> = Vec::new();
+    let mut page_count = 0i64;
+    for n in &doc.nodes {
+        if n.kind == "page" {
+            page_count += 1;
+        }
+        if !is_content_block(&n.kind) {
+            continue;
+        }
+        *counts.entry(n.kind.clone()).or_insert(0) += 1;
+        match n.kind.as_str() {
+            "section" | "subsection" | "heading" => {
+                let sec = n
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("section_number"))
+                    .and_then(|v| v.as_str());
+                let level = n
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("heading_level"))
+                    .and_then(|v| v.as_i64());
+                outline.push(json!({
+                    "kind": n.kind,
+                    "section_number": sec,
+                    "level": level,
+                    "text": n.plain_text,
+                    "page": node_page(n),
+                }));
+            }
+            "abstract" => {
+                if let Some(t) = &n.plain_text {
+                    abstract_parts.push(t.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let abstract_text = if abstract_parts.is_empty() {
+        None
+    } else {
+        Some(abstract_parts.join(" "))
+    };
+
+    Ok(serde_json::to_string(&json!({
+        "entry_id": entry_id,
+        "attachment_id": attachment_id,
+        "has_lcir": true,
+        "extractor_version": doc.source.extractor_version,
+        "page_count": page_count,
+        "outline": outline,
+        "counts": counts,
+        "abstract": abstract_text,
+        "note": "Structure is heuristically recovered from the PDF text layer (origin=layout_model, \
+            per-node confidence). Equations are surface-only (no LaTeX). Use get_document_blocks to \
+            read prose or equations, search_document_nodes to locate content.",
+    }))
+    .unwrap_or_default())
+}
+
+async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    let entry_id = resolve_entry_id(pool, args).await?;
+    let (attachment_id, doc) = match load_entry_lcir(pool, entry_id).await? {
+        Some(x) => x,
+        None => return Ok(no_lcir_response(entry_id)),
+    };
+
+    // kinds / page フィルタ。
+    let kind_filter: Option<Vec<String>> = args.get("kinds").and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect()
+    });
+    let page_filter = args.get("page").and_then(|v| v.as_i64());
+
+    // 読み順の本文ブロック（load_lcir_document のノード順 = ページ→ordinal）。
+    let blocks: Vec<&crate::document_ir::LcirNode> = doc
+        .nodes
+        .iter()
+        .filter(|n| is_content_block(&n.kind))
+        .filter(|n| {
+            kind_filter
+                .as_ref()
+                .map(|ks| ks.iter().any(|k| k == &n.kind))
+                .unwrap_or(true)
+        })
+        .filter(|n| page_filter.is_none_or(|p| node_page(n) == Some(p)))
+        .collect();
+
+    let total_blocks = blocks.len() as i64;
+    let block_start = args.get("block_start").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let max_chars = args
+        .get("max_chars")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(24_000)
+        .clamp(1_000, 200_000) as usize;
+
+    let mut out: Vec<Value> = Vec::new();
+    let mut chars = 0usize;
+    let mut truncated = false;
+    let mut next_block: Option<i64> = None;
+    for (i, n) in blocks.iter().enumerate().skip(block_start as usize) {
+        let text = n.plain_text.clone().unwrap_or_default();
+        // 1 ブロックでも返した上で上限超過なら、そこで切って続きを next_block に載せる。
+        if chars + text.chars().count() > max_chars && !out.is_empty() {
+            next_block = Some(i as i64);
+            truncated = true;
+            break;
+        }
+        chars += text.chars().count();
+        let equation_label = n.math.as_ref().and_then(|m| m.equation_label.clone());
+        let section_number = n
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("section_number"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        out.push(json!({
+            "index": i,
+            "kind": n.kind,
+            "page": node_page(n),
+            "section_number": section_number,
+            "equation_label": equation_label,
+            "text": text,
+        }));
+    }
+
+    Ok(serde_json::to_string(&json!({
+        "entry_id": entry_id,
+        "attachment_id": attachment_id,
+        "has_lcir": true,
+        "total_blocks": total_blocks,
+        "block_start": block_start,
+        "returned": out.len(),
+        "truncated": truncated,
+        "next_block": next_block,
+        "blocks": out,
+    }))
+    .unwrap_or_default())
+}
+
+async fn exec_search_document_nodes(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::InvalidArguments("missing required argument: query".to_string()))?;
+    let collection_id = args.get("collection_id").and_then(|v| v.as_i64());
+    let tag_id = args.get("tag_id").and_then(|v| v.as_i64());
+
+    let hits = crate::db::document_nodes_fts::search_nodes(pool, query, collection_id, tag_id, None)
+        .await?;
+    let results: Vec<Value> = hits
+        .iter()
+        .map(|h| {
+            json!({
+                "entry_id": h.entry.id,
+                "title": h.entry.title,
+                "year": h.entry.year,
+                "node_kind": h.node_kind,
+                "page": h.page,
+                "snippet": h.snippet,
+                "bbox": h.bbox.as_ref().map(|b| json!([b.x, b.y, b.width, b.height])),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::to_string(&json!({ "count": results.len(), "results": results }))
+        .unwrap_or_default())
 }
 
 // ─── 認可トークン ────────────────────────────────────────────────────────────
@@ -1178,6 +1500,9 @@ mod tests {
             "search_entries",
             "resolve_citation_key",
             "export_bibtex",
+            "get_document_structure",
+            "get_document_blocks",
+            "search_document_nodes",
         ] {
             assert!(names.contains(&expected), "missing read tool: {expected}");
         }
@@ -1185,6 +1510,319 @@ mod tests {
         for forbidden in ["create_entry", "update_entry", "delete_entry", "add_tag", "ocr_pdf"] {
             assert!(!names.contains(&forbidden), "must not expose: {forbidden}");
         }
+    }
+
+    /// ツール結果 content[0].text（JSON 文字列）をパースする。
+    fn tool_json(resp: &Value) -> Value {
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// block ノード + block fragment を 1 個作る（LCIR テスト用）。
+    async fn add_block(
+        pool: &SqlitePool,
+        vid: i64,
+        page: i64,
+        kind: &str,
+        ordinal: i64,
+        text: &str,
+        payload: Option<&str>,
+    ) -> i64 {
+        let id = crate::db::document_nodes::insert_node(
+            pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(page),
+                node_kind: kind,
+                ordinal,
+                plain_text: Some(text),
+                language: None,
+                confidence: Some(0.6),
+                origin: Some("layout_model"),
+                payload_json: payload,
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::source_fragments::insert_fragment(
+            pool,
+            &crate::db::source_fragments::NewSourceFragment {
+                node_id: id,
+                page_number: 1,
+                x: 72.0,
+                y: 500.0,
+                width: 300.0,
+                height: 12.0,
+                rotation: 0.0,
+                reading_order: Some(ordinal),
+                fragment_type: Some("block"),
+            },
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    /// LCIR 構築済みエントリ（abstract/section/paragraph/display_math）を作り entry_id を返す。
+    async fn setup_entry_with_lcir(pool: &SqlitePool) -> i64 {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            pool,
+            &EntryInput {
+                title: "Quantum walk paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            pool,
+            entry.id,
+            &format!("attachments/{}/p.pdf", entry.id),
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: schema::EXTRACTOR_NAME,
+                extractor_version: schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = crate::db::document_nodes::insert_node(
+            pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let page = crate::db::document_nodes::insert_node(
+            pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::Page.as_str(),
+                ordinal: 0,
+                plain_text: Some("full page text"),
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        add_block(pool, vid, page, "abstract", 0, "We study quantum walks.", None).await;
+        add_block(
+            pool,
+            vid,
+            page,
+            "section",
+            1,
+            "1 Introduction",
+            Some(r#"{"heading_level":1,"section_number":"1"}"#),
+        )
+        .await;
+        add_block(
+            pool,
+            vid,
+            page,
+            "paragraph",
+            2,
+            "Quantum walks are discrete analogues of diffusion.",
+            None,
+        )
+        .await;
+        let eq = add_block(pool, vid, page, "display_math", 3, "U = S2 C2 S1 C1 (1.1)", None).await;
+        crate::db::math_expressions::insert_math(
+            pool,
+            &crate::db::math_expressions::NewMathExpression {
+                node_id: eq,
+                display_mode: "display",
+                equation_label: Some("(1.1)"),
+                latex: None,
+                presentation_mathml: None,
+                content_mathml: None,
+                openmath_json: None,
+                normalized_text: Some("U = S2 C2 S1 C1 (1.1)"),
+                ast_json: None,
+                semantic_status: "surface_only",
+                confidence: Some(0.75),
+                origin: Some("pdf_text_layer"),
+            },
+        )
+        .await
+        .unwrap();
+        // node-FTS を張る（search_document_nodes 用）。
+        crate::ingestion::regenerate_node_fts_from_lcir(pool, att)
+            .await
+            .unwrap();
+        entry.id
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_document_structure_returns_outline_counts_and_abstract(pool: SqlitePool) {
+        let entry_id = setup_entry_with_lcir(&pool).await;
+        let resp = call_tool(&pool, "get_document_structure", json!({ "entry_id": entry_id })).await;
+        let j = tool_json(&resp);
+        assert_eq!(j["has_lcir"], true);
+        assert_eq!(j["counts"]["display_math"], 1);
+        assert_eq!(j["counts"]["paragraph"], 1);
+        assert_eq!(j["abstract"], "We study quantum walks.");
+        // アウトラインに節が節番号つきで入る。
+        let outline = j["outline"].as_array().unwrap();
+        assert_eq!(outline.len(), 1);
+        assert_eq!(outline[0]["section_number"], "1");
+        assert_eq!(outline[0]["page"], 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_document_blocks_filters_by_kind_and_exposes_math(pool: SqlitePool) {
+        let entry_id = setup_entry_with_lcir(&pool).await;
+        // kinds=["display_math"] → 数式だけ。equation_label が付く。
+        let resp = call_tool(
+            &pool,
+            "get_document_blocks",
+            json!({ "entry_id": entry_id, "kinds": ["display_math"] }),
+        )
+        .await;
+        let j = tool_json(&resp);
+        assert_eq!(j["total_blocks"], 1);
+        let blocks = j["blocks"].as_array().unwrap();
+        assert_eq!(blocks[0]["kind"], "display_math");
+        assert_eq!(blocks[0]["equation_label"], "(1.1)");
+        assert!(blocks[0]["text"].as_str().unwrap().contains("S2 C2"));
+
+        // フィルタ無し → 本文ブロック 4 個（document/page/line は除外）。
+        let all = tool_json(&call_tool(&pool, "get_document_blocks", json!({ "entry_id": entry_id })).await);
+        assert_eq!(all["total_blocks"], 4);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_document_nodes_finds_block_with_bbox(pool: SqlitePool) {
+        setup_entry_with_lcir(&pool).await;
+        let resp = call_tool(&pool, "search_document_nodes", json!({ "query": "quantum walks" })).await;
+        let j = tool_json(&resp);
+        assert!(j["count"].as_i64().unwrap() >= 1);
+        let hit = &j["results"][0];
+        assert!(hit["node_kind"].is_string());
+        assert_eq!(hit["page"], 1);
+        // bbox が [x,y,w,h] で返る（ハイライト用）。
+        assert!(hit["bbox"].as_array().map(|a| a.len() == 4).unwrap_or(false));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn document_tools_report_has_lcir_false_without_lcir(pool: SqlitePool) {
+        // LCIR 未構築のエントリ → has_lcir:false（get_fulltext に退避可能）。
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "No LCIR".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let j = tool_json(&call_tool(&pool, "get_document_structure", json!({ "entry_id": entry.id })).await);
+        assert_eq!(j["has_lcir"], false);
+    }
+
+    /// 手動 E2E: 実 DB コピー + 実 PDF を pdfium で LCIR 構築し、外部 LLM が MCP で受け取る
+    /// JSON（get_document_structure / get_document_blocks / search_document_nodes）を印字する。
+    /// native lib が要るため `#[ignore]`。env 未設定なら skip。ATT の entry を対象にする。
+    /// 例:
+    /// `LCIR_SMOKE_DB=/path/copy.db LCIR_SMOKE_APPDIR="$HOME/Library/Application Support/com.lumencite.app" \
+    ///  LCIR_SMOKE_ATT=8 cargo test --lib mcp_lcir_tools_e2e -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "manual pdfium E2E; needs LCIR_SMOKE_* env + libpdfium"]
+    async fn mcp_lcir_tools_e2e() {
+        let (db, appdir, att) = match (
+            std::env::var("LCIR_SMOKE_DB"),
+            std::env::var("LCIR_SMOKE_APPDIR"),
+            std::env::var("LCIR_SMOKE_ATT"),
+        ) {
+            (Ok(d), Ok(a), Ok(t)) => (d, a, t.parse::<i64>().expect("LCIR_SMOKE_ATT must be int")),
+            _ => {
+                eprintln!("skip: set LCIR_SMOKE_DB / LCIR_SMOKE_APPDIR / LCIR_SMOKE_ATT");
+                return;
+            }
+        };
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePool::connect_with(opts).await.unwrap();
+        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        // 実 PDF を LCIR 構築（既存なら reuse）。
+        let build = crate::ingestion::build_lcir_for_attachment(&pool, Path::new(&appdir), att)
+            .await
+            .unwrap();
+        eprintln!("build: built={} reused={}", build.built, build.reused);
+        let entry_id: i64 = sqlx::query_scalar("SELECT entry_id FROM attachments WHERE id = ?")
+            .bind(att)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let structure = tool_json(
+            &call_tool(&pool, "get_document_structure", json!({ "entry_id": entry_id })).await,
+        );
+        eprintln!(
+            "\n=== get_document_structure ===\n{}",
+            serde_json::to_string_pretty(&structure).unwrap()
+        );
+
+        let eqs = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_blocks",
+                json!({ "entry_id": entry_id, "kinds": ["display_math"], "max_chars": 1500 }),
+            )
+            .await,
+        );
+        eprintln!(
+            "\n=== get_document_blocks kinds=[display_math] (first ~1500 chars) ===\n{}",
+            serde_json::to_string_pretty(&eqs).unwrap()
+        );
+
+        let found = tool_json(
+            &call_tool(&pool, "search_document_nodes", json!({ "query": "wave operator" })).await,
+        );
+        eprintln!(
+            "\n=== search_document_nodes 'wave operator' ===\n{}",
+            serde_json::to_string_pretty(&found).unwrap()
+        );
+
+        assert_eq!(structure["has_lcir"], true);
+        assert!(structure["counts"]["display_math"].as_i64().unwrap_or(0) > 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
