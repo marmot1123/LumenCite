@@ -80,6 +80,7 @@ mod tests {
             origin: None,
             confidence: None,
             payload: None,
+            math: None,
             source_fragments: vec![],
         }
     }

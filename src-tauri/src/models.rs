@@ -168,6 +168,25 @@ pub struct SourceFragment {
     pub fragment_type: Option<String>,
 }
 
+/// 数式の複数表現（migration 0016・Phase 3）。inline_math/display_math ノードに 1:1 で付く。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct MathExpression {
+    pub id: i64,
+    pub node_id: i64,
+    pub display_mode: String,
+    pub equation_label: Option<String>,
+    pub latex: Option<String>,
+    pub presentation_mathml: Option<String>,
+    pub content_mathml: Option<String>,
+    pub openmath_json: Option<String>,
+    pub normalized_text: Option<String>,
+    pub ast_json: Option<String>,
+    pub semantic_status: String,
+    pub confidence: Option<f64>,
+    pub origin: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct EntrySummary {
     pub id: i64,

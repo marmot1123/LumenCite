@@ -39,6 +39,10 @@ pub enum NodeKind {
     Bibliography,
     BibliographyEntry,
     CodeBlock,
+    // Phase 3: 数式表層。
+    InlineMath,
+    DisplayMath,
+    EquationGroup,
 }
 
 impl NodeKind {
@@ -64,6 +68,9 @@ impl NodeKind {
             NodeKind::Bibliography => "bibliography",
             NodeKind::BibliographyEntry => "bibliography_entry",
             NodeKind::CodeBlock => "code_block",
+            NodeKind::InlineMath => "inline_math",
+            NodeKind::DisplayMath => "display_math",
+            NodeKind::EquationGroup => "equation_group",
         }
     }
 
@@ -90,6 +97,9 @@ impl NodeKind {
             "bibliography" => NodeKind::Bibliography,
             "bibliography_entry" => NodeKind::BibliographyEntry,
             "code_block" => NodeKind::CodeBlock,
+            "inline_math" => NodeKind::InlineMath,
+            "display_math" => NodeKind::DisplayMath,
+            "equation_group" => NodeKind::EquationGroup,
             _ => NodeKind::UnknownBlock,
         }
     }
@@ -190,6 +200,9 @@ pub struct LcirNode {
     /// `payload_json` を透過的にパースしたもの。無ければ省略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+    /// 数式表現（Phase 3・inline_math/display_math ノードのみ）。正本は `math_expressions`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub math: Option<super::math::LcirMath>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_fragments: Vec<LcirFragment>,
 }
@@ -233,14 +246,18 @@ mod tests {
             NodeKind::Bibliography,
             NodeKind::BibliographyEntry,
             NodeKind::CodeBlock,
+            NodeKind::InlineMath,
+            NodeKind::DisplayMath,
+            NodeKind::EquationGroup,
         ] {
             assert_eq!(NodeKind::from_db(k.as_str()), k);
         }
-        // Phase 2 の snake_case が期待どおり（DB 列・LCIR JSON と 1:1）。
+        // Phase 2/3 の snake_case が期待どおり（DB 列・LCIR JSON と 1:1）。
         assert_eq!(NodeKind::FigureCaption.as_str(), "figure_caption");
         assert_eq!(NodeKind::BibliographyEntry.as_str(), "bibliography_entry");
-        // Phase 3+ の未知種別（数式等）は UnknownBlock にフォールバック。
-        assert_eq!(NodeKind::from_db("display_math"), NodeKind::UnknownBlock);
+        assert_eq!(NodeKind::DisplayMath.as_str(), "display_math");
+        // Phase 5+ の未実装種別（定理等）は UnknownBlock にフォールバック。
+        assert_eq!(NodeKind::from_db("theorem"), NodeKind::UnknownBlock);
     }
 
     #[test]
@@ -279,6 +296,7 @@ mod tests {
                 origin: Some("pdf_text_layer".to_string()),
                 confidence: None,
                 payload: None,
+                math: None,
                 source_fragments: vec![LcirFragment {
                     page: 1,
                     bbox: BBox::new(0.0, 0.0, 595.0, 842.0),

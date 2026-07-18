@@ -9,7 +9,8 @@ use crate::db::document_nodes_fts::NodeFtsInput;
 use crate::db::document_versions::NewDocumentVersion;
 use crate::db::source_fragments::NewSourceFragment;
 use crate::db::{
-    document_nodes, document_nodes_fts, document_versions, fulltext, settings, source_fragments,
+    document_nodes, document_nodes_fts, document_versions, fulltext, math_expressions, settings,
+    source_fragments,
 };
 use crate::document_ir::{self, CoordinateSpace, ExtractionStatus, FragmentType, NodeKind, Origin};
 use sqlx::SqlitePool;
@@ -282,6 +283,31 @@ pub async fn build_lcir_for_attachment(
             .await
             .map_err(|e| e.to_string())?;
 
+            // display 数式は表層表現 1 行を作る（Phase 3）。PDF 由来なので LaTeX/MathML は未確定で
+            // normalized_text（= クリーンな表層文字列 = block の plain_text）だけを埋め、
+            // semantic_status='surface_only'・origin='pdf_text_layer'。意味は Phase 7 で。
+            if sblock.kind == NodeKind::DisplayMath {
+                math_expressions::insert_math(
+                    &mut *tx,
+                    &math_expressions::NewMathExpression {
+                        node_id: block_node_id,
+                        display_mode: document_ir::MathDisplayMode::Display.as_str(),
+                        equation_label: sblock.equation_label.as_deref(),
+                        latex: None,
+                        presentation_mathml: None,
+                        content_mathml: None,
+                        openmath_json: None,
+                        normalized_text: Some(sblock.text.as_str()),
+                        ast_json: None,
+                        semantic_status: document_ir::MathSemanticStatus::SurfaceOnly.as_str(),
+                        confidence: Some(sblock.confidence),
+                        origin: Some(Origin::PdfTextLayer.as_str()),
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+
             for (li, line) in sblock.lines.iter().enumerate() {
                 let line_node_id = document_nodes::insert_node(
                     &mut *tx,
@@ -534,10 +560,34 @@ pub async fn load_lcir_document(
             });
     }
 
+    // 数式ノードには表層表現（math_expressions）を紐づける（Phase 3）。
+    let mut math_by_node: HashMap<i64, document_ir::LcirMath> = HashMap::new();
+    for m in math_expressions::math_for_version(pool, version.id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        math_by_node.insert(
+            m.node_id,
+            document_ir::LcirMath {
+                display_mode: m.display_mode,
+                equation_label: m.equation_label,
+                latex: m.latex,
+                presentation_mathml: m.presentation_mathml,
+                content_mathml: m.content_mathml,
+                openmath: m.openmath_json,
+                normalized_text: m.normalized_text,
+                semantic_status: m.semantic_status,
+                confidence: m.confidence,
+                origin: m.origin,
+            },
+        );
+    }
+
     let lcir_nodes = nodes
         .into_iter()
         .map(|n| document_ir::LcirNode {
             source_fragments: by_node.remove(&n.id).unwrap_or_default(),
+            math: math_by_node.remove(&n.id),
             payload: n
                 .payload_json
                 .as_deref()
@@ -961,6 +1011,94 @@ mod tests {
         assert!(document_ir::validation::validate(&doc).is_ok());
     }
 
+    /// display_math ノードに紐づく math_expressions が、read 面（LcirNode.math）へ組み上がる
+    /// （Phase 3 の表層表現・PDF 由来は semantic_status='surface_only'）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_lcir_document_includes_math(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let vid = document_versions::insert_version(
+            &pool,
+            &NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck",
+                schema_version: document_ir::schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: document_ir::schema::EXTRACTOR_NAME,
+                extractor_version: document_ir::schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = document_nodes::insert_node(
+            &pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let eq = document_nodes::insert_node(
+            &pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::DisplayMath.as_str(),
+                ordinal: 0,
+                plain_text: Some("U = S2 C2 S1 C1"),
+                language: None,
+                confidence: Some(0.6),
+                origin: Some("layout_model"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        math_expressions::insert_math(
+            &pool,
+            &math_expressions::NewMathExpression {
+                node_id: eq,
+                display_mode: "display",
+                equation_label: Some("(2.1)"),
+                latex: None,
+                presentation_mathml: None,
+                content_mathml: None,
+                openmath_json: None,
+                normalized_text: Some("U = S2 C2 S1 C1"),
+                ast_json: None,
+                semantic_status: document_ir::MathSemanticStatus::SurfaceOnly.as_str(),
+                confidence: Some(0.6),
+                origin: Some("pdf_text_layer"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let doc = load_lcir_document(&pool, att).await.unwrap().unwrap();
+        let math_node = doc.nodes.iter().find(|n| n.kind == "display_math").unwrap();
+        let math = math_node.math.as_ref().expect("display_math ノードは math を持つ");
+        assert_eq!(math.display_mode, "display");
+        assert_eq!(math.equation_label.as_deref(), Some("(2.1)"));
+        assert_eq!(math.semantic_status, "surface_only");
+        assert_eq!(math.normalized_text.as_deref(), Some("U = S2 C2 S1 C1"));
+        assert!(math.latex.is_none(), "PDF 由来では LaTeX 未確定");
+        // 非数式ノードには math が付かない。
+        assert!(doc.nodes.iter().find(|n| n.kind == "document").unwrap().math.is_none());
+    }
+
     /// 手動 pdfium 実機確認: 実 DB コピー + 実 PDF に対して build → load → 冪等 build を走らせる。
     /// native lib（`src-tauri/pdfium/libpdfium.dylib`）が要るため `#[ignore]`。env 未設定なら skip。
     /// 例:
@@ -1004,7 +1142,7 @@ mod tests {
         eprintln!(
             "content_key={} pages={pages} lines={lines}\n  \
              section={} subsection={} heading={} paragraph={} abstract={} \
-             figure_caption={} table_caption={} bibliography_entry={} unknown_block={}",
+             figure_caption={} table_caption={} display_math={} bibliography_entry={} unknown_block={}",
             doc.content_key,
             count("section"),
             count("subsection"),
@@ -1013,8 +1151,28 @@ mod tests {
             count("abstract"),
             count("figure_caption"),
             count("table_caption"),
+            count("display_math"),
             count("bibliography_entry"),
             count("unknown_block"),
+        );
+        // 検出した数式（表層）を数点表示: 制御文字が除かれ normalized_text が埋まること。
+        for n in doc.nodes.iter().filter(|n| n.kind == "display_math").take(5) {
+            let m = n.math.as_ref();
+            eprintln!(
+                "  [display_math] label={:?} status={:?} conf={:?} {:?}",
+                m.and_then(|m| m.equation_label.clone()),
+                m.map(|m| m.semantic_status.clone()),
+                n.confidence,
+                n.plain_text.as_deref().unwrap_or("").chars().take(60).collect::<String>(),
+            );
+        }
+        let math_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM math_expressions").fetch_one(&pool).await.unwrap();
+        eprintln!("math_expressions rows = {math_rows}");
+        assert_eq!(
+            math_rows as usize,
+            count("display_math"),
+            "display_math ノード数と math_expressions 行数が一致する"
         );
         // 見出しの節番号（payload）とブロック領域（bbox）を数点表示。
         for n in doc
