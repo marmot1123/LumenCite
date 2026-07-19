@@ -444,7 +444,13 @@
       "fetchFromIsbn": "Fetch from Open Library",
       "authorMore": " +{{count}} more",
       "downloadPdf": "Also download the PDF from arXiv",
-      "downloadingPdf": "Downloading PDF…"
+      "downloadingPdf": "Downloading PDF…",
+      "completePdf": "PDF",
+      "completeTex": "TeX source",
+      "completeBody": "Already in your library. Download the missing {{items}}?",
+      "completeYes": "Download",
+      "completeNotNow": "Not now",
+      "completeAlways": "Always, don't ask again"
     },
     "addToLibrary": "Add to library",
     "addingToLibrary": "Adding…",
@@ -855,7 +861,14 @@
       "lcirNone": "No un-built PDFs.",
       "lcirDisabled": "LCIR is disabled. Enable it first.",
       "lcirDone": "Built {{built}} of {{total}} ({{failed}} failed).",
-      "lcirError": "Bulk build failed: {{error}}"
+      "lcirError": "Bulk build failed: {{error}}",
+      "texFetch": "Fetch arXiv TeX sources in bulk",
+      "texFetchBusy": "Fetching…",
+      "texFetchBusyProgress": "Fetching… ({{done}}/{{total}})",
+      "texFetchRunning": "A bulk fetch is already running. Please wait for it to finish.",
+      "texFetchNone": "No arXiv entries are missing TeX sources.",
+      "texFetchDone": "Fetched {{fetched}} of {{total}}, built LCIR for {{built}} ({{pdfOnly}} PDF-only, {{failed}} failed).",
+      "texFetchError": "Bulk fetch failed: {{error}}"
     },
     "about": {
       "appTitle": "LumenCite",

@@ -1119,6 +1119,145 @@ async fn set_lcir_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(
     .map_err(|e| e.to_string())
 }
 
+/// クリップ／AddSheet 重複時に欠落（PDF / TeX）を確認なしで自動補完するか（`clipper.complete_missing`）。
+/// "1" のときだけ true。未設定・"0" は false（＝都度確認）。
+#[tauri::command]
+async fn get_clipper_complete_missing(state: State<'_, AppState>) -> Result<bool, String> {
+    setting_is_on(&state.db, db::settings::CLIPPER_COMPLETE_MISSING_KEY).await
+}
+
+/// `clipper.complete_missing` を設定する（AddSheet の「次回以降は確認せず補完」で true にする）。
+#[tauri::command]
+async fn set_clipper_complete_missing(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    db::settings::set_setting(
+        &state.db,
+        db::settings::CLIPPER_COMPLETE_MISSING_KEY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// `fetch_missing_arxiv_sources`（arXiv TeX ソース一括取得）の結果サマリ。
+/// `pdf_only` = TeX 未公開（PDF-only 投稿）で `failed` とは分けて数える。
+/// `built` は取得後に LCIR 構築（or 再利用）まで済んだ件数。取得できたが構築に
+/// 失敗した場合は `fetched` にだけ計上し `failed` は増やさない（取得は成功のため）。
+#[derive(serde::Serialize)]
+struct FetchMissingArxivSourcesResult {
+    total: i64,
+    fetched: i64,
+    built: i64,
+    pdf_only: i64,
+    failed: i64,
+}
+
+/// `fetch_missing_arxiv_sources` の多重起動ガード。設定モーダルを閉じ→開き直すと
+/// フロントの busy 状態が失われて 2 本目を起動でき、同じ対象へ arXiv を二重に叩いて
+/// しまう（別添付は積まれないが 3 秒スロットルが無駄に走る）ため、プロセス全体で 1 本に絞る。
+static TEX_FETCH_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`TEX_FETCH_RUNNING`] を Drop で必ず解除する RAII ガード（途中エラー・panic でも解放）。
+struct TexFetchGuard;
+impl Drop for TexFetchGuard {
+    fn drop(&mut self) {
+        TEX_FETCH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 既存コーパスのバックフィル: ゴミ箱以外で arxiv_id を持ち TeX ソース添付が無い
+/// エントリを対象に、e-print を直列取得して LCIR を構築する。arXiv への礼儀として
+/// リクエスト間 3 秒スロットル。`lcir.enabled` OFF なら何もしない（全 0 を返す）。
+/// 進捗は `tex-fetch-progress` イベントで通知し、完了時に `entries-changed` を発火する。
+#[tauri::command]
+async fn fetch_missing_arxiv_sources(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<FetchMissingArxivSourcesResult, String> {
+    // フラグ OFF では download しても build が no-op になるので、対象取得ごと落とさない。
+    if !ingestion::lcir_enabled(&state.db).await {
+        return Ok(FetchMissingArxivSourcesResult {
+            total: 0,
+            fetched: 0,
+            built: 0,
+            pdf_only: 0,
+            failed: 0,
+        });
+    }
+    // 既に実行中なら弾く（多重起動ガード）。フロントは `already_running` を案内文言に変換する。
+    if TEX_FETCH_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Err("already_running".to_string());
+    }
+    let _guard = TexFetchGuard;
+
+    let targets = db::entries::entries_missing_arxiv_source(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let total = targets.len() as i64;
+    let (mut fetched, mut built, mut pdf_only, mut failed) = (0i64, 0i64, 0i64, 0i64);
+    for (i, (entry_id, arxiv_id)) in targets.into_iter().enumerate() {
+        // 先頭以外はリクエスト前に 3 秒待つ（export.arxiv.org の慣行・バーストしない）。
+        if i > 0 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        let id = metadata::normalize_arxiv_id(&arxiv_id);
+        if id.is_empty() {
+            failed += 1;
+        } else {
+            let url = format!("https://arxiv.org/e-print/{id}");
+            match download::download_and_attach_arxiv_source(
+                &state.db,
+                &state.app_data_dir,
+                entry_id,
+                &id,
+                &url,
+                download::DownloadCaps::default(),
+            )
+            .await
+            {
+                Ok(att) => {
+                    fetched += 1;
+                    // 取得成功 → LCIR 構築（新規なので通常 built、稀に content_key 一致で reused）。
+                    // 構築失敗は best-effort（`failed` は増やさない・詳細パネルから再構築可）。
+                    if let Ok(r) =
+                        ingestion::build_lcir_for_attachment(&state.db, &state.app_data_dir, att.id)
+                            .await
+                    {
+                        if r.built || r.reused {
+                            built += 1;
+                        }
+                    }
+                }
+                // PDF-only 投稿（TeX 未公開）は `fetch_arxiv_source` が先頭 5B の `%PDF-` で
+                // 打ち切り、エラー文に "PDF-only" を含む（download.rs）。HTML/ペイウォール等
+                // （"not a TeX source archive"）は本当の失敗として `failed` に数える。
+                Err(e) if e.contains("PDF-only") => pdf_only += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        // 進捗をフロントへ（多分単位のバッチが「固まって見える」のを避ける）。
+        let _ = app.emit(
+            "tex-fetch-progress",
+            serde_json::json!({ "done": i as i64 + 1, "total": total }),
+        );
+    }
+    // 添付・LCIR が増えたので、開いている一覧・詳細パネルを更新させる。
+    if fetched > 0 {
+        let _ = app.emit("entries-changed", ());
+    }
+    Ok(FetchMissingArxivSourcesResult { total, fetched, built, pdf_only, failed })
+}
+
 // ── highlights ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -3411,6 +3550,8 @@ pub fn run() {
             get_clipper_status,
             set_clipper_enabled,
             get_clipper_connect_code,
+            get_clipper_complete_missing,
+            set_clipper_complete_missing,
             ocr_pdf,
             run_backup_now,
             list_backups,
@@ -3428,6 +3569,7 @@ pub fn run() {
             get_lcir_enabled,
             set_lcir_enabled,
             download_arxiv_source,
+            fetch_missing_arxiv_sources,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

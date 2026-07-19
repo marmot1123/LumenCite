@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { Icon } from "./icons";
@@ -52,6 +52,22 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
   const [duplicateId, setDuplicateId] = useState<number | null>(null);
   // arXiv タブでは PDF も一括ダウンロードする（デフォルト ON）。
   const [downloadPdf, setDownloadPdf] = useState(true);
+  // 既存エントリの欠落補完を尋ねるインライン確認（WKWebView 安全・window.confirm 不使用）。
+  const [confirmMissing, setConfirmMissing] = useState<{ items: string } | null>(null);
+  const confirmResolver = useRef<((c: "complete" | "always" | "skip") => void) | null>(null);
+
+  // 3 択を Promise で待つ（ボタンクリックが resolver を呼ぶ。ref なので再描画で失われない）。
+  const askCompleteMissing = (items: string): Promise<"complete" | "always" | "skip"> =>
+    new Promise((resolve) => {
+      confirmResolver.current = resolve;
+      setConfirmMissing({ items });
+    });
+  const resolveConfirm = (choice: "complete" | "always" | "skip") => {
+    setConfirmMissing(null);
+    const r = confirmResolver.current;
+    confirmResolver.current = null;
+    r?.(choice);
+  };
 
   const handleFetch = async () => {
     if (!value.trim()) return;
@@ -85,38 +101,73 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
     if (!preview) return;
     setPhase("saving");
     try {
-      const entry = await invoke<EntryDetail>("create_entry", { input: preview });
-      // arXiv の場合は PDF も一括でダウンロードして添付する。
-      // ダウンロード失敗（ペイウォール・ネットワーク等）はエントリ作成を
-      // 妨げない — 警告だけ出して詳細パネルから後で添付できるようにする。
       const arxivId = preview.arxiv_id?.trim();
-      if (tabId === "arxiv" && downloadPdf && arxivId) {
-        setPhase("downloading");
+      // 「既に存在するか」を submit 直前に権威的に判定する（fetch 時の duplicateId は
+      // probe 失敗・fetch→submit 間の競合で不正確なことがあるため頼らない）。
+      let existed = false;
+      if (arxivId || preview.doi || preview.isbn) {
         try {
-          await invoke("download_arxiv_pdf", { entryId: entry.id, arxivId });
-        } catch (e) {
-          // エントリは作成済み。PDF 失敗は詳細パネルから後で添付できるので
-          // 作成を妨げず、ログのみに留めて閉じる。
-          console.warn("arXiv PDF download failed:", e);
+          existed = (await invoke<number | null>("find_duplicate_entry", {
+            doi: preview.doi ?? null,
+            arxivId: preview.arxiv_id ?? null,
+            isbn: preview.isbn ?? null,
+          })) != null;
+        } catch {
+          existed = false; // 判定不能なら「新規」とみなし従来どおり
         }
       }
-      // LCIR が有効なら TeX ソースも取得して LCIR を構築する（Web クリッパーと同じ
-      // 自動化・ゲート・best-effort 契約）。シートを閉じるのを待たせないよう
-      // fire-and-forget にし、失敗はログのみ（詳細パネルのボタンから再取得できる）。
+
+      // create_entry は冪等（CR-019）: 既存があれば添付込みの既存 EntryDetail を返す。
+      const entry = await invoke<EntryDetail>("create_entry", { input: preview });
+
       if (tabId === "arxiv" && arxivId) {
-        const entryId = entry.id;
-        void (async () => {
-          try {
-            if (!(await invoke<boolean>("get_lcir_enabled"))) return;
-            const att = await invoke<{ id: number }>("download_arxiv_source", {
-              entryId,
-              arxivId,
-            });
-            await invoke("build_lcir_for_attachment", { attachmentId: att.id });
-          } catch (e) {
-            console.warn("arXiv TeX source fetch failed:", e);
+        // 欠落判定は返ってきた entry.attachments が権威（新規/既存とも二重添付しない）。
+        const hasPdf = entry.attachments.some((a) => a.mime_type.toLowerCase().includes("pdf"));
+        const hasTex = entry.attachments.some((a) => a.mime_type === "application/gzip");
+        const lcir = await invoke<boolean>("get_lcir_enabled").catch(() => false);
+        const wantPdf = downloadPdf && !hasPdf;
+        const wantTex = lcir && !hasTex;
+
+        // 既存エントリで欠落がある場合は clipper.complete_missing に従う（未設定=確認 / "1"=自動）。
+        // 新規エントリはチェックボックスが同意なので確認しない。
+        if (existed && (wantPdf || wantTex)) {
+          const auto = await invoke<boolean>("get_clipper_complete_missing").catch(() => false);
+          if (!auto) {
+            const labels: string[] = [];
+            if (wantPdf) labels.push(t("addSheet.identifier.completePdf"));
+            if (wantTex) labels.push(t("addSheet.identifier.completeTex"));
+            const choice = await askCompleteMissing(labels.join(" ・ "));
+            if (choice === "skip") {
+              onCreated(entry);
+              return;
+            }
+            if (choice === "always") {
+              await invoke("set_clipper_complete_missing", { enabled: true }).catch(() => {});
+            }
           }
-        })();
+        }
+
+        // PDF は欠落時のみダウンロード（無条件添付の quirk 修正）。失敗はログのみ。
+        if (wantPdf) {
+          setPhase("downloading");
+          try {
+            await invoke("download_arxiv_pdf", { entryId: entry.id, arxivId });
+          } catch (e) {
+            console.warn("arXiv PDF download failed:", e);
+          }
+        }
+        // TeX ソースも欠落時のみ（LCIR 有効時）。シートを待たせない fire-and-forget。
+        if (wantTex) {
+          const entryId = entry.id;
+          void (async () => {
+            try {
+              const att = await invoke<{ id: number }>("download_arxiv_source", { entryId, arxivId });
+              await invoke("build_lcir_for_attachment", { attachmentId: att.id });
+            } catch (e) {
+              console.warn("arXiv TeX source fetch failed:", e);
+            }
+          })();
+        }
       }
       onCreated(entry);
     } catch (e) {
@@ -234,6 +285,45 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
           />
           {t("addSheet.identifier.downloadPdf")}
         </label>
+      )}
+
+      {/* 既存エントリの欠落補完（PDF / TeX）を尋ねる 3 択インライン確認 */}
+      {confirmMissing && (
+        <div style={{
+          marginTop: 12, padding: "10px 12px", borderRadius: 7,
+          background: "var(--warn-bg)", border: "1px solid var(--warn-border)",
+        }}>
+          <div style={{ fontSize: 11.5, color: "var(--warn-text)", lineHeight: 1.5, marginBottom: 8 }}>
+            {t("addSheet.identifier.completeBody", { items: confirmMissing.items })}
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            <button
+              onClick={() => resolveConfirm("complete")}
+              style={{
+                padding: "4px 12px", borderRadius: 5, border: "none",
+                background: "var(--accent-strong)", color: "white",
+                fontSize: 11.5, fontWeight: 600, cursor: "pointer",
+              }}
+            >{t("addSheet.identifier.completeYes")}</button>
+            <button
+              onClick={() => resolveConfirm("skip")}
+              style={{
+                padding: "4px 12px", borderRadius: 5,
+                border: "1px solid var(--border-strong)",
+                background: "var(--surface)", color: "var(--text)",
+                fontSize: 11.5, cursor: "pointer",
+              }}
+            >{t("addSheet.identifier.completeNotNow")}</button>
+            <button
+              onClick={() => resolveConfirm("always")}
+              style={{
+                padding: "4px 12px", borderRadius: 5, border: "none",
+                background: "transparent", color: "var(--text-mute)",
+                fontSize: 11.5, cursor: "pointer",
+              }}
+            >{t("addSheet.identifier.completeAlways")}</button>
+          </div>
+        </div>
       )}
 
       <div style={{

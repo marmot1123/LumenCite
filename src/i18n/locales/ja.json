@@ -444,7 +444,13 @@
       "fetchFromIsbn": "Open Library から取得します",
       "authorMore": " 他{{count}}名",
       "downloadPdf": "arXiv から PDF も一緒にダウンロード",
-      "downloadingPdf": "PDF をダウンロード中…"
+      "downloadingPdf": "PDF をダウンロード中…",
+      "completePdf": "PDF",
+      "completeTex": "TeX ソース",
+      "completeBody": "既にライブラリにあります。欠けている {{items}} を取得しますか？",
+      "completeYes": "取得する",
+      "completeNotNow": "今回はしない",
+      "completeAlways": "次回以降は確認しない"
     },
     "addToLibrary": "ライブラリに追加",
     "addingToLibrary": "追加中…",
@@ -855,7 +861,14 @@
       "lcirNone": "未構築の PDF はありません。",
       "lcirDisabled": "LCIR が無効です。先に有効化してください。",
       "lcirDone": "{{total}} 件中 {{built}} 件を構築しました（失敗 {{failed}} 件）。",
-      "lcirError": "一括構築に失敗しました: {{error}}"
+      "lcirError": "一括構築に失敗しました: {{error}}",
+      "texFetch": "arXiv の TeX ソースを一括取得",
+      "texFetchBusy": "取得中…",
+      "texFetchBusyProgress": "取得中… ({{done}}/{{total}})",
+      "texFetchRunning": "既に一括取得を実行中です。完了までお待ちください。",
+      "texFetchNone": "TeX ソースが未取得の arXiv エントリはありません。",
+      "texFetchDone": "{{total}} 件中 {{fetched}} 件取得・{{built}} 件を LCIR 化しました（TeX 未公開 {{pdfOnly}} 件・失敗 {{failed}} 件）。",
+      "texFetchError": "一括取得に失敗しました: {{error}}"
     },
     "about": {
       "appTitle": "LumenCite",
