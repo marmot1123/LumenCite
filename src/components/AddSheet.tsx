@@ -100,6 +100,24 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
           console.warn("arXiv PDF download failed:", e);
         }
       }
+      // LCIR が有効なら TeX ソースも取得して LCIR を構築する（Web クリッパーと同じ
+      // 自動化・ゲート・best-effort 契約）。シートを閉じるのを待たせないよう
+      // fire-and-forget にし、失敗はログのみ（詳細パネルのボタンから再取得できる）。
+      if (tabId === "arxiv" && arxivId) {
+        const entryId = entry.id;
+        void (async () => {
+          try {
+            if (!(await invoke<boolean>("get_lcir_enabled"))) return;
+            const att = await invoke<{ id: number }>("download_arxiv_source", {
+              entryId,
+              arxivId,
+            });
+            await invoke("build_lcir_for_attachment", { attachmentId: att.id });
+          } catch (e) {
+            console.warn("arXiv TeX source fetch failed:", e);
+          }
+        })();
+      }
       onCreated(entry);
     } catch (e) {
       setError(String(e));

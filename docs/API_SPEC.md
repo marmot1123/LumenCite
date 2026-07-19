@@ -439,7 +439,7 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 
 `download_arxiv_pdf` は、arXiv からメタデータ取得してエントリを作成した直後に「PDF も一括で取得する」ためのコマンド（AddSheet の arXiv タブのチェックボックス。デフォルト ON）。`arxiv_id` を正規化して `https://arxiv.org/pdf/<id>` を `download::download_and_attach`（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き）でダウンロードし添付、成功後はバックグラウンドで `pdf-extract` → 全文索引を試みる（索引失敗は無視）。ペイウォールやネットワーク障害で失敗しても呼び出し側はエントリ作成を成功扱いにする（フロントは警告ログのみで詳細パネルからの手動添付に誘導）。
 
-`download_arxiv_source`（LCIR Phase 4）は、同じ正規化 ID で `https://arxiv.org/e-print/<id>` から **TeX ソース**（gzip された tar または単一 .tex）をダウンロードし、`arxiv-<id>-source.gz`・mime `application/gzip` として添付する。同じ SSRF ガード/リダイレクト検証/50MB 上限を共有する。応答検証は `%PDF-`（PDF-only submission = TeX 未公開の明示エラー）と HTML（エラーページ）を弾き、それ以外は受理して形式判定（gzip/tar/単一 .tex）は LCIR ビルド側の内容スニッフィングに委ねる。**再取得は既存の TeX ソース添付を上書きする**（別添付を積まない — 中身が変われば sha256 → content_key が変わり、次のビルドが新版を作って旧版を supersede する）。**全文索引は行わない**（PDF ではないため）。LCIR ビルド（`build_lcir_for_attachment`）は呼び出し側（詳細パネル）が添付成功後に明示的に実行する。
+`download_arxiv_source`（LCIR Phase 4）は、同じ正規化 ID で `https://arxiv.org/e-print/<id>` から **TeX ソース**（gzip された tar または単一 .tex）をダウンロードし、`arxiv-<id>-source.gz`・mime `application/gzip` として添付する。同じ SSRF ガード/リダイレクト検証/50MB 上限を共有する。応答検証は `%PDF-`（PDF-only submission = TeX 未公開の明示エラー）と HTML（エラーページ）を弾き、それ以外は受理して形式判定（gzip/tar/単一 .tex）は LCIR ビルド側の内容スニッフィングに委ねる。**再取得は既存の TeX ソース添付を上書きする**（別添付を積まない — 中身が変われば sha256 → content_key が変わり、次のビルドが新版を作って旧版を supersede する）。**全文索引は行わない**（PDF ではないため）。LCIR ビルド（`build_lcir_for_attachment`）は呼び出し側が添付成功後に実行する — 経路は 3 つ: 詳細パネルのボタン（明示・await）／AddSheet の arXiv 追加（`lcir.enabled` ON のとき自動・fire-and-forget）／Web クリッパー（`lcir.enabled` ON のとき自動・`spawn_tex_source_job`）。
 
 ```ts
 type IndexMissingResult = {

@@ -298,6 +298,7 @@ LumenCite ライブラリを **ターミナルから直接読める** CLI を実
 
 - 添付成功後は**バックグラウンドで全文索引**（`pdf-extract` → `fulltext`）まで自動で行い、直後から PDF 全文検索の対象になる（索引失敗＝スキャン PDF 等は無視し、後追いの手動索引に委ねる）。
 - ダウンロード失敗（ペイウォール・ネットワーク障害・ID 不正）でも**エントリ作成は成功扱い**。フロントは警告をログに残すのみで、詳細パネルからの手動添付に誘導する。
+- **TeX ソース自動取得（LCIR Phase 4 の自動化）**: **`lcir.enabled` が ON のときだけ**、追加直後に fire-and-forget で `download_arxiv_source` → `build_lcir_for_attachment` も実行する（PDF チェックボックスとは独立・Web クリッパーと同じゲートと best-effort 契約。失敗はログのみ・詳細パネルのボタンで再取得可）。
 - 対象は arXiv タブのみ（DOI / ISBN は出版社側の PDF 配布が不定のため対象外）。詳細は `API_SPEC.md` の `download_arxiv_pdf` を参照。
 
 ### 将来検討事項（lumencite-bib Skill の駆動方式）
