@@ -65,12 +65,21 @@ pub struct PdfJob {
     pub url: String,
 }
 
-/// [`handle_clip`] の結果。HTTP 層はこれを見て応答・副作用（sync/イベント/PDF）を行う。
+/// 応答後に spawn する arXiv TeX ソース取得ジョブ（LCIR Phase 4 の自動化）。
+/// arxiv_id は正規化済み。
+#[derive(Debug, Clone)]
+pub struct TexSourceJob {
+    pub entry_id: i64,
+    pub arxiv_id: String,
+}
+
+/// [`handle_clip`] の結果。HTTP 層はこれを見て応答・副作用（sync/イベント/PDF/TeX）を行う。
 pub struct ClipOutcome {
     pub response: Value,
     pub status: u16,
     pub mutated: bool,
     pub pdf_job: Option<PdfJob>,
+    pub tex_source_job: Option<TexSourceJob>,
 }
 
 /// `clipper.enabled` の現在値（リクエスト毎に評価し、トグル変更を即反映）。
@@ -292,6 +301,7 @@ pub async fn handle_clip(pool: &SqlitePool, req: &ClipRequest) -> ClipOutcome {
     match apply_clip(pool, input, req).await {
         Ok(ClipResult::Created { entry_id, title }) => {
             let pdf_job = derive_pdf_url(req).map(|url| PdfJob { entry_id, url });
+            let tex_source_job = derive_tex_source_job(pool, req, entry_id).await;
             let mut response = json!({
                 "status": "created",
                 "entry_id": entry_id,
@@ -300,8 +310,10 @@ pub async fn handle_clip(pool: &SqlitePool, req: &ClipRequest) -> ClipOutcome {
             if pdf_job.is_some() {
                 response["pdf"] = json!("downloading");
             }
-            ClipOutcome { response, status: 200, mutated: true, pdf_job }
+            ClipOutcome { response, status: 200, mutated: true, pdf_job, tex_source_job }
         }
+        // 重複クリップは再ダウンロードしない（PDF ジョブと同じ契約。TeX ソースの
+        // 再取得は詳細パネルのボタンから明示的に行える）。
         Ok(ClipResult::Duplicate { entry_id, title }) => ClipOutcome {
             response: json!({
                 "status": "duplicate",
@@ -311,14 +323,37 @@ pub async fn handle_clip(pool: &SqlitePool, req: &ClipRequest) -> ClipOutcome {
             status: 200,
             mutated: false,
             pdf_job: None,
+            tex_source_job: None,
         },
         Err(e) => ClipOutcome {
             response: json!({ "status": "error", "code": "db_error", "message": e.to_string() }),
             status: 500,
             mutated: false,
             pdf_job: None,
+            tex_source_job: None,
         },
     }
+}
+
+/// arXiv クリップに TeX ソース自動取得ジョブを出すかの判定（LCIR Phase 4 の自動化）。
+///
+/// **`lcir.enabled` が ON のときだけ**出す: LCIR を使わないユーザーのクリップごとに
+/// 数 MB の e-print を黙って落とさない（OFF だと LCIR 構築も no-op で取得の意味が薄い）。
+/// ON なら「クリップ → PDF + TeX ソース + LCIR 構築」まで全自動になる。
+async fn derive_tex_source_job(
+    pool: &SqlitePool,
+    req: &ClipRequest,
+    entry_id: i64,
+) -> Option<TexSourceJob> {
+    let arxiv = non_empty(req.arxiv_id.as_deref())?;
+    let id = crate::metadata::normalize_arxiv_id(arxiv);
+    if id.is_empty() {
+        return None;
+    }
+    if !crate::ingestion::lcir_enabled(pool).await {
+        return None;
+    }
+    Some(TexSourceJob { entry_id, arxiv_id: id })
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -500,6 +535,7 @@ mod tests {
         assert_eq!(outcome.status, 200);
         assert!(outcome.mutated);
         assert!(outcome.pdf_job.is_none());
+        assert!(outcome.tex_source_job.is_none(), "識別子なしに TeX ジョブは出ない");
         assert_eq!(outcome.response["status"], "created");
         assert_eq!(outcome.response["title"], "No Identifier Page");
         assert!(outcome.response.get("pdf").is_none());
@@ -508,6 +544,29 @@ mod tests {
         // 識別子なしページは重複判定対象外のため 2 件目が作られる（v1 仕様）。
         let outcome2 = handle_clip(&pool, &req).await;
         assert_eq!(outcome2.response["status"], "created");
+    }
+
+    /// LCIR Phase 4 自動化: TeX ソースジョブは「arxiv_id あり + `lcir.enabled` ON」の
+    /// ときだけ発行される（OFF のユーザーのクリップごとに e-print を落とさない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tex_source_job_requires_arxiv_id_and_lcir_flag(pool: SqlitePool) {
+        let mut req = clip_req("https://arxiv.org/abs/2301.00001");
+        req.arxiv_id = Some("arXiv:2301.00001v2".to_string());
+
+        // フラグ OFF → 出ない。
+        assert!(derive_tex_source_job(&pool, &req, 1).await.is_none());
+
+        // フラグ ON → 正規化済み ID（プレフィックス・版サフィックス除去）でジョブが出る。
+        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let job = derive_tex_source_job(&pool, &req, 1).await.expect("job");
+        assert_eq!(job.entry_id, 1);
+        assert_eq!(job.arxiv_id, "2301.00001");
+
+        // arxiv_id なし → フラグ ON でも出ない。
+        let plain = clip_req("https://example.com");
+        assert!(derive_tex_source_job(&pool, &plain, 1).await.is_none());
     }
 }
 

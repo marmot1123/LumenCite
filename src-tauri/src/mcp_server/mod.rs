@@ -1353,14 +1353,18 @@ fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &s
                 }
             }
             let pdf_job = outcome.pdf_job.clone();
+            let tex_source_job = outcome.tex_source_job.clone();
             let _ = req.respond(with_cors(
                 Response::from_string(outcome.response.to_string())
                     .with_status_code(outcome.status)
                     .with_header(json_ct()),
             ));
-            // PDF ダウンロードは応答後に非同期実行（serve loop を塞がない）
+            // PDF / TeX ソースのダウンロードは応答後に非同期実行（serve loop を塞がない）
             if let Some(job) = pdf_job {
                 spawn_pdf_job(deps, job);
+            }
+            if let Some(job) = tex_source_job {
+                spawn_tex_source_job(deps, job);
             }
         }
         Route::Rpc => {
@@ -1469,6 +1473,57 @@ fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
             }
             Err(e) => {
                 eprintln!("clipper: PDF download failed for entry {}: {e}", job.entry_id);
+            }
+        }
+    });
+}
+
+/// クリップ後の arXiv TeX ソース自動取得 + LCIR 構築（LCIR Phase 4 の自動化・best-effort）。
+///
+/// ジョブは `lcir.enabled` ON のときだけ発行される（`clipper::derive_tex_source_job`）。
+/// 失敗はログのみでクリップ自体は成功扱い（PDF ジョブと同じ契約）。ビルドは内部でも
+/// フラグを再確認するので、発行後に OFF へ切り替わっても DB には書かない。
+fn spawn_tex_source_job(deps: &ServerDeps, job: clipper::TexSourceJob) {
+    let pool = deps.pool.clone();
+    let app_data_dir = deps.app_data_dir.clone();
+    let app = deps.app.clone();
+    tauri::async_runtime::spawn(async move {
+        use tauri::Emitter;
+        let url = format!("https://arxiv.org/e-print/{}", job.arxiv_id);
+        match crate::download::download_and_attach_arxiv_source(
+            &pool,
+            &app_data_dir,
+            job.entry_id,
+            &job.arxiv_id,
+            &url,
+            crate::download::DownloadCaps::default(),
+        )
+        .await
+        {
+            Ok(att) => {
+                eprintln!(
+                    "clipper: attached TeX source {} to entry {}",
+                    att.file_name, job.entry_id
+                );
+                match crate::ingestion::build_lcir_for_attachment(&pool, &app_data_dir, att.id)
+                    .await
+                {
+                    Ok(r) => {
+                        eprintln!("clipper: LCIR build for attachment {}: {}", att.id, r.message)
+                    }
+                    Err(e) => {
+                        eprintln!("clipper: LCIR build failed for attachment {}: {e}", att.id)
+                    }
+                }
+                if let Some(app) = &app {
+                    let _ = app.emit("entries-changed", ());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "clipper: TeX source download failed for entry {}: {e}",
+                    job.entry_id
+                );
             }
         }
     });
