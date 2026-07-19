@@ -1209,12 +1209,15 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 /// リクエストの行き先。`route()` は pure なので単体テストできる。
 #[derive(Debug, PartialEq)]
 enum Route {
-    /// `OPTIONS /clipper` — CORS preflight（**認証不要**: preflight は Authorization を持たない）
+    /// `OPTIONS /clipper`・`OPTIONS /clipper/complete` — CORS preflight
+    /// （**認証不要**: preflight は Authorization を持たない）
     ClipperPreflight,
     /// `GET /clipper` — ペアリング疎通確認（認証必須）
     ClipperPing,
     /// `POST /clipper` — クリップ本体（認証必須 + `clipper.enabled`）
     Clip,
+    /// `POST /clipper/complete` — 重複エントリの欠落補完（認証必須 + `clipper.enabled`）
+    ClipperComplete,
     /// `POST <その他>` — 既存の JSON-RPC（`/mcp` ほかパス不問。後方互換）
     Rpc,
     /// それ以外のメソッド → 405
@@ -1226,12 +1229,13 @@ fn route(method: &tiny_http::Method, path: &str) -> Route {
     // クエリ・末尾スラッシュを無視してパスを正規化する
     let path = path.split('?').next().unwrap_or(path);
     let path = if path.len() > 1 { path.trim_end_matches('/') } else { path };
-    let is_clipper = path == "/clipper";
-    match (method, is_clipper) {
-        (Method::Options, true) => Route::ClipperPreflight,
-        (Method::Get, true) => Route::ClipperPing,
-        (Method::Post, true) => Route::Clip,
-        (Method::Post, false) => Route::Rpc,
+    // `/clipper/complete` は catch-all の `(Post, _) => Rpc` より**前**に置く。
+    match (method, path) {
+        (Method::Options, "/clipper" | "/clipper/complete") => Route::ClipperPreflight,
+        (Method::Get, "/clipper") => Route::ClipperPing,
+        (Method::Post, "/clipper") => Route::Clip,
+        (Method::Post, "/clipper/complete") => Route::ClipperComplete,
+        (Method::Post, _) => Route::Rpc,
         _ => Route::MethodNotAllowed,
     }
 }
@@ -1247,6 +1251,9 @@ fn cors_headers(origin: Option<&str>) -> Vec<tiny_http::Header> {
         h(b"Access-Control-Allow-Origin", origin.as_bytes()),
         h(b"Access-Control-Allow-Methods", b"GET, POST, OPTIONS"),
         h(b"Access-Control-Allow-Headers", b"Authorization, Content-Type"),
+        // Private Network Access: 拡張 → 127.0.0.1（loopback）への preflight を、
+        // 将来 Chrome が PNA を強制しても通す（現状は host_permissions で免除されるが無害）。
+        h(b"Access-Control-Allow-Private-Network", b"true"),
         h(b"Access-Control-Max-Age", b"600"),
     ]
 }
@@ -1367,6 +1374,54 @@ fn handle_http_request(mut req: tiny_http::Request, deps: &ServerDeps, token: &s
                 spawn_tex_source_job(deps, job);
             }
         }
+        Route::ClipperComplete => {
+            if !tauri::async_runtime::block_on(clipper::clipper_enabled(&deps.pool)) {
+                let body = json!({ "status": "error", "code": "clipper_disabled" });
+                let _ = req.respond(with_cors(
+                    Response::from_string(body.to_string())
+                        .with_status_code(403)
+                        .with_header(json_ct()),
+                ));
+                return;
+            }
+            let body = match read_body(&mut req) {
+                Ok(b) => b,
+                Err((code, msg)) => {
+                    let _ = req
+                        .respond(with_cors(Response::from_string(msg).with_status_code(code)));
+                    return;
+                }
+            };
+            let complete_req: clipper::CompleteRequest = match serde_json::from_str(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    let body = json!({ "status": "error", "code": "bad_request", "message": e.to_string() });
+                    let _ = req.respond(with_cors(
+                        Response::from_string(body.to_string())
+                            .with_status_code(400)
+                            .with_header(json_ct()),
+                    ));
+                    return;
+                }
+            };
+            // handle_complete は DB のみ（欠落再検証 + 設定保存）なので block_on で足りる。
+            // 実ダウンロードは応答後に spawn するジョブが担う（PDF ジョブと同じ契約）。
+            let outcome =
+                tauri::async_runtime::block_on(clipper::handle_complete(&deps.pool, &complete_req));
+            let pdf_job = outcome.pdf_job.clone();
+            let tex_source_job = outcome.tex_source_job.clone();
+            let _ = req.respond(with_cors(
+                Response::from_string(outcome.response.to_string())
+                    .with_status_code(outcome.status)
+                    .with_header(json_ct()),
+            ));
+            if let Some(job) = pdf_job {
+                spawn_pdf_job(deps, job);
+            }
+            if let Some(job) = tex_source_job {
+                spawn_tex_source_job(deps, job);
+            }
+        }
         Route::Rpc => {
             let body = match read_body(&mut req) {
                 Ok(b) => b,
@@ -1441,6 +1496,26 @@ fn read_body(req: &mut tiny_http::Request) -> Result<String, (u16, &'static str)
     Ok(body)
 }
 
+/// 同一エントリへの PDF ダウンロードが同時に走らないようにする in-flight 集合。
+///
+/// 欠落補完の `plan_completion`（PDF なし判定）は `spawn_pdf_job` のダウンロード開始と
+/// 非アトミックなので、同じ論文を複数タブ / 連打で重複クリップすると、両リクエストとも
+/// 「PDF なし」と見て 2 本の PDF ジョブを出し得る。`download_and_attach` は既存 PDF を
+/// dedup せず別名で積む（`create_unique_file`）ため、放置すると同一エントリに PDF が
+/// 二重添付される。エントリ単位で 1 本に絞ることでこれを防ぐ（TeX は上書き契約なので不要）。
+static PDF_JOBS_IN_FLIGHT: std::sync::Mutex<std::collections::BTreeSet<i64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// [`PDF_JOBS_IN_FLIGHT`] からエントリ id を Drop で必ず外す（早期 return / panic でも）。
+struct PdfJobGuard(i64);
+impl Drop for PdfJobGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = PDF_JOBS_IN_FLIGHT.lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
 /// PDF ダウンロードジョブを応答後に非同期実行する。成功したら `entries-changed` で
 /// UI に反映する（添付は .bib の内容に影響しないため sync はキックしない）。
 /// 失敗（ペイウォール・サイズ超過等）はログのみ — エントリ作成は既に成功している。
@@ -1450,6 +1525,21 @@ fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
     let app = deps.app.clone();
     tauri::async_runtime::spawn(async move {
         use tauri::Emitter;
+        // 同一エントリの PDF ジョブが既に走っていれば二重添付を避けてスキップ。
+        {
+            let mut set = match PDF_JOBS_IN_FLIGHT.lock() {
+                Ok(s) => s,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !set.insert(job.entry_id) {
+                eprintln!(
+                    "clipper: PDF job for entry {} already in flight; skipping duplicate",
+                    job.entry_id
+                );
+                return;
+            }
+        }
+        let _in_flight = PdfJobGuard(job.entry_id);
         match crate::download::download_and_attach(
             &pool,
             &app_data_dir,
@@ -1578,9 +1668,16 @@ mod tests {
         assert_eq!(route(&Method::Options, "/clipper"), Route::ClipperPreflight);
         assert_eq!(route(&Method::Get, "/clipper"), Route::ClipperPing);
         assert_eq!(route(&Method::Post, "/clipper"), Route::Clip);
+        // 欠落補完エンドポイント（catch-all Rpc より前に一致する）
+        assert_eq!(route(&Method::Post, "/clipper/complete"), Route::ClipperComplete);
+        assert_eq!(route(&Method::Options, "/clipper/complete"), Route::ClipperPreflight);
         // 末尾スラッシュ・クエリは無視する
         assert_eq!(route(&Method::Post, "/clipper/"), Route::Clip);
+        assert_eq!(route(&Method::Post, "/clipper/complete/"), Route::ClipperComplete);
+        assert_eq!(route(&Method::Post, "/clipper/complete?x=1"), Route::ClipperComplete);
         assert_eq!(route(&Method::Get, "/clipper?x=1"), Route::ClipperPing);
+        // /clipper/complete は POST 専用（GET は 405）
+        assert_eq!(route(&Method::Get, "/clipper/complete"), Route::MethodNotAllowed);
         // 既存 JSON-RPC: POST は任意パスで従来どおり
         assert_eq!(route(&Method::Post, "/mcp"), Route::Rpc);
         assert_eq!(route(&Method::Post, "/"), Route::Rpc);

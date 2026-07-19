@@ -21,8 +21,30 @@ export interface ClipResponse {
   title?: string;
   /** created かつ PDF ダウンロードを開始したとき "downloading" */
   pdf?: string;
+  /** 重複時、欠落があり初回確認を要する（アプリ側設定が未設定）。["pdf","tex"] の部分集合。 */
+  confirm_missing?: string[];
+  /** 重複時、設定 "1" で自動補完を開始した欠落。["pdf","tex"] の部分集合。 */
+  completing?: string[];
   code?: string;
   message?: string;
+}
+
+/** POST /clipper/complete の JSON 応答。 */
+export interface CompleteResponse {
+  status: "completing" | "error";
+  entry_id?: number;
+  completing?: string[];
+  remembered?: boolean;
+  code?: string;
+  message?: string;
+}
+
+/** confirm ポップアップに渡す保留中の欠落補完（chrome.storage.session に置く）。 */
+export interface PendingMissing {
+  entry_id: number;
+  title: string;
+  /** ["pdf"] / ["tex"] / ["pdf","tex"] のいずれか。 */
+  missing: string[];
 }
 
 /** 接続コード（lc1.…）から復元した接続設定。chrome.storage.local に保存する。 */

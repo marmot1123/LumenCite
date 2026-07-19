@@ -312,19 +312,10 @@ pub async fn handle_clip(pool: &SqlitePool, req: &ClipRequest) -> ClipOutcome {
             }
             ClipOutcome { response, status: 200, mutated: true, pdf_job, tex_source_job }
         }
-        // 重複クリップは再ダウンロードしない（PDF ジョブと同じ契約。TeX ソースの
-        // 再取得は詳細パネルのボタンから明示的に行える）。
-        Ok(ClipResult::Duplicate { entry_id, title }) => ClipOutcome {
-            response: json!({
-                "status": "duplicate",
-                "entry_id": entry_id,
-                "title": title,
-            }),
-            status: 200,
-            mutated: false,
-            pdf_job: None,
-            tex_source_job: None,
-        },
+        // 重複クリップ: 欠落があれば補完を提案する（[`duplicate_outcome`]）。
+        Ok(ClipResult::Duplicate { entry_id, title }) => {
+            duplicate_outcome(pool, entry_id, title).await
+        }
         Err(e) => ClipOutcome {
             response: json!({ "status": "error", "code": "db_error", "message": e.to_string() }),
             status: 500,
@@ -354,6 +345,171 @@ async fn derive_tex_source_job(
         return None;
     }
     Some(TexSourceJob { entry_id, arxiv_id: id })
+}
+
+// ─── 重複クリップ時の欠落補完（PDF / TeX ソース）─────────────────────────────
+
+/// エントリに欠けている取得物。
+#[derive(Debug, Default, PartialEq)]
+pub struct MissingSet {
+    pub pdf: bool,
+    pub tex: bool,
+}
+
+impl MissingSet {
+    fn is_empty(&self) -> bool {
+        !self.pdf && !self.tex
+    }
+
+    /// JSON 応答に載せるラベル（拡張のポップアップ表示・順序は pdf→tex）。
+    fn labels(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.pdf {
+            v.push("pdf");
+        }
+        if self.tex {
+            v.push("tex");
+        }
+        v
+    }
+}
+
+/// 欠落と、それを埋めるための応答後ジョブ。
+#[derive(Debug, Default)]
+pub struct CompletionPlan {
+    pub missing: MissingSet,
+    pub pdf_job: Option<PdfJob>,
+    pub tex_source_job: Option<TexSourceJob>,
+}
+
+/// エントリの `arxiv_id` を唯一の導出源に、PDF / TeX ソースの欠落と対応ジョブを計算する。
+///
+/// - PDF 欠落 = mime `%pdf%` の添付なし（URL は arxiv_id から導出）。
+/// - TeX 欠落 = mime `application/gzip` の添付なし **かつ** `lcir.enabled` ON。
+///
+/// `citation_pdf_url` 由来の補完は対象外（arXiv 前提）。エントリが無い / ゴミ箱 /
+/// arxiv_id 無しなら空プラン。全経路（クリップ重複 / `/clipper/complete`）で共有する。
+async fn plan_completion(pool: &SqlitePool, entry_id: i64) -> Result<CompletionPlan, sqlx::Error> {
+    // ゴミ箱のエントリは対象外（confirm 後に trash された TOCTOU も空プランで弾く）。
+    let arxiv_raw: Option<String> =
+        sqlx::query_scalar("SELECT arxiv_id FROM entries WHERE id = ? AND deleted_at IS NULL")
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let arxiv_id = arxiv_raw
+        .as_deref()
+        .map(crate::metadata::normalize_arxiv_id)
+        .filter(|s| !s.is_empty());
+    let Some(arxiv_id) = arxiv_id else {
+        return Ok(CompletionPlan::default());
+    };
+
+    let has_pdf: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM attachments WHERE entry_id = ? AND mime_type LIKE '%pdf%')",
+    )
+    .bind(entry_id)
+    .fetch_one(pool)
+    .await?;
+    let has_tex: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM attachments WHERE entry_id = ? AND mime_type = ?)",
+    )
+    .bind(entry_id)
+    .bind(crate::ingestion::TEX_SOURCE_MIME)
+    .fetch_one(pool)
+    .await?;
+
+    let pdf = !has_pdf;
+    let tex = !has_tex && crate::ingestion::lcir_enabled(pool).await;
+    let pdf_job = pdf.then(|| PdfJob {
+        entry_id,
+        url: format!("https://arxiv.org/pdf/{arxiv_id}"),
+    });
+    let tex_source_job = tex.then(|| TexSourceJob { entry_id, arxiv_id: arxiv_id.clone() });
+    Ok(CompletionPlan { missing: MissingSet { pdf, tex }, pdf_job, tex_source_job })
+}
+
+/// 重複クリップの応答を組み立てる（DB のみ・ネットワークに出ないので単体テスト可）。
+///
+/// 欠落があり設定 "1" なら即補完（`completing` + ジョブ）、未設定なら拡張に確認を促す
+/// （`confirm_missing`・ここでは何もしない）。欠落なしなら従来どおり副作用ゼロの重複応答。
+async fn duplicate_outcome(pool: &SqlitePool, entry_id: i64, title: String) -> ClipOutcome {
+    let plan = plan_completion(pool, entry_id).await.unwrap_or_else(|e| {
+        eprintln!("clipper: completion planning failed for entry {entry_id}: {e}");
+        CompletionPlan::default()
+    });
+    let mut response = json!({
+        "status": "duplicate",
+        "entry_id": entry_id,
+        "title": title,
+    });
+    let (pdf_job, tex_source_job) = if plan.missing.is_empty() {
+        (None, None)
+    } else if complete_missing_enabled(pool).await {
+        response["completing"] = json!(plan.missing.labels());
+        (plan.pdf_job, plan.tex_source_job)
+    } else {
+        response["confirm_missing"] = json!(plan.missing.labels());
+        (None, None)
+    };
+    ClipOutcome { response, status: 200, mutated: false, pdf_job, tex_source_job }
+}
+
+/// `clipper.complete_missing` の現在値（"1" = 確認なしで自動補完）。
+pub async fn complete_missing_enabled(pool: &SqlitePool) -> bool {
+    crate::db::settings::get_setting(pool, crate::db::settings::CLIPPER_COMPLETE_MISSING_KEY)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1")
+}
+
+/// `POST /clipper/complete` のリクエストボディ。
+#[derive(Debug, Default, Deserialize)]
+pub struct CompleteRequest {
+    pub entry_id: i64,
+    /// true なら以後の確認を省く（`clipper.complete_missing="1"` を保存）。
+    #[serde(default)]
+    pub remember: bool,
+}
+
+/// `POST /clipper/complete` のハンドラ（DB のみ・ジョブは HTTP 層が応答後に spawn）。
+///
+/// 欠落をアプリ側で**再検証**してからジョブを組み立てる。`remember` なら設定を保存する。
+pub async fn handle_complete(pool: &SqlitePool, req: &CompleteRequest) -> ClipOutcome {
+    if req.remember {
+        if let Err(e) = crate::db::settings::set_setting(
+            pool,
+            crate::db::settings::CLIPPER_COMPLETE_MISSING_KEY,
+            "1",
+        )
+        .await
+        {
+            eprintln!("clipper: failed to persist complete_missing: {e}");
+        }
+    }
+    match plan_completion(pool, req.entry_id).await {
+        Ok(plan) => ClipOutcome {
+            response: json!({
+                "status": "completing",
+                "entry_id": req.entry_id,
+                "completing": plan.missing.labels(),
+                "remembered": req.remember,
+            }),
+            status: 200,
+            mutated: false,
+            pdf_job: plan.pdf_job,
+            tex_source_job: plan.tex_source_job,
+        },
+        Err(e) => ClipOutcome {
+            response: json!({ "status": "error", "code": "db_error", "message": e.to_string() }),
+            status: 500,
+            mutated: false,
+            pdf_job: None,
+            tex_source_job: None,
+        },
+    }
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -567,6 +723,122 @@ mod tests {
         // arxiv_id なし → フラグ ON でも出ない。
         let plain = clip_req("https://example.com");
         assert!(derive_tex_source_job(&pool, &plain, 1).await.is_none());
+    }
+
+    // ── 欠落補完（plan_completion / duplicate_outcome / handle_complete）──────
+
+    async fn arxiv_entry(pool: &SqlitePool, arxiv: &str) -> i64 {
+        create_entry(pool, &EntryInput {
+            title: "Paper".to_string(),
+            entry_type: "preprint".to_string(),
+            arxiv_id: Some(arxiv.to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn add_att(pool: &SqlitePool, entry_id: i64, name: &str, mime: &str) {
+        crate::db::attachments::add_attachment(
+            pool,
+            entry_id,
+            &format!("attachments/{entry_id}/{name}"),
+            name,
+            mime,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn plan_completion_detects_missing_gated_by_lcir(pool: SqlitePool) {
+        let id = arxiv_entry(&pool, "arXiv:2301.00001v2").await;
+
+        // 添付なし + LCIR OFF → PDF だけ欠落（tex は lcir.enabled が要る）。URL は正規化 ID。
+        let plan = plan_completion(&pool, id).await.unwrap();
+        assert_eq!(plan.missing, MissingSet { pdf: true, tex: false });
+        assert_eq!(plan.pdf_job.as_ref().unwrap().url, "https://arxiv.org/pdf/2301.00001");
+        assert!(plan.tex_source_job.is_none());
+
+        // LCIR ON → tex も欠落に（正規化済み arxiv_id でジョブ）。
+        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1").await.unwrap();
+        let plan = plan_completion(&pool, id).await.unwrap();
+        assert_eq!(plan.missing, MissingSet { pdf: true, tex: true });
+        assert_eq!(plan.tex_source_job.unwrap().arxiv_id, "2301.00001");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn plan_completion_skips_present_attachments(pool: SqlitePool) {
+        let id = arxiv_entry(&pool, "2301.00002").await;
+        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1").await.unwrap();
+        add_att(&pool, id, "p.pdf", "application/pdf").await;
+        add_att(&pool, id, "s.gz", "application/gzip").await;
+        let plan = plan_completion(&pool, id).await.unwrap();
+        assert!(plan.missing.is_empty());
+        assert!(plan.pdf_job.is_none() && plan.tex_source_job.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn plan_completion_empty_without_arxiv_missing_or_trashed(pool: SqlitePool) {
+        // arxiv 無し → 空。
+        let no_arxiv = create_entry(&pool, &EntryInput {
+            title: "x".to_string(), entry_type: "article".to_string(), ..Default::default()
+        }).await.unwrap().id;
+        assert!(plan_completion(&pool, no_arxiv).await.unwrap().missing.is_empty());
+        // 存在しない id → 空。
+        assert!(plan_completion(&pool, 99999).await.unwrap().missing.is_empty());
+        // ゴミ箱 → 空（confirm 後に trash された TOCTOU を弾く）。
+        let trashed = arxiv_entry(&pool, "2301.00003").await;
+        crate::db::entries::trash_entry(&pool, trashed).await.unwrap();
+        assert!(plan_completion(&pool, trashed).await.unwrap().missing.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn duplicate_outcome_confirm_then_completing(pool: SqlitePool) {
+        let id = arxiv_entry(&pool, "2301.00009").await; // PDF 欠落・LCIR OFF
+
+        // 設定未設定 → confirm_missing（ジョブは出さない）。
+        let outcome = duplicate_outcome(&pool, id, "T".to_string()).await;
+        assert_eq!(outcome.response["status"], "duplicate");
+        assert_eq!(outcome.response["confirm_missing"], json!(["pdf"]));
+        assert!(outcome.response.get("completing").is_none());
+        assert!(outcome.pdf_job.is_none(), "確認前はジョブを出さない");
+
+        // 設定 "1" → 即補完（completing + pdf_job）。
+        crate::db::settings::set_setting(&pool, crate::db::settings::CLIPPER_COMPLETE_MISSING_KEY, "1").await.unwrap();
+        let outcome = duplicate_outcome(&pool, id, "T".to_string()).await;
+        assert_eq!(outcome.response["completing"], json!(["pdf"]));
+        assert!(outcome.response.get("confirm_missing").is_none());
+        assert_eq!(outcome.pdf_job.expect("pdf job").entry_id, id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn duplicate_outcome_no_missing_is_side_effect_free(pool: SqlitePool) {
+        let id = arxiv_entry(&pool, "2301.00010").await;
+        add_att(&pool, id, "p.pdf", "application/pdf").await; // PDF あり・LCIR OFF → 欠落なし
+        let outcome = duplicate_outcome(&pool, id, "T".to_string()).await;
+        assert_eq!(outcome.response["status"], "duplicate");
+        assert!(outcome.response.get("confirm_missing").is_none());
+        assert!(outcome.response.get("completing").is_none());
+        assert!(outcome.pdf_job.is_none() && outcome.tex_source_job.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn handle_complete_verifies_and_remembers(pool: SqlitePool) {
+        let id = arxiv_entry(&pool, "2301.00011").await;
+        // remember=true → 設定保存 + jobs（PDF 欠落）。
+        let outcome = handle_complete(&pool, &CompleteRequest { entry_id: id, remember: true }).await;
+        assert_eq!(outcome.response["status"], "completing");
+        assert_eq!(outcome.response["completing"], json!(["pdf"]));
+        assert_eq!(outcome.response["remembered"], json!(true));
+        assert!(outcome.pdf_job.is_some());
+        assert!(complete_missing_enabled(&pool).await, "remember で設定が保存される");
+
+        // 存在しない id → 空 completing・ジョブなし（TOCTOU で消えた）。
+        let outcome = handle_complete(&pool, &CompleteRequest { entry_id: 99999, remember: false }).await;
+        assert_eq!(outcome.response["completing"], json!([]));
+        assert!(outcome.pdf_job.is_none());
     }
 }
 

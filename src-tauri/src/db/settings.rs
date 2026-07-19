@@ -60,6 +60,10 @@ pub const MCP_SERVER_WRITE_ENABLED_KEY: &str = "mcp_server.write_enabled";
 /// `mcp_server.write_enabled` とは独立の同意面としてリクエスト毎に評価する。
 pub const CLIPPER_ENABLED_KEY: &str = "clipper.enabled";
 
+/// クリップ重複時に欠落（PDF / TeX ソース）を確認なしで自動補完するフラグ（"1" で自動、
+/// 未設定なら初回確認）。判断は常にアプリ側で行い、拡張と AddSheet で共有する。
+pub const CLIPPER_COMPLETE_MISSING_KEY: &str = "clipper.complete_missing";
+
 /// OCR 用 LLM プロバイダ / モデル（未設定なら chat の provider / model にフォールバック）。
 pub const LLM_OCR_PROVIDER_KEY: &str = "llm.ocr_provider";
 pub const LLM_OCR_MODEL_KEY: &str = "llm.ocr_model";

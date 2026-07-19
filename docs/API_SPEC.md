@@ -485,6 +485,7 @@ type FulltextResult = {
 | `get_lcir_document` | `attachment_id: i64` | `LcirDocument \| null` |
 | `build_missing_lcir` | — | `LcirBatchResult` |
 | `rebuild_outdated_lcir` | — | `LcirBatchResult` |
+| `fetch_missing_arxiv_sources` | — | `{total, fetched, built, pdf_only, failed}` — ゴミ箱以外で arxiv_id を持ち gzip 添付が無いエントリの e-print を直列取得（3 秒スロットル）して LCIR 構築。多重起動ガード + `tex-fetch-progress {done,total}` 進捗イベント + 完了時 `entries-changed`。`lcir.enabled` OFF は全 0 |
 | `search_lcir_nodes` | `query, collection_id?, tag_id?, view?` | `NodeFtsHit[]` |
 | `get_lcir_node_region` | `node_id: i64` | `SourceFragment \| null` |
 | `get_lcir_enabled` / `set_lcir_enabled` | `—` / `enabled: bool` | `bool` / `()` |
@@ -745,9 +746,10 @@ Chrome 拡張から起動中アプリへエントリを作成するローカル 
 
 | ルート | 認証 | 説明 |
 |--------|------|------|
-| `OPTIONS /clipper` | 不要 | CORS preflight。`Origin` が `chrome-extension://` で始まる場合のみ `Access-Control-Allow-*` を返す（204）。**認証チェックより前に処理**（preflight は Authorization ヘッダを持たないため） |
+| `OPTIONS /clipper`・`OPTIONS /clipper/complete` | 不要 | CORS preflight。`Origin` が `chrome-extension://` で始まる場合のみ `Access-Control-Allow-*`（`Access-Control-Allow-Private-Network: true` 含む）を返す（204）。**認証チェックより前に処理**（preflight は Authorization ヘッダを持たないため） |
 | `GET /clipper` | Bearer | ペアリング疎通確認。`{"ok":true,"app":"LumenCite","version":"..."}` |
 | `POST /clipper` | Bearer | クリップ本体。`clipper.enabled` をリクエスト毎に評価（無効なら 403 `{"status":"error","code":"clipper_disabled"}`） |
+| `POST /clipper/complete` | Bearer | 重複エントリの欠落補完。同ゲート。`{entry_id, remember?}`（下記）。catch-all の JSON-RPC より前にルーティングする |
 
 ```ts
 // POST /clipper リクエストボディ
@@ -770,13 +772,32 @@ type ClipResponse = {
   status: "created" | "duplicate";
   entry_id: number;
   title: string;
-  pdf?: "downloading";     // created かつ PDF URL があるとき。添付は応答後に非同期実行
+  pdf?: "downloading";       // created かつ PDF URL があるとき。添付は応答後に非同期実行
+  // duplicate かつ欠落があるとき（arXiv 前提・["pdf"]/["tex"]/両方）:
+  confirm_missing?: string[]; // clipper.complete_missing 未設定 → 拡張が確認ポップアップを出す
+  completing?: string[];      // clipper.complete_missing=="1" → 応答後に補完ジョブを spawn 済み
+};
+
+// POST /clipper/complete リクエストボディ
+type CompleteRequest = {
+  entry_id: number;
+  remember?: boolean;        // true なら clipper.complete_missing="1" を保存
+};
+
+// POST /clipper/complete 200 応答
+type CompleteResponse = {
+  status: "completing";
+  entry_id: number;
+  completing: string[];      // 実際に補完を開始した欠落（["pdf"]/["tex"]/両方・空なら対象なし）
+  remembered: boolean;
 };
 ```
 
 **サーバー側フロー:** `find_duplicate_entry`（DOI/arXiv/ISBN）→ 重複なら `duplicate` 応答（作成も PDF 添付もしない）→ 識別子があれば `metadata::fetch_by_doi/arxiv/isbn` でメタデータ解決 → `create_entry` → PDF URL（明示 or arXiv 導出）があれば**応答後に** `download_and_attach` を spawn（50MB 上限・30 秒タイムアウト・先頭チャンクの `%PDF-` マジック検証。失敗してもエントリは残る）。作成・添付の成功時は `.bib` 同期キック＋ `entries-changed` を発火。
 
-**TeX ソース自動取得（LCIR Phase 4 の自動化）:** arXiv クリップ（arxiv_id あり）で **`lcir.enabled` が ON のときだけ**、応答後に `spawn_tex_source_job` が `download_and_attach_arxiv_source` → `build_lcir_for_attachment` を best-effort 実行する（`clipper::derive_tex_source_job` がジョブ発行時にフラグを判定）。OFF のユーザーのクリップごとに e-print を落とすことはしない。重複クリップでは再取得しない（再取得は詳細パネルのボタンから）。失敗はログのみでクリップ成功は維持（PDF ジョブと同じ契約）。
+**TeX ソース自動取得（LCIR Phase 4 の自動化）:** arXiv クリップ（arxiv_id あり）で **`lcir.enabled` が ON のときだけ**、応答後に `spawn_tex_source_job` が `download_and_attach_arxiv_source` → `build_lcir_for_attachment` を best-effort 実行する（`clipper::derive_tex_source_job` がジョブ発行時にフラグを判定）。OFF のユーザーのクリップごとに e-print を落とすことはしない。失敗はログのみでクリップ成功は維持（PDF ジョブと同じ契約）。
+
+**重複クリップ時の欠落補完:** 重複エントリに PDF / TeX ソースが欠けていれば補完する。欠落は `plan_completion(pool, entry_id)` がエントリの `arxiv_id` を唯一の導出源に判定する（PDF 欠落 = mime `%pdf%` 添付なし ／ TeX 欠落 = mime `application/gzip` 添付なし **かつ** `lcir.enabled` ON ／ ゴミ箱は `deleted_at IS NULL` で対象外）。`clipper.complete_missing=="1"` なら重複応答で即 `completing` を返しジョブを spawn、未設定なら `confirm_missing` を返す（この時点では何もしない）。`POST /clipper/complete` はアプリ側で欠落を**再検証**してから `spawn_pdf_job` / `spawn_tex_source_job` を発行し、`remember` なら設定を保存する。PDF URL・arxiv_id はエントリの識別子から再導出する（`citation_pdf_url` 由来の補完は対象外 = arXiv 前提）。拡張の確認ポップアップは表示だけを担い、`/clipper/complete` 呼び出しと popup 状態管理は拡張の service worker が持つ（ポップアップは閉じても補完が中断しない設計）。
 
 **メタデータ解決の規則:**
 - 試行順は DOI → arXiv → ISBN（各 10 秒タイムアウト）。ただし **arXiv の DataCite DOI（`10.48550/…`）は CrossRef に無い**ため、arxiv_id があるときは arXiv を先に試す。1 つ失敗しても次の識別子へカスケードする
@@ -799,6 +820,8 @@ type ClipperStatusInfo = {
 | `get_clipper_status` | — | `Result<ClipperStatusInfo>` |
 | `set_clipper_enabled` | `enabled: bool` | `Result<ClipperStatusInfo>` — 有効化時はサーバー未起動なら起動。無効化時、`mcp_server.enabled` も off ならサーバー停止 |
 | `get_clipper_connect_code` | — | `Result<String>` — 拡張に貼る接続コード。形式は `lc1.` + base64url(`{"v":1,"port":<u16>,"token":"<48hex>"}`)。トークン再生成（`regenerate_mcp_server_token`）でペアリングは無効化される |
+| `get_clipper_complete_missing` | — | `Result<bool>` — `clipper.complete_missing == "1"`。AddSheet が確認 vs 自動を判定する |
+| `set_clipper_complete_missing` | `enabled: bool` | `Result<()>` — AddSheet の「次回以降は確認しない」で `"1"` を保存 |
 
 ### OCR（v0.2.0 追加）
 

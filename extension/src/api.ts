@@ -1,6 +1,6 @@
 // LumenCite ローカル API（/clipper）との通信と設定の保存。
 
-import type { ClipPayload, ClipResponse, ClipperConfig } from "./types.js";
+import type { ClipPayload, ClipResponse, CompleteResponse, ClipperConfig } from "./types.js";
 
 const STORAGE_KEY = "clipperConfig";
 
@@ -62,6 +62,38 @@ export async function clip(cfg: ClipperConfig, payload: ClipPayload): Promise<Cl
     let body: ClipResponse;
     try {
       body = (await resp.json()) as ClipResponse;
+    } catch {
+      body = { status: "error", message: `HTTP ${resp.status}` };
+    }
+    return { kind: "response", status: resp.status, body };
+  } catch {
+    return { kind: "unreachable" };
+  }
+}
+
+/** POST /clipper/complete の結果。fetch 不能は kind: "unreachable"。 */
+export type CompleteOutcome =
+  | { kind: "response"; status: number; body: CompleteResponse }
+  | { kind: "unreachable" };
+
+/** 重複クリップの欠落（PDF / TeX）補完を要求する。`remember` で以後の確認を省く。 */
+export async function complete(
+  cfg: ClipperConfig,
+  entryId: number,
+  remember: boolean,
+): Promise<CompleteOutcome> {
+  try {
+    const resp = await fetchWithTimeout(`${baseUrl(cfg)}/complete`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${cfg.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ entry_id: entryId, remember }),
+    });
+    let body: CompleteResponse;
+    try {
+      body = (await resp.json()) as CompleteResponse;
     } catch {
       body = { status: "error", message: `HTTP ${resp.status}` };
     }

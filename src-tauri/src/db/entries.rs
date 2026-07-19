@@ -1203,6 +1203,28 @@ pub async fn find_duplicate_entry(
     Ok(row.map(|(id,)| id))
 }
 
+/// ゴミ箱以外で `arxiv_id` を持ち、TeX ソース添付（mime `application/gzip`）が
+/// **無い**エントリを返す（`(entry_id, raw arxiv_id)`）。arXiv TeX ソース一括取得
+/// バッチ（`fetch_missing_arxiv_sources`）の対象抽出に使う。arxiv_id は生値を返し、
+/// 呼び出し側が `normalize_arxiv_id` で正規化する。
+pub async fn entries_missing_arxiv_source(
+    pool: &SqlitePool,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT e.id, e.arxiv_id FROM entries e
+         WHERE e.deleted_at IS NULL
+           AND e.arxiv_id IS NOT NULL AND TRIM(e.arxiv_id) <> ''
+           AND NOT EXISTS (
+                 SELECT 1 FROM attachments a
+                 WHERE a.entry_id = e.id AND a.mime_type = ?
+           )
+         ORDER BY e.id ASC",
+    )
+    .bind(crate::ingestion::TEX_SOURCE_MIME)
+    .fetch_all(pool)
+    .await
+}
+
 /// canonical 列（`doi/arxiv/isbn_canonical`）を持つ 3 つの識別子。列名・非UNIQUE索引名・
 /// best-effort UNIQUE 索引名を 1 か所で対応づける。
 const CANONICAL_IDENTIFIERS: &[(&str, &str)] = &[
@@ -3336,6 +3358,50 @@ mod tests {
         let hits = get_entries_filtered(&pool, None, None, None, &no).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "tex-only");
+    }
+
+    /// arXiv TeX ソース一括取得の対象抽出（`fetch_missing_arxiv_sources`）:
+    /// arxiv_id を持ち gzip（TeX ソース）添付が無い非ゴミ箱エントリだけを、生 arxiv_id 付きで返す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn entries_missing_arxiv_source_selects_right_targets(pool: SqlitePool) {
+        let arxiv = |id: &str, title: &str| EntryInput {
+            title: title.to_string(),
+            entry_type: "preprint".to_string(),
+            arxiv_id: Some(id.to_string()),
+            ..Default::default()
+        };
+        // A: arxiv + 添付なし → 対象
+        let a = create_entry(&pool, &arxiv("2101.00001", "a")).await.unwrap();
+        // B: arxiv + gzip 添付 → 対象外
+        let b = create_entry(&pool, &arxiv("2101.00002", "b")).await.unwrap();
+        crate::db::attachments::add_attachment(
+            &pool, b.id, &format!("attachments/{}/s.gz", b.id), "s.gz", "application/gzip",
+        ).await.unwrap();
+        // C: arxiv + PDF 添付のみ → 対象（PDF は TeX ソースではない）
+        let c = create_entry(&pool, &arxiv("2101.00003", "c")).await.unwrap();
+        crate::db::attachments::add_attachment(
+            &pool, c.id, &format!("attachments/{}/p.pdf", c.id), "p.pdf", "application/pdf",
+        ).await.unwrap();
+        // D: arxiv 無し → 対象外
+        create_entry(&pool, &EntryInput {
+            title: "d".to_string(), entry_type: "article".to_string(), ..Default::default()
+        }).await.unwrap();
+        // E: arxiv だがゴミ箱 → 対象外
+        let e = create_entry(&pool, &arxiv("2101.00005", "e")).await.unwrap();
+        trash_entry(&pool, e.id).await.unwrap();
+        // F: arxiv が空白のみ → 対象外（TRIM）
+        create_entry(&pool, &arxiv("   ", "f")).await.unwrap();
+
+        let targets = entries_missing_arxiv_source(&pool).await.unwrap();
+        let ids: Vec<i64> = targets.iter().map(|(id, _)| *id).collect();
+        assert_eq!(targets.len(), 2, "対象は A と C のみ: {ids:?}");
+        assert!(ids.contains(&a.id), "arxiv + 添付なし は対象");
+        assert!(ids.contains(&c.id), "arxiv + PDF のみ（gzip 無し）は対象");
+        assert!(!ids.contains(&b.id), "gzip 添付ありは対象外");
+        assert!(!ids.contains(&e.id), "ゴミ箱は対象外");
+        // 生 arxiv_id が返る（呼び出し側が normalize する）。
+        let a_row = targets.iter().find(|(id, _)| *id == a.id).unwrap();
+        assert_eq!(a_row.1, "2101.00001");
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -679,6 +680,19 @@ function DataTab() {
   useEffect(() => {
     invoke<boolean>("get_lcir_enabled").then(setLcirEnabled).catch(() => {});
   }, []);
+  // arXiv TeX 一括取得の進捗（数分かかるので「固まって見える」のを避ける）。
+  // 実行中フラグは共有 `busy` と別に持つ — 数分の実行中に他の Data タブ操作が busy を
+  // 書き換えても、このボタンの無効化・ラベルが誤って戻らないようにするため。
+  const [fetchTexRunning, setFetchTexRunning] = useState(false);
+  const [texProgress, setTexProgress] = useState<{ done: number; total: number } | null>(null);
+  useEffect(() => {
+    const un = listen<{ done: number; total: number }>("tex-fetch-progress", (e) =>
+      setTexProgress(e.payload),
+    );
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
 
   const errMsg = (e: unknown) =>
     typeof e === "string" ? e : (e as Error)?.message ?? String(e);
@@ -812,6 +826,46 @@ function DataTab() {
     }
   };
 
+  const handleFetchTex = async () => {
+    setFetchTexRunning(true);
+    setMessage(null);
+    setError(null);
+    setTexProgress(null);
+    try {
+      const r = await invoke<{
+        total: number;
+        fetched: number;
+        built: number;
+        pdf_only: number;
+        failed: number;
+      }>("fetch_missing_arxiv_sources");
+      if (r.total === 0) {
+        setMessage(t("settings.data.texFetchNone"));
+      } else {
+        setMessage(
+          t("settings.data.texFetchDone", {
+            total: r.total,
+            fetched: r.fetched,
+            built: r.built,
+            pdfOnly: r.pdf_only,
+            failed: r.failed,
+          }),
+        );
+      }
+    } catch (e) {
+      const s = errMsg(e);
+      // 多重起動ガードに弾かれたケースは専用の案内にする。
+      setError(
+        s.includes("already_running")
+          ? t("settings.data.texFetchRunning")
+          : t("settings.data.texFetchError", { error: s }),
+      );
+    } finally {
+      setFetchTexRunning(false);
+      setTexProgress(null);
+    }
+  };
+
   return (
     <>
       <Section title={t("settings.data.backup")} description={t("settings.data.backupDesc")}>
@@ -877,9 +931,19 @@ function DataTab() {
           <input type="checkbox" checked={lcirEnabled} onChange={(e) => void toggleLcir(e.target.checked)} />
           <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.data.lcirEnable")}</span>
         </label>
-        <div style={{ marginTop: 6 }}>
+        <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
           <SecondaryBtn onClick={handleBuildLcir} disabled={!lcirEnabled || busy === "build_lcir"}>
             {busy === "build_lcir" ? t("settings.data.lcirBusy") : t("settings.data.lcirBuild")}
+          </SecondaryBtn>
+          <SecondaryBtn onClick={handleFetchTex} disabled={!lcirEnabled || fetchTexRunning}>
+            {fetchTexRunning
+              ? texProgress
+                ? t("settings.data.texFetchBusyProgress", {
+                    done: texProgress.done,
+                    total: texProgress.total,
+                  })
+                : t("settings.data.texFetchBusy")
+              : t("settings.data.texFetch")}
           </SecondaryBtn>
         </div>
       </Section>
