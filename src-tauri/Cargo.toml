@@ -76,4 +76,8 @@ semver = "1"
 # v0.7.0 CLI: 引数パース（derive）と、Tauri app_data_dir と同一規則の DB パス解決（dirs::data_dir）。
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
+# LCIR Phase 4（TeX 取込）: arXiv e-print（gzip された tar / 単一 .tex）のメモリ内展開。
+# どちらも既に間接依存（zip / tauri-plugin-updater 経由）としてロック済みの版に解決される。
+flate2 = "1"
+tar = "0.4"
 

@@ -110,6 +110,10 @@ export default function App() {
   const [anchorId, setAnchorId] = useState<number | null>(null);
   const selectedId = selectedIds.size === 1 ? [...selectedIds][0] : null;
   const isBulk = selectedIds.size > 1;
+  // 長い非同期処理（TeX ソース取得等）の完了時に、選択が別エントリへ移っていたら
+  // 古い reloadDetail 結果で詳細パネルを巻き戻さないための現在値参照。
+  const selectedIdRef = useRef<number | null>(null);
+  selectedIdRef.current = selectedId;
 
   const clearSelection = () => {
     setSelectedIds(new Set());
@@ -563,7 +567,9 @@ export default function App() {
 
   const reloadDetail = (id: number) =>
     invoke<EntryDetail>("get_entry", { id })
-      .then(setDetail)
+      // 選択が既に別エントリへ移っていたら破棄する（stale closure がパネルを別エントリの
+      // 内容へ巻き戻すと、削除・タグ操作が表示と違うエントリに当たる）。
+      .then((d) => { if (selectedIdRef.current === id) setDetail(d); })
       .catch(console.error);
 
   const handleAddToCollection = (collectionId: number) => {

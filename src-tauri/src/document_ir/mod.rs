@@ -116,7 +116,7 @@ mod tests {
                 extractor_name: schema::EXTRACTOR_NAME.to_string(),
                 extractor_version: schema::EXTRACTOR_VERSION.to_string(),
             },
-            coordinate_space: CoordinateSpace::default(),
+            coordinate_space: Some(CoordinateSpace::default()),
             nodes: vec![
                 LcirNode {
                     id: 1,
@@ -177,7 +177,7 @@ mod tests {
                 extractor_name: schema::EXTRACTOR_NAME.to_string(),
                 extractor_version: schema::EXTRACTOR_VERSION.to_string(),
             },
-            coordinate_space: CoordinateSpace::default(),
+            coordinate_space: Some(CoordinateSpace::default()),
             nodes: vec![
                 LcirNode {
                     id: 1,

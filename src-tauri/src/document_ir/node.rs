@@ -215,7 +215,9 @@ pub struct LcirDocument {
     pub version_id: i64,
     pub content_key: String,
     pub source: LcirSource,
-    pub coordinate_space: CoordinateSpace,
+    /// PDF 由来（pdfium）のみ。TeX 由来（Phase 4）は座標を持たないため省略される。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinate_space: Option<CoordinateSpace>,
     pub nodes: Vec<LcirNode>,
 }
 
@@ -286,7 +288,7 @@ mod tests {
                 extractor_name: "lumencite-pdfium".to_string(),
                 extractor_version: "0.1.0".to_string(),
             },
-            coordinate_space: CoordinateSpace::default(),
+            coordinate_space: Some(CoordinateSpace::default()),
             nodes: vec![LcirNode {
                 id: 2,
                 kind: "page".to_string(),

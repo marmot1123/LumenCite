@@ -66,10 +66,10 @@ pub async fn get_attachment_with_path(
     })
 }
 
-/// 添付レコードと全文索引（fulltext）を **単一トランザクションで**削除する（CR-008）。
-/// これまでは fulltext 削除 → attachments 削除が別クエリで、index 削除失敗を握りつぶすと
-/// orphan なテキストが残り得た。まとめて原子的に消し、ファイル本体の削除だけ呼び出し側の
-/// best-effort に残す。
+/// 添付レコードと全文索引（fulltext / document_nodes_fts）を **単一トランザクションで**
+/// 削除する（CR-008）。これまでは fulltext 削除 → attachments 削除が別クエリで、index 削除
+/// 失敗を握りつぶすと orphan なテキストが残り得た。まとめて原子的に消し、ファイル本体の
+/// 削除だけ呼び出し側の best-effort に残す。
 pub async fn delete_attachment_with_fulltext(
     pool: &SqlitePool,
     id: i64,
@@ -77,8 +77,14 @@ pub async fn delete_attachment_with_fulltext(
     let att = get_attachment_with_path(pool, id).await?;
 
     let mut tx = pool.begin().await?;
-    // fulltext は attachments への FK を持たないため明示削除（cascade では拾えない）。
+    // FTS5 仮想表は attachments への FK を持たないため明示削除（cascade では拾えない）。
+    // LCIR 実表（document_versions/nodes/fragments）は FK cascade で消えるが、その派生の
+    // node-FTS はここで消さないと orphan 行が残る（エントリ削除経路のみ掃除していた既存の穴）。
     sqlx::query("DELETE FROM fulltext WHERE attachment_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM document_nodes_fts WHERE attachment_id = ?")
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -149,7 +155,7 @@ mod tests {
         assert!(dup.is_err(), "重複 file_path は UNIQUE 制約で拒否される");
     }
 
-    /// CR-008: 添付削除は fulltext と attachments 行を原子的に消す。
+    /// CR-008: 添付削除は fulltext / node-FTS と attachments 行を原子的に消す。
     #[sqlx::test(migrations = "./migrations")]
     async fn delete_with_fulltext_removes_both(pool: SqlitePool) {
         let entry_id = make_entry(&pool, "Paper").await;
@@ -161,6 +167,18 @@ mod tests {
         crate::db::fulltext::index_attachment(&pool, att.id, &[(1, "hello world".to_string())])
             .await
             .unwrap();
+        crate::db::document_nodes_fts::index_nodes(
+            &pool,
+            att.id,
+            &[crate::db::document_nodes_fts::NodeFtsInput {
+                node_id: 1,
+                page: 1,
+                node_kind: "paragraph".to_string(),
+                content: "hello block".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
 
         delete_attachment_with_fulltext(&pool, att.id).await.unwrap();
 
@@ -168,8 +186,12 @@ mod tests {
             .bind(att.id).fetch_one(&pool).await.unwrap();
         let ft_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
             .bind(att.id).fetch_one(&pool).await.unwrap();
+        let node_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM document_nodes_fts WHERE attachment_id = ?")
+                .bind(att.id).fetch_one(&pool).await.unwrap();
         assert_eq!(att_rows, 0);
         assert_eq!(ft_rows, 0, "orphan な全文索引が残ってはいけない");
+        assert_eq!(node_rows, 0, "orphan な node-FTS が残ってはいけない");
     }
 
     #[sqlx::test(migrations = "./migrations")]

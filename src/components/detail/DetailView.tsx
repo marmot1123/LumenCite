@@ -82,7 +82,8 @@ export function DetailView({
   const [attachError, setAttachError] = useState<string | null>(null);
 
   // 表示中の添付。複数あれば選択中の 1 件、無選択なら先頭（primary）を開く。
-  const attachments = entry.attachments;
+  // PDF ビューアなので PDF だけを対象にする（arXiv TeX ソース .gz 等は LCIR 用で表示不可）。
+  const attachments = entry.attachments.filter(a => a.mime_type.toLowerCase().includes("pdf"));
   const activeAttachment =
     attachments.find(a => a.id === selectedAttachmentId) ?? attachments[0] ?? null;
   const activeIndex = activeAttachment
