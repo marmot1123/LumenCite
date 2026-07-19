@@ -423,6 +423,7 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 |---------|------|--------|
 | `add_attachment` | `entry_id: i64, file_path: String` | `Result<Attachment>` |
 | `download_arxiv_pdf` | `entry_id: i64, arxiv_id: String` | `Result<Attachment>` — arXiv PDF を DL して添付（v0.7.0） |
+| `download_arxiv_source` | `entry_id: i64, arxiv_id: String` | `Result<Attachment>` — arXiv TeX ソース（e-print）を DL して添付（LCIR Phase 4） |
 | `delete_attachment` | `id: i64` | `Result<()>` |
 | `open_attachment` | `id: i64` | `Result<()>` |
 | `index_attachment` | `id: i64` | `Result<i64>` — 索引した非空ページ数 |
@@ -437,6 +438,8 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 **添付後の自動索引（CR-027）:** 手動添付（`add_attachment`）・arXiv 取得（`download_arxiv_pdf`）・Web クリッパー（MCP `spawn_pdf_job`）のいずれの経路も、添付成功後に共有ヘルパ `db::fulltext::extract_and_index` でバックグラウンド索引する（best-effort・スキャン PDF は OCR へ誘導）。以前はリーダーからの手動添付とクリッパー経路が索引されなかった。
 
 `download_arxiv_pdf` は、arXiv からメタデータ取得してエントリを作成した直後に「PDF も一括で取得する」ためのコマンド（AddSheet の arXiv タブのチェックボックス。デフォルト ON）。`arxiv_id` を正規化して `https://arxiv.org/pdf/<id>` を `download::download_and_attach`（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き）でダウンロードし添付、成功後はバックグラウンドで `pdf-extract` → 全文索引を試みる（索引失敗は無視）。ペイウォールやネットワーク障害で失敗しても呼び出し側はエントリ作成を成功扱いにする（フロントは警告ログのみで詳細パネルからの手動添付に誘導）。
+
+`download_arxiv_source`（LCIR Phase 4）は、同じ正規化 ID で `https://arxiv.org/e-print/<id>` から **TeX ソース**（gzip された tar または単一 .tex）をダウンロードし、`arxiv-<id>-source.gz`・mime `application/gzip` として添付する。同じ SSRF ガード/リダイレクト検証/50MB 上限を共有する。応答検証は `%PDF-`（PDF-only submission = TeX 未公開の明示エラー）と HTML（エラーページ）を弾き、それ以外は受理して形式判定（gzip/tar/単一 .tex）は LCIR ビルド側の内容スニッフィングに委ねる。**再取得は既存の TeX ソース添付を上書きする**（別添付を積まない — 中身が変われば sha256 → content_key が変わり、次のビルドが新版を作って旧版を supersede する）。**全文索引は行わない**（PDF ではないため）。LCIR ビルド（`build_lcir_for_attachment`）は呼び出し側（詳細パネル）が添付成功後に明示的に実行する。
 
 ```ts
 type IndexMissingResult = {
@@ -493,7 +496,7 @@ type LcirBuildResult = {
   reused: boolean;       // 同一 content_key の既存を再利用したか（冪等）
   version_id: number | null;
   content_key: string | null;
-  page_count: number;
+  page_count: number;    // TeX 版（Phase 4）は 0（message にブロック数が入る）
   message: string;
 };
 
@@ -504,7 +507,7 @@ type LcirDocument = {
   version_id: number;
   content_key: string;
   source: { sha256: string; mime_type: string; extractor_name: string; extractor_version: string };
-  coordinate_space: { space: string; origin: string; unit: string; y_axis: string };
+  coordinate_space?: { space: string; origin: string; unit: string; y_axis: string }; // PDF 由来のみ（TeX 由来は座標を持たないため省略）
   nodes: Array<{
     id: number;
     kind: string;           // document / page / section / paragraph / figure_caption / line / ...
@@ -514,13 +517,14 @@ type LcirDocument = {
     origin?: string;        // pdf_text_layer（原文由来） / layout_model（構造推定）
     confidence?: number;
     payload?: unknown;      // 型固有属性。見出しは { heading_level, section_number }
-    math?: {                // 数式表層（Phase 3・inline_math/display_math のみ）
+    math?: {                // 数式（Phase 3/4・inline_math/display_math のみ）
       display_mode: string;           // inline / display
-      equation_label?: string;        // "(2.1)" 等
-      normalized_text?: string;       // 検索用の正規化線形文字列（PDF 表層）
-      latex?: string; presentation_mathml?: string; content_mathml?: string; openmath?: string; // 後続フェーズ
-      semantic_status: string;        // PDF 由来は surface_only
-      confidence?: number; origin?: string;
+      equation_label?: string;        // "(2.1)" 等（TeX 由来は \tag{X} → "(X)"）
+      normalized_text?: string;       // 検索用の正規化線形文字列
+      latex?: string;                 // TeX 由来は原文スニペット（Phase 4）。PDF 由来は undefined
+      presentation_mathml?: string; content_mathml?: string; openmath?: string; // 後続フェーズ
+      semantic_status: string;        // PDF 由来は surface_only / TeX 由来は source_provided
+      confidence?: number; origin?: string; // TeX 由来は origin=tex_source
     };
     source_fragments: Array<{ page: number; bbox: { x: number; y: number; width: number; height: number }; fragment_type?: string }>;
   }>;
@@ -541,10 +545,11 @@ type NodeFtsHit = {
 - `build_lcir_for_attachment` は pdfium で抽出し `document_versions`/`document_nodes`/`source_fragments` を作る。`content_key`（= `sha256(source_sha256|extractor_name|extractor_version|config_hash)`）で冪等：同一 PDF+同一抽出器版なら再抽出せず reuse。新版採用時は同一添付の旧 completed を `superseded` にする。
 - **Phase 2**: 抽出後に論理構造を認識し `document > page > block(段落/見出し/caption 等) > line` の木にする（`extractor_version` 0.1.0→0.2.0）。build 時に派生の `document_nodes_fts` も張り、`search_lcir_nodes` がブロック粒度で検索できる。ヒットの `bbox` で該当ブロックを直接ハイライトできる（`get_lcir_node_region` でも個別取得可）。
 - **Phase 3**: 独立した数式を `display_math` ノードとして認識し `math_expressions`（表層）を作る（`extractor_version` 0.2.0→0.3.0）。PDF 由来は `semantic_status='surface_only'`・`normalized_text` のみ埋め、LaTeX/MathML は Phase 4（TeX）以降。`get_lcir_document` の該当ノードに `math` が付く。制御文字（pdfium のグリフ化け）は除去する。
-- `rebuild_outdated_lcir` は旧抽出器版（例 0.1.0）で作った LCIR を現行版へ再構築する（`build_missing_lcir` は未構築のみ・こちらは版が古いものを対象）。
+- **Phase 4（TeX 取込）**: `build_lcir_for_attachment` は添付の **mime だけ**で抽出器を選ぶ（バッチ対象クエリと同一述語） — `%pdf%` は pdfium、`application/gzip`（`download_arxiv_source` が登録する唯一の値）は **`lumencite-tex`**（独自 semver 0.1.0）、それ以外はエラー。手動での .tex 添付は Phase 4 のスコープ外（`add_attachment` は PDF 前提のため）。gzip 添付の中身は内容スニッフィングで tar / 単一 .tex / PDF-only を判定する。TeX 版の木は `document > block` フラット（page/line/fragment 無し・`LcirBuildResult.page_count` は 0 で `message` にブロック数）。display 数式は**生 LaTeX** を `math_expressions.latex` に `semantic_status='source_provided'`・`origin='tex_source'` で保存する。`\input`/`\include` は tar 内で再帰解決（循環ガード・欠落は warning）。冪等・supersede は従来どおり添付単位（PDF 版と TeX 版は別添付なので互いに supersede しない）。**TeX 版は `document_nodes_fts`/`fulltext` に索引しない**（同一エントリの PDF 版と重複ヒットし bbox も無いため。検索は PDF 版・読み出しは TeX 優先という分担）。
+- `rebuild_outdated_lcir` は旧抽出器版で作った LCIR を現行版へ再構築する（`build_missing_lcir` は未構築のみ・こちらは版が古いものを対象）。どちらも mime で対象抽出器を選び、pdfium 版・TeX 版それぞれの現行 semver と比較する。
 - 座標は既存 `highlights` と同一系（PDF user space・左下原点・pt）。
 - フラグ OFF なら書き込み系は DB に一切書かず（`build`/バッチは `enabled:false`、`get` は `null`）、既存挙動は不変。`search_lcir_nodes` はフラグに関係なく空表を引くだけ。
-- **外部 LLM 向け（MCP サーバー・Phase 3.5）**: 上記 LCIR を MCP read ツール `get_document_structure`（節アウトライン＋カウント＋abstract）／`get_document_blocks`（構造タグ付きブロック・`kinds`/`page` フィルタ・数式は表層のみ）／`search_document_nodes`（ブロック粒度検索＋`bbox`）として公開する（`docs/SPEC.md`「MCP サーバー公開」）。未構築エントリは `has_lcir:false`。
+- **外部 LLM 向け（MCP サーバー・Phase 3.5/4）**: 上記 LCIR を MCP read ツール `get_document_structure`（節アウトライン＋カウント＋abstract）／`get_document_blocks`（構造タグ付きブロック・`kinds`/`page` フィルタ）／`search_document_nodes`（ブロック粒度検索＋`bbox`・PDF 版のみ）として公開する（`docs/SPEC.md`「MCP サーバー公開」）。未構築エントリは `has_lcir:false`。**Phase 4**: エントリに複数表現があるときは **TeX 版を優先**して読む（`document_ir::extractor_priority`）。両ツールに `source` 引数（`"tex"`/`"pdf"`）で表現を明示切替でき、応答に `source`（採用した抽出器）と `available_sources`（併存する表現一覧）が付く。TeX 由来の数式ブロックは `latex`（原文）を返す。`get_document_structure` は `block_count`（本文ブロック総数）を常に返し、TeX 版では `page_count` を `null` にする（ページを持たないため）。`page` フィルタは PDF 版専用（`source` 未指定で `page` を渡すと PDF 版に自動フォールバック。`source:"tex"` と併用時や PDF 版不在時は黙って空にせず明示メッセージ）。
 
 ### エントリ間の関連（relations）
 

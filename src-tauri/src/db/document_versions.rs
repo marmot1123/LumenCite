@@ -141,8 +141,9 @@ pub async fn try_create_content_key_unique_index(pool: &SqlitePool) -> Result<bo
     Ok(true)
 }
 
-/// 完了 LCIR がまだ無い PDF 添付を `(id, file_path)` で返す（ゴミ箱のエントリは除外）。
-/// 「未構築の添付を一括 LCIR 化」バッチが対象を集める。`attachments_without_fulltext` の LCIR 版。
+/// 完了 LCIR がまだ無い LCIR 対象添付（PDF と arXiv TeX ソース）を `(id, file_path)` で返す
+/// （ゴミ箱のエントリは除外）。「未構築の添付を一括 LCIR 化」バッチが対象を集める。
+/// mime 述語は `build_lcir_for_attachment` のディスパッチと同一（`%pdf%` / `application/gzip`）。
 pub async fn attachments_without_completed_lcir(
     pool: &SqlitePool,
 ) -> Result<Vec<(i64, String)>, sqlx::Error> {
@@ -151,7 +152,7 @@ pub async fn attachments_without_completed_lcir(
          FROM attachments a
          JOIN entries e ON e.id = a.entry_id
          WHERE e.deleted_at IS NULL
-           AND a.mime_type LIKE '%pdf%'
+           AND (a.mime_type LIKE '%pdf%' OR a.mime_type = ?)
            AND NOT EXISTS (
                SELECT 1 FROM document_versions dv
                WHERE dv.attachment_id = a.id
@@ -159,6 +160,7 @@ pub async fn attachments_without_completed_lcir(
            )
          ORDER BY a.id",
     )
+    .bind(crate::ingestion::TEX_SOURCE_MIME)
     .fetch_all(pool)
     .await
 }
@@ -167,17 +169,23 @@ pub async fn attachments_without_completed_lcir(
 /// 添付を `(id, file_path)` で返す。抽出ロジックを上げた後（例 Phase 2 で 0.1.0→0.2.0）、既存
 /// コーパスを新版へ再構築するバッチ `rebuild_outdated_lcir` の対象集め。`build_lcir_for_attachment`
 /// は新 content_key で新版を作り旧 completed を supersede するので、これで漏れなく上げられる。
+///
+/// **`mime_pattern` は抽出器とペアで渡すこと**（pdfium なら `%pdf%`・TeX なら
+/// `application/gzip`）。「outdated」は同一抽出器系列の中でだけ意味を持ち、mime を対にしないと
+/// 「pdfium 構築済みの全 PDF が TeX 版を欠く＝outdated」と誤判定して全コーパスを再抽出して
+/// しまう（Phase 4）。
 pub async fn attachments_with_outdated_lcir(
     pool: &SqlitePool,
     extractor_name: &str,
     extractor_version: &str,
+    mime_pattern: &str,
 ) -> Result<Vec<(i64, String)>, sqlx::Error> {
     sqlx::query_as::<_, (i64, String)>(
         "SELECT a.id, a.file_path
          FROM attachments a
          JOIN entries e ON e.id = a.entry_id
          WHERE e.deleted_at IS NULL
-           AND a.mime_type LIKE '%pdf%'
+           AND a.mime_type LIKE ?
            AND EXISTS (
                SELECT 1 FROM document_versions dv
                WHERE dv.attachment_id = a.id
@@ -191,6 +199,7 @@ pub async fn attachments_with_outdated_lcir(
            )
          ORDER BY a.id",
     )
+    .bind(mime_pattern)
     .bind(extractor_name)
     .bind(extractor_version)
     .fetch_all(pool)
@@ -393,11 +402,113 @@ mod tests {
             &pool,
             schema::EXTRACTOR_NAME,
             schema::EXTRACTOR_VERSION,
+            "%pdf%",
         )
         .await
         .unwrap();
         let ids: Vec<i64> = targets.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![outdated], "現行版済み・未構築は除外し、旧版のみ拾う");
+    }
+
+    /// Phase 4: mime と抽出器はペア。pdfium 構築済みの PDF 添付は「TeX 版が無い」ことを理由に
+    /// outdated 扱いされない（mime 対を外すと全コーパス再抽出になる事故の回帰テスト）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn outdated_is_scoped_by_mime_and_extractor_pair(pool: SqlitePool) {
+        // pdfium 現行版で構築済みの PDF 添付。
+        let pdf_att = setup_attachment(&pool).await;
+        insert_version(&pool, &nv(pdf_att, "ck", ExtractionStatus::Completed))
+            .await
+            .unwrap();
+
+        // 旧 TeX 版で構築済みの TeX ソース添付（application/gzip）。
+        let entry = crate::db::entries::create_entry(
+            &pool,
+            &crate::models::EntryInput {
+                title: "T".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let tex_att = add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/arxiv-src.gz", entry.id),
+            "arxiv-src.gz",
+            crate::ingestion::TEX_SOURCE_MIME,
+        )
+        .await
+        .unwrap()
+        .id;
+        let mut old_tex = nv(tex_att, "old-tex", ExtractionStatus::Completed);
+        old_tex.extractor_name = schema::TEX_EXTRACTOR_NAME;
+        old_tex.extractor_version = "0.0.1";
+        old_tex.source_mime_type = crate::ingestion::TEX_SOURCE_MIME;
+        insert_version(&pool, &old_tex).await.unwrap();
+
+        // TeX 抽出器の outdated 対象は TeX mime の添付だけ（PDF は入らない）。
+        let tex_targets = attachments_with_outdated_lcir(
+            &pool,
+            schema::TEX_EXTRACTOR_NAME,
+            schema::TEX_EXTRACTOR_VERSION,
+            crate::ingestion::TEX_SOURCE_MIME,
+        )
+        .await
+        .unwrap();
+        let ids: Vec<i64> = tex_targets.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![tex_att], "PDF 添付は TeX 版の欠如で outdated にならない");
+
+        // pdfium 側の対象は現行版済みなのでゼロ（TeX 添付も入らない）。
+        let pdf_targets = attachments_with_outdated_lcir(
+            &pool,
+            schema::EXTRACTOR_NAME,
+            schema::EXTRACTOR_VERSION,
+            "%pdf%",
+        )
+        .await
+        .unwrap();
+        assert!(pdf_targets.is_empty(), "{pdf_targets:?}");
+    }
+
+    /// Phase 4: 未構築バッチは TeX ソース添付（application/gzip）も対象に含める。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn without_completed_lcir_includes_tex_source_attachments(pool: SqlitePool) {
+        let entry = crate::db::entries::create_entry(
+            &pool,
+            &crate::models::EntryInput {
+                title: "T".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let tex_att = add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/arxiv-src.gz", entry.id),
+            "arxiv-src.gz",
+            crate::ingestion::TEX_SOURCE_MIME,
+        )
+        .await
+        .unwrap()
+        .id;
+        // 対象外の mime（例: text/plain）は入らない。
+        add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/notes.txt", entry.id),
+            "notes.txt",
+            "text/plain",
+        )
+        .await
+        .unwrap();
+
+        let targets = attachments_without_completed_lcir(&pool).await.unwrap();
+        let ids: Vec<i64> = targets.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&tex_att));
+        assert_eq!(ids.len(), 1, "text/plain は対象外: {targets:?}");
     }
 
     #[sqlx::test(migrations = "./migrations")]

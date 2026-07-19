@@ -187,20 +187,25 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
     // 構築された論文だけが対象。未構築なら has_lcir=false を返す（get_fulltext に退避可能）。
     tools.push(json!({
         "name": "get_document_structure",
-        "description": "Return the recovered logical structure (LCIR) of a paper's PDF — its \
-            section outline, block-type counts, and abstract — by entry_id or citation_key. Unlike \
-            get_fulltext (flat page text), this exposes headings/sections with their numbers and \
-            reports how many paragraphs, display equations, captions and bibliography entries were \
-            found. Structure is heuristically recovered from the PDF text layer, so it is \
-            approximate. Returns {has_lcir, page_count, outline:[{kind, section_number, level, \
-            text, page}], counts, abstract}. If has_lcir is false the PDF has no built LCIR (enable \
-            and build it in the app) — fall back to get_fulltext. Then use get_document_blocks to \
-            read the structured text or equations, and search_document_nodes to locate content.",
+        "description": "Return the logical structure (LCIR) of a paper — its section outline, \
+            block-type counts, and abstract — by entry_id or citation_key. Unlike get_fulltext \
+            (flat page text), this exposes headings/sections with their numbers and reports how \
+            many paragraphs, display equations, captions and bibliography entries were found. Two \
+            representations can coexist per paper: \"tex\" (parsed from the arXiv TeX source — \
+            exact structure, exact LaTeX math, but no page numbers) and \"pdf\" (heuristically \
+            recovered from the PDF text layer — approximate, with pages and bounding boxes). By \
+            default the best available is used (tex over pdf); pass `source` to switch explicitly. \
+            Returns {has_lcir, source, available_sources, page_count (null for tex), block_count, \
+            outline:[{kind, section_number, level, text, page}], counts, abstract}. If has_lcir is \
+            false nothing is built (build it in the app) — fall back to get_fulltext. Then use \
+            get_document_blocks to read the structured text or equations, and \
+            search_document_nodes to locate content.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "entry_id": { "type": "integer", "description": "Entry id." },
-                "citation_key": { "type": "string", "description": "Citation key (as in \\cite{}); alternative to entry_id." }
+                "citation_key": { "type": "string", "description": "Citation key (as in \\cite{}); alternative to entry_id." },
+                "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation: \"tex\" (arXiv TeX source; exact LaTeX) or \"pdf\" (PDF text layer; pages/bbox). Omit for the best available (tex preferred)." }
             }
         }
     }));
@@ -208,14 +213,17 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
         "name": "get_document_blocks",
         "description": "Read a paper's content as structure-tagged blocks (LCIR) in reading order — \
             paragraphs, headings, captions and display equations — by entry_id or citation_key. \
-            Better than get_fulltext for structured reading: multi-column layout is de-interleaved \
-            and each block carries its kind and page. Filter with `kinds` (e.g. [\"display_math\"] \
-            to list just the equations with their labels and surface text, or [\"section\", \
-            \"paragraph\"] to read prose). Math is SURFACE ONLY — a cleaned Unicode linear form, \
-            NOT LaTeX/MathML, since it is recovered from the PDF — so treat equations as \
-            approximate. Long documents are paginated: pass block_start (from a previous next_block) \
-            or raise max_chars. Returns {has_lcir, total_blocks, returned, block_start, truncated, \
-            next_block, blocks:[{index, kind, page, section_number?, equation_label?, text}]}.",
+            Better than get_fulltext for structured reading. Filter with `kinds` (e.g. \
+            [\"display_math\"] to list just the equations, or [\"section\",\"paragraph\"] to read \
+            prose). Math depends on the representation: blocks served from the arXiv TeX source \
+            (source \"tex\", preferred when built) carry the EXACT LaTeX in `latex`; blocks from \
+            the PDF (source \"pdf\") are surface-only Unicode text — approximate, no LaTeX. Pass \
+            `source` to switch explicitly; `page` implies the pdf representation (tex has no \
+            pages), so with `page` and no `source` the pdf version is used automatically. Block \
+            indices are only valid within one source. Long documents are paginated: pass \
+            block_start (from a previous next_block) or raise max_chars. Returns {has_lcir, \
+            source, available_sources, total_blocks, returned, block_start, truncated, next_block, \
+            blocks:[{index, kind, page, section_number?, equation_label?, latex?, text}]}.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -226,7 +234,8 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
                     "items": { "type": "string" },
                     "description": "Restrict to these block kinds (e.g. [\"display_math\"], [\"section\",\"paragraph\"]). Omit for all content blocks."
                 },
-                "page": { "type": "integer", "description": "Restrict to a single 1-based PDF page." },
+                "page": { "type": "integer", "description": "Restrict to a single 1-based PDF page (pdf representation only; forces source \"pdf\" when source is omitted)." },
+                "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation: \"tex\" (exact LaTeX math, no pages) or \"pdf\" (pages/bbox, surface-only math). Omit for the best available (tex preferred)." },
                 "block_start": { "type": "integer", "description": "0-based index into the (filtered) block list to start from, for continuing a long read (default 0)." },
                 "max_chars": { "type": "integer", "description": "Max characters of block text to return this call (default 24000)." }
             }
@@ -239,9 +248,12 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             granularity. Each hit reports the entry, node_kind, page, a snippet, and the PDF \
             bounding box (bbox = [x, y, width, height] in PDF points, bottom-left origin) so the \
             exact block can be located/highlighted. Use this to pinpoint where a concept, term or \
-            equation appears across papers. Only covers papers whose LCIR has been built. Returns \
-            {count, results:[{entry_id, title, year, node_kind, page, snippet, bbox}]}. Short or \
-            CJK queries fall back to substring matching.",
+            equation appears across papers. Only covers papers whose PDF-derived LCIR has been \
+            built (TeX-derived text is not in this index; read it via get_document_blocks). Hit \
+            pages refer to the pdf representation — follow up with get_document_blocks(page=...) \
+            which uses the pdf source automatically. Returns {count, results:[{entry_id, title, \
+            year, node_kind, page, snippet, bbox}]}. Short or CJK queries fall back to substring \
+            matching.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -631,33 +643,109 @@ async fn resolve_entry_id(pool: &SqlitePool, args: &Value) -> Result<i64, ToolEr
     ))
 }
 
-/// エントリの、LCIR が構築済みの最初の PDF 添付を `(attachment_id, LcirDocument)` で読む。
-async fn load_entry_lcir(
+/// エントリの「添付ごとの最新 completed 版」を全部返す。並びは **read 優先度降順**
+/// （`extractor_priority`: tex > pdfium）→ attachment_id 昇順。併存する複数表現の列挙と
+/// 既定選択の単一ソース（Phase 4）。
+async fn entry_lcir_versions(
     pool: &SqlitePool,
     entry_id: i64,
-) -> Result<Option<(i64, crate::document_ir::LcirDocument)>, ToolError> {
-    let att_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT a.id FROM attachments a
+) -> Result<Vec<crate::models::DocumentVersion>, ToolError> {
+    let mut versions = sqlx::query_as::<_, crate::models::DocumentVersion>(
+        "SELECT dv.* FROM document_versions dv
+         JOIN attachments a ON a.id = dv.attachment_id
          WHERE a.entry_id = ?
-           AND EXISTS (
-               SELECT 1 FROM document_versions dv
-               WHERE dv.attachment_id = a.id
-                 AND dv.extraction_status IN ('completed', 'completed_with_warnings')
+           AND dv.extraction_status IN ('completed', 'completed_with_warnings')
+           AND dv.id = (
+               SELECT MAX(dv2.id) FROM document_versions dv2
+               WHERE dv2.attachment_id = dv.attachment_id
+                 AND dv2.extraction_status IN ('completed', 'completed_with_warnings')
            )
-         ORDER BY a.id",
+         ORDER BY dv.attachment_id",
     )
     .bind(entry_id)
     .fetch_all(pool)
     .await?;
-    for att in att_ids {
-        if let Some(doc) = crate::ingestion::load_lcir_document(pool, att)
+    versions.sort_by(|a, b| {
+        crate::document_ir::schema::extractor_priority(&b.extractor_name)
+            .cmp(&crate::document_ir::schema::extractor_priority(&a.extractor_name))
+            .then(a.attachment_id.cmp(&b.attachment_id))
+    });
+    Ok(versions)
+}
+
+/// MCP の `source` 引数（"tex"/"pdf"）→ extractor_name。
+fn source_to_extractor(source: &str) -> Result<&'static str, ToolError> {
+    match source {
+        "tex" => Ok(crate::document_ir::schema::TEX_EXTRACTOR_NAME),
+        "pdf" => Ok(crate::document_ir::schema::EXTRACTOR_NAME),
+        other => Err(ToolError::InvalidArguments(format!(
+            "unknown source '{other}' (use \"tex\" or \"pdf\")"
+        ))),
+    }
+}
+
+/// extractor_name → MCP 応答の短い source 名。
+fn short_source_name(extractor_name: &str) -> &str {
+    match extractor_name {
+        crate::document_ir::schema::TEX_EXTRACTOR_NAME => "tex",
+        crate::document_ir::schema::EXTRACTOR_NAME => "pdf",
+        other => other,
+    }
+}
+
+/// 併存する表現の列挙（`available_sources` 応答）。
+fn sources_json(versions: &[crate::models::DocumentVersion]) -> Value {
+    Value::Array(
+        versions
+            .iter()
+            .map(|v| {
+                json!({
+                    "source": short_source_name(&v.extractor_name),
+                    "attachment_id": v.attachment_id,
+                    "extractor_name": v.extractor_name,
+                    "extractor_version": v.extractor_version,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// エントリの LCIR を読む。`source` 指定時はその抽出器の版に限定し、未指定なら
+/// 優先度順（tex > pdfium）で最初に読めた版を返す。読めた/読めないに関わらず
+/// 併存する版の一覧（`available_sources` 用）を返す — 無かったときの案内文を
+/// 「実在する表現」に基づいて組み立てるため。
+#[allow(clippy::type_complexity)]
+async fn load_entry_lcir(
+    pool: &SqlitePool,
+    entry_id: i64,
+    source: Option<&str>,
+) -> Result<
+    (
+        Option<(i64, crate::document_ir::LcirDocument)>,
+        Vec<crate::models::DocumentVersion>,
+    ),
+    ToolError,
+> {
+    let versions = entry_lcir_versions(pool, entry_id).await?;
+    let wanted: Option<&str> = match source {
+        Some(s) => Some(source_to_extractor(s)?),
+        None => None,
+    };
+    for v in &versions {
+        if let Some(name) = wanted {
+            if v.extractor_name != name {
+                continue;
+            }
+        }
+        if let Some(doc) = crate::ingestion::load_lcir_document(pool, v.attachment_id)
             .await
             .map_err(ToolError::Execution)?
         {
-            return Ok(Some((att, doc)));
+            let att = v.attachment_id;
+            return Ok((Some((att, doc)), versions));
         }
     }
-    Ok(None)
+    Ok((None, versions))
 }
 
 /// 本文つき論理ブロック（骨格の document/page/line は除く）。
@@ -670,27 +758,39 @@ fn node_page(n: &crate::document_ir::LcirNode) -> Option<i64> {
     n.source_fragments.first().map(|f| f.page)
 }
 
-fn no_lcir_response(entry_id: i64) -> String {
+fn no_lcir_response(entry_id: i64, source: Option<&str>) -> String {
+    let message = match source {
+        Some(s) => format!(
+            "no built LCIR from source '{s}' for this entry. Omit `source` to use any available \
+             representation, or download/build it in the app (arXiv entries can fetch the TeX \
+             source from the detail panel)."
+        ),
+        None => "no built LCIR for this entry (enable and build LCIR in the app; arXiv entries \
+            can also fetch the TeX source). Fall back to get_fulltext for flat page text."
+            .to_string(),
+    };
     serde_json::to_string(&json!({
         "entry_id": entry_id,
         "has_lcir": false,
-        "message": "no built LCIR for this entry's PDF (enable and build LCIR in the app, \
-            or the entry has no attached PDF). Fall back to get_fulltext for flat page text."
+        "message": message,
     }))
     .unwrap_or_default()
 }
 
 async fn exec_get_document_structure(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
     let entry_id = resolve_entry_id(pool, args).await?;
-    let (attachment_id, doc) = match load_entry_lcir(pool, entry_id).await? {
-        Some(x) => x,
-        None => return Ok(no_lcir_response(entry_id)),
+    let source_arg = args.get("source").and_then(|v| v.as_str());
+    let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
+    let Some((attachment_id, doc)) = loaded else {
+        return Ok(no_lcir_response(entry_id, source_arg));
     };
+    let is_tex = doc.source.extractor_name == crate::document_ir::schema::TEX_EXTRACTOR_NAME;
 
     let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     let mut outline: Vec<Value> = Vec::new();
     let mut abstract_parts: Vec<String> = Vec::new();
     let mut page_count = 0i64;
+    let mut block_count = 0i64;
     for n in &doc.nodes {
         if n.kind == "page" {
             page_count += 1;
@@ -698,6 +798,7 @@ async fn exec_get_document_structure(pool: &SqlitePool, args: &Value) -> Result<
         if !is_content_block(&n.kind) {
             continue;
         }
+        block_count += 1;
         *counts.entry(n.kind.clone()).or_insert(0) += 1;
         match n.kind.as_str() {
             "section" | "subsection" | "heading" => {
@@ -733,36 +834,97 @@ async fn exec_get_document_structure(pool: &SqlitePool, args: &Value) -> Result<
         Some(abstract_parts.join(" "))
     };
 
+    // note と page_count は source 依存: TeX 版はページを持たない（page_count: null）。
+    let note = if is_tex {
+        "Parsed from the arXiv TeX source (origin=tex_source). Display equations carry exact \
+         LaTeX; this representation has no page numbers or bounding boxes (use source=\"pdf\" \
+         for page-anchored reading). Use get_document_blocks to read prose or equations."
+    } else {
+        "Structure is heuristically recovered from the PDF text layer (origin=layout_model, \
+         per-node confidence). Equations are surface-only (no LaTeX). Use get_document_blocks to \
+         read prose or equations, search_document_nodes to locate content."
+    };
     Ok(serde_json::to_string(&json!({
         "entry_id": entry_id,
         "attachment_id": attachment_id,
         "has_lcir": true,
+        "source": short_source_name(&doc.source.extractor_name),
+        "extractor_name": doc.source.extractor_name,
         "extractor_version": doc.source.extractor_version,
-        "page_count": page_count,
+        "available_sources": sources_json(&versions),
+        "page_count": if is_tex { Value::Null } else { json!(page_count) },
+        "block_count": block_count,
         "outline": outline,
         "counts": counts,
         "abstract": abstract_text,
-        "note": "Structure is heuristically recovered from the PDF text layer (origin=layout_model, \
-            per-node confidence). Equations are surface-only (no LaTeX). Use get_document_blocks to \
-            read prose or equations, search_document_nodes to locate content.",
+        "note": note,
     }))
     .unwrap_or_default())
 }
 
 async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
     let entry_id = resolve_entry_id(pool, args).await?;
-    let (attachment_id, doc) = match load_entry_lcir(pool, entry_id).await? {
-        Some(x) => x,
-        None => return Ok(no_lcir_response(entry_id)),
-    };
+    let source_arg = args.get("source").and_then(|v| v.as_str());
+    let page_filter = args.get("page").and_then(|v| v.as_i64());
 
-    // kinds / page フィルタ。
+    // `page` は PDF 空間の概念（search_document_nodes のヒットも PDF 由来）なので、
+    // source 未指定で page が来たら PDF 版へ自動フォールバックする。
+    let effective_source = match (page_filter.is_some(), source_arg) {
+        (true, None) => Some("pdf"),
+        (_, s) => s,
+    };
+    let (loaded, versions) = load_entry_lcir(pool, entry_id, effective_source).await?;
+    let has_tex = versions
+        .iter()
+        .any(|v| v.extractor_name == crate::document_ir::schema::TEX_EXTRACTOR_NAME);
+    let has_pdf = versions
+        .iter()
+        .any(|v| v.extractor_name == crate::document_ir::schema::EXTRACTOR_NAME);
+    let Some((attachment_id, doc)) = loaded else {
+        // page 指定の自動 PDF フォールバックで PDF 版が無かった場合の案内は、
+        // 実在する表現に基づいて出す（無い TeX 版を勧めない）。
+        if page_filter.is_some() && source_arg.is_none() && has_tex {
+            return Ok(serde_json::to_string(&json!({
+                "entry_id": entry_id,
+                "has_lcir": false,
+                "available_sources": sources_json(&versions),
+                "message": "page filtering needs a PDF-derived LCIR and none is built for this \
+                    entry; omit `page` to read the TeX representation, or build the PDF LCIR in \
+                    the app.",
+            }))
+            .unwrap_or_default());
+        }
+        return Ok(no_lcir_response(entry_id, source_arg));
+    };
+    let is_tex = doc.source.extractor_name == crate::document_ir::schema::TEX_EXTRACTOR_NAME;
+    if is_tex && page_filter.is_some() {
+        // 明示 source="tex" + page: 黙って 0 件を返すとエージェントが「中身が無い」と誤解する。
+        let hint = if has_pdf {
+            "the tex representation has no page mapping; omit `page` or use source=\"pdf\"."
+        } else {
+            "the tex representation has no page mapping and no PDF-derived LCIR is built; \
+             omit `page` to read it."
+        };
+        return Ok(serde_json::to_string(&json!({
+            "entry_id": entry_id,
+            "attachment_id": attachment_id,
+            "has_lcir": true,
+            "source": "tex",
+            "available_sources": sources_json(&versions),
+            "total_blocks": 0,
+            "returned": 0,
+            "blocks": [],
+            "message": hint,
+        }))
+        .unwrap_or_default());
+    }
+
+    // kinds フィルタ。
     let kind_filter: Option<Vec<String>> = args.get("kinds").and_then(|v| v.as_array()).map(|a| {
         a.iter()
             .filter_map(|x| x.as_str().map(|s| s.to_string()))
             .collect()
     });
-    let page_filter = args.get("page").and_then(|v| v.as_i64());
 
     // 読み順の本文ブロック（load_lcir_document のノード順 = ページ→ordinal）。
     let blocks: Vec<&crate::document_ir::LcirNode> = doc
@@ -800,6 +962,8 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
         }
         chars += text.chars().count();
         let equation_label = n.math.as_ref().and_then(|m| m.equation_label.clone());
+        // TeX 由来の数式は原文 LaTeX を持つ（Phase 4・semantic_status='source_provided'）。
+        let latex = n.math.as_ref().and_then(|m| m.latex.clone());
         let section_number = n
             .payload
             .as_ref()
@@ -812,6 +976,7 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
             "page": node_page(n),
             "section_number": section_number,
             "equation_label": equation_label,
+            "latex": latex,
             "text": text,
         }));
     }
@@ -820,6 +985,8 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
         "entry_id": entry_id,
         "attachment_id": attachment_id,
         "has_lcir": true,
+        "source": short_source_name(&doc.source.extractor_name),
+        "available_sources": sources_json(&versions),
         "total_blocks": total_blocks,
         "block_start": block_start,
         "returned": out.len(),
@@ -1751,6 +1918,212 @@ mod tests {
         .unwrap();
         let j = tool_json(&call_tool(&pool, "get_document_structure", json!({ "entry_id": entry.id })).await);
         assert_eq!(j["has_lcir"], false);
+    }
+
+    /// 既存エントリに TeX 由来の LCIR（別添付・lumencite-tex・原文 LaTeX・fragment 無し）を足す。
+    async fn add_tex_lcir(pool: &SqlitePool, entry_id: i64) -> i64 {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let att = crate::db::attachments::add_attachment(
+            pool,
+            entry_id,
+            &format!("attachments/{entry_id}/arxiv-src.gz"),
+            "arxiv-src.gz",
+            crate::ingestion::TEX_SOURCE_MIME,
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-tex",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha-tex",
+                source_mime_type: crate::ingestion::TEX_SOURCE_MIME,
+                extractor_name: schema::TEX_EXTRACTOR_NAME,
+                extractor_version: schema::TEX_EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = crate::db::document_nodes::insert_node(
+            pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("tex_source"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let add = |kind: &'static str, ordinal: i64, text: &'static str, payload: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                crate::db::document_nodes::insert_node(
+                    &pool,
+                    &crate::db::document_nodes::NewDocumentNode {
+                        document_version_id: vid,
+                        parent_id: Some(root),
+                        node_kind: kind,
+                        ordinal,
+                        plain_text: Some(text),
+                        language: None,
+                        confidence: Some(0.95),
+                        origin: Some("tex_source"),
+                        payload_json: payload,
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        add("abstract", 0, "We study quantum walks from source.", None).await;
+        add(
+            "section",
+            1,
+            "1 Introduction",
+            Some(r#"{"heading_level":1,"section_number":"1"}"#),
+        )
+        .await;
+        let eq = add("display_math", 2, "U = S_2 C_2 S_1 C_1", None).await;
+        crate::db::math_expressions::insert_math(
+            pool,
+            &crate::db::math_expressions::NewMathExpression {
+                node_id: eq,
+                display_mode: "display",
+                equation_label: None,
+                latex: Some("\\begin{equation}U = S_2 C_2 S_1 C_1\\end{equation}"),
+                presentation_mathml: None,
+                content_mathml: None,
+                openmath_json: None,
+                normalized_text: Some("U = S_2 C_2 S_1 C_1"),
+                ast_json: None,
+                semantic_status: "source_provided",
+                confidence: Some(0.98),
+                origin: Some("tex_source"),
+            },
+        )
+        .await
+        .unwrap();
+        att
+    }
+
+    /// Phase 4: PDF 版と TeX 版が併存するとき、既定では TeX 版が選ばれ（優先順位）、
+    /// available_sources に両方が載り、数式は原文 LaTeX を返す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn document_tools_prefer_tex_source_and_expose_latex(pool: SqlitePool) {
+        let entry_id = setup_entry_with_lcir(&pool).await;
+        add_tex_lcir(&pool, entry_id).await;
+
+        let s = tool_json(&call_tool(&pool, "get_document_structure", json!({ "entry_id": entry_id })).await);
+        assert_eq!(s["has_lcir"], true);
+        assert_eq!(s["source"], "tex");
+        assert!(s["page_count"].is_null(), "TeX 版に page は無い: {}", s["page_count"]);
+        assert!(s["block_count"].as_i64().unwrap() >= 3);
+        let sources = s["available_sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2, "{sources:?}");
+        assert_eq!(sources[0]["source"], "tex", "優先度順（tex が先頭）");
+        assert_eq!(sources[1]["source"], "pdf");
+        assert!(s["note"].as_str().unwrap().contains("TeX source"));
+
+        let b = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_blocks",
+                json!({ "entry_id": entry_id, "kinds": ["display_math"] }),
+            )
+            .await,
+        );
+        assert_eq!(b["source"], "tex");
+        let blocks = b["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert!(
+            blocks[0]["latex"].as_str().unwrap().contains("\\begin{equation}"),
+            "TeX 由来は原文 LaTeX を返す: {}",
+            blocks[0]["latex"]
+        );
+    }
+
+    /// Phase 4: source="pdf" で明示切替でき、page_count が数値に戻る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn document_tools_source_pdf_override(pool: SqlitePool) {
+        let entry_id = setup_entry_with_lcir(&pool).await;
+        add_tex_lcir(&pool, entry_id).await;
+
+        let s = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_structure",
+                json!({ "entry_id": entry_id, "source": "pdf" }),
+            )
+            .await,
+        );
+        assert_eq!(s["source"], "pdf");
+        assert_eq!(s["page_count"], 1);
+
+        // 無い source を明示すると has_lcir:false + 明示メッセージ。
+        let entry2 = create_entry(
+            &pool,
+            &EntryInput {
+                title: "PDF only".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let none = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_structure",
+                json!({ "entry_id": entry2.id, "source": "tex" }),
+            )
+            .await,
+        );
+        assert_eq!(none["has_lcir"], false);
+        assert!(none["message"].as_str().unwrap().contains("'tex'"));
+    }
+
+    /// Phase 4: `page` は PDF 空間の概念 — source 未指定なら pdf 版へ自動フォールバックし、
+    /// source="tex" と併用したら明示メッセージ（黙って 0 件にしない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn document_blocks_page_filter_falls_back_to_pdf(pool: SqlitePool) {
+        let entry_id = setup_entry_with_lcir(&pool).await;
+        add_tex_lcir(&pool, entry_id).await;
+
+        let b = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_blocks",
+                json!({ "entry_id": entry_id, "page": 1 }),
+            )
+            .await,
+        );
+        assert_eq!(b["source"], "pdf", "page 指定で pdf 版に自動フォールバック");
+        assert!(b["total_blocks"].as_i64().unwrap() >= 1);
+
+        let t = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_blocks",
+                json!({ "entry_id": entry_id, "page": 1, "source": "tex" }),
+            )
+            .await,
+        );
+        assert_eq!(t["total_blocks"], 0);
+        assert!(t["message"].as_str().unwrap().contains("no page mapping"));
     }
 
     /// 手動 E2E: 実 DB コピー + 実 PDF を pdfium で LCIR 構築し、外部 LLM が MCP で受け取る

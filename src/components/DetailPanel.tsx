@@ -279,6 +279,15 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   // 添付ごとの全文索引状態。
   const [indexStatus, setIndexStatus] = useState<Record<number, "indexed" | "none" | "indexing">>({});
   const [indexNote, setIndexNote] = useState<string | null>(null);
+  // arXiv TeX ソース取得（LCIR Phase 4）。
+  const [texBusy, setTexBusy] = useState(false);
+  // ダウンロード中にユーザーが別エントリへ移った場合、完了時の表示更新を捨てるための現在値参照
+  // （texBusy 自体はリセットしない — 同一エントリへの二重ダウンロード防止のため）。
+  const entryIdRef = useRef<number | null>(null);
+  entryIdRef.current = entry?.id ?? null;
+
+  // PDF 以外（arXiv TeX ソース .gz 等）はビューア・全文索引の対象外。
+  const isPdfAttachment = (mime: string) => mime.toLowerCase().includes("pdf");
 
   useEffect(() => {
     setConfirmDelete(false);
@@ -289,10 +298,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setIndexNote(null);
   }, [entry?.id]);
 
-  // 添付の全文索引状態を取得する（エントリ切替・添付増減で再取得）。
+  // 添付の全文索引状態を取得する（エントリ切替・添付増減で再取得）。PDF のみが対象。
   useEffect(() => {
     let cancelled = false;
-    const atts = entry?.attachments ?? [];
+    const atts = (entry?.attachments ?? []).filter(a => isPdfAttachment(a.mime_type));
     if (atts.length === 0) {
       setIndexStatus({});
       return;
@@ -382,6 +391,53 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
       onAttachmentsChanged?.();
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  // arXiv の TeX ソース（e-print）を取得して添付し、続けて LCIR を構築する（Phase 4）。
+  // フラグ OFF のときは「取得はしたが未構築」を明示する（隠れた状態を作らない）。
+  // ダウンロードは数十秒かかりうるので、完了時に別エントリへ移っていたら表示更新は捨てる。
+  const handleFetchTexSource = async () => {
+    if (!entry?.arxiv_id || texBusy) return;
+    const startedFor = entry.id;
+    const stillHere = () => entryIdRef.current === startedFor;
+    setTexBusy(true);
+    setAttachError(null);
+    setIndexNote(null);
+    try {
+      let att: { id: number };
+      try {
+        att = await invoke<{ id: number }>("download_arxiv_source", {
+          entryId: startedFor,
+          arxivId: entry.arxiv_id,
+        });
+      } catch (e: any) {
+        if (stillHere()) {
+          setAttachError(t("detailPanel.texSourceError", { error: e?.message ?? String(e) }));
+        }
+        return;
+      }
+      if (stillHere()) onAttachmentsChanged?.();
+      // ここからは添付は成功済み: ビルド失敗は「取得失敗」と混同させない。
+      try {
+        const res = await invoke<{ enabled: boolean; built: boolean; reused: boolean; message: string }>(
+          "build_lcir_for_attachment",
+          { attachmentId: att.id },
+        );
+        if (stillHere()) {
+          setIndexNote(
+            res.enabled
+              ? t("detailPanel.texSourceDoneBuilt")
+              : t("detailPanel.texSourceDoneNoLcir"),
+          );
+        }
+      } catch (e: any) {
+        if (stillHere()) {
+          setAttachError(t("detailPanel.texSourceBuildFailed", { error: e?.message ?? String(e) }));
+        }
+      }
+    } finally {
+      setTexBusy(false);
     }
   };
 
@@ -599,48 +655,72 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                     color: "var(--text)",
                   }}>
                     <Icon name="paperclip" size={11} color="var(--text-faint)" />
-                    <button
-                      onClick={() => invoke("open_pdf_viewer", { id: att.id }).catch(console.error)}
-                      style={{
-                        flex: 1, minWidth: 0, padding: 0, border: "none",
-                        background: "transparent", color: "var(--text)",
-                        fontSize: 12, textAlign: "left", cursor: "pointer",
-                        overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      }}
-                      title={att.file_name}
-                    >{att.file_name}</button>
-                    <span
-                      title={
-                        indexStatus[att.id] === "indexed"
-                          ? t("detailPanel.indexedBadge")
-                          : t("detailPanel.notIndexedBadge")
-                      }
-                      style={{
-                        width: 6, height: 6, borderRadius: "50%", flex: "none",
-                        background: indexStatus[att.id] === "indexed"
-                          ? "var(--accent)"
-                          : "var(--border-strong)",
-                      }}
-                    />
-                    <button
-                      onClick={() => handleIndexAttachment(att.id)}
-                      disabled={indexStatus[att.id] === "indexing"}
-                      style={{
-                        width: 16, height: 16, padding: 0, border: "none",
-                        background: "transparent",
-                        cursor: indexStatus[att.id] === "indexing" ? "default" : "pointer",
-                        display: "inline-flex", alignItems: "center", justifyContent: "center",
-                        borderRadius: 3, color: "var(--text-faint)",
-                        opacity: indexStatus[att.id] === "indexing" ? 0.5 : 1,
-                      }}
-                      title={
-                        indexStatus[att.id] === "indexed"
-                          ? t("detailPanel.reindexTitle")
-                          : t("detailPanel.indexNowTitle")
-                      }
-                    >
-                      <Icon name="sync" size={11} color="var(--text-faint)" />
-                    </button>
+                    {isPdfAttachment(att.mime_type) ? (
+                      <button
+                        onClick={() => invoke("open_pdf_viewer", { id: att.id }).catch(console.error)}
+                        style={{
+                          flex: 1, minWidth: 0, padding: 0, border: "none",
+                          background: "transparent", color: "var(--text)",
+                          fontSize: 12, textAlign: "left", cursor: "pointer",
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        }}
+                        title={att.file_name}
+                      >{att.file_name}</button>
+                    ) : (
+                      // PDF ではない添付（arXiv TeX ソース等）はビューアを開けない。
+                      <span
+                        style={{
+                          flex: 1, minWidth: 0, color: "var(--text)", fontSize: 12,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        }}
+                        title={att.file_name}
+                      >{att.file_name}</span>
+                    )}
+                    {isPdfAttachment(att.mime_type) ? (
+                      <>
+                        <span
+                          title={
+                            indexStatus[att.id] === "indexed"
+                              ? t("detailPanel.indexedBadge")
+                              : t("detailPanel.notIndexedBadge")
+                          }
+                          style={{
+                            width: 6, height: 6, borderRadius: "50%", flex: "none",
+                            background: indexStatus[att.id] === "indexed"
+                              ? "var(--accent)"
+                              : "var(--border-strong)",
+                          }}
+                        />
+                        <button
+                          onClick={() => handleIndexAttachment(att.id)}
+                          disabled={indexStatus[att.id] === "indexing"}
+                          style={{
+                            width: 16, height: 16, padding: 0, border: "none",
+                            background: "transparent",
+                            cursor: indexStatus[att.id] === "indexing" ? "default" : "pointer",
+                            display: "inline-flex", alignItems: "center", justifyContent: "center",
+                            borderRadius: 3, color: "var(--text-faint)",
+                            opacity: indexStatus[att.id] === "indexing" ? 0.5 : 1,
+                          }}
+                          title={
+                            indexStatus[att.id] === "indexed"
+                              ? t("detailPanel.reindexTitle")
+                              : t("detailPanel.indexNowTitle")
+                          }
+                        >
+                          <Icon name="sync" size={11} color="var(--text-faint)" />
+                        </button>
+                      </>
+                    ) : (
+                      <span
+                        title={t("detailPanel.texChipTitle")}
+                        style={{
+                          flex: "none", fontSize: 9.5, fontWeight: 600, letterSpacing: "0.04em",
+                          padding: "0 5px", borderRadius: 4, lineHeight: "14px",
+                          background: "var(--accent-soft)", color: "var(--accent-strong)",
+                        }}
+                      >TeX</span>
+                    )}
                     <button
                       onClick={() => handleDeleteAttachment(att.id)}
                       style={{
@@ -655,21 +735,41 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                     </button>
                   </div>
                 ))}
-                <button
-                  onClick={handleAttachPdf}
-                  disabled={attaching}
-                  style={{
-                    display: "inline-flex", alignItems: "center", gap: 3, alignSelf: "flex-start",
-                    padding: "2px 8px", borderRadius: 5,
-                    border: "1px dashed var(--border-strong)",
-                    background: "transparent", color: "var(--text-faint)",
-                    fontSize: 11, cursor: attaching ? "default" : "pointer",
-                    opacity: attaching ? 0.5 : 1,
-                  }}
-                >
-                  <Icon name="plus" size={9} color="var(--text-faint)" />
-                  {attaching ? t("detailPanel.attaching") : t("detailPanel.addPdf")}
-                </button>
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  <button
+                    onClick={handleAttachPdf}
+                    disabled={attaching}
+                    style={{
+                      display: "inline-flex", alignItems: "center", gap: 3,
+                      padding: "2px 8px", borderRadius: 5,
+                      border: "1px dashed var(--border-strong)",
+                      background: "transparent", color: "var(--text-faint)",
+                      fontSize: 11, cursor: attaching ? "default" : "pointer",
+                      opacity: attaching ? 0.5 : 1,
+                    }}
+                  >
+                    <Icon name="plus" size={9} color="var(--text-faint)" />
+                    {attaching ? t("detailPanel.attaching") : t("detailPanel.addPdf")}
+                  </button>
+                  {entry.arxiv_id && (
+                    <button
+                      onClick={handleFetchTexSource}
+                      disabled={texBusy}
+                      title={t("detailPanel.texSourceTitle")}
+                      style={{
+                        display: "inline-flex", alignItems: "center", gap: 3,
+                        padding: "2px 8px", borderRadius: 5,
+                        border: "1px dashed var(--border-strong)",
+                        background: "transparent", color: "var(--text-faint)",
+                        fontSize: 11, cursor: texBusy ? "default" : "pointer",
+                        opacity: texBusy ? 0.5 : 1,
+                      }}
+                    >
+                      <Icon name="download" size={9} color="var(--text-faint)" />
+                      {texBusy ? t("detailPanel.texSourceBusy") : t("detailPanel.texSource")}
+                    </button>
+                  )}
+                </div>
                 {attachError && (
                   <div style={{ fontSize: 11, color: "var(--danger-strong)", marginTop: 2 }}>
                     {attachError}

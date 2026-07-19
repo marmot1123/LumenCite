@@ -65,7 +65,7 @@ mod tests {
                 extractor_name: "lumencite-pdfium".to_string(),
                 extractor_version: "0.1.0".to_string(),
             },
-            coordinate_space: CoordinateSpace::default(),
+            coordinate_space: Some(CoordinateSpace::default()),
             nodes,
         }
     }

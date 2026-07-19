@@ -98,67 +98,75 @@ impl Default for DownloadCaps {
     }
 }
 
+/// SSRF ガード付きで URL を取得し、最終応答（非リダイレクト・成功ステータス）を返す共有コア。
+///
+/// リダイレクトを自動追尾せず、各ホップで scheme（http/https のみ）と解決先 IP
+/// （公開アドレスのみ）を検証してから接続する（CR-003）。`fetch_pdf` /
+/// `fetch_arxiv_source` が共有し、ペイロード検証は呼び出し側が行う。
+async fn fetch_response(url: &str, caps: DownloadCaps) -> Result<reqwest::Response, String> {
+    let mut current = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+
+    for _ in 0..=MAX_REDIRECTS {
+        if !matches!(current.scheme(), "http" | "https") {
+            return Err("only http and https URLs are allowed".to_string());
+        }
+        let host = current
+            .host_str()
+            .ok_or_else(|| "URL has no host".to_string())?
+            .to_string();
+        let port = current
+            .port_or_known_default()
+            .ok_or_else(|| "URL has no port".to_string())?;
+        // 解決先を検証し、その addr に接続を固定する。
+        let addr = resolve_public_addr(&host, port, caps.allow_private_hosts).await?;
+
+        let client = reqwest::Client::builder()
+            .user_agent("LumenCite/0.1 (mailto:support@lumencite.app)")
+            .timeout(caps.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&host, addr)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let resp = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| format!("download failed: {e}"))?;
+
+        if resp.status().is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| "redirect without Location".to_string())?;
+            // 相対 Location を現在 URL 基準で解決し、次ホップとして再検証する。
+            current = current
+                .join(location)
+                .map_err(|e| format!("invalid redirect target: {e}"))?;
+            continue;
+        }
+
+        return resp
+            .error_for_status()
+            .map_err(|e| format!("download failed: {e}"));
+    }
+    Err("too many redirects".to_string())
+}
+
+/// Content-Disposition のファイル名を取り出す（共有）。
+fn response_cd_name(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(content_disposition_filename)
+}
+
 /// PDF をメモリへダウンロードして検証する。
 /// 返り値は `(バイト列, Content-Disposition のファイル名)`。
 pub async fn fetch_pdf(url: &str, caps: DownloadCaps) -> Result<(Vec<u8>, Option<String>), String> {
-    // SSRF 対策（CR-003）: リダイレクトを自動追尾せず、各ホップで
-    // scheme（http/https のみ）と解決先 IP（公開アドレスのみ）を検証してから接続する。
-    let mut current = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
-
-    let resp = 'follow: {
-        for _ in 0..=MAX_REDIRECTS {
-            if !matches!(current.scheme(), "http" | "https") {
-                return Err("only http and https URLs are allowed".to_string());
-            }
-            let host = current
-                .host_str()
-                .ok_or_else(|| "URL has no host".to_string())?
-                .to_string();
-            let port = current
-                .port_or_known_default()
-                .ok_or_else(|| "URL has no port".to_string())?;
-            // 解決先を検証し、その addr に接続を固定する。
-            let addr = resolve_public_addr(&host, port, caps.allow_private_hosts).await?;
-
-            let client = reqwest::Client::builder()
-                .user_agent("LumenCite/0.1 (mailto:support@lumencite.app)")
-                .timeout(caps.timeout)
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve(&host, addr)
-                .build()
-                .map_err(|e| e.to_string())?;
-
-            let resp = client
-                .get(current.clone())
-                .send()
-                .await
-                .map_err(|e| format!("download failed: {e}"))?;
-
-            if resp.status().is_redirection() {
-                let location = resp
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| "redirect without Location".to_string())?;
-                // 相対 Location を現在 URL 基準で解決し、次ホップとして再検証する。
-                current = current
-                    .join(location)
-                    .map_err(|e| format!("invalid redirect target: {e}"))?;
-                continue;
-            }
-
-            break 'follow resp
-                .error_for_status()
-                .map_err(|e| format!("download failed: {e}"))?;
-        }
-        return Err("too many redirects".to_string());
-    };
-
-    let cd_name = resp
-        .headers()
-        .get("content-disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(content_disposition_filename);
+    let resp = fetch_response(url, caps).await?;
+    let cd_name = response_cd_name(&resp);
 
     let mut bytes: Vec<u8> = Vec::new();
     let mut stream = resp;
@@ -181,6 +189,123 @@ pub async fn fetch_pdf(url: &str, caps: DownloadCaps) -> Result<(Vec<u8>, Option
     Ok((bytes, cd_name))
 }
 
+/// arXiv e-print（TeX ソース）をメモリへダウンロードして検証する（LCIR Phase 4）。
+///
+/// 正常応答は gzip（tar か単一 .tex）。PDF-only 投稿は arXiv が PDF を返すので、
+/// 「TeX ソースが公開されていない」ことをユーザーに分かる形で弾く。HTML（エラーページ等）も
+/// 弾く。それ以外は受理し、詳細な形式判定は LCIR ビルド側の内容スニッフィングに任せる。
+pub async fn fetch_arxiv_source(
+    url: &str,
+    caps: DownloadCaps,
+) -> Result<Vec<u8>, String> {
+    let resp = fetch_response(url, caps).await?;
+
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = resp;
+    loop {
+        let chunk = stream.chunk().await.map_err(|e| format!("download failed: {e}"))?;
+        let Some(chunk) = chunk else { break };
+        if bytes.len() as u64 + chunk.len() as u64 > caps.max_bytes {
+            return Err(format!(
+                "source exceeds the {} MB limit",
+                caps.max_bytes / 1024 / 1024
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+        // PDF-only 投稿は先頭 5 バイトで確定するので以降を読まない。
+        if bytes.len() >= 5 && bytes.starts_with(b"%PDF-") {
+            return Err(
+                "this arXiv submission is PDF-only (no TeX source is published)".to_string()
+            );
+        }
+    }
+    if bytes.is_empty() {
+        return Err("empty response".to_string());
+    }
+    // HTML（エラーページ・ペイウォール等）: gzip / tar / TeX が '<' で始まることはない。
+    if bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'<') {
+        return Err("response is not a TeX source archive".to_string());
+    }
+    Ok(bytes)
+}
+
+/// arXiv TeX ソースを `arxiv-<id>-source.gz`・mime `application/gzip` として添付する。
+/// 全文索引は行わない（PDF ではない）。LCIR ビルドは呼び出し側が添付成功後に明示実行する。
+/// `url` は呼び出し側が組み立てる（本番は `https://arxiv.org/e-print/<id>`・テストは fixture）。
+pub async fn download_and_attach_arxiv_source(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    entry_id: i64,
+    arxiv_id: &str,
+    url: &str,
+    caps: DownloadCaps,
+) -> Result<Attachment, String> {
+    let bytes = fetch_arxiv_source(url, caps).await?;
+
+    // 再取得（v1→v2 改訂など）は**既存の TeX ソース添付を上書き**する: 別添付を積むと
+    // read 優先順位のタイブレークで古い方が選ばれ続けるうえ、添付 id が変わると
+    // supersede チェーンも切れる。同一添付の中身が変われば sha256 → content_key が変わり、
+    // 次の build が新版を作って旧版を supersede する（正しい版管理に自然に乗る）。
+    let existing: Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, file_path FROM attachments
+         WHERE entry_id = ? AND mime_type = ? ORDER BY id LIMIT 1",
+    )
+    .bind(entry_id)
+    .bind(crate::ingestion::TEX_SOURCE_MIME)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some((att_id, rel_path)) = existing {
+        let abs = app_data_dir.join(&rel_path);
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&abs, &bytes).map_err(|e| e.to_string())?;
+        return crate::db::attachments::get_attachment(pool, att_id)
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let entry_dir = app_data_dir.join("attachments").join(entry_id.to_string());
+    std::fs::create_dir_all(&entry_dir).map_err(|e| e.to_string())?;
+
+    // 旧式 ID（hep-th/9901001）の '/' は sanitize で除去される。
+    let mut stem = sanitize_file_name(&format!("arxiv-{arxiv_id}-source"));
+    if stem.is_empty() {
+        stem = "arxiv-source".to_string();
+    }
+    let (mut file, dest) =
+        create_unique_file(&entry_dir, &format!("{stem}.gz")).map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        if let Err(e) = file.write_all(&bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&dest);
+            return Err(e.to_string());
+        }
+    }
+    drop(file);
+
+    let dest_name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let rel_path = format!("attachments/{entry_id}/{dest_name}");
+
+    match crate::db::attachments::add_attachment(
+        pool,
+        entry_id,
+        &rel_path,
+        &dest_name,
+        crate::ingestion::TEX_SOURCE_MIME,
+    )
+    .await
+    {
+        Ok(att) => Ok(att),
+        Err(e) => {
+            let _ = std::fs::remove_file(&dest);
+            Err(e.to_string())
+        }
+    }
+}
+
 /// PDF を `<app_data_dir>/attachments/<entry_id>/` に保存して DB に登録する。
 /// DB 登録に失敗したら保存したファイルは削除する（`add_attachment` コマンドと同じ方針）。
 pub async fn download_and_attach(
@@ -196,11 +321,15 @@ pub async fn download_and_attach(
     std::fs::create_dir_all(&entry_dir).map_err(|e| e.to_string())?;
 
     let file_name = suggested_file_name(url, cd_name.as_deref());
-    // 名前を原子的に予約してから書き込む（CR-008）。
+    // 名前を原子的に予約してから書き込む（CR-008）。書き込み失敗時は予約したファイルを残さない。
     let (mut file, dest) = create_unique_file(&entry_dir, &file_name).map_err(|e| e.to_string())?;
     {
         use std::io::Write;
-        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        if let Err(e) = file.write_all(&bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&dest);
+            return Err(e.to_string());
+        }
     }
     drop(file);
 
@@ -479,6 +608,139 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 1);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── arXiv TeX ソース（LCIR Phase 4） ──────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn arxiv_source_happy_path_attaches_gzip(pool: SqlitePool) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let entry_id = make_entry(&pool).await;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"\\documentclass{article}\\begin{document}x\\end{document}").unwrap();
+        let url = serve_once(enc.finish().unwrap());
+        let dir = temp_app_dir("texsrc");
+
+        let att = download_and_attach_arxiv_source(
+            &pool, &dir, entry_id, "2301.00001", &url, test_caps(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(att.file_name, "arxiv-2301.00001-source.gz");
+        assert_eq!(att.mime_type, crate::ingestion::TEX_SOURCE_MIME);
+        let stored = dir.join("attachments").join(entry_id.to_string()).join(&att.file_name);
+        assert!(stored.exists());
+        assert!(std::fs::read(&stored).unwrap().starts_with(&[0x1f, 0x8b]));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PDF-only 投稿（e-print が PDF を返す）は「TeX 未公開」の明示エラーで、ファイルも行も残らない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn arxiv_source_rejects_pdf_only_and_html(pool: SqlitePool) {
+        let entry_id = make_entry(&pool).await;
+        let dir = temp_app_dir("texsrc-bad");
+
+        let url = serve_once(b"%PDF-1.5 pdf-only submission".to_vec());
+        let err = download_and_attach_arxiv_source(
+            &pool, &dir, entry_id, "old/9901001", &url, test_caps(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("PDF-only"), "{err}");
+
+        let url = serve_once(b"<!doctype html><html>error</html>".to_vec());
+        let err = download_and_attach_arxiv_source(
+            &pool, &dir, entry_id, "old/9901001", &url, test_caps(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not a TeX source"), "{err}");
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attachments WHERE entry_id = ?")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 再取得は別添付を積まず、既存の TeX ソース添付の中身を上書きする（レビュー回帰:
+    /// 重複添付だと read 優先順位が古い方を選び続ける）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn arxiv_source_refetch_overwrites_existing_attachment(pool: SqlitePool) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let entry_id = make_entry(&pool).await;
+        let dir = temp_app_dir("texsrc-refetch");
+        let gz = |body: &[u8]| {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(body).unwrap();
+            enc.finish().unwrap()
+        };
+
+        let url1 = serve_once(gz(b"v1 content"));
+        let first = download_and_attach_arxiv_source(
+            &pool, &dir, entry_id, "2301.00001", &url1, test_caps(),
+        )
+        .await
+        .unwrap();
+
+        let url2 = serve_once(gz(b"v2 content revised"));
+        let second = download_and_attach_arxiv_source(
+            &pool, &dir, entry_id, "2301.00001", &url2, test_caps(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.id, second.id, "同一添付行を再利用する");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attachments WHERE entry_id = ? AND mime_type = ?",
+        )
+        .bind(entry_id)
+        .bind(crate::ingestion::TEX_SOURCE_MIME)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 1, "TeX ソース添付は 1 行のまま");
+
+        // 中身は v2 に置き換わっている。
+        let stored = dir.join("attachments").join(entry_id.to_string()).join(&first.file_name);
+        let mut dec = flate2::read::GzDecoder::new(std::fs::File::open(&stored).unwrap());
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut dec, &mut body).unwrap();
+        assert_eq!(body, "v2 content revised");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 旧式 ID（hep-th/9901001）の '/' はファイル名から除去される。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn arxiv_source_sanitizes_old_style_ids(pool: SqlitePool) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let entry_id = make_entry(&pool).await;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"x").unwrap();
+        let url = serve_once(enc.finish().unwrap());
+        let dir = temp_app_dir("texsrc-old");
+
+        let att = download_and_attach_arxiv_source(
+            &pool, &dir, entry_id, "hep-th/9901001", &url, test_caps(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(att.file_name, "arxiv-hep-th9901001-source.gz");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -787,6 +787,36 @@ async fn download_arxiv_pdf(
     Ok(att)
 }
 
+/// arXiv ID から TeX ソース（e-print）をダウンロードして添付する（LCIR Phase 4）。
+///
+/// `https://arxiv.org/e-print/<id>` は gzip（tar か単一 .tex）を返す。`arxiv-<id>-source.gz`・
+/// mime `application/gzip` として保存し、**全文索引は行わない**（PDF ではない）。LCIR ビルドは
+/// 呼び出し側（詳細パネル）が添付成功後に `build_lcir_for_attachment` を明示実行する。
+/// PDF-only 投稿（TeX 未公開）は明示エラーになる。SSRF ガード・50MB 上限は PDF 取得と共有。
+#[tauri::command]
+async fn download_arxiv_source(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    entry_id: i64,
+    arxiv_id: String,
+) -> Result<Attachment, String> {
+    let id = metadata::normalize_arxiv_id(&arxiv_id);
+    if id.is_empty() {
+        return Err("arXiv ID が空です".to_string());
+    }
+    let url = format!("https://arxiv.org/e-print/{id}");
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    download::download_and_attach_arxiv_source(
+        &state.db,
+        &app_data_dir,
+        entry_id,
+        &id,
+        &url,
+        download::DownloadCaps::default(),
+    )
+    .await
+}
+
 #[tauri::command]
 async fn delete_attachment(
     app: tauri::AppHandle,
@@ -3397,6 +3427,7 @@ pub fn run() {
             get_lcir_node_region,
             get_lcir_enabled,
             set_lcir_enabled,
+            download_arxiv_source,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

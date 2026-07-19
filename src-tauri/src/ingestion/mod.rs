@@ -3,6 +3,7 @@
 
 pub mod pdf;
 pub mod structure;
+pub mod tex;
 
 use crate::db::document_nodes::NewDocumentNode;
 use crate::db::document_nodes_fts::NodeFtsInput;
@@ -16,6 +17,10 @@ use crate::document_ir::{self, CoordinateSpace, ExtractionStatus, FragmentType, 
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// arXiv TeX ソース添付の mime（`download_arxiv_source` が登録する唯一の値）。
+/// **build ディスパッチとバッチ対象クエリはこの値を同一述語として共有する**（Phase 4）。
+pub const TEX_SOURCE_MIME: &str = "application/gzip";
 
 /// 実験フラグ。OFF の間は LCIR 経路を一切実行しない（既存挙動 byte-for-byte 不変）。
 pub async fn lcir_enabled(pool: &SqlitePool) -> bool {
@@ -49,11 +54,15 @@ pub struct LcirBatchResult {
     pub failed: i64,
 }
 
-/// 添付 1 件の LCIR を pdfium 抽出で構築する。
+/// 添付 1 件の LCIR を構築する。抽出器は添付の **mime だけ**で選ぶ（バッチ対象クエリと
+/// 同一述語・`docs/LCIR_design_overview.md` Phase 4）: `%pdf%` → pdfium / `application/gzip`
+/// （arXiv TeX ソース） → `lumencite-tex`。それ以外はエラー。
 ///
 /// content_key で冪等: この添付に同一 content_key の completed があれば再抽出せず reuse。
-/// 新版を採用したら同一添付の旧 completed を superseded にし、`parent_version_id` で連結する。
-/// フラグ OFF なら何もせず `enabled: false` を返す（DB に一切書かない）。
+/// **SHA-256 → reuse 判定 → 抽出**の順にし、rebuild バッチが対象を広めに拾っても
+/// フル抽出は走らない。新版を採用したら同一添付の旧 completed を superseded にし、
+/// `parent_version_id` で連結する（添付単位なので PDF 版と TeX 版が互いを supersede
+/// することはない）。フラグ OFF なら何もせず `enabled: false` を返す（DB に一切書かない）。
 pub async fn build_lcir_for_attachment(
     pool: &SqlitePool,
     app_data_dir: &Path,
@@ -82,29 +91,35 @@ pub async fn build_lcir_for_attachment(
         row.ok_or_else(|| format!("attachment {attachment_id} not found"))?;
     let abs_path = app_data_dir.join(&file_path);
 
-    // SHA-256 と pdfium 抽出は CPU/IO/native 依存なので blocking スレッドへ。
-    let abs2 = abs_path.clone();
-    let extracted = tokio::task::spawn_blocking(move || {
-        let sha = document_ir::sha256_file(&abs2).map_err(|e| format!("sha256 failed: {e}"))?;
-        let doc = pdf::extract_document(&abs2)?;
-        Ok::<_, String>((sha, doc))
-    })
-    .await;
-    let (source_sha256, extracted_doc) = match extracted {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(e),
-        Err(e) => return Err(format!("extraction task panicked: {e}")),
+    let is_tex = mime_type == TEX_SOURCE_MIME;
+    let is_pdf = mime_type.to_ascii_lowercase().contains("pdf");
+    if !is_pdf && !is_tex {
+        return Err(format!("unsupported attachment type for LCIR: {mime_type}"));
+    }
+    let (extractor_name, extractor_version) = if is_tex {
+        (
+            document_ir::schema::TEX_EXTRACTOR_NAME,
+            document_ir::schema::TEX_EXTRACTOR_VERSION,
+        )
+    } else {
+        (
+            document_ir::schema::EXTRACTOR_NAME,
+            document_ir::schema::EXTRACTOR_VERSION,
+        )
     };
 
-    let config_hash = "";
-    let ckey = document_ir::content_key(
-        &source_sha256,
-        document_ir::schema::EXTRACTOR_NAME,
-        document_ir::schema::EXTRACTOR_VERSION,
-        config_hash,
-    );
+    // まず SHA-256 だけ計算する（IO なので blocking スレッドへ）。
+    let abs2 = abs_path.clone();
+    let source_sha256 = tokio::task::spawn_blocking(move || document_ir::sha256_file(&abs2))
+        .await
+        .map_err(|e| format!("sha256 task panicked: {e}"))?
+        .map_err(|e| format!("sha256 failed: {e}"))?;
 
-    // 冪等: 既存 completed があれば reuse（再抽出しない）。
+    let config_hash = "";
+    let ckey =
+        document_ir::content_key(&source_sha256, extractor_name, extractor_version, config_hash);
+
+    // 冪等: 既存 completed があれば reuse（抽出そのものを省く）。
     if let Some(existing) = document_versions::find_completed(pool, attachment_id, &ckey)
         .await
         .map_err(|e| e.to_string())?
@@ -128,11 +143,74 @@ pub async fn build_lcir_for_attachment(
         });
     }
 
-    // 新版の親 = 現在の最新 completed（supersede チェーン）。
+    // 新版の親 = 現在の最新 completed（supersede チェーン・添付単位 = 同一抽出器系列）。
     let parent_version_id = document_versions::latest_completed_for_attachment(pool, attachment_id)
         .await
         .map_err(|e| e.to_string())?
         .map(|v| v.id);
+
+    let (version_id, page_count, message) = if is_tex {
+        let (vid, blocks) = build_tex_version(
+            pool,
+            attachment_id,
+            &abs_path,
+            &mime_type,
+            &source_sha256,
+            &ckey,
+            parent_version_id,
+        )
+        .await?;
+        (vid, 0, format!("built LCIR from TeX source: {blocks} block(s)"))
+    } else {
+        let (vid, pages) = build_pdf_version(
+            pool,
+            attachment_id,
+            &abs_path,
+            &mime_type,
+            &source_sha256,
+            &ckey,
+            parent_version_id,
+        )
+        .await?;
+        (vid, pages, format!("built LCIR: {pages} page(s)"))
+    };
+
+    // 派生の node-FTS を張り直す（best-effort。失敗しても LCIR 本体は確定済みなので build は
+    // 成功扱い）。TeX 版は内部ガードで索引対象外になる。
+    if let Err(e) = regenerate_node_fts_from_lcir(pool, attachment_id).await {
+        eprintln!("LCIR: node-FTS regeneration failed for attachment {attachment_id}: {e}");
+    }
+
+    Ok(LcirBuildResult {
+        enabled: true,
+        built: true,
+        reused: false,
+        version_id: Some(version_id),
+        content_key: Some(ckey),
+        page_count,
+        message,
+    })
+}
+
+/// pdfium 抽出で version + `document > page > block > line` の木を作る（Phase 1-3 の経路）。
+/// 返り値は (version_id, page_count)。
+async fn build_pdf_version(
+    pool: &SqlitePool,
+    attachment_id: i64,
+    abs_path: &Path,
+    mime_type: &str,
+    source_sha256: &str,
+    ckey: &str,
+    parent_version_id: Option<i64>,
+) -> Result<(i64, i64), String> {
+    // pdfium 抽出は CPU/native 依存なので blocking スレッドへ。
+    let abs2 = abs_path.to_path_buf();
+    let extracted = tokio::task::spawn_blocking(move || pdf::extract_document(&abs2)).await;
+    let extracted_doc = match extracted {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(format!("extraction task panicked: {e}")),
+    };
 
     let metadata = serde_json::json!({
         "coordinate_space": CoordinateSpace::default(),
@@ -157,13 +235,13 @@ pub async fn build_lcir_for_attachment(
         &mut *tx,
         &NewDocumentVersion {
             attachment_id,
-            content_key: &ckey,
+            content_key: ckey,
             schema_version: document_ir::schema::SCHEMA_VERSION,
-            source_sha256: &source_sha256,
-            source_mime_type: &mime_type,
+            source_sha256,
+            source_mime_type: mime_type,
             extractor_name: document_ir::schema::EXTRACTOR_NAME,
             extractor_version: document_ir::schema::EXTRACTOR_VERSION,
-            config_hash,
+            config_hash: "",
             parent_version_id,
             status,
             warnings_json: warnings_json.as_deref(),
@@ -352,20 +430,167 @@ pub async fn build_lcir_for_attachment(
 
     tx.commit().await.map_err(|e| e.to_string())?;
 
-    // 派生の node-FTS を張り直す（best-effort。失敗しても LCIR 本体は確定済みなので build は成功扱い）。
-    if let Err(e) = regenerate_node_fts_from_lcir(pool, attachment_id).await {
-        eprintln!("LCIR: node-FTS regeneration failed for attachment {attachment_id}: {e}");
+    Ok((version_id, page_count))
+}
+
+/// TeX 抽出（`ingestion::tex`）で version + `document > block` のフラット木を作る（Phase 4）。
+/// page/line ノードと `source_fragments` は作らない（TeX に PDF 座標は無い）。display 数式は
+/// **原文 LaTeX** を `math_expressions.latex` に `semantic_status='source_provided'` で保存する。
+/// 返り値は (version_id, block_count)。
+async fn build_tex_version(
+    pool: &SqlitePool,
+    attachment_id: i64,
+    abs_path: &Path,
+    mime_type: &str,
+    source_sha256: &str,
+    ckey: &str,
+    parent_version_id: Option<i64>,
+) -> Result<(i64, i64), String> {
+    // gzip/tar 展開 + 解析は CPU/IO 依存なので blocking スレッドへ。
+    let abs2 = abs_path.to_path_buf();
+    let extracted = tokio::task::spawn_blocking(move || tex::extract_document(&abs2)).await;
+    let doc = match extracted {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(e) => return Err(format!("extraction task panicked: {e}")),
+    };
+
+    // TeX には座標が無いので coordinate_space は記録しない。
+    let metadata = serde_json::json!({
+        "main_file": doc.main_file,
+        "source_file_count": doc.source_file_count,
+        "block_count": doc.blocks.len(),
+    })
+    .to_string();
+    let warnings_json = if doc.warnings.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&doc.warnings).unwrap_or_default())
+    };
+    let status = if doc.warnings.is_empty() {
+        ExtractionStatus::Completed
+    } else {
+        ExtractionStatus::CompletedWithWarnings
+    };
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    let version_id = document_versions::insert_version(
+        &mut *tx,
+        &NewDocumentVersion {
+            attachment_id,
+            content_key: ckey,
+            schema_version: document_ir::schema::SCHEMA_VERSION,
+            source_sha256,
+            source_mime_type: mime_type,
+            extractor_name: document_ir::schema::TEX_EXTRACTOR_NAME,
+            extractor_version: document_ir::schema::TEX_EXTRACTOR_VERSION,
+            config_hash: "",
+            parent_version_id,
+            status,
+            warnings_json: warnings_json.as_deref(),
+            metadata_json: Some(&metadata),
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // document ルート（原文由来なので origin=tex_source）。
+    let doc_node_id = document_nodes::insert_node(
+        &mut *tx,
+        &NewDocumentNode {
+            document_version_id: version_id,
+            parent_id: None,
+            node_kind: NodeKind::Document.as_str(),
+            ordinal: 0,
+            plain_text: None,
+            language: None,
+            confidence: None,
+            origin: Some(Origin::TexSource.as_str()),
+            payload_json: None,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let block_count = doc.blocks.len() as i64;
+    for (bi, block) in doc.blocks.iter().enumerate() {
+        let payload_json = tex_block_payload_json(block);
+        let node_id = document_nodes::insert_node(
+            &mut *tx,
+            &NewDocumentNode {
+                document_version_id: version_id,
+                parent_id: Some(doc_node_id),
+                node_kind: block.kind.as_str(),
+                ordinal: bi as i64,
+                plain_text: Some(block.text.as_str()),
+                language: None,
+                confidence: Some(block.confidence),
+                origin: Some(Origin::TexSource.as_str()),
+                payload_json: payload_json.as_deref(),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if block.kind == NodeKind::DisplayMath {
+            math_expressions::insert_math(
+                &mut *tx,
+                &math_expressions::NewMathExpression {
+                    node_id,
+                    display_mode: document_ir::MathDisplayMode::Display.as_str(),
+                    equation_label: block.equation_label.as_deref(),
+                    latex: block.latex.as_deref(),
+                    presentation_mathml: None,
+                    content_mathml: None,
+                    openmath_json: None,
+                    normalized_text: Some(block.text.as_str()),
+                    ast_json: None,
+                    semantic_status: document_ir::MathSemanticStatus::SourceProvided.as_str(),
+                    confidence: Some(block.confidence),
+                    origin: Some(Origin::TexSource.as_str()),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
     }
 
-    Ok(LcirBuildResult {
-        enabled: true,
-        built: true,
-        reused: false,
-        version_id: Some(version_id),
-        content_key: Some(ckey),
-        page_count,
-        message: format!("built LCIR: {page_count} page(s)"),
-    })
+    document_versions::mark_superseded_for_attachment(&mut *tx, attachment_id, version_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    Ok((version_id, block_count))
+}
+
+/// TeX ブロックの型固有属性（見出し階層・節番号・\label 名・cite key）を payload_json にする。
+fn tex_block_payload_json(b: &tex::TexBlock) -> Option<String> {
+    let mut map = serde_json::Map::new();
+    if let Some(level) = b.heading_level {
+        map.insert("heading_level".to_string(), serde_json::Value::from(level));
+    }
+    if let Some(ref number) = b.section_number {
+        map.insert(
+            "section_number".to_string(),
+            serde_json::Value::from(number.clone()),
+        );
+    }
+    if !b.labels.is_empty() {
+        map.insert(
+            "labels".to_string(),
+            serde_json::Value::from(b.labels.clone()),
+        );
+    }
+    if let Some(ref key) = b.cite_key {
+        map.insert("cite_key".to_string(), serde_json::Value::from(key.clone()));
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map).to_string())
+    }
 }
 
 /// ブロックの型固有属性（見出し階層・節番号）を payload_json にする。無ければ None。
@@ -404,7 +629,10 @@ pub async fn build_missing_lcir(
 
 /// 現行より古い抽出器版（例 Phase 1 の 0.1.0）で作られた LCIR を、現行版へ再構築する。
 /// 抽出ロジックを上げた後、既存コーパスに新しい構造認識を行き渡らせるためのバッチ。
-/// フラグ OFF なら `enabled: false` で即返す。
+///
+/// **抽出器と mime フィルタは必ずペアで渡す**（Phase 4）: 「outdated」は同一抽出器系列の
+/// 中でだけ意味を持つ。pdfium 版で構築済みの PDF を「TeX 版が無いから outdated」と誤判定
+/// して全コーパス再抽出する事故を防ぐ。フラグ OFF なら `enabled: false` で即返す。
 pub async fn rebuild_outdated_lcir(
     pool: &SqlitePool,
     app_data_dir: &Path,
@@ -412,13 +640,24 @@ pub async fn rebuild_outdated_lcir(
     if !lcir_enabled(pool).await {
         return Ok(disabled_batch());
     }
-    let targets = document_versions::attachments_with_outdated_lcir(
+    let mut targets = document_versions::attachments_with_outdated_lcir(
         pool,
         document_ir::schema::EXTRACTOR_NAME,
         document_ir::schema::EXTRACTOR_VERSION,
+        "%pdf%",
     )
     .await
     .map_err(|e| e.to_string())?;
+    targets.extend(
+        document_versions::attachments_with_outdated_lcir(
+            pool,
+            document_ir::schema::TEX_EXTRACTOR_NAME,
+            document_ir::schema::TEX_EXTRACTOR_VERSION,
+            TEX_SOURCE_MIME,
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+    );
     Ok(run_build_batch(pool, app_data_dir, targets).await)
 }
 
@@ -473,6 +712,11 @@ pub async fn regenerate_page_fts_from_lcir(
         Some(v) => v,
         None => return Ok(0),
     };
+    // ページ FTS は pdfium 版のみ（TeX 版は page ノードを持たず、`fulltext` はページ粒度の
+    // PDF 検索インデックスなので触らない）。
+    if version.extractor_name != document_ir::schema::EXTRACTOR_NAME {
+        return Ok(0);
+    }
     let pages = document_nodes::page_nodes_for_version(pool, version.id)
         .await
         .map_err(|e| e.to_string())?;
@@ -510,6 +754,14 @@ pub async fn regenerate_node_fts_from_lcir(
             return Ok(0);
         }
     };
+    // TeX 版（Phase 4）は node-FTS に載せない: 同一エントリの PDF 版と本文が重複ヒットし、
+    // bbox も持たないため（検索 = PDF 版 / 読み出し = TeX 優先の分担・design overview §8）。
+    if version.extractor_name != document_ir::schema::EXTRACTOR_NAME {
+        document_nodes_fts::unindex_attachment(pool, attachment_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(0);
+    }
     let rows = document_nodes::indexable_nodes_for_version(pool, version.id)
         .await
         .map_err(|e| e.to_string())?;
@@ -602,6 +854,12 @@ pub async fn load_lcir_document(
         })
         .collect();
 
+    // TeX 版（Phase 4）は PDF 座標を持たないので coordinate_space を主張しない。
+    let coordinate_space = if version.extractor_name == document_ir::schema::EXTRACTOR_NAME {
+        Some(CoordinateSpace::default())
+    } else {
+        None
+    };
     Ok(Some(document_ir::LcirDocument {
         schema: document_ir::schema::SCHEMA_URI.to_string(),
         schema_version: version.schema_version,
@@ -613,7 +871,7 @@ pub async fn load_lcir_document(
             extractor_name: version.extractor_name,
             extractor_version: version.extractor_version,
         },
-        coordinate_space: CoordinateSpace::default(),
+        coordinate_space,
         nodes: lcir_nodes,
     }))
 }
@@ -926,6 +1184,195 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// TeX ソース添付（application/gzip）の build 一式（CI 実行可能・pdfium 不要）:
+    /// mime ディスパッチ → gzip 展開 → フラット木（page/line/fragment 無し）→ 原文 LaTeX の
+    /// math_expressions → node-FTS 非索引 → 冪等 reuse。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_tex_attachment_end_to_end(pool: SqlitePool) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Tex Paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let file_name = "arxiv-2301.00001-source.gz";
+        let rel = format!("attachments/{}/{}", entry.id, file_name);
+        let att = add_attachment(&pool, entry.id, &rel, file_name, TEX_SOURCE_MIME)
+            .await
+            .unwrap()
+            .id;
+
+        // gzip した単一 .tex をテンポラリ app_data_dir に配置。
+        let root = std::env::temp_dir().join(format!("lcir-tex-e2e-{}", std::process::id()));
+        let dir = root.join("attachments").join(entry.id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let tex = "\\documentclass{article}\\title{Tex Paper}\\begin{document}\n\
+                   \\begin{abstract}\nAbout transformers.\n\\end{abstract}\n\
+                   \\section{Intro}\nBody text here.\n\
+                   \\begin{equation}\\label{eq:e}E=mc^2\\end{equation}\n\
+                   \\end{document}";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(tex.as_bytes()).unwrap();
+        std::fs::write(dir.join(file_name), enc.finish().unwrap()).unwrap();
+
+        let res = build_lcir_for_attachment(&pool, &root, att).await.unwrap();
+        assert!(res.enabled && res.built && !res.reused, "{res:?}");
+        assert_eq!(res.page_count, 0, "TeX 版に page は無い");
+        assert!(res.message.contains("block(s)"), "{}", res.message);
+
+        let doc = load_lcir_document(&pool, att).await.unwrap().unwrap();
+        assert_eq!(doc.source.extractor_name, document_ir::schema::TEX_EXTRACTOR_NAME);
+        assert!(doc.coordinate_space.is_none(), "TeX 版は座標系を主張しない");
+        assert!(doc.nodes.iter().all(|n| n.kind != "page" && n.kind != "line"));
+        assert!(doc.nodes.iter().all(|n| n.source_fragments.is_empty()));
+        assert!(doc.nodes.iter().any(|n| n.kind == "front_matter"));
+        assert!(doc.nodes.iter().any(|n| n.kind == "abstract"));
+        assert!(doc.nodes.iter().any(|n| n.kind == "section"));
+        let math = doc.nodes.iter().find(|n| n.kind == "display_math").unwrap();
+        let m = math.math.as_ref().expect("math row for display_math");
+        assert!(m.latex.as_deref().unwrap().contains("E=mc^2"));
+        assert_eq!(m.semantic_status, "source_provided");
+        assert_eq!(m.origin.as_deref(), Some("tex_source"));
+        assert_eq!(math.origin.as_deref(), Some("tex_source"));
+        assert!(document_ir::validation::validate(&doc).is_ok());
+
+        // TeX 版は node-FTS に載らない。
+        let fts_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM document_nodes_fts WHERE attachment_id = ?")
+                .bind(att)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fts_rows, 0, "TeX 版は node-FTS 非索引");
+
+        // 冪等: 同一バイトの再 build は reuse（抽出も走らない）。
+        let again = build_lcir_for_attachment(&pool, &root, att).await.unwrap();
+        assert!(again.reused, "{again:?}");
+        assert_eq!(again.content_key, res.content_key);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// LCIR 対象外の mime は明示エラー（バッチ対象クエリと同一述語のディスパッチ）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_rejects_unsupported_mime(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "P".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = add_attachment(&pool, entry.id, "attachments/x/notes.txt", "notes.txt", "text/plain")
+            .await
+            .unwrap()
+            .id;
+        let err = build_lcir_for_attachment(&pool, Path::new("/nonexistent"), att)
+            .await
+            .unwrap_err();
+        assert!(err.contains("unsupported"), "{err}");
+    }
+
+    /// 最新版が TeX（非 pdfium）の添付では node-FTS を張らず、古い索引もクリアする（Phase 4）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn regenerate_node_fts_skips_tex_versions(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let vid = document_versions::insert_version(
+            &pool,
+            &NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-tex",
+                schema_version: document_ir::schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: TEX_SOURCE_MIME,
+                extractor_name: document_ir::schema::TEX_EXTRACTOR_NAME,
+                extractor_version: document_ir::schema::TEX_EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = document_nodes::insert_node(
+            &pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("tex_source"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        document_nodes::insert_node(
+            &pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::Paragraph.as_str(),
+                ordinal: 0,
+                plain_text: Some("tex paragraph text"),
+                language: None,
+                confidence: Some(0.9),
+                origin: Some("tex_source"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        // 古い索引が残っているケースを模す。
+        document_nodes_fts::index_nodes(
+            &pool,
+            att,
+            &[NodeFtsInput {
+                node_id: 999,
+                page: 1,
+                node_kind: "paragraph".to_string(),
+                content: "stale pdf row".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let n = regenerate_node_fts_from_lcir(&pool, att).await.unwrap();
+        assert_eq!(n, 0, "TeX 版は索引しない");
+        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(document_nodes_fts::search_nodes(&pool, "tex paragraph", None, None, None)
+            .await
+            .unwrap()
+            .is_empty());
+        // ページ FTS 側も TeX 版では何もしない。
+        assert_eq!(regenerate_page_fts_from_lcir(&pool, att).await.unwrap(), 0);
     }
 
     /// 手組みの LCIR を read 面（LcirDocument）に組み立て、fragment がノードに紐づき、

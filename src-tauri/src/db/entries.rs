@@ -30,12 +30,21 @@ fn push_filter<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a EntryFilter) {
         Some(false) => { qb.push(" AND e.starred = 0"); }
         None => {}
     }
+    // 「添付」= PDF 添付（UI ラベル・CLI ヘルプとも「PDF 添付」）。arXiv TeX ソース
+    // （application/gzip・LCIR Phase 4）は数えない — TeX ソースだけのエントリを
+    // 「PDF あり」と偽らないため。
     match filter.has_attachment {
         Some(true) => {
-            qb.push(" AND EXISTS (SELECT 1 FROM attachments a WHERE a.entry_id = e.id)");
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM attachments a WHERE a.entry_id = e.id \
+                 AND a.mime_type LIKE '%pdf%')",
+            );
         }
         Some(false) => {
-            qb.push(" AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.entry_id = e.id)");
+            qb.push(
+                " AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.entry_id = e.id \
+                 AND a.mime_type LIKE '%pdf%')",
+            );
         }
         None => {}
     }
@@ -326,13 +335,14 @@ async fn load_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, sqlx::
     .fetch_all(pool)
     .await?;
 
-    let has_attachment: bool =
-        sqlx::query("SELECT COUNT(*) as cnt FROM attachments WHERE entry_id = ?")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .map(|r| r.get::<i64, _>("cnt") > 0)
-            .unwrap_or(false);
+    let has_attachment: bool = sqlx::query(
+        "SELECT COUNT(*) as cnt FROM attachments WHERE entry_id = ? AND mime_type LIKE '%pdf%'",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .map(|r| r.get::<i64, _>("cnt") > 0)
+    .unwrap_or(false);
 
     let journal: Option<String> = sqlx::query_scalar(
         "SELECT field_value FROM extra_fields WHERE entry_id = ? AND field_name = 'journal'",
@@ -470,7 +480,7 @@ async fn load_entry_summary(pool: &SqlitePool, id: i64) -> Result<EntrySummary, 
     .await?;
 
     let has_attachment: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM attachments WHERE entry_id = ?",
+        "SELECT COUNT(*) FROM attachments WHERE entry_id = ? AND mime_type LIKE '%pdf%'",
     )
     .bind(id)
     .fetch_one(pool)
@@ -555,7 +565,9 @@ pub async fn get_entry(pool: &SqlitePool, id: i64) -> Result<EntryDetail, sqlx::
     .fetch_all(pool)
     .await?;
 
-    let has_attachment = !attachments.is_empty();
+    let has_attachment = attachments
+        .iter()
+        .any(|a| a.mime_type.to_lowercase().contains("pdf"));
 
     let collections: Vec<Collection> = sqlx::query(
         "SELECT c.id, c.name, c.parent_id FROM collections c
@@ -3299,6 +3311,31 @@ mod tests {
         let hits = get_entries_filtered(&pool, None, None, None, &no).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "without");
+    }
+
+    /// Phase 4: 「添付」フィルタは PDF 添付の意味 — arXiv TeX ソース（gzip）だけの
+    /// エントリは「添付あり」に数えない（UI/CLI の「PDF 添付」ラベルを偽らない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn filter_has_attachment_ignores_tex_sources(pool: SqlitePool) {
+        let tex_only = make_entry_full(&pool, "tex-only", "article", None, false).await;
+        crate::db::attachments::add_attachment(
+            &pool,
+            tex_only,
+            &format!("attachments/{tex_only}/arxiv-src.gz"),
+            "arxiv-src.gz",
+            "application/gzip",
+        )
+        .await
+        .unwrap();
+
+        let yes = EntryFilter { has_attachment: Some(true), ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &yes).await.unwrap();
+        assert!(hits.is_empty(), "TeX ソースのみは PDF 添付ありに数えない");
+
+        let no = EntryFilter { has_attachment: Some(false), ..Default::default() };
+        let hits = get_entries_filtered(&pool, None, None, None, &no).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "tex-only");
     }
 
     #[sqlx::test(migrations = "./migrations")]
