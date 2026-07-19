@@ -776,6 +776,8 @@ type ClipResponse = {
 
 **サーバー側フロー:** `find_duplicate_entry`（DOI/arXiv/ISBN）→ 重複なら `duplicate` 応答（作成も PDF 添付もしない）→ 識別子があれば `metadata::fetch_by_doi/arxiv/isbn` でメタデータ解決 → `create_entry` → PDF URL（明示 or arXiv 導出）があれば**応答後に** `download_and_attach` を spawn（50MB 上限・30 秒タイムアウト・先頭チャンクの `%PDF-` マジック検証。失敗してもエントリは残る）。作成・添付の成功時は `.bib` 同期キック＋ `entries-changed` を発火。
 
+**TeX ソース自動取得（LCIR Phase 4 の自動化）:** arXiv クリップ（arxiv_id あり）で **`lcir.enabled` が ON のときだけ**、応答後に `spawn_tex_source_job` が `download_and_attach_arxiv_source` → `build_lcir_for_attachment` を best-effort 実行する（`clipper::derive_tex_source_job` がジョブ発行時にフラグを判定）。OFF のユーザーのクリップごとに e-print を落とすことはしない。重複クリップでは再取得しない（再取得は詳細パネルのボタンから）。失敗はログのみでクリップ成功は維持（PDF ジョブと同じ契約）。
+
 **メタデータ解決の規則:**
 - 試行順は DOI → arXiv → ISBN（各 10 秒タイムアウト）。ただし **arXiv の DataCite DOI（`10.48550/…`）は CrossRef に無い**ため、arxiv_id があるときは arXiv を先に試す。1 つ失敗しても次の識別子へカスケードする
 - 全滅・識別子なしは**フォールバック入力**へ（クリップ自体は失敗させない）: 拡張が送った `title` / `authors` / `published_date` / `site_name` を使い、**arxiv_id があれば `preprint`、無ければ `webpage`** 種別で作成する。識別子は素通しで保存し、後からのクリップでも重複検出が効く
