@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-22
+
+The headline is **multiple PDF attachments per entry** — a paper and its supplemental material (SI) can now live on the same entry, both readable in the full-screen reader and both full-text searchable. This release also bundles the reliability and code-review fixes accumulated since v0.7.0 (complete backups with automatic restore, full-text self-heal, identifier de-duplication), Web Clipper acquisition hardening, and the first experimental phases of **LCIR**, a machine-readable intermediate representation for papers, gated behind an off-by-default flag. No migration is required; existing libraries upgrade unchanged.
+
+### Added
+
+- **Multiple PDF attachments per entry (body + supplemental)** — an entry can now hold several PDFs (e.g. the main article plus its Supplementary Information) and read them all. The full-screen reader (`DetailView`) gains an **attachment switcher** (shown only when an entry has 2+ attachments) that drives the PDF viewer, OCR, print and detached-window views, plus an **in-reader "add PDF"** control so supplements can be attached without leaving the reader. Each attachment is indexed independently, so a newly added supplement becomes full-text searchable in the background right away. This builds on existing schema and commands — **no migration and no new API**. Returning from a supplement to the body no longer clobbers the body's last-read page.
+- **LCIR — machine-readable intermediate representation (experimental, `lcir.enabled` default off)** — the first phases (0–4) of a structured, machine-readable form of each paper, built for AI-agent consumption: a pdfium-based foundation that captures text with page coordinates, bulk backfill of already-attached PDFs with a settings toggle, logical-structure recognition with node-level full-text search, math-surface recognition (`math_expressions`), read tools exposed over MCP, and arXiv **TeX source** ingestion with multiple-representation priority and source switching (raw LaTeX math preserved from the TeX when available). The entire feature sits behind an off-by-default experimental flag and does not affect existing behaviour when disabled.
+- **Web Clipper acquisition hardening** — when a clip lands on an entry that already exists, the extension can now **fill in a missing primary** (PDF / TeX source) instead of silently returning `duplicate`, via a service-worker-owned confirmation popup and a `POST /clipper/complete` route. A **bulk TeX-source fetch** (`fetch_missing_arxiv_sources`) backfills arXiv TeX for entries that lack it, and arXiv clips/adds auto-fetch the TeX source when `lcir.enabled` is on. Includes an AddSheet quirk fix. Requires the updated extension (v0.2.0) from this release's assets.
+- **Toolbar simplification** — the list toolbar drops the "Columns" and "Sort" buttons, enlarges the search box, moves the metadata/full-text toggle out to the toolbar, and adds a one-click clear button.
+
+### Fixed
+
+- **Complete, self-restoring backups + full-text self-heal (CR-018)** — backups now **bundle the attachment files** into a complete `.zip` (previously the DB only), and a backup can be **restored/imported automatically on the next launch** (a two-phase apply that runs before the app opens the library). The full-text index also **self-heals** on startup when the FTS table is missing or out of sync.
+- **Identifier canonicalization + de-duplication (CR-019)** — identifiers (DOI / arXiv) are canonicalized before comparison, duplicates are detected across all add paths, and a best-effort UNIQUE constraint guards against re-introducing them.
+- **Code-review fixes (2026-07-11)** — a batch of correctness and robustness fixes from the July code review (36 of 39 findings, with the remaining partial items landed in a follow-up).
+
 ## [0.7.0] - 2026-07-05
 
 The headline is a **command-line interface** for reading and writing the library headlessly, built for AI-agent × LaTeX workflows (the `lumencite-bib` Skill) and shell scripting. This release also adds manual/bulk full-text index triggers and one-shot arXiv PDF download when adding an entry. No migration is required; existing libraries upgrade unchanged.
