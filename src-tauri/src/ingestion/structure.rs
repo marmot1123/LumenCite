@@ -38,6 +38,10 @@ pub struct StructuredBlock {
     pub section_number: Option<String>,
     /// 数式番号（"(2.1)" 等）。display_math のみ・検出できたとき。
     pub equation_label: Option<String>,
+    /// 定理番号（"2.3" / "A.1" 等）。定理系ノードのみ・行頭テキストから検出できたとき（Phase 5）。
+    pub theorem_number: Option<String>,
+    /// 定理・証明の付記名（"Theorem 1 (Zorn)." の "Zorn"）。定理系ノードのみ（Phase 5）。
+    pub note: Option<String>,
     /// 構成する行（読み順）。各行は node_kind=line の子ノードになる。
     pub lines: Vec<StructuredLine>,
 }
@@ -255,6 +259,8 @@ fn classify_block(
             heading_level,
             section_number,
             equation_label: None,
+            theorem_number: None,
+            note: None,
             lines,
         })
     };
@@ -268,7 +274,27 @@ fn classify_block(
         }
     }
 
-    // 2. display 数式。見出しより先に見て、大フォントの数式を見出しに誤判定させない
+    // 2. 定理・定義・証明（Phase 5・PDF 由来のヒューリスティック）。行頭キーワード + 番号で判定し、
+    //    数式・見出し検出より先に見る（"Theorem 2.3." の '.' や記号で誤分類させない）。確信は
+    //    中程度で、番号・note を payload に載せる（呼び出し側で origin=layout_model）。
+    if !in_bibliography {
+        if let Some(th) = detect_theorem(first) {
+            return Some(StructuredBlock {
+                kind: th.kind,
+                text: text.clone(),
+                bbox,
+                confidence: th.confidence,
+                heading_level: None,
+                section_number: None,
+                equation_label: None,
+                theorem_number: th.number,
+                note: th.note,
+                lines,
+            });
+        }
+    }
+
+    // 3. display 数式。見出しより先に見て、大フォントの数式を見出しに誤判定させない
     //    （Phase 3。意味は取らず表層のみ＝呼び出し側で semantic_status='surface_only'）。
     if !in_bibliography {
         if let Some((confidence, equation_label)) = detect_display_math(&text, lines.len()) {
@@ -280,12 +306,14 @@ fn classify_block(
                 heading_level: None,
                 section_number: None,
                 equation_label,
+                theorem_number: None,
+                note: None,
                 lines,
             });
         }
     }
 
-    // 3. 見出し（参考文献モードでは番号付き見出しを無効化 = "1. Author…" の誤検出回避）。
+    // 4. 見出し（参考文献モードでは番号付き見出しを無効化 = "1. Author…" の誤検出回避）。
     if let Some(h) = detect_heading(
         first,
         lines.len(),
@@ -302,7 +330,7 @@ fn classify_block(
         return mk(h.kind, h.confidence, h.level, h.section_number, lines);
     }
 
-    // 4. モードに応じた本文分類。
+    // 5. モードに応じた本文分類。
     match state.mode {
         Mode::Abstract => mk(NodeKind::Abstract, 0.7, None, None, lines),
         Mode::Bibliography => mk(NodeKind::BibliographyEntry, 0.5, None, None, lines),
@@ -503,6 +531,113 @@ fn detect_caption(first: &str) -> Option<NodeKind> {
     } else {
         None
     }
+}
+
+/// 定理系ブロックの検出結果（Phase 5・PDF ヒューリスティック）。
+struct TheoremHit {
+    kind: NodeKind,
+    number: Option<String>,
+    note: Option<String>,
+    confidence: f64,
+}
+
+/// 行頭が定理系キーワード（"Theorem 2.3." / "Proof." / "Definition (Name)." 等）で始まるか。
+///
+/// PDF レイアウト由来なので確信は中程度。参照文中の "Theorem 2 shows …"（キーワード + 番号の後が
+/// 終端記号でない）は棄却し、誤検出より欠損を選ぶ。number（"2.3"）と note（丸括弧名）を取り出す。
+fn detect_theorem(first: &str) -> Option<TheoremHit> {
+    let f = first.trim_start();
+    let word: String = f.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    if word.is_empty() {
+        return None;
+    }
+    let kind = match word.to_ascii_lowercase().as_str() {
+        "theorem" => NodeKind::Theorem,
+        "lemma" => NodeKind::Lemma,
+        "proposition" => NodeKind::Proposition,
+        "corollary" => NodeKind::Corollary,
+        "definition" => NodeKind::Definition,
+        "remark" => NodeKind::Remark,
+        "example" => NodeKind::Example,
+        "proof" => NodeKind::Proof,
+        _ => return None,
+    };
+    let rest = f[word.len()..].trim_start();
+
+    // proof は番号を持たないことが多い（"Proof." / "Proof of Theorem 2.3." / "Proof:"）。
+    if kind == NodeKind::Proof {
+        let lower = rest.to_ascii_lowercase();
+        let ok = rest.is_empty()
+            || rest.starts_with(['.', ':', '(', '—', '–'])
+            || lower == "of"
+            || lower.starts_with("of ");
+        return ok.then_some(TheoremHit {
+            kind,
+            number: None,
+            note: note_before_period(rest),
+            confidence: 0.6,
+        });
+    }
+
+    // それ以外は「番号（任意）+ 終端記号」で定理見出しとみなす。
+    let number = parse_theorem_number(rest);
+    let after_num = match &number {
+        Some(n) => rest[n.len()..].trim_start(),
+        None => rest,
+    };
+    let terminated = after_num.starts_with(['.', ':', '(', '—', '–']);
+    if !terminated {
+        return None;
+    }
+    // 番号 + 終端は確信高め、番号なし（"Definition."）は中程度。
+    let confidence = if number.is_some() { 0.7 } else { 0.6 };
+    Some(TheoremHit {
+        kind,
+        number,
+        note: note_before_period(after_num),
+        confidence,
+    })
+}
+
+/// 行頭の定理番号（"2" / "2.3" / 付録 "A.1"）を取り出す。数字を含まなければ None。
+fn parse_theorem_number(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    // 付録形 "A.1"（大文字 + '.' + 数字）。
+    let appendix = b.len() >= 3
+        && b[0].is_ascii_uppercase()
+        && b[1] == b'.'
+        && b[2].is_ascii_digit();
+    let prefix: String = if appendix {
+        std::iter::once(b[0] as char)
+            .chain(
+                s[1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.'),
+            )
+            .collect()
+    } else {
+        s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect()
+    };
+    let trimmed = prefix.trim_end_matches('.');
+    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// 最初の '.'/':' より前に現れる "(..)" の中身を付記名として取り出す（"(Zorn). Statement" → "Zorn"）。
+/// 文中の "(x, y)" を誤って拾わないよう、括弧は先頭の終端記号より前にある場合だけ採用する。
+fn note_before_period(s: &str) -> Option<String> {
+    let paren = s.find('(')?;
+    let terminator = s
+        .find(['.', ':'])
+        .unwrap_or(usize::MAX);
+    if paren > terminator {
+        return None;
+    }
+    let close = s[paren + 1..].find(')')?;
+    let inner = s[paren + 1..paren + 1 + close].trim();
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
 /// 文らしさ（英字が数個以上）。ページ番号 "12" や孤立記号を段落から除くための粗い判定。
@@ -895,6 +1030,73 @@ mod tests {
         assert_eq!(blocks[1].kind, NodeKind::DisplayMath);
         assert_eq!(blocks[1].equation_label.as_deref(), Some("(2.1)"));
         assert!(blocks[1].confidence >= 0.5);
+    }
+
+    #[test]
+    fn detect_theorem_matches_headers_and_rejects_references() {
+        // キーワード + 番号 + 終端記号 → 定理系（number/note を取り出す）。
+        let t = detect_theorem("Theorem 2.3. Let X be a compact set").unwrap();
+        assert_eq!(t.kind, NodeKind::Theorem);
+        assert_eq!(t.number.as_deref(), Some("2.3"));
+        assert!(t.confidence >= 0.7);
+        // 付記名（丸括弧）を取り出す。
+        let t = detect_theorem("Theorem 1 (Zorn's Lemma). Every poset ...").unwrap();
+        assert_eq!(t.number.as_deref(), Some("1"));
+        assert_eq!(t.note.as_deref(), Some("Zorn's Lemma"));
+        // 付録番号 "A.1"。
+        assert_eq!(
+            detect_theorem("Lemma A.1. The map is continuous").unwrap().kind,
+            NodeKind::Lemma
+        );
+        // proof は番号なしでも "." / "of" で認識。
+        assert_eq!(detect_theorem("Proof.").unwrap().kind, NodeKind::Proof);
+        assert_eq!(
+            detect_theorem("Proof of Theorem 2.3. We first ...").unwrap().kind,
+            NodeKind::Proof
+        );
+        // 参照文中の "Theorem 2 shows …" は終端記号が続かないので棄却（誤検出より欠損）。
+        assert!(detect_theorem("Theorem 2 shows that the bound holds").is_none());
+        // 定理でない散文の行頭語。
+        assert!(detect_theorem("Example usage is shown in the appendix").is_none());
+        assert!(detect_theorem("Remarkably, the result also holds here").is_none());
+        // 文中の "(x, y)" を note と誤認しない（終端記号が括弧より前）。
+        let t = detect_theorem("Definition 4.1. Let (x, y) denote a pair").unwrap();
+        assert_eq!(t.kind, NodeKind::Definition);
+        assert_eq!(t.note, None);
+    }
+
+    #[test]
+    fn theorem_block_is_classified_with_number_payload() {
+        let p = build_page(&[
+            ("some body sentence to anchor the median here", 10.0, 0.0),
+            ("and a second body line of running prose now", 10.0, G),
+            ("and a third body line to anchor the median", 10.0, G),
+            ("Theorem 2.3. Every bounded sequence has a limit", 10.0, H),
+            ("Proof. Consider the monotone subsequence and", 10.0, H),
+        ]);
+        let blocks = recognize(&p);
+        let thm = blocks.iter().find(|b| b.kind == NodeKind::Theorem).unwrap();
+        assert_eq!(thm.theorem_number.as_deref(), Some("2.3"));
+        assert!(thm.confidence >= 0.7);
+        assert!(blocks.iter().any(|b| b.kind == NodeKind::Proof));
+    }
+
+    #[test]
+    fn theorem_keyword_in_bibliography_mode_is_not_detected() {
+        // 参考文献モードでは定理検出を行わない: "Theorem 1. …" で始まる行も書誌項目にする
+        // （本文モードなら Theorem になる行を、mode ガードが抑える対比）。
+        let p = build_page(&[
+            ("References", 12.0, 0.0),
+            ("Theorem 1. A. Author, A Title. Journal 2020", 10.0, H),
+            ("Lemma 2. B. Author, B Title. Journal 2021", 10.0, G),
+            ("Proof 3. C. Author, C Title. Journal 2022", 10.0, G),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[0].kind, NodeKind::Heading); // "References"
+        assert_eq!(blocks[1].kind, NodeKind::BibliographyEntry);
+        assert!(!blocks
+            .iter()
+            .any(|b| matches!(b.kind, NodeKind::Theorem | NodeKind::Lemma | NodeKind::Proof)));
     }
 
     #[test]

@@ -586,6 +586,9 @@ fn tex_block_payload_json(b: &tex::TexBlock) -> Option<String> {
     if let Some(ref key) = b.cite_key {
         map.insert("cite_key".to_string(), serde_json::Value::from(key.clone()));
     }
+    if let Some(ref note) = b.note {
+        map.insert("note".to_string(), serde_json::Value::from(note.clone()));
+    }
     if map.is_empty() {
         None
     } else {
@@ -593,7 +596,7 @@ fn tex_block_payload_json(b: &tex::TexBlock) -> Option<String> {
     }
 }
 
-/// ブロックの型固有属性（見出し階層・節番号）を payload_json にする。無ければ None。
+/// ブロックの型固有属性（見出し階層・節番号・定理番号・付記名）を payload_json にする。無ければ None。
 fn block_payload_json(b: &structure::StructuredBlock) -> Option<String> {
     let mut map = serde_json::Map::new();
     if let Some(level) = b.heading_level {
@@ -604,6 +607,15 @@ fn block_payload_json(b: &structure::StructuredBlock) -> Option<String> {
             "section_number".to_string(),
             serde_json::Value::from(number.clone()),
         );
+    }
+    if let Some(ref number) = b.theorem_number {
+        map.insert(
+            "theorem_number".to_string(),
+            serde_json::Value::from(number.clone()),
+        );
+    }
+    if let Some(ref note) = b.note {
+        map.insert("note".to_string(), serde_json::Value::from(note.clone()));
     }
     if map.is_empty() {
         None
@@ -1602,6 +1614,43 @@ mod tests {
             count("bibliography_entry"),
             count("unknown_block"),
         );
+        // Phase 5: 定理系ノードの内訳と数点のサンプル（番号・付記名 payload）。
+        eprintln!(
+            "  theorem={} lemma={} proposition={} corollary={} definition={} remark={} example={} proof={}",
+            count("theorem"),
+            count("lemma"),
+            count("proposition"),
+            count("corollary"),
+            count("definition"),
+            count("remark"),
+            count("example"),
+            count("proof"),
+        );
+        for n in doc
+            .nodes
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.kind.as_str(),
+                    "theorem" | "lemma" | "proposition" | "corollary" | "definition" | "remark"
+                        | "example" | "proof"
+                )
+            })
+            .take(8)
+        {
+            let bbox = n
+                .source_fragments
+                .first()
+                .map(|f| format!("p{} ({:.0},{:.0})", f.page, f.bbox.x, f.bbox.y));
+            eprintln!(
+                "  [{}] conf={:?} payload={:?} {:?} {}",
+                n.kind,
+                n.confidence,
+                n.payload,
+                bbox,
+                n.plain_text.as_deref().unwrap_or("").chars().take(70).collect::<String>(),
+            );
+        }
         // 検出した数式（表層）を数点表示: 制御文字が除かれ normalized_text が埋まること。
         for n in doc.nodes.iter().filter(|n| n.kind == "display_math").take(5) {
             let m = n.math.as_ref();
@@ -1613,9 +1662,18 @@ mod tests {
                 n.plain_text.as_deref().unwrap_or("").chars().take(60).collect::<String>(),
             );
         }
-        let math_rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM math_expressions").fetch_one(&pool).await.unwrap();
-        eprintln!("math_expressions rows = {math_rows}");
+        // このビルド（= 読み込んだ最新版）にスコープする。実 DB には他添付・TeX 版・superseded 版の
+        // math 行も溜まっているため、グローバル COUNT(*) は単一版の display_math 数と一致しない。
+        let math_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM math_expressions me
+             JOIN document_nodes dn ON dn.id = me.node_id
+             WHERE dn.document_version_id = ?",
+        )
+        .bind(doc.version_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        eprintln!("math_expressions rows (this version) = {math_rows}");
         assert_eq!(
             math_rows as usize,
             count("display_math"),

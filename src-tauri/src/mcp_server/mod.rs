@@ -964,17 +964,24 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
         let equation_label = n.math.as_ref().and_then(|m| m.equation_label.clone());
         // TeX 由来の数式は原文 LaTeX を持つ（Phase 4・semantic_status='source_provided'）。
         let latex = n.math.as_ref().and_then(|m| m.latex.clone());
-        let section_number = n
-            .payload
-            .as_ref()
-            .and_then(|p| p.get("section_number"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let payload_str = |key: &str| {
+            n.payload
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        let section_number = payload_str("section_number");
+        // 定理系ノード（Phase 5）: 番号・付記名を surface して "定理 2.3 の証明" 取得に使えるようにする。
+        let theorem_number = payload_str("theorem_number");
+        let note = payload_str("note");
         out.push(json!({
             "index": i,
             "kind": n.kind,
             "page": node_page(n),
             "section_number": section_number,
+            "theorem_number": theorem_number,
+            "note": note,
             "equation_label": equation_label,
             "latex": latex,
             "text": text,
@@ -2040,6 +2047,116 @@ mod tests {
         // フィルタ無し → 本文ブロック 4 個（document/page/line は除外）。
         let all = tool_json(&call_tool(&pool, "get_document_blocks", json!({ "entry_id": entry_id })).await);
         assert_eq!(all["total_blocks"], 4);
+    }
+
+    /// Phase 5 完了条件「定理と証明を一つの問い合わせで取得できる」: `kinds` フィルタで
+    /// theorem + proof をまとめて取り、定理番号・付記名が surface されること。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_document_blocks_returns_theorem_and_proof_with_number(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Math paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/p.pdf", entry.id),
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: schema::EXTRACTOR_NAME,
+                extractor_version: schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let page = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::Page.as_str(),
+                ordinal: 0,
+                plain_text: Some("full page text"),
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        add_block(&pool, vid, page, "paragraph", 0, "Introductory prose.", None).await;
+        add_block(
+            &pool,
+            vid,
+            page,
+            "theorem",
+            1,
+            "Every bounded sequence has a convergent subsequence.",
+            Some(r#"{"theorem_number":"2.3","note":"Bolzano--Weierstrass"}"#),
+        )
+        .await;
+        add_block(&pool, vid, page, "proof", 2, "Consider a monotone subsequence.", None).await;
+
+        let j = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_blocks",
+                json!({ "entry_id": entry.id, "kinds": ["theorem", "proof"] }),
+            )
+            .await,
+        );
+        assert_eq!(j["total_blocks"], 2, "定理 + 証明だけを取れる");
+        let blocks = j["blocks"].as_array().unwrap();
+        let thm = blocks.iter().find(|b| b["kind"] == "theorem").unwrap();
+        assert_eq!(thm["theorem_number"], "2.3");
+        assert_eq!(thm["note"], "Bolzano--Weierstrass");
+        assert!(blocks.iter().any(|b| b["kind"] == "proof"));
+
+        // 構造カウントにも定理系が汎用的に現れる。
+        let s = tool_json(&call_tool(&pool, "get_document_structure", json!({ "entry_id": entry.id })).await);
+        assert_eq!(s["counts"]["theorem"], 1);
+        assert_eq!(s["counts"]["proof"], 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]

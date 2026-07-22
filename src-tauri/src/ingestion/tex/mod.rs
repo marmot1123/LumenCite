@@ -73,6 +73,8 @@ pub struct TexBlock {
     pub heading_level: Option<i64>,
     /// bibliography_entry のみ: `\bibitem{key}` の key。
     pub cite_key: Option<String>,
+    /// 定理系のみ: `\begin{theorem}[note]` の付記名（Phase 5）。
+    pub note: Option<String>,
     pub confidence: f64,
 }
 
@@ -727,6 +729,8 @@ struct Parser<'a> {
     /// preamble の自明マクロ（`\be` → `equation` 等）。
     begin_aliases: BTreeMap<String, String>,
     end_aliases: BTreeMap<String, String>,
+    /// 定理系環境名 → ノード種別（Phase 5）。標準名 + `\newtheorem` で宣言された独自名。
+    theorem_envs: BTreeMap<String, NodeKind>,
 }
 
 impl<'a> Parser<'a> {
@@ -743,6 +747,7 @@ impl<'a> Parser<'a> {
             unknown_envs: BTreeSet::new(),
             begin_aliases: BTreeMap::new(),
             end_aliases: BTreeMap::new(),
+            theorem_envs: default_theorem_envs(),
         }
     }
 
@@ -792,6 +797,7 @@ impl<'a> Parser<'a> {
                     section_number: None,
                     heading_level: None,
                     cite_key: None,
+                    note: None,
                     confidence: 0.95,
                 });
             }
@@ -806,6 +812,11 @@ impl<'a> Parser<'a> {
         while i < bytes.len() {
             if bytes[i] == b'\\' && unescaped(preamble, i) {
                 let (word, after) = read_control_word(preamble, i + 1);
+                // `\newtheorem{env}{Display}`（Phase 5）: 環境名を表示名からノード種別へ対応づける。
+                if word == "newtheorem" {
+                    i = self.collect_newtheorem(preamble, after);
+                    continue;
+                }
                 let name_and_body = match word {
                     "def" => {
                         // \def\be{...}
@@ -883,6 +894,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `\newtheorem` の 1 宣言を解析して `theorem_envs` に登録する（`after` = `\newtheorem` の直後）。
+    /// 対応形: `\newtheorem{env}{Display}` / `\newtheorem{env}[shared]{Display}` /
+    /// `\newtheorem{env}{Display}[within]` / `\newtheorem*{env}{Display}`。返り値は次の走査位置。
+    fn collect_newtheorem(&mut self, s: &str, after: usize) -> usize {
+        let mut j = after;
+        if s.as_bytes().get(j) == Some(&b'*') {
+            j += 1;
+        }
+        let j = skip_ws(s, j);
+        let Some((env, k)) = read_group(s, j) else {
+            return after.max(j);
+        };
+        // 表示名は「env の次の必須 `{..}`」。共有カウンタ `[shared]` を挟む形にも対応する。
+        let k = skip_optional(s, k);
+        let k = skip_ws(s, k);
+        let Some((display, end)) = read_group(s, k) else {
+            return k;
+        };
+        if let Some(kind) = theorem_kind_from_title(display) {
+            self.theorem_envs.insert(env.trim().to_string(), kind);
+        }
+        end
+    }
+
     // ── 出力ヘルパ ──
 
     fn push_block(&mut self, b: TexBlock) {
@@ -907,6 +942,7 @@ impl<'a> Parser<'a> {
             section_number: None,
             heading_level: None,
             cite_key: None,
+            note: None,
             confidence: 0.9,
         });
     }
@@ -927,6 +963,7 @@ impl<'a> Parser<'a> {
             section_number: None,
             heading_level: None,
             cite_key: None,
+            note: None,
             confidence: 0.9,
         });
     }
@@ -1120,6 +1157,7 @@ impl<'a> Parser<'a> {
                         section_number: None,
                         heading_level: None,
                         cite_key: None,
+                        note: None,
                         confidence: 0.95,
                     });
                     self.i = end;
@@ -1408,6 +1446,7 @@ impl<'a> Parser<'a> {
             section_number: number,
             heading_level: Some(level),
             cite_key: None,
+            note: None,
             confidence: 0.95,
         });
     }
@@ -1453,6 +1492,7 @@ impl<'a> Parser<'a> {
                     section_number: None,
                     heading_level: None,
                     cite_key: None,
+                    note: None,
                     confidence: 0.95,
                 });
                 self.i = after_end;
@@ -1479,6 +1519,7 @@ impl<'a> Parser<'a> {
                             section_number: None,
                             heading_level: None,
                             cite_key: None,
+                            note: None,
                             confidence: 0.95,
                         });
                     }
@@ -1507,6 +1548,7 @@ impl<'a> Parser<'a> {
                         section_number: None,
                         heading_level: None,
                         cite_key: None,
+                        note: None,
                         confidence: 0.9,
                     });
                 }
@@ -1530,6 +1572,7 @@ impl<'a> Parser<'a> {
                         section_number: None,
                         heading_level: None,
                         cite_key: None,
+                        note: None,
                         confidence: 0.95,
                     });
                     self.i = self.i + rel + end_marker.len();
@@ -1560,6 +1603,7 @@ impl<'a> Parser<'a> {
                     section_number: None,
                     heading_level: None,
                     cite_key: None,
+                    note: None,
                     confidence: 0.95,
                 });
                 for (key, text) in split_bibitems(content) {
@@ -1572,6 +1616,7 @@ impl<'a> Parser<'a> {
                         section_number: None,
                         heading_level: None,
                         cite_key: Some(key),
+                        note: None,
                         confidence: 0.9,
                     });
                 }
@@ -1606,6 +1651,41 @@ impl<'a> Parser<'a> {
                 }
             }
             return; // 中身は通常フローで解析（\end{env} は on_backslash 側で flush のみ）。
+        }
+        // 定理・定義・証明（Phase 5）。環境名 → 種別。原文由来なので高信頼。本文は 1 ブロックに
+        // まとめ（`\label` を除き collapse）、`[note]` と `\label` を捕捉する。内側の display 数式は
+        // 生 LaTeX のまま本文に残る（別ノード化はしない — TeX の統計と統一）。
+        if let Some(kind) = self.theorem_envs.get(env).copied() {
+            self.flush_paragraph();
+            // 任意の付記名 `\begin{theorem}[Pythagoras]` を消費して捕捉する。
+            let (note, after_opt) = read_optional_arg(s, self.i);
+            self.i = after_opt;
+            match self.find_env_end(self.i, env) {
+                Some((content_end, after_end)) => {
+                    let inner = &s[self.i..content_end];
+                    let labels = collect_labels(inner);
+                    let text = collapse_ws(&strip_labels(inner));
+                    self.push_block(TexBlock {
+                        kind,
+                        text,
+                        latex: None,
+                        equation_label: None,
+                        labels,
+                        section_number: None,
+                        heading_level: None,
+                        cite_key: None,
+                        note,
+                        confidence: 0.95,
+                    });
+                    self.i = after_end;
+                }
+                None => {
+                    self.warnings
+                        .push(format!("unterminated theorem-like environment '{env}'"));
+                    self.i = s.len();
+                }
+            }
+            return;
         }
         if env == "document" {
             return;
@@ -1705,6 +1785,7 @@ impl<'a> Parser<'a> {
             section_number: None,
             heading_level: None,
             cite_key: None,
+            note: None,
             confidence: 0.98,
         });
     }
@@ -1725,6 +1806,99 @@ fn find_control_word(s: &str, from: usize, word: &str) -> Option<usize> {
         i = pos + 1;
     }
     None
+}
+
+/// 定理系環境名の既定マップ（Phase 5）。amsthm が予約する `proof` と、クラス/パッケージが
+/// 予約しうる標準英名。独自名・略記（`thm`/`lem` 等）は preamble の `\newtheorem` で足す。
+fn default_theorem_envs() -> BTreeMap<String, NodeKind> {
+    [
+        ("theorem", NodeKind::Theorem),
+        ("lemma", NodeKind::Lemma),
+        ("proposition", NodeKind::Proposition),
+        ("corollary", NodeKind::Corollary),
+        ("definition", NodeKind::Definition),
+        ("remark", NodeKind::Remark),
+        ("example", NodeKind::Example),
+        ("proof", NodeKind::Proof),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// `\newtheorem{env}{Display}` の表示名からノード種別を推定する（"Main Theorem" → Theorem）。
+/// 8 種のどれにも一致しなければ None（未知の定理様環境は従来どおり透過扱いになる）。
+fn theorem_kind_from_title(title: &str) -> Option<NodeKind> {
+    let t = title.to_ascii_lowercase();
+    // 具体的な語を先に見る（"proposition" は "proof" と衝突しない）。
+    for (kw, kind) in [
+        ("theorem", NodeKind::Theorem),
+        ("lemma", NodeKind::Lemma),
+        ("proposition", NodeKind::Proposition),
+        ("corollary", NodeKind::Corollary),
+        ("definition", NodeKind::Definition),
+        ("remark", NodeKind::Remark),
+        ("example", NodeKind::Example),
+        ("proof", NodeKind::Proof),
+    ] {
+        if t.contains(kw) {
+            return Some(kind);
+        }
+    }
+    None
+}
+
+/// `s[i]` 以降の任意 `[..]` を 1 個読んで中身を返す（brace-aware・改行可）。無ければ (None, i)。
+fn read_optional_arg(s: &str, i: usize) -> (Option<String>, usize) {
+    let j = skip_ws(s, i);
+    let bytes = s.as_bytes();
+    if j >= bytes.len() || bytes[j] != b'[' {
+        return (None, i);
+    }
+    let mut brace = 0i64;
+    let mut k = j + 1;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'{' if unescaped(s, k) => brace += 1,
+            b'}' if unescaped(s, k) => brace -= 1,
+            b']' if unescaped(s, k) && brace <= 0 => {
+                let inner = collapse_ws(&s[j + 1..k]);
+                return (if inner.is_empty() { None } else { Some(inner) }, k + 1);
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    (None, i)
+}
+
+/// `\label{..}` を除去する（本文ノイズ）。他のコマンドは温存する。
+fn strip_labels(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s.as_bytes()[i] == b'\\' && unescaped(s, i) {
+            let (word, after) = read_control_word(s, i + 1);
+            if word == "label" {
+                let j = skip_ws(s, after);
+                i = read_group(s, j).map(|(_, e)| e).unwrap_or(after);
+                continue;
+            }
+            // control symbol（`\%` 等）はマルチバイトを割らないよう char 長で進める。
+            let end = if word.is_empty() {
+                i + 1 + s[i + 1..].chars().next().map_or(0, |c| c.len_utf8())
+            } else {
+                after
+            };
+            out.push_str(&s[i..end]);
+            i = end;
+            continue;
+        }
+        let ch_len = s[i..].chars().next().map_or(1, |c| c.len_utf8());
+        out.push_str(&s[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
 }
 
 /// テキスト中の `\label{..}` 名を全て集める。
@@ -2190,7 +2364,7 @@ mod tests {
         let doc = extract(&[(
             "main.tex",
             "\\documentclass{article}\\begin{document}\n\
-             \\begin{theorem}\nEvery finite group is finite.\n\\end{theorem}\n\
+             \\begin{mysterybox}\nEvery finite group is finite.\n\\end{mysterybox}\n\
              \\begin{widetext}\n\\begin{equation} w = 1 \\end{equation}\n\\end{widetext}\n\
              \\end{document}",
         )]);
@@ -2200,8 +2374,87 @@ mod tests {
         assert!(doc
             .warnings
             .iter()
-            .any(|w| w.contains("unrecognized environments") && w.contains("theorem")));
-        assert!(!doc.blocks.iter().any(|b| b.text.contains("\\begin{theorem}")));
+            .any(|w| w.contains("unrecognized environments") && w.contains("mysterybox")));
+        assert!(!doc.blocks.iter().any(|b| b.text.contains("\\begin{mysterybox}")));
+    }
+
+    // ── 定理・定義・証明（Phase 5） ──
+
+    #[test]
+    fn standard_theorem_and_proof_environments_become_typed_nodes() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{theorem}\\label{thm:main}\nEvery bounded sequence has a convergent subsequence.\n\\end{theorem}\n\
+             \\begin{proof}\nConsider a monotone subsequence; it converges.\n\\end{proof}\n\
+             \\begin{definition}\nA set is compact if every cover has a finite subcover.\n\\end{definition}\n\
+             \\end{document}",
+        )]);
+        let thm = find(&doc, NodeKind::Theorem);
+        assert_eq!(thm.len(), 1);
+        assert!(thm[0].text.contains("bounded sequence"));
+        assert_eq!(thm[0].labels, vec!["thm:main"]);
+        // \label は本文テキストからは除かれる。
+        assert!(!thm[0].text.contains("\\label"), "{}", thm[0].text);
+        assert!((thm[0].confidence - 0.95).abs() < 1e-9);
+        assert_eq!(find(&doc, NodeKind::Proof).len(), 1);
+        assert_eq!(find(&doc, NodeKind::Definition).len(), 1);
+    }
+
+    #[test]
+    fn newtheorem_custom_names_map_to_kinds() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\n\
+             \\newtheorem{thm}{Theorem}\n\
+             \\newtheorem{lem}[thm]{Lemma}\n\
+             \\newtheorem{prop}{Proposition}[section]\n\
+             \\newtheorem*{rmk}{Remark}\n\
+             \\begin{document}\n\
+             \\begin{thm}\nStatement of the theorem.\n\\end{thm}\n\
+             \\begin{lem}\nStatement of the lemma.\n\\end{lem}\n\
+             \\begin{prop}\nStatement of the proposition.\n\\end{prop}\n\
+             \\begin{rmk}\nA passing remark.\n\\end{rmk}\n\
+             \\end{document}",
+        )]);
+        assert_eq!(find(&doc, NodeKind::Theorem).len(), 1, "{:?}", kinds(&doc));
+        assert_eq!(find(&doc, NodeKind::Lemma).len(), 1);
+        assert_eq!(find(&doc, NodeKind::Proposition).len(), 1);
+        assert_eq!(find(&doc, NodeKind::Remark).len(), 1);
+        // 独自環境名が段落に漏れない。
+        assert!(!doc.blocks.iter().any(|b| b.text.contains("\\begin{thm}")));
+    }
+
+    #[test]
+    fn theorem_optional_note_is_captured() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{theorem}[Bolzano--Weierstrass]\nEvery bounded sequence ...\n\\end{theorem}\n\
+             \\end{document}",
+        )]);
+        let thm = find(&doc, NodeKind::Theorem);
+        assert_eq!(thm.len(), 1);
+        assert_eq!(thm[0].note.as_deref(), Some("Bolzano--Weierstrass"));
+        // note は本文テキストには含めない。
+        assert!(!thm[0].text.contains("Bolzano"), "{}", thm[0].text);
+        assert!(thm[0].text.contains("bounded sequence"));
+    }
+
+    #[test]
+    fn theorem_body_keeps_inner_display_math_as_raw_latex() {
+        // 定理内の display 数式は独立ノード化せず、生 LaTeX のまま本文に残す（flat 統計）。
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{theorem}\nWe have \\begin{equation} E = mc^2 \\end{equation} for all bodies.\n\\end{theorem}\n\
+             \\end{document}",
+        )]);
+        let thm = find(&doc, NodeKind::Theorem);
+        assert_eq!(thm.len(), 1);
+        assert!(thm[0].text.contains("E = mc^2"), "{}", thm[0].text);
+        // 定理の内側は別 display_math ノードにしない。
+        assert!(find(&doc, NodeKind::DisplayMath).is_empty(), "{:?}", kinds(&doc));
     }
 
     // ── 参考文献 ──
@@ -2507,6 +2760,19 @@ mod tests {
             count(NodeKind::BibliographyEntry),
             doc.warnings,
         );
+        // Phase 5: 定理系ノードの内訳。
+        eprintln!(
+            "  [phase5] theorem={} lemma={} proposition={} corollary={} definition={} \
+             remark={} example={} proof={}",
+            count(NodeKind::Theorem),
+            count(NodeKind::Lemma),
+            count(NodeKind::Proposition),
+            count(NodeKind::Corollary),
+            count(NodeKind::Definition),
+            count(NodeKind::Remark),
+            count(NodeKind::Example),
+            count(NodeKind::Proof),
+        );
         for b in doc.blocks.iter().filter(|b| b.heading_level.is_some()).take(12) {
             eprintln!("  [{}] {:?} {}", b.kind.as_str(), b.section_number, b.text);
         }
@@ -2515,6 +2781,33 @@ mod tests {
                 "  [math] label={:?} latex={}",
                 b.equation_label,
                 b.latex.as_deref().unwrap_or("").chars().take(90).collect::<String>()
+            );
+        }
+        // 定理・証明のサンプル（note/label と本文冒頭）。
+        for b in doc
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.kind,
+                    NodeKind::Theorem
+                        | NodeKind::Lemma
+                        | NodeKind::Proposition
+                        | NodeKind::Corollary
+                        | NodeKind::Definition
+                        | NodeKind::Remark
+                        | NodeKind::Example
+                        | NodeKind::Proof
+                )
+            })
+            .take(10)
+        {
+            eprintln!(
+                "  [{}] note={:?} labels={:?} {}",
+                b.kind.as_str(),
+                b.note,
+                b.labels,
+                b.text.chars().take(80).collect::<String>()
             );
         }
         assert!(doc.blocks.iter().any(|b| b.kind == NodeKind::Section));
