@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 /// - **Phase 2（論理構造）**: heading/section/subsection/abstract/paragraph/list/list_item/
 ///   figure_caption/table_caption/footnote/citation/bibliography/bibliography_entry/
 ///   code_block/front_matter。
+/// - **Phase 3（数式表層）**: inline_math/display_math/equation_group。
+/// - **Phase 5（定理・定義・証明）**: definition/theorem/lemma/proposition/corollary/remark/
+///   example/proof。
 ///
 /// DB は自由 TEXT なので variant 追加に migration は要らない。認識に確信が持てないブロックは
 /// 誤った型を確定せず `UnknownBlock` にする（roadmap「欠損を許容」）。
@@ -43,6 +46,15 @@ pub enum NodeKind {
     InlineMath,
     DisplayMath,
     EquationGroup,
+    // Phase 5: 定理・定義・証明。
+    Definition,
+    Theorem,
+    Lemma,
+    Proposition,
+    Corollary,
+    Remark,
+    Example,
+    Proof,
 }
 
 impl NodeKind {
@@ -71,6 +83,14 @@ impl NodeKind {
             NodeKind::InlineMath => "inline_math",
             NodeKind::DisplayMath => "display_math",
             NodeKind::EquationGroup => "equation_group",
+            NodeKind::Definition => "definition",
+            NodeKind::Theorem => "theorem",
+            NodeKind::Lemma => "lemma",
+            NodeKind::Proposition => "proposition",
+            NodeKind::Corollary => "corollary",
+            NodeKind::Remark => "remark",
+            NodeKind::Example => "example",
+            NodeKind::Proof => "proof",
         }
     }
 
@@ -100,6 +120,14 @@ impl NodeKind {
             "inline_math" => NodeKind::InlineMath,
             "display_math" => NodeKind::DisplayMath,
             "equation_group" => NodeKind::EquationGroup,
+            "definition" => NodeKind::Definition,
+            "theorem" => NodeKind::Theorem,
+            "lemma" => NodeKind::Lemma,
+            "proposition" => NodeKind::Proposition,
+            "corollary" => NodeKind::Corollary,
+            "remark" => NodeKind::Remark,
+            "example" => NodeKind::Example,
+            "proof" => NodeKind::Proof,
             _ => NodeKind::UnknownBlock,
         }
     }
@@ -251,15 +279,26 @@ mod tests {
             NodeKind::InlineMath,
             NodeKind::DisplayMath,
             NodeKind::EquationGroup,
+            NodeKind::Definition,
+            NodeKind::Theorem,
+            NodeKind::Lemma,
+            NodeKind::Proposition,
+            NodeKind::Corollary,
+            NodeKind::Remark,
+            NodeKind::Example,
+            NodeKind::Proof,
         ] {
             assert_eq!(NodeKind::from_db(k.as_str()), k);
         }
-        // Phase 2/3 の snake_case が期待どおり（DB 列・LCIR JSON と 1:1）。
+        // Phase 2/3/5 の snake_case が期待どおり（DB 列・LCIR JSON と 1:1）。
         assert_eq!(NodeKind::FigureCaption.as_str(), "figure_caption");
         assert_eq!(NodeKind::BibliographyEntry.as_str(), "bibliography_entry");
         assert_eq!(NodeKind::DisplayMath.as_str(), "display_math");
-        // Phase 5+ の未実装種別（定理等）は UnknownBlock にフォールバック。
-        assert_eq!(NodeKind::from_db("theorem"), NodeKind::UnknownBlock);
+        // Phase 5: 定理系は from_db で解決する。
+        assert_eq!(NodeKind::from_db("theorem"), NodeKind::Theorem);
+        assert_eq!(NodeKind::from_db("proof"), NodeKind::Proof);
+        // Phase 8+ の未実装種別（図・表）は UnknownBlock にフォールバック。
+        assert_eq!(NodeKind::from_db("figure"), NodeKind::UnknownBlock);
     }
 
     #[test]
