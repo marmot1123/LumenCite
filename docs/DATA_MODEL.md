@@ -458,6 +458,29 @@ paragraph/theorem/proof 等のノードから、それが参照する equation/t
 | `metadata_json` | TEXT | 生の参照文字列・突き合わせたキー/番号など |
 | `created_at` | TEXT | `datetime('now')` |
 
+#### `symbols` / `symbol_occurrences` — 記号定義とその出現（Phase 6b / migration 0018）
+
+論文が定義する記号（"let $U$ be ...", "define $H$ as ...", "denote by $\mathcal{H}$ ...", "$U := ...$"）を、TeX 本文のインライン数式 `$...$` から抽出する（`ingestion::symbols`）。**TeX 版のみ**（PDF はインライン数式が区切り無しで潰れ記号を切り出せない）。surface_form/description は原文の verbatim だが「この文がこの記号を定義している」対応づけは**ヒューリスティック推定**なので `confidence` で区別する（強いトリガ + インライン数式が揃ったときだけ拾う＝誤検出より欠損）。`symbol_occurrences` は保守的に、**定義済み記号が display 数式に表層一致した箇所だけ**を記録する。同一節内の同一表層の再定義は 1 個に畳む。version 削除でカスケード消去。
+
+`symbols`:
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `id` | INTEGER PK | AUTOINCREMENT |
+| `document_version_id` | INTEGER FK → document_versions | ON DELETE CASCADE |
+| `surface_form` | TEXT NOT NULL | 記号の表層（"U" / "\mathcal{H}" / "U_0"） |
+| `normalized_form` | TEXT | 装飾（\mathbf/\mathcal 等）を剥いた正規化・任意 |
+| `description` | TEXT | 定義文から取り出した説明（インライン数式を含めてよい） |
+| `symbol_type` | TEXT | operator/matrix/set/graph/… の推定・任意 |
+| `defined_at_node_id` | INTEGER FK → document_nodes | ON DELETE CASCADE。定義位置（"jump to definition"） |
+| `scope_node_id` | INTEGER FK → document_nodes | ON DELETE SET NULL。定義を含む節（軽いスコープ） |
+| `semantic_json` | TEXT | 未モデル化の意味属性（後続） |
+| `confidence` | REAL | **定義検出**の確からしさ（意味ではない） |
+| `origin` | TEXT | `tex_source` |
+| `created_at` | TEXT | `datetime('now')` |
+
+`symbol_occurrences`: `id` / `symbol_id`(FK → symbols CASCADE) / `node_id`(FK → document_nodes CASCADE) / `local_offset_json` / `surface_form` NOT NULL / `confidence`（表層一致は近似）/ `origin` / `created_at`。
+
 ---
 
 ## 設計上の注意

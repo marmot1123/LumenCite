@@ -13,6 +13,7 @@ pub mod mcp_audit;
 pub mod node_relations;
 pub mod settings;
 pub mod source_fragments;
+pub mod symbols;
 pub mod tags;
 
 #[cfg(test)]

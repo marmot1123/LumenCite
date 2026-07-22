@@ -38,7 +38,9 @@ pub const TEX_EXTRACTOR_NAME: &str = "lumencite-tex";
 /// - `0.3.0`: Phase 6a。本文に原文のまま残る `\ref`/`\eqref`/`\cite` を `\label`/cite key と照合して
 ///   参照グラフ（`node_relations`）を張る（proof→theorem の proves も）。出力（関係辺）が増えるので
 ///   旧版は `rebuild_outdated_lcir` で張り直せるよう版を上げる。
-pub const TEX_EXTRACTOR_VERSION: &str = "0.3.0";
+/// - `0.4.0`: Phase 6b。定義文（"let $U$ be ...", "$H := ...$"）からインライン数式を記号として抽出し
+///   `symbols`/`symbol_occurrences` を作る。出力（記号）が増えるので旧版は張り直せるよう版を上げる。
+pub const TEX_EXTRACTOR_VERSION: &str = "0.4.0";
 
 /// read 面で複数表現からどれを既定採用するかの優先度（大きいほど優先）。
 /// 原資料に近い TeX（生 LaTeX・原文構造）を PDF 抽出（推定構造・表層数式）より優先する。

@@ -4,6 +4,7 @@
 pub mod graph;
 pub mod pdf;
 pub mod structure;
+pub mod symbols;
 pub mod tex;
 
 use crate::db::document_nodes::NewDocumentNode;
@@ -533,8 +534,9 @@ async fn build_tex_version(
     .map_err(|e| e.to_string())?;
 
     let block_count = doc.blocks.len() as i64;
-    // 参照グラフ用に block ノードの軽量ビューを集める（TeX はフラットなので ordinal = 読み順）。
+    // 参照グラフ / 記号系用に block ノードの軽量ビューを集める（TeX はフラットなので ordinal = 読み順）。
     let mut graph_nodes: Vec<graph::GraphNode> = Vec::new();
+    let mut symbol_nodes: Vec<symbols::SymbolNode> = Vec::new();
     for (bi, block) in doc.blocks.iter().enumerate() {
         let payload_json = tex_block_payload_json(block);
         let node_id = document_nodes::insert_node(
@@ -564,6 +566,13 @@ async fn build_tex_version(
             theorem_number: None,
             cite_key: block.cite_key.clone(),
         });
+        symbol_nodes.push(symbols::SymbolNode {
+            id: node_id,
+            kind: block.kind,
+            reading_index: bi as i64,
+            plain_text: block.text.clone(),
+            latex: block.latex.clone(),
+        });
 
         if block.kind == NodeKind::DisplayMath {
             math_expressions::insert_math(
@@ -590,6 +599,8 @@ async fn build_tex_version(
 
     // 参照グラフ（\ref/\eqref/\cite・proof→theorem）を解決して張る（Phase 6a・TeX は label 一致）。
     insert_relations_for_version(&mut tx, version_id, &graph_nodes, graph::RefStrategy::Tex).await?;
+    // 記号定義（"let $U$ be ...", "$H := ...$"）を抽出（Phase 6b・TeX のみ）。
+    insert_symbols_for_version(&mut tx, version_id, &symbol_nodes).await?;
 
     document_versions::mark_superseded_for_attachment(&mut *tx, attachment_id, version_id)
         .await
@@ -651,6 +662,55 @@ async fn insert_relations_for_version(
                 confidence: Some(edge.confidence),
                 origin: Some(edge.origin.as_str()),
                 metadata_json: edge.metadata_json.as_deref(),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 収集した block ノードのビューから記号定義（Phase 6b・TeX のみ）を抽出し、`symbols` /
+/// `symbol_occurrences` に挿入する。build のトランザクション内で（全ノード挿入後・commit 前に）
+/// 呼ぶ。抽出は純関数（`symbols::extract_symbols`）。origin=tex_source（表層は原文由来・対応づけ
+/// はヒューリスティックなので confidence で区別）。
+async fn insert_symbols_for_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    version_id: i64,
+    symbol_nodes: &[symbols::SymbolNode],
+) -> Result<(), String> {
+    let (extracted, occurrences) = symbols::extract_symbols(symbol_nodes);
+    let mut symbol_ids: Vec<i64> = Vec::with_capacity(extracted.len());
+    for s in &extracted {
+        let id = crate::db::symbols::insert_symbol(
+            &mut **tx,
+            &crate::db::symbols::NewSymbol {
+                document_version_id: version_id,
+                surface_form: &s.surface_form,
+                normalized_form: s.normalized_form.as_deref(),
+                description: s.description.as_deref(),
+                symbol_type: s.symbol_type.map(|t| t.as_str()),
+                defined_at_node_id: Some(s.defined_at_node_id),
+                scope_node_id: s.scope_node_id,
+                semantic_json: None,
+                confidence: Some(s.confidence),
+                origin: Some(Origin::TexSource.as_str()),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        symbol_ids.push(id);
+    }
+    for o in &occurrences {
+        crate::db::symbols::insert_occurrence(
+            &mut **tx,
+            &crate::db::symbols::NewSymbolOccurrence {
+                symbol_id: symbol_ids[o.symbol_index],
+                node_id: o.node_id,
+                local_offset_json: None,
+                surface_form: &o.surface_form,
+                confidence: Some(o.confidence),
+                origin: Some(Origin::TexSource.as_str()),
             },
         )
         .await
@@ -947,6 +1007,40 @@ pub async fn load_lcir_document(
         })
         .collect();
 
+    // 記号定義とその出現（Phase 6b・記号系）を版単位で載せる。出現は symbol_id でまとめる。
+    let mut occ_by_symbol: HashMap<i64, Vec<document_ir::LcirSymbolOccurrence>> = HashMap::new();
+    for o in crate::db::symbols::occurrences_for_version(pool, version.id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        occ_by_symbol
+            .entry(o.symbol_id)
+            .or_default()
+            .push(document_ir::LcirSymbolOccurrence {
+                node_id: o.node_id,
+                surface_form: o.surface_form,
+                confidence: o.confidence,
+                origin: o.origin,
+            });
+    }
+    let symbol_list = crate::db::symbols::symbols_for_version(pool, version.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|s| document_ir::LcirSymbol {
+            occurrences: occ_by_symbol.remove(&s.id).unwrap_or_default(),
+            id: s.id,
+            surface_form: s.surface_form,
+            normalized_form: s.normalized_form,
+            description: s.description,
+            symbol_type: s.symbol_type,
+            defined_at_node_id: s.defined_at_node_id,
+            scope_node_id: s.scope_node_id,
+            confidence: s.confidence,
+            origin: s.origin,
+        })
+        .collect();
+
     // TeX 版（Phase 4）は PDF 座標を持たないので coordinate_space を主張しない。
     let coordinate_space = if version.extractor_name == document_ir::schema::EXTRACTOR_NAME {
         Some(CoordinateSpace::default())
@@ -967,6 +1061,7 @@ pub async fn load_lcir_document(
         coordinate_space,
         nodes: lcir_nodes,
         relations,
+        symbols: symbol_list,
     }))
 }
 
@@ -1315,7 +1410,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tex = "\\documentclass{article}\\title{Tex Paper}\\begin{document}\n\
                    \\begin{abstract}\nAbout transformers.\n\\end{abstract}\n\
-                   \\section{Intro}\nBody text here.\n\
+                   \\section{Intro}\nBody text here. Let $E$ be the total energy of the system.\n\
                    \\begin{equation}\\label{eq:e}E=mc^2\\end{equation}\n\
                    \\end{document}";
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
@@ -1342,6 +1437,20 @@ mod tests {
         assert_eq!(m.origin.as_deref(), Some("tex_source"));
         assert_eq!(math.origin.as_deref(), Some("tex_source"));
         assert!(document_ir::validation::validate(&doc).is_ok());
+
+        // Phase 6b: 定義文 "Let $E$ be ..." から記号 E を抽出し、数式 $E=mc^2$ に出現を張る。
+        let sym = doc
+            .symbols
+            .iter()
+            .find(|s| s.surface_form == "E")
+            .expect("symbol E extracted from definition sentence");
+        assert_eq!(sym.description.as_deref(), Some("the total energy of the system"));
+        assert_eq!(sym.origin.as_deref(), Some("tex_source"));
+        assert!(sym.defined_at_node_id.is_some(), "定義ノードが紐づく");
+        assert!(
+            sym.occurrences.iter().any(|o| o.node_id == math.id),
+            "記号 E は display 数式 E=mc^2 に出現する"
+        );
 
         // TeX 版は node-FTS に載らない。
         let fts_rows: i64 =

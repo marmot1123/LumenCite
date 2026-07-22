@@ -9,6 +9,7 @@ pub mod node;
 pub mod relation;
 pub mod schema;
 pub mod source;
+pub mod symbol;
 pub mod validation;
 
 pub use math::{LcirMath, MathDisplayMode, MathSemanticStatus};
@@ -17,6 +18,7 @@ pub use node::{
 };
 pub use relation::{LcirRelation, RelationType};
 pub use source::{BBox, CoordinateSpace, FragmentType};
+pub use symbol::{LcirSymbol, LcirSymbolOccurrence, SymbolType};
 
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -150,6 +152,7 @@ mod tests {
                 },
             ],
             relations: vec![],
+            symbols: vec![],
         };
         let fixture: LcirDocument =
             serde_json::from_str(include_str!("testdata/minimal_lcir.json")).unwrap();
@@ -256,6 +259,7 @@ mod tests {
                 },
             ],
             relations: vec![],
+            symbols: vec![],
         };
         let fixture: LcirDocument =
             serde_json::from_str(include_str!("testdata/structured_lcir.json")).unwrap();
