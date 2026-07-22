@@ -2844,6 +2844,35 @@ mod tests {
             );
         }
 
+        // Phase 6b: 記号定義を純関数で抽出して集計（実データで誤検出を目視確認）。
+        use crate::ingestion::symbols::{extract_symbols, SymbolNode};
+        let sym_nodes: Vec<SymbolNode> = doc
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| SymbolNode {
+                id: i as i64,
+                kind: b.kind,
+                reading_index: i as i64,
+                plain_text: b.text.clone(),
+                latex: b.latex.clone(),
+            })
+            .collect();
+        let (syms, occs) = extract_symbols(&sym_nodes);
+        eprintln!("  [phase6b] symbols = {} occurrences = {}", syms.len(), occs.len());
+        for s in syms.iter().take(20) {
+            eprintln!(
+                "    [{}] norm={:?} type={:?} conf={} desc={:?}",
+                s.surface_form,
+                s.normalized_form,
+                s.symbol_type.map(|t| t.as_str()),
+                s.confidence,
+                s.description
+                    .as_deref()
+                    .map(|d| d.chars().take(60).collect::<String>())
+            );
+        }
+
         assert!(doc.blocks.iter().any(|b| b.kind == NodeKind::Section));
         assert!(doc.blocks.iter().any(|b| b.kind == NodeKind::Paragraph));
     }

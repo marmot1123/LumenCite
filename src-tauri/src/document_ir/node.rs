@@ -251,6 +251,10 @@ pub struct LcirDocument {
     /// 正本は SQLite の `node_relations`。無ければ省略（既存 fixture との後方互換）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relations: Vec<super::relation::LcirRelation>,
+    /// 記号定義（Phase 6b・記号系）。定義文から取り出した記号 + 出現。TeX 版のみ。
+    /// 正本は SQLite の `symbols`/`symbol_occurrences`。無ければ省略。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbols: Vec<super::symbol::LcirSymbol>,
 }
 
 #[cfg(test)]
@@ -349,6 +353,7 @@ mod tests {
                 }],
             }],
             relations: vec![],
+            symbols: vec![],
         };
         let json = serde_json::to_string(&doc).unwrap();
         let back: LcirDocument = serde_json::from_str(&json).unwrap();

@@ -202,6 +202,36 @@ pub struct NodeRelation {
     pub created_at: String,
 }
 
+/// 記号定義（migration 0018・Phase 6b）。定義文から取り出した記号。TeX 版のみ。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct Symbol {
+    pub id: i64,
+    pub document_version_id: i64,
+    pub surface_form: String,
+    pub normalized_form: Option<String>,
+    pub description: Option<String>,
+    pub symbol_type: Option<String>,
+    pub defined_at_node_id: Option<i64>,
+    pub scope_node_id: Option<i64>,
+    pub semantic_json: Option<String>,
+    pub confidence: Option<f64>,
+    pub origin: Option<String>,
+    pub created_at: String,
+}
+
+/// 記号の出現（migration 0018・Phase 6b）。定義済み記号が display 数式ノードに現れた箇所。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct SymbolOccurrence {
+    pub id: i64,
+    pub symbol_id: i64,
+    pub node_id: i64,
+    pub local_offset_json: Option<String>,
+    pub surface_form: String,
+    pub confidence: Option<f64>,
+    pub origin: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct EntrySummary {
     pub id: i64,

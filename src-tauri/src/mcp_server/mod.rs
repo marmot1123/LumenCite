@@ -297,6 +297,36 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             }
         }
     }));
+    tools.push(json!({
+        "name": "get_symbol_definitions",
+        "description": "Return the notation/symbol definitions (LCIR) a paper introduces — by \
+            entry_id or citation_key. Recognized heuristically from definition sentences in the \
+            arXiv TeX source (\"let $U$ be ...\", \"define $H$ as ...\", \"denote by \
+            $\\mathcal{H}$ ...\", \"$U := ...$\"), so this is **TeX-only** (PDF inline math cannot be \
+            isolated reliably); returns empty for PDF-only entries. Each symbol carries its \
+            surface_form (raw LaTeX like \"U\" or \"\\mathcal{H}\"), normalized_form, a \
+            description extracted from the sentence, a best-effort symbol_type, the node where it \
+            is defined (defined_at, for \"jump to definition\"), the enclosing section (scope), and \
+            its occurrences in display equations. The surface/description text is verbatim from the \
+            source but the definition ASSOCIATION is heuristic — hence a moderate confidence. \
+            Use it to answer \"what is $U$ in this paper\", \"list the notation\", \"where is \
+            $\\mathcal{H}$ defined\", \"which equations use $\\gamma$\". Filter with `symbol` \
+            (exact surface) or `query` (substring over surface/normalized/description). Returns \
+            {has_lcir, source, count, symbols:[{surface_form, normalized_form, description, \
+            symbol_type, confidence, defined_at:{node_id,kind,snippet}, scope, occurrence_count, \
+            occurrences:[{node_id, equation_label}]}]}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry_id": { "type": "integer", "description": "Entry id." },
+                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
+                "symbol": { "type": "string", "description": "Exact surface_form to fetch (e.g. \"U\" or \"\\\\mathcal{H}\")." },
+                "query": { "type": "string", "description": "Case-insensitive substring over surface_form / normalized_form / description." },
+                "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation. Symbols exist only for \"tex\"; omit for the best available (tex preferred)." },
+                "max_symbols": { "type": "integer", "description": "Max symbols to return (default 200)." }
+            }
+        }
+    }));
 
     // write 系（Phase 2・ゲート有効時のみ）。`mutate` の定義を流用し、許可リスト
     // （`WRITE_TOOLS`）に絞る。delete_entry はリストに無いので公開されない。
@@ -474,6 +504,7 @@ async fn exec_tool(
         "get_document_blocks" => exec_get_document_blocks(pool, &args).await,
         "search_document_nodes" => exec_search_document_nodes(pool, &args).await,
         "get_node_relations" => exec_get_node_relations(pool, &args).await,
+        "get_symbol_definitions" => exec_get_symbol_definitions(pool, &args).await,
         // それ以外（delete_entry / ocr_* / 無効化中の write 等）は非公開。
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
@@ -1166,6 +1197,105 @@ async fn exec_get_node_relations(pool: &SqlitePool, args: &Value) -> Result<Stri
         "truncated": truncated,
         "counts_by_type": counts_by_type,
         "relations": relations,
+    }))
+    .unwrap_or_default())
+}
+
+async fn exec_get_symbol_definitions(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    let entry_id = resolve_entry_id(pool, args).await?;
+    let source_arg = args.get("source").and_then(|v| v.as_str());
+    let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
+    let Some((_attachment_id, doc)) = loaded else {
+        return Ok(no_lcir_response(entry_id, source_arg));
+    };
+
+    let exact = args.get("symbol").and_then(|v| v.as_str());
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase());
+    let max_symbols = args
+        .get("max_symbols")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(200)
+        .max(1) as usize;
+
+    let node_by_id: std::collections::HashMap<i64, &crate::document_ir::LcirNode> =
+        doc.nodes.iter().map(|n| (n.id, n)).collect();
+
+    let mut symbols_out: Vec<Value> = Vec::new();
+    let mut truncated = false;
+    for s in &doc.symbols {
+        if let Some(ex) = exact {
+            if s.surface_form != ex {
+                continue;
+            }
+        }
+        if let Some(q) = &query {
+            let hay = format!(
+                "{} {} {}",
+                s.surface_form,
+                s.normalized_form.as_deref().unwrap_or(""),
+                s.description.as_deref().unwrap_or("")
+            )
+            .to_lowercase();
+            if !hay.contains(q) {
+                continue;
+            }
+        }
+        if symbols_out.len() >= max_symbols {
+            truncated = true;
+            break;
+        }
+        let defined_at = s.defined_at_node_id.and_then(|id| node_by_id.get(&id)).map(|n| {
+            json!({
+                "node_id": n.id,
+                "kind": n.kind,
+                "snippet": n.plain_text.as_deref().map(|t| relation_snippet(t, 200)),
+            })
+        });
+        let scope = s.scope_node_id.and_then(|id| node_by_id.get(&id)).map(|n| {
+            json!({
+                "node_id": n.id,
+                "section_number": n.payload.as_ref().and_then(|p| p.get("section_number")),
+                "text": n.plain_text,
+            })
+        });
+        let occurrences: Vec<Value> = s
+            .occurrences
+            .iter()
+            .take(25)
+            .map(|o| {
+                let equation_label = node_by_id
+                    .get(&o.node_id)
+                    .and_then(|n| n.math.as_ref())
+                    .and_then(|m| m.equation_label.clone());
+                json!({ "node_id": o.node_id, "equation_label": equation_label })
+            })
+            .collect();
+        symbols_out.push(json!({
+            "id": s.id,
+            "surface_form": s.surface_form,
+            "normalized_form": s.normalized_form,
+            "description": s.description,
+            "symbol_type": s.symbol_type,
+            "confidence": s.confidence,
+            "origin": s.origin,
+            "defined_at": defined_at,
+            "scope": scope,
+            "occurrence_count": s.occurrences.len(),
+            "occurrences": occurrences,
+        }));
+    }
+
+    Ok(serde_json::to_string(&json!({
+        "entry_id": entry_id,
+        "has_lcir": true,
+        "source": short_source_name(&doc.source.extractor_name),
+        "available_sources": sources_json(&versions),
+        "count": symbols_out.len(),
+        "truncated": truncated,
+        "symbols": symbols_out,
     }))
     .unwrap_or_default())
 }
@@ -1967,6 +2097,7 @@ mod tests {
             "get_document_blocks",
             "search_document_nodes",
             "get_node_relations",
+            "get_symbol_definitions",
         ] {
             assert!(names.contains(&expected), "missing read tool: {expected}");
         }
@@ -2347,6 +2478,171 @@ mod tests {
             .await,
         );
         assert_eq!(touching["count"], 2);
+    }
+
+    /// Phase 6b: get_symbol_definitions が TeX 版の記号定義を defined_at/scope/occurrences つきで返し、
+    /// symbol/query で絞れること。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_symbol_definitions_returns_symbols_with_scope_and_occurrences(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Tex paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/p.gz", entry.id),
+            "p.gz",
+            "application/gzip",
+        )
+        .await
+        .unwrap()
+        .id;
+        // TeX 版（記号系は TeX のみ）。
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/gzip",
+                extractor_name: schema::TEX_EXTRACTOR_NAME,
+                extractor_version: schema::TEX_EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mk = |kind: &'static str, ord: i64, text: &'static str, payload: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                crate::db::document_nodes::insert_node(
+                    &pool,
+                    &crate::db::document_nodes::NewDocumentNode {
+                        document_version_id: vid,
+                        parent_id: None,
+                        node_kind: kind,
+                        ordinal: ord,
+                        plain_text: Some(text),
+                        language: None,
+                        confidence: Some(0.9),
+                        origin: Some("tex_source"),
+                        payload_json: payload,
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let sec = mk("section", 0, "2 Preliminaries", Some(r#"{"section_number":"2"}"#)).await;
+        let para = mk("paragraph", 1, "Let $U$ be the time evolution operator.", None).await;
+        let eq = mk("display_math", 2, "U = S_2 C_2 S_1 C_1", None).await;
+        crate::db::math_expressions::insert_math(
+            &pool,
+            &crate::db::math_expressions::NewMathExpression {
+                node_id: eq,
+                display_mode: "display",
+                equation_label: Some("(1.1)"),
+                latex: Some("U = S_2 C_2 S_1 C_1"),
+                presentation_mathml: None,
+                content_mathml: None,
+                openmath_json: None,
+                normalized_text: Some("U = S_2 C_2 S_1 C_1"),
+                ast_json: None,
+                semantic_status: "source_provided",
+                confidence: Some(0.98),
+                origin: Some("tex_source"),
+            },
+        )
+        .await
+        .unwrap();
+        let sid = crate::db::symbols::insert_symbol(
+            &pool,
+            &crate::db::symbols::NewSymbol {
+                document_version_id: vid,
+                surface_form: "U",
+                normalized_form: Some("U"),
+                description: Some("the time evolution operator"),
+                symbol_type: Some("operator"),
+                defined_at_node_id: Some(para),
+                scope_node_id: Some(sec),
+                semantic_json: None,
+                confidence: Some(0.6),
+                origin: Some("tex_source"),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::symbols::insert_occurrence(
+            &pool,
+            &crate::db::symbols::NewSymbolOccurrence {
+                symbol_id: sid,
+                node_id: eq,
+                local_offset_json: None,
+                surface_form: "U",
+                confidence: Some(0.5),
+                origin: Some("tex_source"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let j = tool_json(
+            &call_tool(&pool, "get_symbol_definitions", json!({ "entry_id": entry.id })).await,
+        );
+        assert_eq!(j["has_lcir"], true);
+        assert_eq!(j["source"], "tex");
+        assert_eq!(j["count"], 1);
+        let s = &j["symbols"][0];
+        assert_eq!(s["surface_form"], "U");
+        assert_eq!(s["description"], "the time evolution operator");
+        assert_eq!(s["symbol_type"], "operator");
+        assert_eq!(s["defined_at"]["node_id"], para);
+        assert_eq!(s["defined_at"]["kind"], "paragraph");
+        assert_eq!(s["scope"]["section_number"], "2");
+        assert_eq!(s["occurrence_count"], 1);
+        assert_eq!(s["occurrences"][0]["equation_label"], "(1.1)");
+
+        // query / symbol フィルタ。
+        let hit = tool_json(
+            &call_tool(
+                &pool,
+                "get_symbol_definitions",
+                json!({ "entry_id": entry.id, "query": "evolution" }),
+            )
+            .await,
+        );
+        assert_eq!(hit["count"], 1);
+        let miss = tool_json(
+            &call_tool(
+                &pool,
+                "get_symbol_definitions",
+                json!({ "entry_id": entry.id, "query": "zzz-nope" }),
+            )
+            .await,
+        );
+        assert_eq!(miss["count"], 0);
+        let exact = tool_json(
+            &call_tool(
+                &pool,
+                "get_symbol_definitions",
+                json!({ "entry_id": entry.id, "symbol": "U" }),
+            )
+            .await,
+        );
+        assert_eq!(exact["count"], 1);
     }
 
     /// Phase 5 完了条件「定理と証明を一つの問い合わせで取得できる」: `kinds` フィルタで
@@ -2782,9 +3078,23 @@ mod tests {
             serde_json::to_string_pretty(&proves["relations"]).unwrap()
         );
 
+        // Phase 6b: 記号定義（TeX 版がある場合のみ非空）。
+        let syms = tool_json(&call_tool(&pool, "get_symbol_definitions", json!({ "entry_id": entry_id })).await);
+        eprintln!(
+            "\n=== get_symbol_definitions (source={}, count={}) first few ===",
+            syms["source"], syms["count"]
+        );
+        for s in syms["symbols"].as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().take(12) {
+            eprintln!(
+                "  [{}] type={} conf={} occ={} desc={}",
+                s["surface_form"], s["symbol_type"], s["confidence"], s["occurrence_count"], s["description"]
+            );
+        }
+
         assert_eq!(structure["has_lcir"], true);
         assert!(structure["counts"]["display_math"].as_i64().unwrap_or(0) > 0);
         assert_eq!(rels["has_lcir"], true);
+        assert_eq!(syms["has_lcir"], true);
     }
 
     #[sqlx::test(migrations = "./migrations")]
