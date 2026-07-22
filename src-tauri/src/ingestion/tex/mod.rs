@@ -2810,6 +2810,40 @@ mod tests {
                 b.text.chars().take(80).collect::<String>()
             );
         }
+        // Phase 6a: 参照グラフ（\ref/\eqref/\cite・proof→theorem）を純関数で解決して type 別に集計。
+        use crate::ingestion::graph::{resolve_relations, GraphNode, RefStrategy};
+        let graph_nodes: Vec<GraphNode> = doc
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| GraphNode {
+                id: i as i64,
+                kind: b.kind,
+                reading_index: i as i64,
+                plain_text: b.text.clone(),
+                labels: b.labels.clone(),
+                equation_label: b.equation_label.clone(),
+                theorem_number: None,
+                cite_key: b.cite_key.clone(),
+            })
+            .collect();
+        let edges = resolve_relations(&graph_nodes, RefStrategy::Tex);
+        let mut by_type: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for e in &edges {
+            *by_type.entry(e.relation_type.as_str()).or_insert(0) += 1;
+        }
+        eprintln!("  [phase6a] node_relations = {} | {by_type:?}", edges.len());
+        for e in edges.iter().take(8) {
+            eprintln!(
+                "    [{}] {}→{} conf={} meta={:?}",
+                e.relation_type.as_str(),
+                e.from_node_id,
+                e.to_node_id,
+                e.confidence,
+                e.metadata_json
+            );
+        }
+
         assert!(doc.blocks.iter().any(|b| b.kind == NodeKind::Section));
         assert!(doc.blocks.iter().any(|b| b.kind == NodeKind::Paragraph));
     }

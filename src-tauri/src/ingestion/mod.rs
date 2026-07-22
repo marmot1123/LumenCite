@@ -1,6 +1,7 @@
 //! LCIR の取り込み（ingestion）。実験フラグ判定・添付ごとの LCIR 構築（pdfium）・
 //! 派生 FTS 再生成・read 面の組み立て。既存 `fulltext` 経路は触らず、LCIR は追加の side-build。
 
+pub mod graph;
 pub mod pdf;
 pub mod structure;
 pub mod tex;
@@ -10,8 +11,8 @@ use crate::db::document_nodes_fts::NodeFtsInput;
 use crate::db::document_versions::NewDocumentVersion;
 use crate::db::source_fragments::NewSourceFragment;
 use crate::db::{
-    document_nodes, document_nodes_fts, document_versions, fulltext, math_expressions, settings,
-    source_fragments,
+    document_nodes, document_nodes_fts, document_versions, fulltext, math_expressions,
+    node_relations, settings, source_fragments,
 };
 use crate::document_ir::{self, CoordinateSpace, ExtractionStatus, FragmentType, NodeKind, Origin};
 use sqlx::SqlitePool;
@@ -274,6 +275,9 @@ async fn build_pdf_version(
     // （abstract/参考文献モードが複数ページに渡るため）。
     let mut page_count = 0i64;
     let mut recognizer = structure::RecognizerState::new();
+    // 参照グラフ用に block ノードの軽量ビューを読み順（ページ跨ぎの通し番号）で集める（Phase 6a）。
+    let mut graph_nodes: Vec<graph::GraphNode> = Vec::new();
+    let mut reading_index = 0i64;
     for (pi, page) in extracted_doc.pages.iter().enumerate() {
         let payload = serde_json::json!({
             "page_width_pt": page.width_pt,
@@ -344,6 +348,18 @@ async fn build_pdf_version(
             )
             .await
             .map_err(|e| e.to_string())?;
+            // 参照グラフ用ビュー（PDF は label/cite_key を持たず、番号一致で解決する）。
+            graph_nodes.push(graph::GraphNode {
+                id: block_node_id,
+                kind: sblock.kind,
+                reading_index,
+                plain_text: sblock.text.clone(),
+                labels: Vec::new(),
+                equation_label: sblock.equation_label.clone(),
+                theorem_number: sblock.theorem_number.clone(),
+                cite_key: None,
+            });
+            reading_index += 1;
             source_fragments::insert_fragment(
                 &mut *tx,
                 &NewSourceFragment {
@@ -422,6 +438,9 @@ async fn build_pdf_version(
             }
         }
     }
+
+    // 参照グラフ（本文→数式/定理、proof→theorem）を解決して張る（Phase 6a・PDF は番号一致）。
+    insert_relations_for_version(&mut tx, version_id, &graph_nodes, graph::RefStrategy::Pdf).await?;
 
     // 新版採用: 同一添付の旧 completed を superseded に。
     document_versions::mark_superseded_for_attachment(&mut *tx, attachment_id, version_id)
@@ -514,6 +533,8 @@ async fn build_tex_version(
     .map_err(|e| e.to_string())?;
 
     let block_count = doc.blocks.len() as i64;
+    // 参照グラフ用に block ノードの軽量ビューを集める（TeX はフラットなので ordinal = 読み順）。
+    let mut graph_nodes: Vec<graph::GraphNode> = Vec::new();
     for (bi, block) in doc.blocks.iter().enumerate() {
         let payload_json = tex_block_payload_json(block);
         let node_id = document_nodes::insert_node(
@@ -532,6 +553,17 @@ async fn build_tex_version(
         )
         .await
         .map_err(|e| e.to_string())?;
+        // 参照グラフ用ビュー（TeX は \label/cite_key を原資料から持つ）。
+        graph_nodes.push(graph::GraphNode {
+            id: node_id,
+            kind: block.kind,
+            reading_index: bi as i64,
+            plain_text: block.text.clone(),
+            labels: block.labels.clone(),
+            equation_label: block.equation_label.clone(),
+            theorem_number: None,
+            cite_key: block.cite_key.clone(),
+        });
 
         if block.kind == NodeKind::DisplayMath {
             math_expressions::insert_math(
@@ -555,6 +587,9 @@ async fn build_tex_version(
             .map_err(|e| e.to_string())?;
         }
     }
+
+    // 参照グラフ（\ref/\eqref/\cite・proof→theorem）を解決して張る（Phase 6a・TeX は label 一致）。
+    insert_relations_for_version(&mut tx, version_id, &graph_nodes, graph::RefStrategy::Tex).await?;
 
     document_versions::mark_superseded_for_attachment(&mut *tx, attachment_id, version_id)
         .await
@@ -594,6 +629,34 @@ fn tex_block_payload_json(b: &tex::TexBlock) -> Option<String> {
     } else {
         Some(serde_json::Value::Object(map).to_string())
     }
+}
+
+/// 収集した block ノードのビューから参照グラフ（Phase 6a）を解決し、`node_relations` に挿入する。
+/// build のトランザクション内で（全ノード挿入後・commit 前に）呼ぶ。抽出は純関数
+/// （`graph::resolve_relations`）で、原文由来（TeX）と推定（PDF）を strategy で切り替える。
+async fn insert_relations_for_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    version_id: i64,
+    graph_nodes: &[graph::GraphNode],
+    strategy: graph::RefStrategy,
+) -> Result<(), String> {
+    for edge in graph::resolve_relations(graph_nodes, strategy) {
+        node_relations::insert_relation(
+            &mut **tx,
+            &node_relations::NewNodeRelation {
+                document_version_id: version_id,
+                from_node_id: edge.from_node_id,
+                relation_type: edge.relation_type.as_str(),
+                to_node_id: edge.to_node_id,
+                confidence: Some(edge.confidence),
+                origin: Some(edge.origin.as_str()),
+                metadata_json: edge.metadata_json.as_deref(),
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// ブロックの型固有属性（見出し階層・節番号・定理番号・付記名）を payload_json にする。無ければ None。
@@ -866,6 +929,24 @@ pub async fn load_lcir_document(
         })
         .collect();
 
+    // ノード間の型付き関係（Phase 6a・参照グラフ）を版単位で載せる。
+    let relations = node_relations::relations_for_version(pool, version.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|r| document_ir::LcirRelation {
+            from_node_id: r.from_node_id,
+            relation_type: r.relation_type,
+            to_node_id: r.to_node_id,
+            confidence: r.confidence,
+            origin: r.origin,
+            metadata: r
+                .metadata_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
+        })
+        .collect();
+
     // TeX 版（Phase 4）は PDF 座標を持たないので coordinate_space を主張しない。
     let coordinate_space = if version.extractor_name == document_ir::schema::EXTRACTOR_NAME {
         Some(CoordinateSpace::default())
@@ -885,6 +966,7 @@ pub async fn load_lcir_document(
         },
         coordinate_space,
         nodes: lcir_nodes,
+        relations,
     }))
 }
 
@@ -1710,6 +1792,34 @@ mod tests {
                 .unwrap();
         eprintln!("document_nodes_fts rows = {node_count}");
         assert!(node_count > 0, "build 後は node-FTS が張られる");
+
+        // Phase 6a: 参照グラフ。type 別カウントと数点のサンプルを表示（PDF は番号一致・layout_model）。
+        let mut rel_by_type: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for r in &doc.relations {
+            *rel_by_type.entry(r.relation_type.clone()).or_insert(0) += 1;
+        }
+        eprintln!(
+            "node_relations (this version) = {} | {rel_by_type:?}",
+            doc.relations.len()
+        );
+        for r in doc.relations.iter().take(8) {
+            eprintln!(
+                "  [{}] {}→{} conf={:?} origin={:?} meta={:?}",
+                r.relation_type, r.from_node_id, r.to_node_id, r.confidence, r.origin, r.metadata,
+            );
+        }
+        let rel_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM node_relations WHERE document_version_id = ?")
+                .bind(doc.version_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rel_rows as usize,
+            doc.relations.len(),
+            "node_relations 行数と派生ビューが一致"
+        );
 
         // 冪等性: 同一 PDF を再 build → 再抽出せず reuse（同一 content_key）。
         let again = build_lcir_for_attachment(&pool, Path::new(&appdir), att)

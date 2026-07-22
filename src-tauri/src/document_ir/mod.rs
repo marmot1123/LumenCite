@@ -6,6 +6,7 @@
 
 pub mod math;
 pub mod node;
+pub mod relation;
 pub mod schema;
 pub mod source;
 pub mod validation;
@@ -14,6 +15,7 @@ pub use math::{LcirMath, MathDisplayMode, MathSemanticStatus};
 pub use node::{
     ExtractionStatus, LcirDocument, LcirFragment, LcirNode, LcirSource, NodeKind, Origin,
 };
+pub use relation::{LcirRelation, RelationType};
 pub use source::{BBox, CoordinateSpace, FragmentType};
 
 use sha2::{Digest, Sha256};
@@ -147,6 +149,7 @@ mod tests {
                     }],
                 },
             ],
+            relations: vec![],
         };
         let fixture: LcirDocument =
             serde_json::from_str(include_str!("testdata/minimal_lcir.json")).unwrap();
@@ -252,6 +255,7 @@ mod tests {
                     source_fragments: vec![page_frag("line", para_bbox)],
                 },
             ],
+            relations: vec![],
         };
         let fixture: LcirDocument =
             serde_json::from_str(include_str!("testdata/structured_lcir.json")).unwrap();

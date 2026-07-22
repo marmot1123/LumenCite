@@ -20,7 +20,10 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 /// - `0.4.0`: Phase 5。行頭キーワードから定理・定義・証明ブロック
 ///   （`theorem`/`lemma`/`proposition`/`corollary`/`definition`/`remark`/`example`/`proof`）を
 ///   信頼度付きで認識し、番号・付記名を payload に載せる。出力が変わるので旧版は supersede される。
-pub const EXTRACTOR_VERSION: &str = "0.4.0";
+/// - `0.5.0`: Phase 6a。本文の "Theorem 2.3"/"Eq. (2.1)" を定理番号/数式番号と照合して参照グラフ
+///   （`node_relations`・refers_to_*・proof→theorem の proves）を張る。抽出出力（派生の関係辺）が
+///   増えるので、既存コーパスは `rebuild_outdated_lcir` で張り直せるよう版を上げる。
+pub const EXTRACTOR_VERSION: &str = "0.5.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。
@@ -32,7 +35,10 @@ pub const TEX_EXTRACTOR_NAME: &str = "lumencite-tex";
 ///   （front_matter/abstract/節/段落/display 数式=生 LaTeX/caption/list/code/thebibliography）。
 /// - `0.2.0`: Phase 5。定理系環境（標準名 + preamble の `\newtheorem` 宣言）と `proof` を型付き
 ///   ノードにし、`[note]`・`\label` を捕捉する。出力が変わるので旧版は再構築時に supersede される。
-pub const TEX_EXTRACTOR_VERSION: &str = "0.2.0";
+/// - `0.3.0`: Phase 6a。本文に原文のまま残る `\ref`/`\eqref`/`\cite` を `\label`/cite key と照合して
+///   参照グラフ（`node_relations`）を張る（proof→theorem の proves も）。出力（関係辺）が増えるので
+///   旧版は `rebuild_outdated_lcir` で張り直せるよう版を上げる。
+pub const TEX_EXTRACTOR_VERSION: &str = "0.3.0";
 
 /// read 面で複数表現からどれを既定採用するかの優先度（大きいほど優先）。
 /// 原資料に近い TeX（生 LaTeX・原文構造）を PDF 抽出（推定構造・表層数式）より優先する。

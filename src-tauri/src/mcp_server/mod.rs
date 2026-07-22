@@ -264,6 +264,39 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             "required": ["query"]
         }
     }));
+    tools.push(json!({
+        "name": "get_node_relations",
+        "description": "Return the cross-reference graph (LCIR) of a paper — typed directed edges \
+            between its blocks — by entry_id or citation_key. Edges are resolved from the source: \
+            \"tex\" (from \\ref/\\eqref/\\cite matched against \\label and \\bibitem keys — high \
+            confidence, origin tex_source) or \"pdf\" (from \"Theorem 2.3\"/\"Eq. (2.1)\" strings \
+            matched against theorem/equation numbers — approximate, origin layout_model). tex is \
+            preferred when built; pass `source` to switch. Relation types: cites, \
+            refers_to_equation, refers_to_theorem, refers_to_figure, refers_to_table, \
+            refers_to_section, refers_to, and proves (proof → the theorem it proves). Use it to \
+            answer \"what does this proof prove\", \"what cites/uses equation (2.1)\", \"which \
+            results does this section reference\". Filter with `relation_type` and/or `node_id` \
+            (edges touching that block, either direction). Returns {has_lcir, source, \
+            available_sources, count, counts_by_type, relations:[{relation_type, confidence, \
+            origin, from:{node_id,kind,page,snippet}, to:{node_id,kind,page,snippet, \
+            theorem_number?, equation_label?, section_number?, labels?}, metadata}]}. If has_lcir \
+            is false nothing is built (build it in the app).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry_id": { "type": "integer", "description": "Entry id." },
+                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
+                "relation_type": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Restrict to these relation types (e.g. [\"proves\"], [\"cites\"], [\"refers_to_equation\",\"refers_to_theorem\"]). Omit for all."
+                },
+                "node_id": { "type": "integer", "description": "Only edges touching this node id (as from or to). Node ids come from get_document_blocks / search_document_nodes." },
+                "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation: \"tex\" (\\ref/\\cite resolution) or \"pdf\" (number-string resolution). Omit for the best available (tex preferred)." },
+                "max_relations": { "type": "integer", "description": "Max edges to return (default 300)." }
+            }
+        }
+    }));
 
     // write 系（Phase 2・ゲート有効時のみ）。`mutate` の定義を流用し、許可リスト
     // （`WRITE_TOOLS`）に絞る。delete_entry はリストに無いので公開されない。
@@ -440,6 +473,7 @@ async fn exec_tool(
         "get_document_structure" => exec_get_document_structure(pool, &args).await,
         "get_document_blocks" => exec_get_document_blocks(pool, &args).await,
         "search_document_nodes" => exec_search_document_nodes(pool, &args).await,
+        "get_node_relations" => exec_get_node_relations(pool, &args).await,
         // それ以外（delete_entry / ocr_* / 無効化中の write 等）は非公開。
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
@@ -1031,6 +1065,109 @@ async fn exec_search_document_nodes(pool: &SqlitePool, args: &Value) -> Result<S
 
     Ok(serde_json::to_string(&json!({ "count": results.len(), "results": results }))
         .unwrap_or_default())
+}
+
+/// 短いスニペット（char 単位で安全に切る）。
+fn relation_snippet(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut s: String = text.chars().take(max).collect();
+    s.push('…');
+    s
+}
+
+/// 関係辺の端点ノードを応答用 JSON にする（kind/page/snippet + 番号・label 等の識別子）。
+fn relation_node_json(n: &crate::document_ir::LcirNode) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("node_id".to_string(), json!(n.id));
+    obj.insert("kind".to_string(), json!(n.kind));
+    obj.insert("page".to_string(), json!(node_page(n)));
+    if let Some(t) = &n.plain_text {
+        obj.insert("snippet".to_string(), json!(relation_snippet(t, 160)));
+    }
+    if let Some(p) = &n.payload {
+        for key in ["theorem_number", "section_number", "labels"] {
+            if let Some(v) = p.get(key) {
+                obj.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    if let Some(el) = n.math.as_ref().and_then(|m| m.equation_label.as_ref()) {
+        obj.insert("equation_label".to_string(), json!(el));
+    }
+    Value::Object(obj)
+}
+
+async fn exec_get_node_relations(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    let entry_id = resolve_entry_id(pool, args).await?;
+    let source_arg = args.get("source").and_then(|v| v.as_str());
+    let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
+    let Some((_attachment_id, doc)) = loaded else {
+        return Ok(no_lcir_response(entry_id, source_arg));
+    };
+
+    // 型フィルタ（省略時は全種別）と node_id フィルタ（端点のどちらかが一致）。
+    let type_filter: Option<Vec<String>> = args.get("relation_type").and_then(|v| v.as_array()).map(
+        |arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        },
+    );
+    let node_filter = args.get("node_id").and_then(|v| v.as_i64());
+    let max_relations = args
+        .get("max_relations")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(300)
+        .max(1) as usize;
+
+    let node_by_id: std::collections::HashMap<i64, &crate::document_ir::LcirNode> =
+        doc.nodes.iter().map(|n| (n.id, n)).collect();
+
+    let mut counts_by_type: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    let mut relations: Vec<Value> = Vec::new();
+    let mut truncated = false;
+    for r in &doc.relations {
+        if let Some(types) = &type_filter {
+            if !types.iter().any(|t| t == &r.relation_type) {
+                continue;
+            }
+        }
+        if let Some(nid) = node_filter {
+            if r.from_node_id != nid && r.to_node_id != nid {
+                continue;
+            }
+        }
+        *counts_by_type.entry(r.relation_type.clone()).or_insert(0) += 1;
+        if relations.len() >= max_relations {
+            truncated = true;
+            continue;
+        }
+        let from = node_by_id.get(&r.from_node_id).map(|n| relation_node_json(n));
+        let to = node_by_id.get(&r.to_node_id).map(|n| relation_node_json(n));
+        relations.push(json!({
+            "relation_type": r.relation_type,
+            "confidence": r.confidence,
+            "origin": r.origin,
+            "from": from,
+            "to": to,
+            "metadata": r.metadata,
+        }));
+    }
+
+    Ok(serde_json::to_string(&json!({
+        "entry_id": entry_id,
+        "has_lcir": true,
+        "source": short_source_name(&doc.source.extractor_name),
+        "available_sources": sources_json(&versions),
+        "count": relations.len(),
+        "truncated": truncated,
+        "counts_by_type": counts_by_type,
+        "relations": relations,
+    }))
+    .unwrap_or_default())
 }
 
 // ─── 認可トークン ────────────────────────────────────────────────────────────
@@ -1829,6 +1966,7 @@ mod tests {
             "get_document_structure",
             "get_document_blocks",
             "search_document_nodes",
+            "get_node_relations",
         ] {
             assert!(names.contains(&expected), "missing read tool: {expected}");
         }
@@ -2047,6 +2185,168 @@ mod tests {
         // フィルタ無し → 本文ブロック 4 個（document/page/line は除外）。
         let all = tool_json(&call_tool(&pool, "get_document_blocks", json!({ "entry_id": entry_id })).await);
         assert_eq!(all["total_blocks"], 4);
+    }
+
+    /// Phase 6a: get_node_relations が参照グラフを端点ノード情報つきで返し、型/ノードで絞れること。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_relations_returns_edges_with_endpoints(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Math paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/p.pdf", entry.id),
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: schema::EXTRACTOR_NAME,
+                extractor_version: schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let page = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::Page.as_str(),
+                ordinal: 0,
+                plain_text: Some("full page text"),
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let thm = add_block(
+            &pool,
+            vid,
+            page,
+            "theorem",
+            0,
+            "Theorem 2.3. Bounded implies compact.",
+            Some(r#"{"theorem_number":"2.3"}"#),
+        )
+        .await;
+        let para = add_block(
+            &pool,
+            vid,
+            page,
+            "paragraph",
+            1,
+            "The result follows by Theorem 2.3.",
+            None,
+        )
+        .await;
+        let proof = add_block(&pool, vid, page, "proof", 2, "Proof. Immediate.", None).await;
+        // 参照辺を手で入れる（build 経路の代わり・端点 enrich と絞り込みの検証）。
+        crate::db::node_relations::insert_relation(
+            &pool,
+            &crate::db::node_relations::NewNodeRelation {
+                document_version_id: vid,
+                from_node_id: para,
+                relation_type: "refers_to_theorem",
+                to_node_id: thm,
+                confidence: Some(0.6),
+                origin: Some("layout_model"),
+                metadata_json: Some(r#"{"number":"2.3"}"#),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::node_relations::insert_relation(
+            &pool,
+            &crate::db::node_relations::NewNodeRelation {
+                document_version_id: vid,
+                from_node_id: proof,
+                relation_type: "proves",
+                to_node_id: thm,
+                confidence: Some(0.6),
+                origin: Some("layout_model"),
+                metadata_json: Some(r#"{"by":"adjacency"}"#),
+            },
+        )
+        .await
+        .unwrap();
+
+        let j = tool_json(&call_tool(&pool, "get_node_relations", json!({ "entry_id": entry.id })).await);
+        assert_eq!(j["has_lcir"], true);
+        assert_eq!(j["source"], "pdf");
+        assert_eq!(j["count"], 2);
+        assert_eq!(j["counts_by_type"]["proves"], 1);
+        assert_eq!(j["counts_by_type"]["refers_to_theorem"], 1);
+        let rels = j["relations"].as_array().unwrap();
+        let proves = rels.iter().find(|r| r["relation_type"] == "proves").unwrap();
+        assert_eq!(proves["from"]["kind"], "proof");
+        assert_eq!(proves["to"]["kind"], "theorem");
+        assert_eq!(proves["to"]["theorem_number"], "2.3");
+        assert_eq!(proves["to"]["page"], 1);
+
+        // relation_type フィルタ。
+        let only = tool_json(
+            &call_tool(
+                &pool,
+                "get_node_relations",
+                json!({ "entry_id": entry.id, "relation_type": ["proves"] }),
+            )
+            .await,
+        );
+        assert_eq!(only["count"], 1);
+
+        // node_id フィルタ: 定理に触れる辺は 2 本（refers_to_theorem と proves）。
+        let touching = tool_json(
+            &call_tool(
+                &pool,
+                "get_node_relations",
+                json!({ "entry_id": entry.id, "node_id": thm }),
+            )
+            .await,
+        );
+        assert_eq!(touching["count"], 2);
     }
 
     /// Phase 5 完了条件「定理と証明を一つの問い合わせで取得できる」: `kinds` フィルタで
@@ -2463,8 +2763,28 @@ mod tests {
             serde_json::to_string_pretty(&found).unwrap()
         );
 
+        // Phase 6a: 参照グラフ全体と、proves だけ絞った結果。
+        let rels = tool_json(&call_tool(&pool, "get_node_relations", json!({ "entry_id": entry_id })).await);
+        eprintln!(
+            "\n=== get_node_relations (counts_by_type) ===\n{}",
+            serde_json::to_string_pretty(&rels["counts_by_type"]).unwrap()
+        );
+        let proves = tool_json(
+            &call_tool(
+                &pool,
+                "get_node_relations",
+                json!({ "entry_id": entry_id, "relation_type": ["proves"] }),
+            )
+            .await,
+        );
+        eprintln!(
+            "\n=== get_node_relations relation_type=[proves] (first few) ===\n{}",
+            serde_json::to_string_pretty(&proves["relations"]).unwrap()
+        );
+
         assert_eq!(structure["has_lcir"], true);
         assert!(structure["counts"]["display_math"].as_i64().unwrap_or(0) > 0);
+        assert_eq!(rels["has_lcir"], true);
     }
 
     #[sqlx::test(migrations = "./migrations")]

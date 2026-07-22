@@ -187,6 +187,21 @@ pub struct MathExpression {
     pub created_at: String,
 }
 
+/// ノード間の型付き関係（migration 0017・Phase 6a）。paragraph/theorem/proof 等のノードから、
+/// それが参照する equation/theorem/figure/section/bibliography_entry ノードへの有向辺。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct NodeRelation {
+    pub id: i64,
+    pub document_version_id: i64,
+    pub from_node_id: i64,
+    pub relation_type: String,
+    pub to_node_id: i64,
+    pub confidence: Option<f64>,
+    pub origin: Option<String>,
+    pub metadata_json: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct EntrySummary {
     pub id: i64,
