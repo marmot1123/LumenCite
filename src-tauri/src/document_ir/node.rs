@@ -247,6 +247,10 @@ pub struct LcirDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinate_space: Option<CoordinateSpace>,
     pub nodes: Vec<LcirNode>,
+    /// ノード間の型付き関係（Phase 6a・参照グラフ）。辺は特定ノードに属さないので文書レベルに持つ。
+    /// 正本は SQLite の `node_relations`。無ければ省略（既存 fixture との後方互換）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relations: Vec<super::relation::LcirRelation>,
 }
 
 #[cfg(test)]
@@ -344,6 +348,7 @@ mod tests {
                     fragment_type: Some("page".to_string()),
                 }],
             }],
+            relations: vec![],
         };
         let json = serde_json::to_string(&doc).unwrap();
         let back: LcirDocument = serde_json::from_str(&json).unwrap();

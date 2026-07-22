@@ -67,6 +67,7 @@ mod tests {
             },
             coordinate_space: Some(CoordinateSpace::default()),
             nodes,
+            relations: vec![],
         }
     }
 
