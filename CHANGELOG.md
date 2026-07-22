@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-23
+
+This release advances **LCIR** — the experimental, machine-readable intermediate representation for papers introduced in v0.8.0 — with three more phases: typed theorem/definition/proof nodes, a cross-reference graph, and symbol definitions. Everything stays gated behind the off-by-default `lcir.enabled` flag, so default behaviour is **byte-for-byte unchanged** and the Web Clipper extension is unchanged from v0.8.0. Two additive migrations (`0017`, `0018`) create new tables that remain empty unless the flag is on — no data migration, and existing libraries upgrade unchanged.
+
+### Added
+
+- **LCIR — typed theorem/definition/proof nodes (Phase 5, experimental)** — recognizes theorem-like environments (theorem, lemma, definition, proof, …) as first-class typed nodes in the document structure, from both PDF text and arXiv TeX source. No new tables.
+- **LCIR — cross-reference graph (Phase 6a, experimental)** — a typed, directed edge graph (`node_relations`) linking document nodes: TeX `\ref`/`\eqref`/`\cite` resolved to labels and cite keys, PDF cross-references ("Theorem 2.3") matched by number and kind, and proofs linked to the theorems they prove. Adds migration `0017`.
+- **LCIR — symbol definitions (Phase 6b, experimental)** — extracts mathematical symbols and their definitions from inline TeX math in definition sentences (e.g. "let $X$ be…", "$H := …$"). Adds migration `0018`.
+- **New LCIR read tools over MCP** — `get_document_blocks` (with a node-kind filter), `get_node_relations`, and `get_symbol_definitions`, available when `lcir.enabled` is on.
+
 ## [0.8.0] - 2026-07-22
 
 The headline is **multiple PDF attachments per entry** — a paper and its supplemental material (SI) can now live on the same entry, both readable in the full-screen reader and both full-text searchable. This release also bundles the reliability and code-review fixes accumulated since v0.7.0 (complete backups with automatic restore, full-text self-heal, identifier de-duplication), Web Clipper acquisition hardening, and the first experimental phases of **LCIR**, a machine-readable intermediate representation for papers, gated behind an off-by-default flag. No migration is required; existing libraries upgrade unchanged.

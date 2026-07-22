@@ -1,6 +1,6 @@
 [package]
 name = "lumencite"
-version = "0.8.0"
+version = "0.9.0"
 description = "Reference and bibliography management for researchers"
 authors = ["Motoki Seki <marmot.motoki@gmail.com>"]
 license = "MIT"
