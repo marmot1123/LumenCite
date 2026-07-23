@@ -2425,8 +2425,10 @@ mod tests {
             eprintln!("self-heal ok: {}", abs.display());
         }
 
-        // 一時 appdir を後片付け（best-effort）。
-        let _ = std::fs::remove_dir_all(&build_root);
+        // 一時 appdir を後片付け（best-effort）。LCIR_SMOKE_KEEP=1 なら crop PNG の目視確認用に残す。
+        if std::env::var("LCIR_SMOKE_KEEP").as_deref() != Ok("1") {
+            let _ = std::fs::remove_dir_all(&build_root);
+        }
     }
 
     // ---- エントリ→版解決（Phase 9a で共有化。MCP / エクスポート / CLI の単一ソース） ----
