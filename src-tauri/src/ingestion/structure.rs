@@ -816,6 +816,7 @@ mod tests {
             rotation_deg: 0.0,
             plain_text: String::new(),
             blocks: segs,
+            image_regions: Vec::new(),
         }
     }
 

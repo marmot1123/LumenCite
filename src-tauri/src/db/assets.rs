@@ -68,6 +68,31 @@ where
     Ok(id)
 }
 
+/// self-heal（Phase 8a・reuse 経路）: 再レンダリングしたファイルのメタデータを
+/// relative_path 一致で更新する。行が無ければ 0 を返す（新規行は作らない）。
+pub async fn refresh_asset_file(
+    pool: &SqlitePool,
+    version_id: i64,
+    relative_path: &str,
+    sha256: &str,
+    dims: (i64, i64),
+    size_bytes: i64,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE assets SET sha256 = ?, width = ?, height = ?, size_bytes = ?
+         WHERE document_version_id = ? AND relative_path = ?",
+    )
+    .bind(sha256)
+    .bind(dims.0)
+    .bind(dims.1)
+    .bind(size_bytes)
+    .bind(version_id)
+    .bind(relative_path)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// 1 バージョンの全アセットを返す（read 面の `LcirNode.assets` 組み立て用）。
 pub async fn assets_for_version(
     pool: &SqlitePool,

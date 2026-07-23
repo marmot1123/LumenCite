@@ -400,7 +400,9 @@ fn suggested_file_name(url: &str, cd_name: Option<&str>) -> String {
 }
 
 /// パス区切り・制御文字・先頭ドットを除去し、長すぎる名前を丸める。
-fn sanitize_file_name(name: &str) -> String {
+/// 手動添付（`add_attachment`）も通す: 先頭ドット除去により、LCIR アセット用の予約名
+/// `.lcir` とユーザーファイルが衝突しないことを構造的に保証する（Phase 8a）。
+pub(crate) fn sanitize_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':'))
