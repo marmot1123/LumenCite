@@ -3358,8 +3358,23 @@ mod tests {
         crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1")
             .await
             .unwrap();
+        // 一時 appdir に対象添付だけをコピーして build する（実 appdir へ書き込まない・
+        // lcir_build_real_pdf と同方式・Phase 8a のアセット書き出しを隔離）。
+        let (file_path,): (String,) =
+            sqlx::query_as("SELECT file_path FROM attachments WHERE id = ?")
+                .bind(att)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let build_root = std::env::temp_dir().join(format!(
+            "lumencite-mcp-smoke-{att}-{}",
+            std::process::id()
+        ));
+        let dest = build_root.join(&file_path);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(Path::new(&appdir).join(&file_path), &dest).unwrap();
         // 実 PDF を LCIR 構築（既存なら reuse）。
-        let build = crate::ingestion::build_lcir_for_attachment(&pool, Path::new(&appdir), att)
+        let build = crate::ingestion::build_lcir_for_attachment(&pool, &build_root, att)
             .await
             .unwrap();
         eprintln!("build: built={} reused={}", build.built, build.reused);
@@ -3430,10 +3445,30 @@ mod tests {
             );
         }
 
+        // Phase 8a: 図一覧（tikz ベクター図の論文では count 0 が正当なので数はアサートしない）。
+        let figs = tool_json(&call_tool(&pool, "get_figures", json!({ "entry_id": entry_id })).await);
+        eprintln!(
+            "\n=== get_figures (source={}, count={}) ===",
+            figs["source"], figs["count"]
+        );
+        for f in figs["figures"].as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().take(8) {
+            eprintln!(
+                "  [figure] page={} number={} bbox={} caption={} assets={}",
+                f["page"],
+                f["figure_number"],
+                f["bbox"],
+                f["caption"]["text"],
+                f["assets"],
+            );
+        }
+
         assert_eq!(structure["has_lcir"], true);
         assert!(structure["counts"]["display_math"].as_i64().unwrap_or(0) > 0);
         assert_eq!(rels["has_lcir"], true);
         assert_eq!(syms["has_lcir"], true);
+        assert_eq!(figs["has_lcir"], true);
+
+        let _ = std::fs::remove_dir_all(&build_root);
     }
 
     #[sqlx::test(migrations = "./migrations")]

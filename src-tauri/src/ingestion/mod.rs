@@ -2150,6 +2150,10 @@ mod tests {
 
     /// 手動 pdfium 実機確認: 実 DB コピー + 実 PDF に対して build → load → 冪等 build を走らせる。
     /// native lib（`src-tauri/pdfium/libpdfium.dylib`）が要るため `#[ignore]`。env 未設定なら skip。
+    ///
+    /// **LCIR_SMOKE_APPDIR は「コピー元」**（実 appdir・読むだけ）。テストは一時ディレクトリに
+    /// 対象添付だけをコピーしてそこへ build するので、実 appdir に Phase 8a のアセットや
+    /// trash が書き込まれることはない。
     /// 例:
     /// `LCIR_SMOKE_DB=/path/copy.db LCIR_SMOKE_APPDIR="$HOME/Library/Application Support/com.lumencite.app" \
     ///  LCIR_SMOKE_ATT=8 cargo test --ignored lcir_build_real_pdf -- --nocapture`
@@ -2176,7 +2180,24 @@ mod tests {
             .await
             .unwrap();
 
-        let res = build_lcir_for_attachment(&pool, Path::new(&appdir), att)
+        // 一時 appdir: 対象添付だけを実 appdir からコピーして再現する（Phase 8a のアセット
+        // 書き込み・GC・trash を実 appdir から隔離する）。
+        let (file_path,): (String,) =
+            sqlx::query_as("SELECT file_path FROM attachments WHERE id = ?")
+                .bind(att)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let build_root = std::env::temp_dir().join(format!(
+            "lumencite-lcir-smoke-{att}-{}",
+            std::process::id()
+        ));
+        let dest = build_root.join(&file_path);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(Path::new(&appdir).join(&file_path), &dest).unwrap();
+        eprintln!("build appdir = {}", build_root.display());
+
+        let res = build_lcir_for_attachment(&pool, &build_root, att)
             .await
             .unwrap();
         eprintln!("build result: {res:?}");
@@ -2329,8 +2350,57 @@ mod tests {
             "node_relations 行数と派生ビューが一致"
         );
 
+        // Phase 8a: 図領域・アセット・caption_of。ベクター図（tikz）主体の論文では 0 件が
+        // 正当なのでハードアサートしない（カウントと実ファイル整合のみ検証）。
+        let fig_nodes: Vec<_> = doc.nodes.iter().filter(|n| n.kind == "figure").collect();
+        let caption_of = doc
+            .relations
+            .iter()
+            .filter(|r| r.relation_type == "caption_of")
+            .count();
+        let asset_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE document_version_id = ?")
+                .bind(doc.version_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        eprintln!(
+            "figures={} caption_of={} asset rows={}",
+            fig_nodes.len(),
+            caption_of,
+            asset_rows
+        );
+        let mut first_asset_abs: Option<std::path::PathBuf> = None;
+        for n in fig_nodes.iter().take(8) {
+            let bbox = n
+                .source_fragments
+                .first()
+                .map(|f| format!("p{} ({:.0},{:.0} {:.0}x{:.0})", f.page, f.bbox.x, f.bbox.y, f.bbox.width, f.bbox.height));
+            eprintln!("  [figure] payload={:?} {:?}", n.payload, bbox);
+            for a in &n.assets {
+                let abs = build_root.join(&a.relative_path);
+                let on_disk = abs.is_file();
+                eprintln!(
+                    "    asset role={} {}x{:?} {}B {} exists={}",
+                    a.role,
+                    a.width.unwrap_or(0),
+                    a.height,
+                    a.size_bytes.unwrap_or(0),
+                    a.relative_path,
+                    on_disk,
+                );
+                assert!(on_disk, "アセット行が指すファイルが実在する");
+                assert_eq!(
+                    document_ir::sha256_file(&abs).unwrap(),
+                    a.sha256,
+                    "ファイル内容と sha256 が一致する"
+                );
+                first_asset_abs.get_or_insert(abs);
+            }
+        }
+
         // 冪等性: 同一 PDF を再 build → 再抽出せず reuse（同一 content_key）。
-        let again = build_lcir_for_attachment(&pool, Path::new(&appdir), att)
+        let again = build_lcir_for_attachment(&pool, &build_root, att)
             .await
             .unwrap();
         eprintln!(
@@ -2339,6 +2409,24 @@ mod tests {
         );
         assert!(again.reused, "same PDF should reuse via content_key");
         assert_eq!(again.content_key, res.content_key);
+
+        // Phase 8a: reuse 経路の self-heal — アセットファイルを消して再 build すると復活する。
+        if let Some(abs) = first_asset_abs {
+            std::fs::remove_file(&abs).unwrap();
+            let healed = build_lcir_for_attachment(&pool, &build_root, att)
+                .await
+                .unwrap();
+            assert!(healed.reused);
+            assert!(
+                abs.is_file(),
+                "self-heal が欠損アセットを再レンダリングする: {}",
+                abs.display()
+            );
+            eprintln!("self-heal ok: {}", abs.display());
+        }
+
+        // 一時 appdir を後片付け（best-effort）。
+        let _ = std::fs::remove_dir_all(&build_root);
     }
 
     // ---- エントリ→版解決（Phase 9a で共有化。MCP / エクスポート / CLI の単一ソース） ----
