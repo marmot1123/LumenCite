@@ -755,8 +755,20 @@ async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOut
 
     match &a.output {
         Some(path) => {
-            std::fs::write(path, &text)
-                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+            // 同一ディレクトリの一時ファイル経由で原子的に置く（書込失敗時に
+            // 出力先へ切り詰めたゴミを残さない）。
+            let tmp = path.with_file_name(format!(
+                "{}.tmp",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "export-lcir".to_string())
+            ));
+            std::fs::write(&tmp, &text)
+                .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+            std::fs::rename(&tmp, path).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("failed to write {}: {e}", path.display())
+            })?;
             Ok(CmdOutput::new(format!("wrote {}", path.display())))
         }
         None => Ok(CmdOutput::new(text)),
@@ -1189,6 +1201,89 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("## Abstract"), "{written}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// PDF 版（pdfium 由来の実データ形）を直接 INSERT で用意し、`--source pdf` の成功経路を
+    /// 共有リゾルバ→レンダラまで通しで検証する（pdfium 不要・CI 完結）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_lcir_markdown_pdf_source_end_to_end(pool: SqlitePool) {
+        let entry_id = build_tex_lcir_fixture(&pool, "pdfsrc").await;
+        let pdf_att = db::attachments::add_attachment(
+            &pool,
+            entry_id,
+            "attachments/z/p.pdf",
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        let ver: i64 = sqlx::query(
+            "INSERT INTO document_versions
+                (attachment_id, content_key, schema_version, source_sha256, source_mime_type,
+                 extractor_name, extractor_version, config_hash, extraction_status)
+             VALUES (?, 'ck-pdf-e2e', '0.1.0', 'sha', 'application/pdf',
+                     'lumencite-pdfium', '0.5.0', '', 'completed')",
+        )
+        .bind(pdf_att)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        // PDF 実データ形: heading("Abstract") + abstract 本文 + 見出しごと verbatim な定理/証明。
+        let insert = |parent: Option<i64>,
+                          ordinal: i64,
+                          kind: &'static str,
+                          text: Option<&'static str>,
+                          payload: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO document_nodes
+                        (document_version_id, parent_id, node_kind, ordinal, plain_text, payload_json)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(ver)
+                .bind(parent)
+                .bind(kind)
+                .bind(ordinal)
+                .bind(text)
+                .bind(payload)
+                .execute(&pool)
+                .await
+                .unwrap()
+                .last_insert_rowid()
+            }
+        };
+        let root = insert(None, 0, "document", None, None).await;
+        insert(Some(root), 0, "heading", Some("Abstract"), None).await;
+        insert(Some(root), 1, "abstract", Some("We prove things."), None).await;
+        insert(
+            Some(root),
+            2,
+            "theorem",
+            Some("Theorem 2.3 (Zorn). Every poset has a maximal chain."),
+            Some(r#"{"theorem_number": "2.3", "note": "Zorn"}"#),
+        )
+        .await;
+        insert(Some(root), 3, "proof", Some("Proof. Consider the union."), None).await;
+
+        let out = cmd_export_lcir(
+            &pool,
+            &export_lcir_args(&entry_id.to_string(), "md", Some("pdf")),
+        )
+        .await
+        .unwrap();
+        let md = &out.stdout;
+        assert!(md.contains("lcir_source: \"lumencite-pdfium"), "PDF 版が選ばれる: {md}");
+        assert_eq!(md.matches("## Abstract").count(), 1, "{md}");
+        assert_eq!(md.matches("Theorem 2.3").count(), 1, "見出し二重化しない: {md}");
+        assert_eq!(md.matches("Proof.").count(), 1, "{md}");
+        // 既定（source 未指定）は tex 優先のまま。
+        let out = cmd_export_lcir(&pool, &export_lcir_args(&entry_id.to_string(), "md", None))
+            .await
+            .unwrap();
+        assert!(out.stdout.contains("lcir_source: \"lumencite-tex"), "{}", out.stdout);
     }
 
     #[sqlx::test(migrations = "./migrations")]

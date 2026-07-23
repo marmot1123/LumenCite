@@ -25,6 +25,14 @@ pub struct MarkdownHeader {
     pub citation_key: Option<String>,
 }
 
+/// 文書単位の描画状態。PDF 由来の文書は「"Abstract" という heading ノード」と
+/// 「abstract 本文ノード（複数可）」を併存させるため、`## Abstract` 見出しは文書に
+/// 1 回だけ出す（重複排除）。
+#[derive(Default)]
+struct RenderState {
+    abstract_heading_done: bool,
+}
+
 /// `LcirDocument` を Markdown 文字列に描画する。
 pub fn render_markdown(doc: &LcirDocument, header: Option<&MarkdownHeader>) -> String {
     let mut out = String::new();
@@ -41,8 +49,9 @@ pub fn render_markdown(doc: &LcirDocument, header: Option<&MarkdownHeader>) -> S
         v.sort_by_key(|n| n.ordinal);
     }
 
+    let mut state = RenderState::default();
     for root in children.get(&None).cloned().unwrap_or_default() {
-        render_node(root, &children, &mut out);
+        render_node(root, &children, &mut state, &mut out);
     }
 
     let trimmed = out.trim_end();
@@ -57,12 +66,13 @@ pub fn render_markdown(doc: &LcirDocument, header: Option<&MarkdownHeader>) -> S
 fn render_node(
     n: &LcirNode,
     children: &HashMap<Option<i64>, Vec<&LcirNode>>,
+    state: &mut RenderState,
     out: &mut String,
 ) {
     match n.kind.as_str() {
         // 骨格: 自分は描画せず子へ。`page` の plain_text はページ全文（＝ブロックと重複）
         // なので出さない。
-        "document" | "page" => render_children(n, children, out),
+        "document" | "page" => render_children(n, children, state, out),
         // `line` は親ブロックの plain_text と重複する。
         "line" => {}
         "front_matter" => {
@@ -72,24 +82,33 @@ fn render_node(
         }
         "abstract" => {
             if let Some(t) = text(n) {
-                push_block(out, "## Abstract");
+                push_abstract_heading(state, out);
                 push_block(out, &t);
             }
         }
         "section" => push_heading(n, 2, out),
         "subsection" => push_heading(n, 3, out),
         "heading" => {
-            // TeX の subsubsection 以下は heading + `heading_level`（1 = section 相当）。
-            let level = payload_i64(n, "heading_level").unwrap_or(1).clamp(1, 5) as usize + 1;
-            push_heading(n, level, out);
+            // PDF 認識器は "Abstract" 行を heading として出し、本文を別の abstract ノードに
+            // する。素通しすると `## Abstract` が二重になるので、ここで一本化する。
+            if is_abstract_heading(n) {
+                push_abstract_heading(state, out);
+            } else {
+                // TeX の subsubsection 以下は heading + `heading_level`（1 = section 相当）。
+                let level = payload_i64(n, "heading_level").unwrap_or(1).clamp(1, 5) as usize + 1;
+                push_heading(n, level, out);
+            }
         }
         "display_math" => push_display_math(n, out),
         "definition" | "theorem" | "lemma" | "proposition" | "corollary" | "remark"
         | "example" => push_theorem_like(n, out),
         "proof" => {
             let body = text(n).unwrap_or_default();
+            // PDF 由来（structure.rs）は本文が "Proof. …" を verbatim に含む — 二重付与しない。
             let full = if body.is_empty() {
                 "*Proof.*".to_string()
+            } else if starts_with_ci(&body, "proof") {
+                body
             } else {
                 format!("*Proof.* {body}")
             };
@@ -107,6 +126,22 @@ fn render_node(
                     items.push_str(&format!("- {t}\n"));
                 }
             }
+            // 実データの list は list_item 子を持たず、"• item" 行を自分の plain_text に
+            // 持つ（TeX 抽出器・フラット木）。落とさず箇条書きに変換する。
+            if items.is_empty() {
+                if let Some(t) = text(n) {
+                    for line in t.lines() {
+                        let line = line.trim_start();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        match line.strip_prefix("• ") {
+                            Some(rest) => items.push_str(&format!("- {rest}\n")),
+                            None => items.push_str(&format!("- {line}\n")),
+                        }
+                    }
+                }
+            }
             if !items.is_empty() {
                 push_block(out, items.trim_end());
             }
@@ -120,7 +155,7 @@ fn render_node(
         }
         "bibliography" => {
             push_block(out, "## References");
-            render_children(n, children, out);
+            render_children(n, children, state, out);
         }
         "bibliography_entry" => {
             if let Some(t) = text(n) {
@@ -135,7 +170,7 @@ fn render_node(
         // テキストが無ければ子に降りる（構造だけのコンテナを黙って捨てない）。
         _ => match text(n) {
             Some(t) => push_block(out, &t),
-            None => render_children(n, children, out),
+            None => render_children(n, children, state, out),
         },
     }
 }
@@ -143,11 +178,38 @@ fn render_node(
 fn render_children(
     n: &LcirNode,
     children: &HashMap<Option<i64>, Vec<&LcirNode>>,
+    state: &mut RenderState,
     out: &mut String,
 ) {
     for c in children.get(&Some(n.id)).cloned().unwrap_or_default() {
-        render_node(c, children, out);
+        render_node(c, children, state, out);
     }
+}
+
+/// `## Abstract` を文書に 1 回だけ出す。
+fn push_abstract_heading(state: &mut RenderState, out: &mut String) {
+    if !state.abstract_heading_done {
+        push_block(out, "## Abstract");
+        state.abstract_heading_done = true;
+    }
+}
+
+/// heading ノードが abstract の見出し（"Abstract" / "ABSTRACT" / 末尾 `:`・`.` 付き）か。
+fn is_abstract_heading(n: &LcirNode) -> bool {
+    text(n)
+        .map(|t| {
+            t.trim()
+                .trim_end_matches([':', '.'])
+                .trim()
+                .eq_ignore_ascii_case("abstract")
+        })
+        .unwrap_or(false)
+}
+
+/// ASCII prefix の大文字小文字無視 starts_with（char 境界安全）。
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
 /// 見出し。TeX/PDF とも `plain_text` は節番号込みなので、payload の `section_number` は
@@ -195,7 +257,16 @@ fn push_display_math(n: &LcirNode, out: &mut String) {
 }
 
 /// 定理系ノード（Phase 5）。`> **Theorem 2.3** (Note). 本文` の blockquote。
+/// PDF 由来（structure.rs）は本文が "Theorem 2.3 (Note). …" の見出しごと verbatim なので、
+/// 種別語で始まる本文には合成見出しを重ねない（push_heading の二重付与ガードと同型）。
 fn push_theorem_like(n: &LcirNode, out: &mut String) {
+    let body = text(n);
+    if let Some(b) = &body {
+        if starts_with_ci(b, &n.kind) {
+            push_block(out, &prefix_lines("> ", b));
+            return;
+        }
+    }
     let mut head = format!("**{}", capitalize(&n.kind));
     if let Some(num) = payload_str(n, "theorem_number") {
         head.push(' ');
@@ -206,8 +277,8 @@ fn push_theorem_like(n: &LcirNode, out: &mut String) {
         head.push_str(&format!(" ({note})"));
     }
     head.push('.');
-    let full = match text(n) {
-        Some(body) => format!("{head} {body}"),
+    let full = match body {
+        Some(b) => format!("{head} {b}"),
         None => head,
     };
     push_block(out, &prefix_lines("> ", &full));
@@ -525,6 +596,59 @@ mod tests {
     fn empty_document_renders_empty_string() {
         let d = doc(vec![node(1, None, 0, "document", None)]);
         assert_eq!(render_markdown(&d, None), "");
+    }
+
+    #[test]
+    fn tex_list_without_item_children_falls_back_to_bullet_text() {
+        // 実データ形: TeX 抽出器はフラット木で、"• item" 行を list 自身の plain_text に持つ。
+        let list = node(2, Some(1), 0, "list", Some("• first point\n• second point"));
+        let d = doc(vec![node(1, None, 0, "document", None), list]);
+        let md = render_markdown(&d, None);
+        assert!(md.contains("- first point\n- second point"), "{md}");
+        assert!(!md.contains('•'), "bullet は Markdown 記法に変換: {md}");
+    }
+
+    #[test]
+    fn pdf_theorem_and_proof_headers_are_not_duplicated() {
+        // 実データ形: PDF（structure.rs）は見出しごと verbatim + payload に番号/付記名。
+        let mut thm = node(
+            2,
+            Some(1),
+            0,
+            "theorem",
+            Some("Theorem 2.3 (Zorn). Every poset has a maximal chain."),
+        );
+        thm.payload = serde_json::json!({"theorem_number": "2.3", "note": "Zorn"}).into();
+        let proof = node(3, Some(1), 1, "proof", Some("Proof. Consider the union."));
+        let d = doc(vec![node(1, None, 0, "document", None), thm, proof]);
+        let md = render_markdown(&d, None);
+        assert_eq!(md.matches("Theorem 2.3").count(), 1, "見出しを重ねない: {md}");
+        assert!(md.contains("> Theorem 2.3 (Zorn). Every poset"), "{md}");
+        assert_eq!(md.matches("Proof.").count(), 1, "{md}");
+        assert!(md.contains("> Proof. Consider the union."), "{md}");
+        assert!(!md.contains("*Proof.* Proof."), "{md}");
+    }
+
+    #[test]
+    fn abstract_heading_is_emitted_once_for_pdf_shape() {
+        // 実データ形: PDF は heading("Abstract") + abstract 本文ノード（複数可）。
+        let d = doc(vec![
+            node(1, None, 0, "document", None),
+            node(2, Some(1), 0, "heading", Some("Abstract")),
+            node(3, Some(1), 1, "abstract", Some("First abstract block.")),
+            node(4, Some(1), 2, "abstract", Some("Second abstract block.")),
+        ]);
+        let md = render_markdown(&d, None);
+        assert_eq!(md.matches("## Abstract").count(), 1, "{md}");
+        assert!(md.contains("First abstract block."), "{md}");
+        assert!(md.contains("Second abstract block."), "{md}");
+        // TeX 形（heading なし・abstract のみ）でも見出しは出る。
+        let d2 = doc(vec![
+            node(1, None, 0, "document", None),
+            node(2, Some(1), 0, "abstract", Some("Tex abstract.")),
+        ]);
+        let md2 = render_markdown(&d2, None);
+        assert_eq!(md2.matches("## Abstract").count(), 1, "{md2}");
     }
 
     #[test]

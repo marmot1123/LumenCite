@@ -301,12 +301,21 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setIndexNote(null);
   }, [entry?.id]);
 
-  // LCIR フラグ（Phase 9a: エクスポートボタンの表示可否）。設定変更は稀なのでマウント時のみ。
+  // LCIR フラグ（Phase 9a: エクスポートボタンの表示可否）。設定モーダルでの切替を
+  // 拾えるよう、エントリ切替のたびに再取得する（ローカル invoke で安価）。
   useEffect(() => {
+    let cancelled = false;
     invoke<boolean>("get_lcir_enabled")
-      .then(setLcirEnabled)
-      .catch(() => setLcirEnabled(false));
-  }, []);
+      .then(v => {
+        if (!cancelled) setLcirEnabled(v);
+      })
+      .catch(() => {
+        if (!cancelled) setLcirEnabled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [entry?.id]);
 
   // 添付の全文索引状態を取得する（エントリ切替・添付増減で再取得）。PDF のみが対象。
   useEffect(() => {
@@ -452,19 +461,24 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   };
 
   // LCIR を JSON / Markdown に書き出す（Phase 9a）。保存ダイアログのキャンセルは無言で戻る。
+  // ダイアログを開いたまま別エントリへ移った場合、完了/エラー表示は捨てる（TeX 取得と同じ契約）。
   const handleExportLcir = async (format: "json" | "markdown") => {
     if (!entry || lcirExportBusy) return;
+    const startedFor = entry.id;
+    const stillHere = () => entryIdRef.current === startedFor;
     setLcirExportBusy(true);
     setAttachError(null);
     setIndexNote(null);
     try {
       const path = await invoke<string | null>(
         format === "json" ? "export_lcir_json" : "export_lcir_markdown",
-        { entryId: entry.id },
+        { entryId: startedFor },
       );
-      if (path) setIndexNote(t("detailPanel.lcirExportDone", { path }));
+      if (path && stillHere()) setIndexNote(t("detailPanel.lcirExportDone", { path }));
     } catch (e: any) {
-      setAttachError(t("detailPanel.lcirExportFailed", { error: e?.message ?? String(e) }));
+      if (stillHere()) {
+        setAttachError(t("detailPanel.lcirExportFailed", { error: e?.message ?? String(e) }));
+      }
     } finally {
       setLcirExportBusy(false);
     }
