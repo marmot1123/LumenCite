@@ -232,6 +232,31 @@ pub struct SymbolOccurrence {
     pub created_at: String,
 }
 
+/// 図表アセット（migration 0019・Phase 8a）。バイナリ本体は FS・行は相対パス + SHA-256 参照。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct Asset {
+    pub id: i64,
+    pub document_version_id: i64,
+    pub sha256: String,
+    pub mime_type: String,
+    pub relative_path: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub size_bytes: Option<i64>,
+    pub metadata_json: Option<String>,
+    pub created_at: String,
+}
+
+/// ノード ↔ アセット紐づけ（migration 0019・Phase 8a）。`role` は page_crop 等。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct NodeAsset {
+    pub id: i64,
+    pub node_id: i64,
+    pub asset_id: i64,
+    pub role: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct EntrySummary {
     pub id: i64,

@@ -7,7 +7,7 @@
     "sha256": "deadbeef",
     "mime_type": "application/pdf",
     "extractor_name": "lumencite-pdfium",
-    "extractor_version": "0.5.0"
+    "extractor_version": "0.6.0"
   },
   "coordinate_space": {
     "space": "pdf_user_space",

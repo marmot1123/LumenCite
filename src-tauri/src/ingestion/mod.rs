@@ -1,6 +1,7 @@
 //! LCIR の取り込み（ingestion）。実験フラグ判定・添付ごとの LCIR 構築（pdfium）・
 //! 派生 FTS 再生成・read 面の組み立て。既存 `fulltext` 経路は触らず、LCIR は追加の side-build。
 
+pub mod figures;
 pub mod graph;
 pub mod pdf;
 pub mod structure;
@@ -82,14 +83,14 @@ pub async fn build_lcir_for_attachment(
         });
     }
 
-    // 添付の相対パス / mime を取得。
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT file_path, mime_type FROM attachments WHERE id = ?")
+    // 添付の相対パス / mime / entry_id を取得。
+    let row: Option<(String, String, i64)> =
+        sqlx::query_as("SELECT file_path, mime_type, entry_id FROM attachments WHERE id = ?")
             .bind(attachment_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
-    let (file_path, mime_type) =
+    let (file_path, mime_type, entry_id) =
         row.ok_or_else(|| format!("attachment {attachment_id} not found"))?;
     let abs_path = app_data_dir.join(&file_path);
 
@@ -134,6 +135,13 @@ pub async fn build_lcir_for_attachment(
         if let Err(e) = regenerate_node_fts_from_lcir(pool, attachment_id).await {
             eprintln!("LCIR: node-FTS regeneration failed for attachment {attachment_id}: {e}");
         }
+        // アセットファイルの self-heal（Phase 8a・best-effort）: DB 行が指すファイルが消えて
+        // いたら再抽出して書き直す（reuse は抽出を省くため、ここで補わないと恒久欠損になる）。
+        if !is_tex {
+            if let Err(e) = heal_missing_assets(pool, app_data_dir, existing.id, &abs_path).await {
+                eprintln!("LCIR: asset self-heal failed for attachment {attachment_id}: {e}");
+            }
+        }
         return Ok(LcirBuildResult {
             enabled: true,
             built: false,
@@ -164,16 +172,25 @@ pub async fn build_lcir_for_attachment(
         .await?;
         (vid, 0, format!("built LCIR from TeX source: {blocks} block(s)"))
     } else {
-        let (vid, pages) = build_pdf_version(
-            pool,
+        // アセットの相対ディレクトリ（Phase 8a）。attachments.file_path の親（'/' 区切り保証済み）
+        // に '/' 文字列連結で組む（OS パス演算から逆算しない — Windows で '\\' を DB に入れない）。
+        let asset_parent = file_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_else(|| format!("attachments/{entry_id}"));
+        let key16 = &ckey[..16];
+        let asset_rel_dir = format!("{asset_parent}/.lcir/{attachment_id}/{key16}");
+        let ctx = PdfBuildCtx {
             attachment_id,
-            &abs_path,
-            &mime_type,
-            &source_sha256,
-            &ckey,
+            abs_path: &abs_path,
+            mime_type: &mime_type,
+            source_sha256: &source_sha256,
+            ckey: &ckey,
             parent_version_id,
-        )
-        .await?;
+            app_data_dir,
+            asset_rel_dir: &asset_rel_dir,
+        };
+        let (vid, pages) = build_pdf_version(pool, &ctx).await?;
         (vid, pages, format!("built LCIR: {pages} page(s)"))
     };
 
@@ -194,30 +211,155 @@ pub async fn build_lcir_for_attachment(
     })
 }
 
-/// pdfium 抽出で version + `document > page > block > line` の木を作る（Phase 1-3 の経路）。
-/// 返り値は (version_id, page_count)。
-async fn build_pdf_version(
-    pool: &SqlitePool,
+/// `build_pdf_version` の入力一式（Phase 8a でアセット書き出し先が増えたためまとめた）。
+struct PdfBuildCtx<'a> {
     attachment_id: i64,
-    abs_path: &Path,
-    mime_type: &str,
-    source_sha256: &str,
-    ckey: &str,
+    abs_path: &'a Path,
+    mime_type: &'a str,
+    source_sha256: &'a str,
+    ckey: &'a str,
     parent_version_id: Option<i64>,
-) -> Result<(i64, i64), String> {
-    // pdfium 抽出は CPU/native 依存なので blocking スレッドへ。
-    let abs2 = abs_path.to_path_buf();
-    let extracted = tokio::task::spawn_blocking(move || pdf::extract_document(&abs2)).await;
+    app_data_dir: &'a Path,
+    /// アセットディレクトリ（app data dir 相対・'/' 区切り・content_key 先頭 16hex まで含む）。
+    asset_rel_dir: &'a str,
+}
+
+/// pdfium 抽出で version + `document > page > block > line` の木を作る（Phase 1-3 の経路）。
+/// Phase 8a: 図領域の `figure` ノード + crop PNG アセット + `caption_of` 辺も作る。
+/// 返り値は (version_id, page_count)。
+async fn build_pdf_version(pool: &SqlitePool, ctx: &PdfBuildCtx<'_>) -> Result<(i64, i64), String> {
+    let abs_asset_dir = ctx.app_data_dir.join(ctx.asset_rel_dir);
+
+    // pdfium 抽出は CPU/native 依存なので blocking スレッドへ。crop PNG は抽出中に
+    // asset_dir へ書き出す（tx の外・メモリに貯めない）。
+    let abs2 = ctx.abs_path.to_path_buf();
+    let asset_dir2 = abs_asset_dir.clone();
+    let extracted =
+        tokio::task::spawn_blocking(move || pdf::extract_document(&abs2, Some(&asset_dir2))).await;
     let extracted_doc = match extracted {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(e),
-        Err(e) => return Err(format!("extraction task panicked: {e}")),
+        Ok(Err(e)) => {
+            // 抽出失敗: 書きかけのアセットを best-effort で除去（同一 content_key の完了版は
+            // 存在しない = reuse 経路に乗らなかったので、このディレクトリは今回のもの）。
+            let _ = std::fs::remove_dir_all(&abs_asset_dir);
+            return Err(e);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&abs_asset_dir);
+            return Err(format!("extraction task panicked: {e}"));
+        }
     };
 
+    let result = insert_pdf_version_tx(pool, ctx, &extracted_doc).await;
+    match result {
+        Ok(ok) => {
+            // 旧 content_key ディレクトリ（superseded 版のアセット）を回収する（best-effort・
+            // DB の assets 行は provenance として残す = 読み出しは latest completed のみ）。
+            gc_stale_asset_dirs(ctx.app_data_dir, &abs_asset_dir);
+            Ok(ok)
+        }
+        Err(e) => {
+            // tx 失敗: 今回書いたアセットの孤児を best-effort で除去。
+            let _ = std::fs::remove_dir_all(&abs_asset_dir);
+            Err(e)
+        }
+    }
+}
+
+/// reuse 経路のアセット self-heal（Phase 8a・best-effort）。この版の assets 行が指すファイルが
+/// 1 つでも欠けていたら再抽出して同一パスへ書き直す（同一 content_key = 抽出は決定的なので
+/// ファイル名・領域は再現する）。DB は sha256/寸法/サイズだけ更新し、version 行・ノード・辺は
+/// 不変。バックアップ復元後の部分欠損や手動削除からの回復経路（fulltext FTS5 self-heal と同型）。
+async fn heal_missing_assets(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    version_id: i64,
+    abs_path: &Path,
+) -> Result<(), String> {
+    let rows = crate::db::assets::assets_for_version(pool, version_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    if rows
+        .iter()
+        .all(|a| app_data_dir.join(&a.relative_path).is_file())
+    {
+        return Ok(());
+    }
+    // アセットディレクトリは行の relative_path（'/' 区切り）から復元する。
+    let Some((rel_dir, _)) = rows[0].relative_path.rsplit_once('/') else {
+        return Ok(());
+    };
+    let rel_dir = rel_dir.to_string();
+    let abs2 = abs_path.to_path_buf();
+    let dir2 = app_data_dir.join(&rel_dir);
+    let extracted = tokio::task::spawn_blocking(move || pdf::extract_document(&abs2, Some(&dir2)))
+        .await
+        .map_err(|e| format!("asset heal task panicked: {e}"))?
+        .map_err(|e| format!("asset heal extraction failed: {e}"))?;
+    let mut refreshed = 0u64;
+    for page in &extracted.pages {
+        for region in &page.image_regions {
+            if let Some(file) = &region.file {
+                let rel = format!("{rel_dir}/{}", file.file_name);
+                refreshed += crate::db::assets::refresh_asset_file(
+                    pool,
+                    version_id,
+                    &rel,
+                    &file.sha256,
+                    (file.width_px as i64, file.height_px as i64),
+                    file.size_bytes as i64,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    eprintln!(
+        "LCIR: asset self-heal re-rendered files for version {version_id} ({refreshed} row(s) refreshed)"
+    );
+    Ok(())
+}
+
+/// `.lcir/<attachment_id>/` 直下の「現 content_key 以外」のサブディレクトリを trash へ。
+fn gc_stale_asset_dirs(app_data_dir: &Path, abs_asset_dir: &Path) {
+    let (Some(parent), Some(current)) = (abs_asset_dir.parent(), abs_asset_dir.file_name()) else {
+        return;
+    };
+    let Ok(rd) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() && entry.file_name() != current {
+            let _ = crate::attachment_trash::move_to_trash(app_data_dir, &p);
+        }
+    }
+}
+
+/// version 行 + ノード木 + 数式 + 図アセット + 関係辺を 1 トランザクションで挿入する。
+async fn insert_pdf_version_tx(
+    pool: &SqlitePool,
+    ctx: &PdfBuildCtx<'_>,
+    extracted_doc: &pdf::ExtractedDocument,
+) -> Result<(i64, i64), String> {
+    let attachment_id = ctx.attachment_id;
+    let (figure_total, asset_total) = extracted_doc
+        .pages
+        .iter()
+        .flat_map(|p| p.image_regions.iter())
+        .fold((0usize, 0usize), |(f, a), r| {
+            (f + 1, a + usize::from(r.file.is_some()))
+        });
     let metadata = serde_json::json!({
         "coordinate_space": CoordinateSpace::default(),
         "page_count": extracted_doc.pages.len(),
         "pdfium_render": "0.8",
+        "figure_count": figure_total,
+        "asset_count": asset_total,
+        "render_target_width": pdf::RENDER_TARGET_WIDTH,
     })
     .to_string();
     let warnings_json = if extracted_doc.warnings.is_empty() {
@@ -237,14 +379,14 @@ async fn build_pdf_version(
         &mut *tx,
         &NewDocumentVersion {
             attachment_id,
-            content_key: ckey,
+            content_key: ctx.ckey,
             schema_version: document_ir::schema::SCHEMA_VERSION,
-            source_sha256,
-            source_mime_type: mime_type,
+            source_sha256: ctx.source_sha256,
+            source_mime_type: ctx.mime_type,
             extractor_name: document_ir::schema::EXTRACTOR_NAME,
             extractor_version: document_ir::schema::EXTRACTOR_VERSION,
             config_hash: "",
-            parent_version_id,
+            parent_version_id: ctx.parent_version_id,
             status,
             warnings_json: warnings_json.as_deref(),
             metadata_json: Some(&metadata),
@@ -279,6 +421,8 @@ async fn build_pdf_version(
     // 参照グラフ用に block ノードの軽量ビューを読み順（ページ跨ぎの通し番号）で集める（Phase 6a）。
     let mut graph_nodes: Vec<graph::GraphNode> = Vec::new();
     let mut reading_index = 0i64;
+    // 図の文書通し番号（Phase 8a・1 始まり）。
+    let mut figure_index = 0i64;
     for (pi, page) in extracted_doc.pages.iter().enumerate() {
         let payload = serde_json::json!({
             "page_width_pt": page.width_pt,
@@ -331,6 +475,9 @@ async fn build_pdf_version(
         // 論理ブロック + その行。ブロック型は推定なので origin=layout_model + confidence を必ず持たせ、
         // 行テキストは PDF レイヤー由来なので pdf_text_layer にする（原文由来と推定を区別）。
         let blocks = structure::recognize_page(page, &mut recognizer);
+        // 図領域ペアリング候補の caption（Phase 8a）。Algorithm/Listing は FigureCaption だが
+        // 画像領域の caption ではないのでラベル語で除外する。
+        let mut page_captions: Vec<(i64, document_ir::BBox, Option<String>)> = Vec::new();
         for (bi, sblock) in blocks.iter().enumerate() {
             let payload_json = block_payload_json(sblock);
             let block_node_id = document_nodes::insert_node(
@@ -361,6 +508,15 @@ async fn build_pdf_version(
                 cite_key: None,
             });
             reading_index += 1;
+            if sblock.kind == NodeKind::FigureCaption
+                && matches!(sblock.caption_label.as_deref(), Some("Figure") | Some("Fig"))
+            {
+                page_captions.push((
+                    block_node_id,
+                    sblock.bbox,
+                    sblock.caption_number.clone(),
+                ));
+            }
             source_fragments::insert_fragment(
                 &mut *tx,
                 &NewSourceFragment {
@@ -436,6 +592,120 @@ async fn build_pdf_version(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+            }
+        }
+
+        // Phase 8a: 図領域 → figure ノード + crop アセット + caption_of 辺。
+        // 領域はレイアウト推定なので origin=layout_model + confidence。caption とのペアは
+        // 幾何（相互最近のみ）で決め、番号は caption の "Figure N" から引き継ぐ。
+        if !page.image_regions.is_empty() {
+            let fig_bboxes: Vec<document_ir::BBox> =
+                page.image_regions.iter().map(|r| r.bbox).collect();
+            let cap_bboxes: Vec<document_ir::BBox> =
+                page_captions.iter().map(|(_, b, _)| *b).collect();
+            let pair_map: std::collections::HashMap<usize, usize> =
+                figures::pair_captions(&fig_bboxes, &cap_bboxes)
+                    .into_iter()
+                    .collect();
+            for (ri, region) in page.image_regions.iter().enumerate() {
+                figure_index += 1;
+                let paired = pair_map.get(&ri).copied();
+                let figure_number =
+                    paired.and_then(|ci| page_captions[ci].2.as_deref());
+                let mut payload = serde_json::Map::new();
+                payload.insert(
+                    "figure_index".to_string(),
+                    serde_json::Value::from(figure_index),
+                );
+                if let Some(n) = figure_number {
+                    payload.insert(
+                        "figure_number".to_string(),
+                        serde_json::Value::from(n.to_string()),
+                    );
+                }
+                let payload_json = serde_json::Value::Object(payload).to_string();
+                let figure_node_id = document_nodes::insert_node(
+                    &mut *tx,
+                    &NewDocumentNode {
+                        document_version_id: version_id,
+                        parent_id: Some(page_node_id),
+                        node_kind: NodeKind::Figure.as_str(),
+                        ordinal: (blocks.len() + ri) as i64,
+                        plain_text: None,
+                        language: None,
+                        confidence: Some(0.6),
+                        origin: Some(Origin::LayoutModel.as_str()),
+                        payload_json: Some(&payload_json),
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                source_fragments::insert_fragment(
+                    &mut *tx,
+                    &NewSourceFragment {
+                        node_id: figure_node_id,
+                        page_number: page.page_number,
+                        x: region.bbox.x,
+                        y: region.bbox.y,
+                        width: region.bbox.width,
+                        height: region.bbox.height,
+                        rotation: page.rotation_deg,
+                        reading_order: None,
+                        fragment_type: Some(FragmentType::Block.as_str()),
+                    },
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                if let Some(file) = &region.file {
+                    let relative_path = format!("{}/{}", ctx.asset_rel_dir, file.file_name);
+                    let asset_meta = serde_json::json!({
+                        "page": page.page_number,
+                        "region_index": ri,
+                        "render_target_width": pdf::RENDER_TARGET_WIDTH,
+                    })
+                    .to_string();
+                    let asset_id = crate::db::assets::insert_asset(
+                        &mut *tx,
+                        &crate::db::assets::NewAsset {
+                            document_version_id: version_id,
+                            sha256: &file.sha256,
+                            mime_type: "image/png",
+                            relative_path: &relative_path,
+                            width: Some(file.width_px as i64),
+                            height: Some(file.height_px as i64),
+                            size_bytes: Some(file.size_bytes as i64),
+                            metadata_json: Some(&asset_meta),
+                        },
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    crate::db::assets::insert_node_asset(
+                        &mut *tx,
+                        &crate::db::assets::NewNodeAsset {
+                            node_id: figure_node_id,
+                            asset_id,
+                        },
+                        "page_crop",
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+                if let Some(ci) = paired {
+                    node_relations::insert_relation(
+                        &mut *tx,
+                        &node_relations::NewNodeRelation {
+                            document_version_id: version_id,
+                            from_node_id: page_captions[ci].0,
+                            relation_type: document_ir::RelationType::CaptionOf.as_str(),
+                            to_node_id: figure_node_id,
+                            confidence: Some(0.6),
+                            origin: Some(Origin::LayoutModel.as_str()),
+                            metadata_json: None,
+                        },
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
             }
         }
     }
@@ -740,6 +1010,18 @@ fn block_payload_json(b: &structure::StructuredBlock) -> Option<String> {
     if let Some(ref note) = b.note {
         map.insert("note".to_string(), serde_json::Value::from(note.clone()));
     }
+    if let Some(ref label) = b.caption_label {
+        map.insert(
+            "caption_label".to_string(),
+            serde_json::Value::from(label.clone()),
+        );
+    }
+    if let Some(ref number) = b.caption_number {
+        map.insert(
+            "caption_number".to_string(),
+            serde_json::Value::from(number.clone()),
+        );
+    }
     if map.is_empty() {
         None
     } else {
@@ -970,11 +1252,46 @@ pub async fn load_lcir_document(
         );
     }
 
+    // 図表アセット（Phase 8a）を node_assets 経由でノードに紐づける。
+    // relative_path はメタデータ参照でファイルの存在は保証しない（欠損許容）。
+    let asset_rows: HashMap<i64, crate::models::Asset> =
+        crate::db::assets::assets_for_version(pool, version.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|a| (a.id, a))
+            .collect();
+    let mut assets_by_node: HashMap<i64, Vec<document_ir::LcirAsset>> = HashMap::new();
+    for link in crate::db::assets::node_assets_for_version(pool, version.id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        if let Some(a) = asset_rows.get(&link.asset_id) {
+            assets_by_node
+                .entry(link.node_id)
+                .or_default()
+                .push(document_ir::LcirAsset {
+                    role: link.role,
+                    mime_type: a.mime_type.clone(),
+                    relative_path: a.relative_path.clone(),
+                    width: a.width,
+                    height: a.height,
+                    size_bytes: a.size_bytes,
+                    sha256: a.sha256.clone(),
+                    metadata: a
+                        .metadata_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok()),
+                });
+        }
+    }
+
     let lcir_nodes = nodes
         .into_iter()
         .map(|n| document_ir::LcirNode {
             source_fragments: by_node.remove(&n.id).unwrap_or_default(),
             math: math_by_node.remove(&n.id),
+            assets: assets_by_node.remove(&n.id).unwrap_or_default(),
             payload: n
                 .payload_json
                 .as_deref()
@@ -1833,6 +2150,10 @@ mod tests {
 
     /// 手動 pdfium 実機確認: 実 DB コピー + 実 PDF に対して build → load → 冪等 build を走らせる。
     /// native lib（`src-tauri/pdfium/libpdfium.dylib`）が要るため `#[ignore]`。env 未設定なら skip。
+    ///
+    /// **LCIR_SMOKE_APPDIR は「コピー元」**（実 appdir・読むだけ）。テストは一時ディレクトリに
+    /// 対象添付だけをコピーしてそこへ build するので、実 appdir に Phase 8a のアセットや
+    /// trash が書き込まれることはない。
     /// 例:
     /// `LCIR_SMOKE_DB=/path/copy.db LCIR_SMOKE_APPDIR="$HOME/Library/Application Support/com.lumencite.app" \
     ///  LCIR_SMOKE_ATT=8 cargo test --ignored lcir_build_real_pdf -- --nocapture`
@@ -1859,7 +2180,24 @@ mod tests {
             .await
             .unwrap();
 
-        let res = build_lcir_for_attachment(&pool, Path::new(&appdir), att)
+        // 一時 appdir: 対象添付だけを実 appdir からコピーして再現する（Phase 8a のアセット
+        // 書き込み・GC・trash を実 appdir から隔離する）。
+        let (file_path,): (String,) =
+            sqlx::query_as("SELECT file_path FROM attachments WHERE id = ?")
+                .bind(att)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let build_root = std::env::temp_dir().join(format!(
+            "lumencite-lcir-smoke-{att}-{}",
+            std::process::id()
+        ));
+        let dest = build_root.join(&file_path);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(Path::new(&appdir).join(&file_path), &dest).unwrap();
+        eprintln!("build appdir = {}", build_root.display());
+
+        let res = build_lcir_for_attachment(&pool, &build_root, att)
             .await
             .unwrap();
         eprintln!("build result: {res:?}");
@@ -2012,8 +2350,57 @@ mod tests {
             "node_relations 行数と派生ビューが一致"
         );
 
+        // Phase 8a: 図領域・アセット・caption_of。ベクター図（tikz）主体の論文では 0 件が
+        // 正当なのでハードアサートしない（カウントと実ファイル整合のみ検証）。
+        let fig_nodes: Vec<_> = doc.nodes.iter().filter(|n| n.kind == "figure").collect();
+        let caption_of = doc
+            .relations
+            .iter()
+            .filter(|r| r.relation_type == "caption_of")
+            .count();
+        let asset_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM assets WHERE document_version_id = ?")
+                .bind(doc.version_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        eprintln!(
+            "figures={} caption_of={} asset rows={}",
+            fig_nodes.len(),
+            caption_of,
+            asset_rows
+        );
+        let mut first_asset_abs: Option<std::path::PathBuf> = None;
+        for n in fig_nodes.iter().take(8) {
+            let bbox = n
+                .source_fragments
+                .first()
+                .map(|f| format!("p{} ({:.0},{:.0} {:.0}x{:.0})", f.page, f.bbox.x, f.bbox.y, f.bbox.width, f.bbox.height));
+            eprintln!("  [figure] payload={:?} {:?}", n.payload, bbox);
+            for a in &n.assets {
+                let abs = build_root.join(&a.relative_path);
+                let on_disk = abs.is_file();
+                eprintln!(
+                    "    asset role={} {}x{:?} {}B {} exists={}",
+                    a.role,
+                    a.width.unwrap_or(0),
+                    a.height,
+                    a.size_bytes.unwrap_or(0),
+                    a.relative_path,
+                    on_disk,
+                );
+                assert!(on_disk, "アセット行が指すファイルが実在する");
+                assert_eq!(
+                    document_ir::sha256_file(&abs).unwrap(),
+                    a.sha256,
+                    "ファイル内容と sha256 が一致する"
+                );
+                first_asset_abs.get_or_insert(abs);
+            }
+        }
+
         // 冪等性: 同一 PDF を再 build → 再抽出せず reuse（同一 content_key）。
-        let again = build_lcir_for_attachment(&pool, Path::new(&appdir), att)
+        let again = build_lcir_for_attachment(&pool, &build_root, att)
             .await
             .unwrap();
         eprintln!(
@@ -2022,6 +2409,26 @@ mod tests {
         );
         assert!(again.reused, "same PDF should reuse via content_key");
         assert_eq!(again.content_key, res.content_key);
+
+        // Phase 8a: reuse 経路の self-heal — アセットファイルを消して再 build すると復活する。
+        if let Some(abs) = first_asset_abs {
+            std::fs::remove_file(&abs).unwrap();
+            let healed = build_lcir_for_attachment(&pool, &build_root, att)
+                .await
+                .unwrap();
+            assert!(healed.reused);
+            assert!(
+                abs.is_file(),
+                "self-heal が欠損アセットを再レンダリングする: {}",
+                abs.display()
+            );
+            eprintln!("self-heal ok: {}", abs.display());
+        }
+
+        // 一時 appdir を後片付け（best-effort）。LCIR_SMOKE_KEEP=1 なら crop PNG の目視確認用に残す。
+        if std::env::var("LCIR_SMOKE_KEEP").as_deref() != Ok("1") {
+            let _ = std::fs::remove_dir_all(&build_root);
+        }
     }
 
     // ---- エントリ→版解決（Phase 9a で共有化。MCP / エクスポート / CLI の単一ソース） ----
@@ -2092,6 +2499,71 @@ mod tests {
         insert_root_node(pool, pdf_ver).await;
         insert_root_node(pool, tex_ver).await;
         (entry.id, pdf_att, tex_att)
+    }
+
+    /// Phase 8a: load_lcir_document が figure ノードへ assets（node_assets 経由）を紐づけ、
+    /// caption_of 辺も relations に載ること（build を通さない DB 直挿入・pdfium 不要）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_lcir_document_attaches_assets_to_nodes(pool: SqlitePool) {
+        let (_entry_id, pdf_att, _tex_att) = setup_two_source_entry(&pool).await;
+        let ver = document_versions::latest_completed_for_attachment(&pool, pdf_att)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let figure: i64 = sqlx::query_scalar(
+            "INSERT INTO document_nodes
+                (document_version_id, parent_id, node_kind, ordinal, confidence, origin, payload_json)
+             VALUES (?, NULL, 'figure', 1, 0.6, 'layout_model', '{\"figure_index\":1,\"figure_number\":\"2\"}')
+             RETURNING id",
+        )
+        .bind(ver)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let asset_id = crate::db::assets::insert_asset(
+            &pool,
+            &crate::db::assets::NewAsset {
+                document_version_id: ver,
+                sha256: "abc",
+                mime_type: "image/png",
+                relative_path: "attachments/x/.lcir/1/deadbeef/fig-p001-00.png",
+                width: Some(800),
+                height: Some(600),
+                size_bytes: Some(4321),
+                metadata_json: Some(r#"{"page":1,"region_index":0}"#),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::assets::insert_node_asset(
+            &pool,
+            &crate::db::assets::NewNodeAsset {
+                node_id: figure,
+                asset_id,
+            },
+            "page_crop",
+        )
+        .await
+        .unwrap();
+
+        let doc = load_lcir_document(&pool, pdf_att).await.unwrap().unwrap();
+        let fig_node = doc.nodes.iter().find(|n| n.kind == "figure").unwrap();
+        assert_eq!(fig_node.assets.len(), 1);
+        let a = &fig_node.assets[0];
+        assert_eq!(a.role, "page_crop");
+        assert_eq!(a.mime_type, "image/png");
+        assert_eq!(
+            a.relative_path,
+            "attachments/x/.lcir/1/deadbeef/fig-p001-00.png"
+        );
+        assert_eq!(a.width, Some(800));
+        assert_eq!(a.size_bytes, Some(4321));
+        assert_eq!(a.sha256, "abc");
+        assert_eq!(a.metadata.as_ref().unwrap()["page"], 1);
+        // figure 以外のノード（root）には assets が付かない。
+        let root = doc.nodes.iter().find(|n| n.kind == "document").unwrap();
+        assert!(root.assets.is_empty());
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -688,9 +688,11 @@ async fn add_attachment(
     if !src.exists() {
         return Err(format!("ファイルが見つかりません: {source_path}"));
     }
+    // DL 経路と同じサニタイズ（先頭ドット除去で `.lcir` 予約名との衝突も防ぐ・Phase 8a）。
     let file_name = src
         .file_name()
-        .map(|s| s.to_string_lossy().to_string())
+        .map(|s| download::sanitize_file_name(&s.to_string_lossy()))
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| "ファイル名を取得できません".to_string())?;
 
     let root = attachments_root(&app)?;
@@ -835,6 +837,14 @@ async fn delete_attachment(
     let abs = root.join(&removed.file_path);
     if let Err(e) = attachment_trash::move_to_trash(&root, &abs) {
         eprintln!("attachment trash failed ({}): {e}", abs.display());
+    }
+    // LCIR アセット（Phase 8a・`.lcir/<attachment_id>/`）も回収する。DB 行は FK カスケードで
+    // 消えるがファイルは残るため。進行中ビルドとの競合で復活した孤児はエントリ purge で回収。
+    if let Some((parent, _)) = removed.file_path.rsplit_once('/') {
+        let lcir_dir = root.join(parent).join(".lcir").join(id.to_string());
+        if let Err(e) = attachment_trash::move_to_trash(&root, &lcir_dir) {
+            eprintln!("lcir asset trash failed ({}): {e}", lcir_dir.display());
+        }
     }
     attachment_trash::sweep_trash(&root);
     Ok(())

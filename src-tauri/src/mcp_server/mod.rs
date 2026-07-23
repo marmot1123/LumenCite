@@ -273,7 +273,8 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             matched against theorem/equation numbers — approximate, origin layout_model). tex is \
             preferred when built; pass `source` to switch. Relation types: cites, \
             refers_to_equation, refers_to_theorem, refers_to_figure, refers_to_table, \
-            refers_to_section, refers_to, and proves (proof → the theorem it proves). Use it to \
+            refers_to_section, refers_to, proves (proof → the theorem it proves), and caption_of \
+            (a figure caption → its detected figure region, pdf only). Use it to \
             answer \"what does this proof prove\", \"what cites/uses equation (2.1)\", \"which \
             results does this section reference\". Filter with `relation_type` and/or `node_id` \
             (edges touching that block, either direction). Returns {has_lcir, source, \
@@ -324,6 +325,31 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
                 "query": { "type": "string", "description": "Case-insensitive substring over surface_form / normalized_form / description." },
                 "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation. Symbols exist only for \"tex\"; omit for the best available (tex preferred)." },
                 "max_symbols": { "type": "integer", "description": "Max symbols to return (default 200)." }
+            }
+        }
+    }));
+    tools.push(json!({
+        "name": "get_figures",
+        "description": "Return the detected figures (LCIR) of a paper — by entry_id or \
+            citation_key. **PDF-only**: figure regions are detected from embedded raster images on \
+            each page (origin layout_model, moderate confidence), so vector figures (TikZ/pgf, \
+            common in math papers) legitimately yield zero figures — an empty list does NOT mean \
+            the paper has no figures. Each figure carries its page and bbox ([x, y, width, height] \
+            in PDF points, bottom-left origin), the figure number when a nearby \"Figure N\" \
+            caption was paired (caption_of edge), the caption text, and its stored assets \
+            (page-crop PNGs). Asset relative_path is a path under the app data directory as \
+            METADATA — the file's existence is not guaranteed and no image bytes are returned. \
+            Use it to answer \"what figures does this paper have\", \"what does Figure 2 show\" \
+            (caption text), \"where is Figure 2 on the page\" (page + bbox). Returns {has_lcir, \
+            source, available_sources, count, figures:[{node_id, page, bbox, figure_number?, \
+            caption:{node_id, text}?, assets:[{role, relative_path, mime_type, width, height, \
+            size_bytes}]}]}. If has_lcir is false no PDF version is built (build it in the app).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry_id": { "type": "integer", "description": "Entry id." },
+                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
+                "max_figures": { "type": "integer", "description": "Max figures to return (default 100)." }
             }
         }
     }));
@@ -505,6 +531,7 @@ async fn exec_tool(
         "search_document_nodes" => exec_search_document_nodes(pool, &args).await,
         "get_node_relations" => exec_get_node_relations(pool, &args).await,
         "get_symbol_definitions" => exec_get_symbol_definitions(pool, &args).await,
+        "get_figures" => exec_get_figures(pool, &args).await,
         // それ以外（delete_entry / ocr_* / 無効化中の write 等）は非公開。
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
@@ -987,6 +1014,14 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
         // 定理系ノード（Phase 5）: 番号・付記名を surface して "定理 2.3 の証明" 取得に使えるようにする。
         let theorem_number = payload_str("theorem_number");
         let note = payload_str("note");
+        // figure ノード（Phase 8a）は plain_text を持たない: 空 text の意味が分かるよう
+        // 図番号とアセット数を付ける（画像本体は get_figures で）。
+        let figure_number = payload_str("figure_number");
+        let asset_count = if n.assets.is_empty() {
+            None
+        } else {
+            Some(n.assets.len())
+        };
         out.push(json!({
             "index": i,
             "kind": n.kind,
@@ -994,6 +1029,8 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
             "section_number": section_number,
             "theorem_number": theorem_number,
             "note": note,
+            "figure_number": figure_number,
+            "asset_count": asset_count,
             "equation_label": equation_label,
             "latex": latex,
             "text": text,
@@ -1243,6 +1280,103 @@ async fn exec_get_symbol_definitions(pool: &SqlitePool, args: &Value) -> Result<
         "count": symbols_out.len(),
         "truncated": truncated,
         "symbols": symbols_out,
+    }))
+    .unwrap_or_default())
+}
+
+/// 図一覧（Phase 8a）。図領域は PDF 版のみに存在するため常に pdf 版を読む
+/// （`get_document_blocks` の page フィルタが pdf を強制するのと同じ分担）。
+/// アセットの `relative_path` はメタデータ参照でファイルの存在は保証しない（欠損許容・
+/// base64 は返さない）。ベクター図（tikz）はアセット 0 件が正当。
+async fn exec_get_figures(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    let entry_id = resolve_entry_id(pool, args).await?;
+    let (loaded, versions) = load_entry_lcir(pool, entry_id, Some("pdf")).await?;
+    let Some((attachment_id, doc)) = loaded else {
+        return Ok(no_lcir_response(entry_id, Some("pdf")));
+    };
+    let max_figures = args
+        .get("max_figures")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(100)
+        .max(1) as usize;
+
+    // caption_of 辺（from = caption / to = figure）から caption を解決する。
+    let mut caption_by_figure: std::collections::HashMap<i64, i64> =
+        std::collections::HashMap::new();
+    for r in &doc.relations {
+        if r.relation_type == "caption_of" {
+            caption_by_figure.insert(r.to_node_id, r.from_node_id);
+        }
+    }
+    let node_by_id: std::collections::HashMap<i64, &crate::document_ir::LcirNode> =
+        doc.nodes.iter().map(|n| (n.id, n)).collect();
+
+    let mut figures: Vec<Value> = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+    for n in &doc.nodes {
+        if n.kind != "figure" {
+            continue;
+        }
+        total += 1;
+        if figures.len() >= max_figures {
+            truncated = true;
+            continue;
+        }
+        let bbox = n
+            .source_fragments
+            .first()
+            .map(|f| json!([f.bbox.x, f.bbox.y, f.bbox.width, f.bbox.height]));
+        let figure_number = n
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("figure_number"))
+            .cloned();
+        let caption = caption_by_figure
+            .get(&n.id)
+            .and_then(|cid| node_by_id.get(cid))
+            .map(|c| {
+                json!({
+                    "node_id": c.id,
+                    "text": c.plain_text,
+                })
+            });
+        let assets: Vec<Value> = n
+            .assets
+            .iter()
+            .map(|a| {
+                json!({
+                    "role": a.role,
+                    "relative_path": a.relative_path,
+                    "mime_type": a.mime_type,
+                    "width": a.width,
+                    "height": a.height,
+                    "size_bytes": a.size_bytes,
+                })
+            })
+            .collect();
+        figures.push(json!({
+            "node_id": n.id,
+            "page": node_page(n),
+            "bbox": bbox,
+            "figure_number": figure_number,
+            "caption": caption,
+            "assets": assets,
+        }));
+    }
+
+    Ok(serde_json::to_string(&json!({
+        "entry_id": entry_id,
+        "attachment_id": attachment_id,
+        "has_lcir": true,
+        "source": short_source_name(&doc.source.extractor_name),
+        "available_sources": sources_json(&versions),
+        "count": total,
+        "truncated": truncated,
+        "figures": figures,
+        "note": "figure regions come from embedded raster images (origin layout_model); vector \
+            figures (TikZ/pgf) legitimately yield zero. asset relative_path is metadata only — \
+            file existence is not guaranteed and no image bytes are returned.",
     }))
     .unwrap_or_default())
 }
@@ -2045,6 +2179,7 @@ mod tests {
             "search_document_nodes",
             "get_node_relations",
             "get_symbol_definitions",
+            "get_figures",
         ] {
             assert!(names.contains(&expected), "missing read tool: {expected}");
         }
@@ -2425,6 +2560,263 @@ mod tests {
             .await,
         );
         assert_eq!(touching["count"], 2);
+    }
+
+    /// Phase 8a: get_figures が figure ノードを bbox・図番号・caption（caption_of 辺から）・
+    /// アセット（相対パスのみ）つきで返すこと。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_figures_returns_figures_with_caption_and_assets(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Figure paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/p.pdf", entry.id),
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-fig",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: schema::EXTRACTOR_NAME,
+                extractor_version: schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let page = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::Page.as_str(),
+                ordinal: 0,
+                plain_text: Some("page text"),
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let caption = add_block(
+            &pool,
+            vid,
+            page,
+            "figure_caption",
+            0,
+            "Figure 2: The apparatus.",
+            Some(r#"{"caption_label":"Figure","caption_number":"2"}"#),
+        )
+        .await;
+        // figure ノード（plain_text 無し・bbox fragment 付き）。
+        let figure = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(page),
+                node_kind: NodeKind::Figure.as_str(),
+                ordinal: 1,
+                plain_text: None,
+                language: None,
+                confidence: Some(0.6),
+                origin: Some("layout_model"),
+                payload_json: Some(r#"{"figure_index":1,"figure_number":"2"}"#),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::source_fragments::insert_fragment(
+            &pool,
+            &crate::db::source_fragments::NewSourceFragment {
+                node_id: figure,
+                page_number: 1,
+                x: 100.0,
+                y: 400.0,
+                width: 300.0,
+                height: 200.0,
+                rotation: 0.0,
+                reading_order: None,
+                fragment_type: Some("block"),
+            },
+        )
+        .await
+        .unwrap();
+        let asset_id = crate::db::assets::insert_asset(
+            &pool,
+            &crate::db::assets::NewAsset {
+                document_version_id: vid,
+                sha256: "abc",
+                mime_type: "image/png",
+                relative_path: "attachments/1/.lcir/1/deadbeef/fig-p001-00.png",
+                width: Some(800),
+                height: Some(534),
+                size_bytes: Some(4321),
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::assets::insert_node_asset(
+            &pool,
+            &crate::db::assets::NewNodeAsset {
+                node_id: figure,
+                asset_id,
+            },
+            "page_crop",
+        )
+        .await
+        .unwrap();
+        crate::db::node_relations::insert_relation(
+            &pool,
+            &crate::db::node_relations::NewNodeRelation {
+                document_version_id: vid,
+                from_node_id: caption,
+                relation_type: "caption_of",
+                to_node_id: figure,
+                confidence: Some(0.6),
+                origin: Some("layout_model"),
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let j = tool_json(&call_tool(&pool, "get_figures", json!({ "entry_id": entry.id })).await);
+        assert_eq!(j["has_lcir"], true);
+        assert_eq!(j["source"], "pdf");
+        assert_eq!(j["count"], 1);
+        let f = &j["figures"][0];
+        assert_eq!(f["node_id"], figure);
+        assert_eq!(f["page"], 1);
+        assert_eq!(f["bbox"], json!([100.0, 400.0, 300.0, 200.0]));
+        assert_eq!(f["figure_number"], "2");
+        assert_eq!(f["caption"]["node_id"], caption);
+        assert_eq!(f["caption"]["text"], "Figure 2: The apparatus.");
+        let a = &f["assets"][0];
+        assert_eq!(a["role"], "page_crop");
+        assert_eq!(a["relative_path"], "attachments/1/.lcir/1/deadbeef/fig-p001-00.png");
+        assert_eq!(a["width"], 800);
+        assert_eq!(a["size_bytes"], 4321);
+        // バイト列は返さない（メタデータ参照のみ）。
+        assert!(a.get("data").is_none() && a.get("base64").is_none());
+
+        // blocks 経由でも figure ノードが figure_number/asset_count つきで見える（空 text の説明）。
+        let blocks = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_blocks",
+                json!({ "entry_id": entry.id, "kinds": ["figure"] }),
+            )
+            .await,
+        );
+        assert_eq!(blocks["returned"], 1);
+        assert_eq!(blocks["blocks"][0]["figure_number"], "2");
+        assert_eq!(blocks["blocks"][0]["asset_count"], 1);
+        assert_eq!(blocks["blocks"][0]["text"], "");
+    }
+
+    /// Phase 8a: PDF 版が無い（TeX のみ）エントリでは get_figures は has_lcir:false を返すこと。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_figures_requires_pdf_version(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Tex only".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/s.gz", entry.id),
+            "s.gz",
+            "application/gzip",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-tex",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/gzip",
+                extractor_name: schema::TEX_EXTRACTOR_NAME,
+                extractor_version: schema::TEX_EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("tex_source"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let j = tool_json(&call_tool(&pool, "get_figures", json!({ "entry_id": entry.id })).await);
+        assert_eq!(j["has_lcir"], false);
     }
 
     /// Phase 6b: get_symbol_definitions が TeX 版の記号定義を defined_at/scope/occurrences つきで返し、
@@ -2966,8 +3358,23 @@ mod tests {
         crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1")
             .await
             .unwrap();
+        // 一時 appdir に対象添付だけをコピーして build する（実 appdir へ書き込まない・
+        // lcir_build_real_pdf と同方式・Phase 8a のアセット書き出しを隔離）。
+        let (file_path,): (String,) =
+            sqlx::query_as("SELECT file_path FROM attachments WHERE id = ?")
+                .bind(att)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let build_root = std::env::temp_dir().join(format!(
+            "lumencite-mcp-smoke-{att}-{}",
+            std::process::id()
+        ));
+        let dest = build_root.join(&file_path);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(Path::new(&appdir).join(&file_path), &dest).unwrap();
         // 実 PDF を LCIR 構築（既存なら reuse）。
-        let build = crate::ingestion::build_lcir_for_attachment(&pool, Path::new(&appdir), att)
+        let build = crate::ingestion::build_lcir_for_attachment(&pool, &build_root, att)
             .await
             .unwrap();
         eprintln!("build: built={} reused={}", build.built, build.reused);
@@ -3038,10 +3445,30 @@ mod tests {
             );
         }
 
+        // Phase 8a: 図一覧（tikz ベクター図の論文では count 0 が正当なので数はアサートしない）。
+        let figs = tool_json(&call_tool(&pool, "get_figures", json!({ "entry_id": entry_id })).await);
+        eprintln!(
+            "\n=== get_figures (source={}, count={}) ===",
+            figs["source"], figs["count"]
+        );
+        for f in figs["figures"].as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().take(8) {
+            eprintln!(
+                "  [figure] page={} number={} bbox={} caption={} assets={}",
+                f["page"],
+                f["figure_number"],
+                f["bbox"],
+                f["caption"]["text"],
+                f["assets"],
+            );
+        }
+
         assert_eq!(structure["has_lcir"], true);
         assert!(structure["counts"]["display_math"].as_i64().unwrap_or(0) > 0);
         assert_eq!(rels["has_lcir"], true);
         assert_eq!(syms["has_lcir"], true);
+        assert_eq!(figs["has_lcir"], true);
+
+        let _ = std::fs::remove_dir_all(&build_root);
     }
 
     #[sqlx::test(migrations = "./migrations")]

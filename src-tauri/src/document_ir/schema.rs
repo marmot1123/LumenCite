@@ -23,7 +23,10 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 /// - `0.5.0`: Phase 6a。本文の "Theorem 2.3"/"Eq. (2.1)" を定理番号/数式番号と照合して参照グラフ
 ///   （`node_relations`・refers_to_*・proof→theorem の proves）を張る。抽出出力（派生の関係辺）が
 ///   増えるので、既存コーパスは `rebuild_outdated_lcir` で張り直せるよう版を上げる。
-pub const EXTRACTOR_VERSION: &str = "0.5.0";
+/// - `0.6.0`: Phase 8a。埋込画像（トップレベル Image オブジェクト）から図領域を検出して
+///   `figure` ノード + ページ crop PNG アセット（`assets`/`node_assets`）+ `caption_of` 辺を
+///   作り、caption の payload にラベル語・番号を載せる。出力が変わるので旧版は supersede される。
+pub const EXTRACTOR_VERSION: &str = "0.6.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。
