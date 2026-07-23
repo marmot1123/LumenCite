@@ -357,6 +357,16 @@ CLI（読取＋書込）が揃ったので、LaTeX 執筆支援の `lumencite-bi
 - **Markdown の品質は由来に依存**: TeX 版は原文 LaTeX（`$..$` インライン温存・display は `$$..$$`）・定理番号・cite key まで出る。PDF 版は surface-only（数式は Unicode 線形のまま・`$$` を付けない）。出力の YAML フロントマターに `lcir_source`（抽出器名・版）を記録し、由来を常に区別する（roadmap §16）。
 - **やらないこと（9b へ）**: JATS/TEI/HTML+MathML。embedding・ノードチャンク API は Phase 10。
 
+### LCIR 図表アセット基盤（Phase 8a・v0.10.0 同梱候補）
+
+Phase 8（図表機械可読化）の最小スライス。**PDF 版のみ**（`lumencite-pdfium` 0.5.0→0.6.0・TeX 抽出器は不変）。
+
+- **図領域検出**: ページ内の埋込画像オブジェクト（トップレベル Image のみ）の bbox を近接マージして図領域とし、`figure` ノード（bbox 付き・`origin='layout_model'`・confidence 0.6）を作る。**tikz/pgf 等のベクター図は Image オブジェクトを持たないためアセット 0 件が正当**（誤検出より欠損。数学系コーパスでは体感が薄い既知の限界）。
+- **ページ crop アセット**: 図領域をページレンダリング（幅 1600px・OCR と同値）から切り出した PNG として `attachments/<entry_id>/.lcir/` 配下に保存し、`assets`/`node_assets`（migration 0019）で参照する。バイナリは FS・DB は相対パス + SHA-256（ADR #3）。
+- **caption 関連付け**: 同一ページの figure caption と幾何ペアリング（相互最近のみ・曖昧なら張らない）して `caption_of` 辺を張り、caption の番号（"Figure 2" → "2"）を figure ノードの `figure_number` に載せる。
+- **読み出し**: MCP `get_figures`（図番号 → 画像パス・caption・本文位置を一問い合わせ）+ `LcirDocument` に `assets` が透過で載る（JSON エクスポート含む）。
+- **やらないこと**: 表のセル構造化（8b・TeX tabular 救出）／XObjectForm 内画像（誤配置 crop 回避を優先）／plot 軸・凡例・alt text（8c・Vision opt-in）／TeX tarball 内画像の取込。
+
 ### 1エントリ複数 PDF 添付（本文＋補助資料）— Phase 1
 
 同じ DOI の論文に **本文 PDF** と **supplemental material（SI）等の補助 PDF** が別ファイルで存在するとき、両方を同じエントリに添付して閲覧・全文検索できるようにする。「同一 DOI ＝同一の著作」という前提に立ち、補助 PDF は**別エントリ（別文献）ではなく、本文論文に紐づく添付ファイルの一つ**として扱う（Zotero が添付を item の子として複数ぶら下げるのと同型のモデル）。
