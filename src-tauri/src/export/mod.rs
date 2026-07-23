@@ -47,6 +47,7 @@ mod tests {
                 payload: None,
                 math: None,
                 source_fragments: Vec::new(),
+                assets: Vec::new(),
             }],
             relations: Vec::new(),
             symbols: Vec::new(),

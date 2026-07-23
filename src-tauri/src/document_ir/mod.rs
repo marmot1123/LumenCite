@@ -4,6 +4,7 @@
 //! `document_nodes` / `source_fragments`）で、`LcirDocument` はその派生ビュー。
 //! ここは pdfium にも sqlx にも依存しないので CI で完全にテストできる。
 
+pub mod asset;
 pub mod math;
 pub mod node;
 pub mod relation;
@@ -12,6 +13,7 @@ pub mod source;
 pub mod symbol;
 pub mod validation;
 
+pub use asset::LcirAsset;
 pub use math::{LcirMath, MathDisplayMode, MathSemanticStatus};
 pub use node::{
     ExtractionStatus, LcirDocument, LcirFragment, LcirNode, LcirSource, NodeKind, Origin,
@@ -133,6 +135,7 @@ mod tests {
                     payload: None,
                     math: None,
                     source_fragments: vec![],
+                    assets: vec![],
                 },
                 LcirNode {
                     id: 2,
@@ -149,6 +152,7 @@ mod tests {
                         bbox: BBox::new(0.0, 0.0, 595.0, 842.0),
                         fragment_type: Some("page".to_string()),
                     }],
+                    assets: vec![],
                 },
             ],
             relations: vec![],
@@ -196,6 +200,7 @@ mod tests {
                     payload: None,
                     math: None,
                     source_fragments: vec![],
+                    assets: vec![],
                 },
                 LcirNode {
                     id: 2,
@@ -208,6 +213,7 @@ mod tests {
                     payload: None,
                     math: None,
                     source_fragments: vec![page_frag("page", BBox::new(0.0, 0.0, 595.0, 842.0))],
+                    assets: vec![],
                 },
                 LcirNode {
                     id: 3,
@@ -220,6 +226,7 @@ mod tests {
                     payload: Some(serde_json::json!({"heading_level": 1, "section_number": "1"})),
                     math: None,
                     source_fragments: vec![page_frag("block", heading_bbox)],
+                    assets: vec![],
                 },
                 LcirNode {
                     id: 4,
@@ -232,6 +239,7 @@ mod tests {
                     payload: None,
                     math: None,
                     source_fragments: vec![page_frag("line", heading_bbox)],
+                    assets: vec![],
                 },
                 LcirNode {
                     id: 5,
@@ -244,6 +252,7 @@ mod tests {
                     payload: None,
                     math: None,
                     source_fragments: vec![page_frag("block", para_bbox)],
+                    assets: vec![],
                 },
                 LcirNode {
                     id: 6,
@@ -256,6 +265,7 @@ mod tests {
                     payload: None,
                     math: None,
                     source_fragments: vec![page_frag("line", para_bbox)],
+                    assets: vec![],
                 },
             ],
             relations: vec![],

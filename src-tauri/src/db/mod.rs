@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod attachments;
 pub mod authors;
 pub mod chat;

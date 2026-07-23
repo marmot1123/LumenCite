@@ -970,11 +970,46 @@ pub async fn load_lcir_document(
         );
     }
 
+    // 図表アセット（Phase 8a）を node_assets 経由でノードに紐づける。
+    // relative_path はメタデータ参照でファイルの存在は保証しない（欠損許容）。
+    let asset_rows: HashMap<i64, crate::models::Asset> =
+        crate::db::assets::assets_for_version(pool, version.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|a| (a.id, a))
+            .collect();
+    let mut assets_by_node: HashMap<i64, Vec<document_ir::LcirAsset>> = HashMap::new();
+    for link in crate::db::assets::node_assets_for_version(pool, version.id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        if let Some(a) = asset_rows.get(&link.asset_id) {
+            assets_by_node
+                .entry(link.node_id)
+                .or_default()
+                .push(document_ir::LcirAsset {
+                    role: link.role,
+                    mime_type: a.mime_type.clone(),
+                    relative_path: a.relative_path.clone(),
+                    width: a.width,
+                    height: a.height,
+                    size_bytes: a.size_bytes,
+                    sha256: a.sha256.clone(),
+                    metadata: a
+                        .metadata_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok()),
+                });
+        }
+    }
+
     let lcir_nodes = nodes
         .into_iter()
         .map(|n| document_ir::LcirNode {
             source_fragments: by_node.remove(&n.id).unwrap_or_default(),
             math: math_by_node.remove(&n.id),
+            assets: assets_by_node.remove(&n.id).unwrap_or_default(),
             payload: n
                 .payload_json
                 .as_deref()

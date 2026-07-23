@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 /// - **Phase 3（数式表層）**: inline_math/display_math/equation_group。
 /// - **Phase 5（定理・定義・証明）**: definition/theorem/lemma/proposition/corollary/remark/
 ///   example/proof。
+/// - **Phase 8a（図表アセット基盤）**: figure（図領域・PDF 版のみ合成）/ table（enum 予約・
+///   8b の表セル構造化で合成）。
 ///
 /// DB は自由 TEXT なので variant 追加に migration は要らない。認識に確信が持てないブロックは
 /// 誤った型を確定せず `UnknownBlock` にする（roadmap「欠損を許容」）。
@@ -55,6 +57,9 @@ pub enum NodeKind {
     Remark,
     Example,
     Proof,
+    // Phase 8a: 図表。
+    Figure,
+    Table,
 }
 
 impl NodeKind {
@@ -91,6 +96,8 @@ impl NodeKind {
             NodeKind::Remark => "remark",
             NodeKind::Example => "example",
             NodeKind::Proof => "proof",
+            NodeKind::Figure => "figure",
+            NodeKind::Table => "table",
         }
     }
 
@@ -128,6 +135,8 @@ impl NodeKind {
             "remark" => NodeKind::Remark,
             "example" => NodeKind::Example,
             "proof" => NodeKind::Proof,
+            "figure" => NodeKind::Figure,
+            "table" => NodeKind::Table,
             _ => NodeKind::UnknownBlock,
         }
     }
@@ -233,6 +242,10 @@ pub struct LcirNode {
     pub math: Option<super::math::LcirMath>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_fragments: Vec<LcirFragment>,
+    /// バイナリアセット参照（Phase 8a・figure ノードのみ）。正本は `assets`/`node_assets`。
+    /// `relative_path` はメタデータ参照でファイルの存在は保証しない（欠損許容）。無ければ省略。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<super::asset::LcirAsset>,
 }
 
 /// LCIR ドキュメント（派生ビュー）。正本は SQLite の document_versions/nodes/fragments。
@@ -295,6 +308,8 @@ mod tests {
             NodeKind::Remark,
             NodeKind::Example,
             NodeKind::Proof,
+            NodeKind::Figure,
+            NodeKind::Table,
         ] {
             assert_eq!(NodeKind::from_db(k.as_str()), k);
         }
@@ -305,8 +320,11 @@ mod tests {
         // Phase 5: 定理系は from_db で解決する。
         assert_eq!(NodeKind::from_db("theorem"), NodeKind::Theorem);
         assert_eq!(NodeKind::from_db("proof"), NodeKind::Proof);
-        // Phase 8+ の未実装種別（図・表）は UnknownBlock にフォールバック。
-        assert_eq!(NodeKind::from_db("figure"), NodeKind::UnknownBlock);
+        // Phase 8a: 図・表も from_db で解決する。
+        assert_eq!(NodeKind::from_db("figure"), NodeKind::Figure);
+        assert_eq!(NodeKind::from_db("table"), NodeKind::Table);
+        // 未実装種別（8b の表セル等）は引き続き UnknownBlock にフォールバック。
+        assert_eq!(NodeKind::from_db("table_cell"), NodeKind::UnknownBlock);
     }
 
     #[test]
@@ -351,6 +369,7 @@ mod tests {
                     bbox: BBox::new(0.0, 0.0, 595.0, 842.0),
                     fragment_type: Some("page".to_string()),
                 }],
+                assets: vec![],
             }],
             relations: vec![],
             symbols: vec![],

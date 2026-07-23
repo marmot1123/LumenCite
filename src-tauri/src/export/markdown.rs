@@ -401,6 +401,7 @@ mod tests {
             payload: None,
             math: None,
             source_fragments: Vec::new(),
+            assets: Vec::new(),
         }
     }
 

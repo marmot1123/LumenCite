@@ -84,6 +84,7 @@ mod tests {
             payload: None,
             math: None,
             source_fragments: vec![],
+            assets: vec![],
         }
     }
 
