@@ -95,6 +95,8 @@ enum Command {
     Collections,
     /// Full-text search across attached PDFs.
     Fulltext(FulltextArgs),
+    /// Export an entry's LCIR (machine-readable document IR) as JSON or Markdown.
+    ExportLcir(ExportLcirArgs),
     /// Create a new entry (write).
     Add(AddArgs),
     /// Update fields of an existing entry by id or citation key (write).
@@ -251,6 +253,22 @@ struct ExportArgs {
 }
 
 #[derive(Args, Debug)]
+struct ExportLcirArgs {
+    /// Numeric entry id or citation key.
+    id_or_key: String,
+    /// Output format: json (LCIR derived view) or md (structured Markdown).
+    #[arg(long, value_parser = ["json", "md"], default_value = "json")]
+    format: String,
+    /// Force a representation: tex (arXiv TeX source) or pdf (PDF text layer).
+    /// Omit for the best available (tex preferred).
+    #[arg(long, value_parser = ["tex", "pdf"])]
+    source: Option<String>,
+    /// Write to a file instead of stdout.
+    #[arg(short = 'o', long = "output", value_name = "PATH")]
+    output: Option<std::path::PathBuf>,
+}
+
+#[derive(Args, Debug)]
 struct FulltextArgs {
     /// Search terms (joined with spaces).
     query: Vec<String>,
@@ -341,6 +359,7 @@ async fn execute(cli: Cli) -> Result<CmdOutput, String> {
             let q = a.query.join(" ");
             cmd_fulltext(&pool, &q, a.collection, a.tag, human).await
         }
+        Command::ExportLcir(a) => cmd_export_lcir(&pool, &a).await,
         // ── write（ハイブリッド C ルーティング。詳細は cli::write） ──
         Command::Add(a) => match build_add_request(&a) {
             Ok(req) => write::dispatch_write(&db_path, &pool, req, force).await,
@@ -692,6 +711,58 @@ async fn cmd_fulltext(
     Ok(CmdOutput::new(stdout))
 }
 
+/// `export-lcir`（Phase 9a）: エントリの LCIR を JSON / Markdown で書き出す。
+/// 既定は stdout（`--format json` は `--human` の影響を受けない生 JSON）。`-o` でファイルへ。
+async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOutput, String> {
+    let entry_id = resolve_entry_id(pool, &a.id_or_key).await?;
+    let wanted = match a.source.as_deref() {
+        Some(s) => Some(crate::ingestion::source_to_extractor(s)?),
+        None => None,
+    };
+    let (found, versions) = crate::ingestion::load_entry_lcir(pool, entry_id, wanted).await?;
+    let Some((_att, doc)) = found else {
+        let available: Vec<&str> = versions
+            .iter()
+            .map(|v| crate::ingestion::short_source_name(&v.extractor_name))
+            .collect();
+        return Err(if available.is_empty() {
+            "no built LCIR for this entry (enable LCIR in the app and build it first)".to_string()
+        } else {
+            format!(
+                "no built LCIR for the requested source (available: {})",
+                available.join(", ")
+            )
+        });
+    };
+
+    let text = match a.format.as_str() {
+        "md" => {
+            let detail = db::entries::get_entry(pool, entry_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let header = crate::export::MarkdownHeader {
+                title: detail.title.clone(),
+                authors: detail.authors.iter().map(|au| au.name.clone()).collect(),
+                year: detail.year,
+                doi: detail.doi.clone(),
+                arxiv_id: detail.arxiv_id.clone(),
+                citation_key: detail.citation_key.clone(),
+            };
+            crate::export::render_markdown(&doc, Some(&header))
+        }
+        _ => crate::export::lcir_json_pretty(&doc)?,
+    };
+
+    match &a.output {
+        Some(path) => {
+            std::fs::write(path, &text)
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+            Ok(CmdOutput::new(format!("wrote {}", path.display())))
+        }
+        None => Ok(CmdOutput::new(text)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,5 +1083,133 @@ mod tests {
             .await
             .unwrap();
         assert!(id.is_none());
+    }
+
+    // ---- export-lcir（Phase 9a） ----
+
+    /// TeX 版 LCIR を実 build して (entry_id, citation_key) を返すフィクスチャ。
+    /// `label` はテスト間の temp dir 衝突回避。
+    async fn build_tex_lcir_fixture(pool: &SqlitePool, label: &str) -> i64 {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        db::settings::set_setting(pool, db::settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let entry = db::entries::create_entry(pool, &sample_input("Lcir Paper", "lcir2026a", 2026))
+            .await
+            .unwrap();
+        let file_name = "arxiv-9999.00001-source.gz";
+        let rel = format!("attachments/{}/{}", entry.id, file_name);
+        let att = db::attachments::add_attachment(
+            pool,
+            entry.id,
+            &rel,
+            file_name,
+            crate::ingestion::TEX_SOURCE_MIME,
+        )
+        .await
+        .unwrap()
+        .id;
+
+        let root = std::env::temp_dir().join(format!(
+            "cli-lcir-export-{}-{}",
+            label,
+            std::process::id()
+        ));
+        let dir = root.join("attachments").join(entry.id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let tex = "\\documentclass{article}\\title{Lcir Paper}\\begin{document}\n\
+                   \\begin{abstract}\nAbout quantum walks.\n\\end{abstract}\n\
+                   \\section{Intro}\nLet $E$ be the total energy.\n\
+                   \\begin{equation}\\label{eq:e}E=mc^2\\end{equation}\n\
+                   \\end{document}";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(tex.as_bytes()).unwrap();
+        std::fs::write(dir.join(file_name), enc.finish().unwrap()).unwrap();
+
+        let res = crate::ingestion::build_lcir_for_attachment(pool, &root, att)
+            .await
+            .unwrap();
+        assert!(res.built, "{res:?}");
+        entry.id
+    }
+
+    fn export_lcir_args(id_or_key: &str, format: &str, source: Option<&str>) -> ExportLcirArgs {
+        ExportLcirArgs {
+            id_or_key: id_or_key.to_string(),
+            format: format.to_string(),
+            source: source.map(|s| s.to_string()),
+            output: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_lcir_json_emits_valid_derived_view(pool: SqlitePool) {
+        let entry_id = build_tex_lcir_fixture(&pool, "json").await;
+        let out = cmd_export_lcir(&pool, &export_lcir_args(&entry_id.to_string(), "json", None))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+        assert_eq!(v["source"]["extractor_name"], "lumencite-tex");
+        assert!(out.stdout.contains("E=mc^2"), "原文 LaTeX を含む");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_lcir_markdown_renders_structure_by_citation_key(pool: SqlitePool) {
+        let _ = build_tex_lcir_fixture(&pool, "md").await;
+        let out = cmd_export_lcir(&pool, &export_lcir_args("lcir2026a", "md", Some("tex")))
+            .await
+            .unwrap();
+        let md = &out.stdout;
+        assert!(md.starts_with("---\n"), "フロントマターで始まる: {md}");
+        assert!(md.contains("citation_key: \"lcir2026a\""), "{md}");
+        assert!(md.contains("lcir_source: \"lumencite-tex"), "{md}");
+        assert!(md.contains("## Abstract"), "{md}");
+        assert!(md.contains("## 1 Intro"), "{md}");
+        assert!(md.contains("Let $E$ be the total energy."), "{md}");
+        assert!(
+            md.contains("$$\n\\begin{equation}\\label{eq:e}E=mc^2\\end{equation}\n$$"),
+            "{md}"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_lcir_writes_to_output_file(pool: SqlitePool) {
+        let entry_id = build_tex_lcir_fixture(&pool, "out").await;
+        let path = std::env::temp_dir().join(format!(
+            "cli-lcir-export-out-{}.md",
+            std::process::id()
+        ));
+        let mut args = export_lcir_args(&entry_id.to_string(), "md", None);
+        args.output = Some(path.clone());
+        let out = cmd_export_lcir(&pool, &args).await.unwrap();
+        assert!(out.stdout.starts_with("wrote "), "{}", out.stdout);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("## Abstract"), "{written}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_lcir_errors_without_lcir_and_lists_available_sources(pool: SqlitePool) {
+        // LCIR なし → 案内エラー。
+        let entry = db::entries::create_entry(&pool, &sample_input("No Lcir", "nolcir2026", 2026))
+            .await
+            .unwrap();
+        let err = cmd_export_lcir(&pool, &export_lcir_args(&entry.id.to_string(), "json", None))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no built LCIR"), "{err}");
+
+        // TeX 版のみのエントリに --source pdf → 併存一覧つきエラー。
+        let entry_id = build_tex_lcir_fixture(&pool, "src").await;
+        let err = cmd_export_lcir(
+            &pool,
+            &export_lcir_args(&entry_id.to_string(), "json", Some("pdf")),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("available: tex"), "{err}");
     }
 }

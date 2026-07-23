@@ -708,54 +708,14 @@ async fn resolve_entry_id(pool: &SqlitePool, args: &Value) -> Result<i64, ToolEr
     ))
 }
 
-/// エントリの「添付ごとの最新 completed 版」を全部返す。並びは **read 優先度降順**
-/// （`extractor_priority`: tex > pdfium）→ attachment_id 昇順。併存する複数表現の列挙と
-/// 既定選択の単一ソース（Phase 4）。
-async fn entry_lcir_versions(
-    pool: &SqlitePool,
-    entry_id: i64,
-) -> Result<Vec<crate::models::DocumentVersion>, ToolError> {
-    let mut versions = sqlx::query_as::<_, crate::models::DocumentVersion>(
-        "SELECT dv.* FROM document_versions dv
-         JOIN attachments a ON a.id = dv.attachment_id
-         WHERE a.entry_id = ?
-           AND dv.extraction_status IN ('completed', 'completed_with_warnings')
-           AND dv.id = (
-               SELECT MAX(dv2.id) FROM document_versions dv2
-               WHERE dv2.attachment_id = dv.attachment_id
-                 AND dv2.extraction_status IN ('completed', 'completed_with_warnings')
-           )
-         ORDER BY dv.attachment_id",
-    )
-    .bind(entry_id)
-    .fetch_all(pool)
-    .await?;
-    versions.sort_by(|a, b| {
-        crate::document_ir::schema::extractor_priority(&b.extractor_name)
-            .cmp(&crate::document_ir::schema::extractor_priority(&a.extractor_name))
-            .then(a.attachment_id.cmp(&b.attachment_id))
-    });
-    Ok(versions)
-}
-
 /// MCP の `source` 引数（"tex"/"pdf"）→ extractor_name。
 fn source_to_extractor(source: &str) -> Result<&'static str, ToolError> {
-    match source {
-        "tex" => Ok(crate::document_ir::schema::TEX_EXTRACTOR_NAME),
-        "pdf" => Ok(crate::document_ir::schema::EXTRACTOR_NAME),
-        other => Err(ToolError::InvalidArguments(format!(
-            "unknown source '{other}' (use \"tex\" or \"pdf\")"
-        ))),
-    }
+    crate::ingestion::source_to_extractor(source).map_err(ToolError::InvalidArguments)
 }
 
 /// extractor_name → MCP 応答の短い source 名。
 fn short_source_name(extractor_name: &str) -> &str {
-    match extractor_name {
-        crate::document_ir::schema::TEX_EXTRACTOR_NAME => "tex",
-        crate::document_ir::schema::EXTRACTOR_NAME => "pdf",
-        other => other,
-    }
+    crate::ingestion::short_source_name(extractor_name)
 }
 
 /// 併存する表現の列挙（`available_sources` 応答）。
@@ -791,26 +751,13 @@ async fn load_entry_lcir(
     ),
     ToolError,
 > {
-    let versions = entry_lcir_versions(pool, entry_id).await?;
     let wanted: Option<&str> = match source {
         Some(s) => Some(source_to_extractor(s)?),
         None => None,
     };
-    for v in &versions {
-        if let Some(name) = wanted {
-            if v.extractor_name != name {
-                continue;
-            }
-        }
-        if let Some(doc) = crate::ingestion::load_lcir_document(pool, v.attachment_id)
-            .await
-            .map_err(ToolError::Execution)?
-        {
-            let att = v.attachment_id;
-            return Ok((Some((att, doc)), versions));
-        }
-    }
-    Ok((None, versions))
+    crate::ingestion::load_entry_lcir(pool, entry_id, wanted)
+        .await
+        .map_err(ToolError::Execution)
 }
 
 /// 本文つき論理ブロック（骨格の document/page/line は除く）。

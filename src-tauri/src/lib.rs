@@ -4,6 +4,7 @@ mod bibtex;
 pub mod cli;
 mod db;
 pub mod document_ir;
+pub mod export;
 pub mod ingestion;
 mod download;
 mod keychain;
@@ -1117,6 +1118,114 @@ async fn set_lcir_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+/// LCIR（実験・Phase 9a）: エクスポート用にエントリの LCIR と書誌情報を読む。
+/// `source` 未指定は read 優先度（tex > pdfium）。未構築は併存一覧つきのエラー文言。
+async fn load_lcir_for_export(
+    pool: &SqlitePool,
+    entry_id: i64,
+    source: Option<&str>,
+) -> Result<(document_ir::LcirDocument, EntryDetail), String> {
+    let wanted = match source {
+        Some(s) => Some(ingestion::source_to_extractor(s)?),
+        None => None,
+    };
+    let (found, versions) = ingestion::load_entry_lcir(pool, entry_id, wanted).await?;
+    let Some((_att, doc)) = found else {
+        let available: Vec<&str> = versions
+            .iter()
+            .map(|v| ingestion::short_source_name(&v.extractor_name))
+            .collect();
+        return Err(match (source, available.is_empty()) {
+            (_, true) => "no built LCIR for this entry (enable LCIR in settings and build it \
+                          from the detail panel or Settings > Data)"
+                .to_string(),
+            (Some(s), false) => format!(
+                "no built LCIR from source '{s}' (available: {})",
+                available.join(", ")
+            ),
+            (None, false) => format!(
+                "LCIR versions exist but none could be loaded (available: {})",
+                available.join(", ")
+            ),
+        });
+    };
+    let detail = db::entries::get_entry(pool, entry_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((doc, detail))
+}
+
+/// 保存ダイアログを開いてテキストを書き出す（`export_database_json` と同型）。
+/// キャンセルで `Ok(None)`、成功で書き出し先パス。
+async fn save_text_via_dialog(
+    app: tauri::AppHandle,
+    file_name: String,
+    filter_name: &'static str,
+    extensions: &'static [&'static str],
+    contents: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = app
+            .dialog()
+            .file()
+            .set_file_name(&file_name)
+            .add_filter(filter_name, extensions)
+            .blocking_save_file()
+        else {
+            return Ok(None);
+        };
+        let path_buf = path.into_path().map_err(|e| e.to_string())?;
+        std::fs::write(&path_buf, contents).map_err(|e| e.to_string())?;
+        Ok(Some(path_buf.to_string_lossy().to_string()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// LCIR（実験・Phase 9a）: エントリの LCIR を JSON 派生ビューとして保存ダイアログで書き出す。
+/// validation 通過必須。`source` は "tex"/"pdf"（未指定 = tex 優先）。
+#[tauri::command]
+async fn export_lcir_json(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    entry_id: i64,
+    source: Option<String>,
+) -> Result<Option<String>, String> {
+    let (doc, detail) = load_lcir_for_export(&state.db, entry_id, source.as_deref()).await?;
+    let json = export::lcir_json_pretty(&doc)?;
+    let stem = detail
+        .citation_key
+        .clone()
+        .unwrap_or_else(|| format!("entry-{entry_id}"));
+    save_text_via_dialog(app, format!("{stem}-lcir.json"), "JSON", &["json"], json).await
+}
+
+/// LCIR（実験・Phase 9a）: エントリの LCIR を構造付き Markdown として保存ダイアログで書き出す。
+#[tauri::command]
+async fn export_lcir_markdown(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    entry_id: i64,
+    source: Option<String>,
+) -> Result<Option<String>, String> {
+    let (doc, detail) = load_lcir_for_export(&state.db, entry_id, source.as_deref()).await?;
+    let header = export::MarkdownHeader {
+        title: detail.title.clone(),
+        authors: detail.authors.iter().map(|a| a.name.clone()).collect(),
+        year: detail.year,
+        doi: detail.doi.clone(),
+        arxiv_id: detail.arxiv_id.clone(),
+        citation_key: detail.citation_key.clone(),
+    };
+    let md = export::render_markdown(&doc, Some(&header));
+    let stem = detail
+        .citation_key
+        .clone()
+        .unwrap_or_else(|| format!("entry-{entry_id}"));
+    save_text_via_dialog(app, format!("{stem}.md"), "Markdown", &["md"], md).await
 }
 
 /// クリップ／AddSheet 重複時に欠落（PDF / TeX）を確認なしで自動補完するか（`clipper.complete_missing`）。
@@ -3568,6 +3677,8 @@ pub fn run() {
             get_lcir_node_region,
             get_lcir_enabled,
             set_lcir_enabled,
+            export_lcir_json,
+            export_lcir_markdown,
             download_arxiv_source,
             fetch_missing_arxiv_sources,
         ])
