@@ -42,6 +42,11 @@ pub struct StructuredBlock {
     pub theorem_number: Option<String>,
     /// 定理・証明の付記名（"Theorem 1 (Zorn)." の "Zorn"）。定理系ノードのみ（Phase 5）。
     pub note: Option<String>,
+    /// caption のラベル語（"Figure" / "Fig" / "Table" / "Algorithm" / "Listing"・正規化済み）。
+    /// caption ノードのみ（Phase 8a）。図領域ペアリングで Algorithm/Listing を除外する鍵。
+    pub caption_label: Option<String>,
+    /// caption の番号（"Figure 2:" → "2"・"A.1" 形も）。caption ノードのみ・検出できたとき（Phase 8a）。
+    pub caption_number: Option<String>,
     /// 構成する行（読み順）。各行は node_kind=line の子ノードになる。
     pub lines: Vec<StructuredLine>,
 }
@@ -261,6 +266,8 @@ fn classify_block(
             equation_label: None,
             theorem_number: None,
             note: None,
+            caption_label: None,
+            caption_number: None,
             lines,
         })
     };
@@ -268,9 +275,23 @@ fn classify_block(
     let in_bibliography = matches!(state.mode, Mode::Bibliography);
 
     // 1. caption（参考文献モードでは "Figure" は稀なのでスキップ）。行頭ラベルが最優先。
+    //    ラベル語と番号は payload に載せる（Phase 8a: 図領域ペアリング・図番号参照の鍵）。
     if !in_bibliography {
-        if let Some(cap_kind) = detect_caption(first) {
-            return mk(cap_kind, 0.75, None, None, lines);
+        if let Some(cap) = detect_caption(first) {
+            return Some(StructuredBlock {
+                kind: cap.kind,
+                text: text.clone(),
+                bbox,
+                confidence: 0.75,
+                heading_level: None,
+                section_number: None,
+                equation_label: None,
+                theorem_number: None,
+                note: None,
+                caption_label: Some(cap.label.to_string()),
+                caption_number: cap.number,
+                lines,
+            });
         }
     }
 
@@ -289,6 +310,8 @@ fn classify_block(
                 equation_label: None,
                 theorem_number: th.number,
                 note: th.note,
+                caption_label: None,
+                caption_number: None,
                 lines,
             });
         }
@@ -308,6 +331,8 @@ fn classify_block(
                 equation_label,
                 theorem_number: None,
                 note: None,
+                caption_label: None,
+                caption_number: None,
                 lines,
             });
         }
@@ -505,32 +530,41 @@ fn heading_keyword(first: &str) -> Option<&'static str> {
     HEADING_KEYWORDS.iter().copied().find(|&k| lower == k)
 }
 
+/// caption 検出の結果（Phase 8a でラベル語・番号を追加）。
+struct CaptionHit {
+    kind: NodeKind,
+    /// 正規化したラベル語（"FIGURE 2" でも "Figure"）。
+    label: &'static str,
+    /// caption 番号（"2" / "A.1"）。取れないときは None（検出自体は従来どおり成立する）。
+    number: Option<String>,
+}
+
 /// 行頭が "Figure 1" / "Table 2:" / "Fig. 3" のような caption ラベルか。
-fn detect_caption(first: &str) -> Option<NodeKind> {
+fn detect_caption(first: &str) -> Option<CaptionHit> {
     let f = first.trim_start();
     let lower = f.to_ascii_lowercase();
-    let (label_len, kind) = if lower.starts_with("figure") {
-        (6, NodeKind::FigureCaption)
+    let (label_len, kind, label) = if lower.starts_with("figure") {
+        (6, NodeKind::FigureCaption, "Figure")
     } else if lower.starts_with("fig.") {
-        (4, NodeKind::FigureCaption)
+        (4, NodeKind::FigureCaption, "Fig")
     } else if lower.starts_with("fig ") {
-        (3, NodeKind::FigureCaption)
+        (3, NodeKind::FigureCaption, "Fig")
     } else if lower.starts_with("table") {
-        (5, NodeKind::TableCaption)
+        (5, NodeKind::TableCaption, "Table")
     } else if lower.starts_with("algorithm") {
-        (9, NodeKind::FigureCaption)
+        (9, NodeKind::FigureCaption, "Algorithm")
     } else if lower.starts_with("listing") {
-        (7, NodeKind::FigureCaption)
+        (7, NodeKind::FigureCaption, "Listing")
     } else {
         return None;
     };
     // ラベル直後の数文字以内に番号（数字）があること（"Figures show…" の誤検出回避）。
     let after: String = f[label_len..].chars().take(6).collect();
-    if after.chars().any(|c| c.is_ascii_digit()) {
-        Some(kind)
-    } else {
-        None
+    if !after.chars().any(|c| c.is_ascii_digit()) {
+        return None;
     }
+    let number = parse_theorem_number(f[label_len..].trim_start());
+    Some(CaptionHit { kind, label, number })
 }
 
 /// 定理系ブロックの検出結果（Phase 5・PDF ヒューリスティック）。
@@ -888,6 +922,36 @@ mod tests {
         assert_eq!(blocks[0].kind, NodeKind::Paragraph);
         assert_eq!(blocks[1].kind, NodeKind::FigureCaption);
         assert_eq!(blocks[2].kind, NodeKind::TableCaption);
+        // Phase 8a: ラベル語と番号を payload 用に捕捉する。
+        assert_eq!(blocks[1].caption_label.as_deref(), Some("Figure"));
+        assert_eq!(blocks[1].caption_number.as_deref(), Some("1"));
+        assert_eq!(blocks[2].caption_label.as_deref(), Some("Table"));
+        assert_eq!(blocks[2].caption_number.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn caption_label_variants_and_appendix_numbers() {
+        let p = build_page(&[
+            ("some earlier body sentence appears here", 10.0, 0.0),
+            ("and it continues onto a second line", 10.0, G),
+            ("and a third line to anchor the median", 10.0, G),
+            ("plus a fourth line keeping gaps small", 10.0, G),
+            ("and a fifth line to hold the median down", 10.0, G),
+            ("Fig. 3a shows the apparatus in detail", 10.0, H),
+            ("Algorithm 2: Greedy matching procedure", 10.0, H),
+            ("Table A.1: Supplementary hyperparameters", 10.0, H),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[1].kind, NodeKind::FigureCaption);
+        assert_eq!(blocks[1].caption_label.as_deref(), Some("Fig"));
+        assert_eq!(blocks[1].caption_number.as_deref(), Some("3"));
+        // Algorithm/Listing は FigureCaption だがラベル語で区別できる（図領域ペアリングから除外する鍵）。
+        assert_eq!(blocks[2].kind, NodeKind::FigureCaption);
+        assert_eq!(blocks[2].caption_label.as_deref(), Some("Algorithm"));
+        assert_eq!(blocks[2].caption_number.as_deref(), Some("2"));
+        // 付録番号 "A.1" も取れる。
+        assert_eq!(blocks[3].kind, NodeKind::TableCaption);
+        assert_eq!(blocks[3].caption_number.as_deref(), Some("A.1"));
     }
 
     #[test]

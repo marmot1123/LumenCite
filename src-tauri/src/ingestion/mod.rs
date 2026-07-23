@@ -1,6 +1,7 @@
 //! LCIR の取り込み（ingestion）。実験フラグ判定・添付ごとの LCIR 構築（pdfium）・
 //! 派生 FTS 再生成・read 面の組み立て。既存 `fulltext` 経路は触らず、LCIR は追加の side-build。
 
+pub mod figures;
 pub mod graph;
 pub mod pdf;
 pub mod structure;
@@ -739,6 +740,18 @@ fn block_payload_json(b: &structure::StructuredBlock) -> Option<String> {
     }
     if let Some(ref note) = b.note {
         map.insert("note".to_string(), serde_json::Value::from(note.clone()));
+    }
+    if let Some(ref label) = b.caption_label {
+        map.insert(
+            "caption_label".to_string(),
+            serde_json::Value::from(label.clone()),
+        );
+    }
+    if let Some(ref number) = b.caption_number {
+        map.insert(
+            "caption_number".to_string(),
+            serde_json::Value::from(number.clone()),
+        );
     }
     if map.is_empty() {
         None
