@@ -1065,6 +1065,88 @@ pub async fn load_lcir_document(
     }))
 }
 
+// ---- エントリ→版解決（Phase 4 の read 優先度。MCP / エクスポート / CLI で共有） ----
+
+/// エントリの「添付ごとの最新 completed 版」を全部返す。並びは **read 優先度降順**
+/// （`extractor_priority`: tex > pdfium）→ attachment_id 昇順。併存する複数表現の列挙と
+/// 既定選択の単一ソース。
+pub async fn entry_lcir_versions(
+    pool: &SqlitePool,
+    entry_id: i64,
+) -> Result<Vec<crate::models::DocumentVersion>, sqlx::Error> {
+    let mut versions = sqlx::query_as::<_, crate::models::DocumentVersion>(
+        "SELECT dv.* FROM document_versions dv
+         JOIN attachments a ON a.id = dv.attachment_id
+         WHERE a.entry_id = ?
+           AND dv.extraction_status IN ('completed', 'completed_with_warnings')
+           AND dv.id = (
+               SELECT MAX(dv2.id) FROM document_versions dv2
+               WHERE dv2.attachment_id = dv.attachment_id
+                 AND dv2.extraction_status IN ('completed', 'completed_with_warnings')
+           )
+         ORDER BY dv.attachment_id",
+    )
+    .bind(entry_id)
+    .fetch_all(pool)
+    .await?;
+    versions.sort_by(|a, b| {
+        document_ir::schema::extractor_priority(&b.extractor_name)
+            .cmp(&document_ir::schema::extractor_priority(&a.extractor_name))
+            .then(a.attachment_id.cmp(&b.attachment_id))
+    });
+    Ok(versions)
+}
+
+/// `source` 引数（"tex"/"pdf"）→ extractor_name。エラーはそのままユーザーに見せる文言。
+pub fn source_to_extractor(source: &str) -> Result<&'static str, String> {
+    match source {
+        "tex" => Ok(document_ir::schema::TEX_EXTRACTOR_NAME),
+        "pdf" => Ok(document_ir::schema::EXTRACTOR_NAME),
+        other => Err(format!("unknown source '{other}' (use \"tex\" or \"pdf\")")),
+    }
+}
+
+/// extractor_name → 短い source 名（"tex"/"pdf"）。未知の抽出器名はそのまま返す。
+pub fn short_source_name(extractor_name: &str) -> &str {
+    match extractor_name {
+        document_ir::schema::TEX_EXTRACTOR_NAME => "tex",
+        document_ir::schema::EXTRACTOR_NAME => "pdf",
+        other => other,
+    }
+}
+
+/// エントリの LCIR を読む。`wanted_extractor`（extractor_name・`source_to_extractor` で
+/// 解決済み）指定時はその抽出器の版に限定し、未指定なら優先度順（tex > pdfium）で最初に
+/// 読めた版を返す。読めた/読めないに関わらず併存する版の一覧も返す — 「無かったとき」の
+/// 案内文を実在する表現に基づいて組み立てるため。
+#[allow(clippy::type_complexity)]
+pub async fn load_entry_lcir(
+    pool: &SqlitePool,
+    entry_id: i64,
+    wanted_extractor: Option<&str>,
+) -> Result<
+    (
+        Option<(i64, document_ir::LcirDocument)>,
+        Vec<crate::models::DocumentVersion>,
+    ),
+    String,
+> {
+    let versions = entry_lcir_versions(pool, entry_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    for v in &versions {
+        if let Some(name) = wanted_extractor {
+            if v.extractor_name != name {
+                continue;
+            }
+        }
+        if let Some(doc) = load_lcir_document(pool, v.attachment_id).await? {
+            return Ok((Some((v.attachment_id, doc)), versions));
+        }
+    }
+    Ok((None, versions))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1940,5 +2022,144 @@ mod tests {
         );
         assert!(again.reused, "same PDF should reuse via content_key");
         assert_eq!(again.content_key, res.content_key);
+    }
+
+    // ---- エントリ→版解決（Phase 9a で共有化。MCP / エクスポート / CLI の単一ソース） ----
+
+    /// completed 版を直接 INSERT する（build を通さない軽量セットアップ）。
+    async fn insert_completed_version(
+        pool: &SqlitePool,
+        attachment_id: i64,
+        extractor_name: &str,
+        content_key: &str,
+    ) -> i64 {
+        sqlx::query(
+            "INSERT INTO document_versions
+                (attachment_id, content_key, schema_version, source_sha256, source_mime_type,
+                 extractor_name, extractor_version, config_hash, extraction_status)
+             VALUES (?, ?, '0.1.0', 'sha', 'application/octet-stream', ?, '0.0.1', '', 'completed')",
+        )
+        .bind(attachment_id)
+        .bind(content_key)
+        .bind(extractor_name)
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
+    async fn insert_root_node(pool: &SqlitePool, version_id: i64) {
+        sqlx::query(
+            "INSERT INTO document_nodes (document_version_id, parent_id, node_kind, ordinal)
+             VALUES (?, NULL, 'document', 0)",
+        )
+        .bind(version_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// 2 添付（PDF 版 + TeX 版）を持つエントリを作り、(entry_id, pdf_att, tex_att) を返す。
+    async fn setup_two_source_entry(pool: &SqlitePool) -> (i64, i64, i64) {
+        let entry = create_entry(
+            pool,
+            &EntryInput {
+                title: "Two Sources".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let pdf_att = add_attachment(pool, entry.id, "attachments/x/p.pdf", "p.pdf", "application/pdf")
+            .await
+            .unwrap()
+            .id;
+        let tex_att = add_attachment(pool, entry.id, "attachments/x/s.gz", "s.gz", TEX_SOURCE_MIME)
+            .await
+            .unwrap()
+            .id;
+        let pdf_ver =
+            insert_completed_version(pool, pdf_att, document_ir::schema::EXTRACTOR_NAME, "ck-pdf")
+                .await;
+        let tex_ver = insert_completed_version(
+            pool,
+            tex_att,
+            document_ir::schema::TEX_EXTRACTOR_NAME,
+            "ck-tex",
+        )
+        .await;
+        insert_root_node(pool, pdf_ver).await;
+        insert_root_node(pool, tex_ver).await;
+        (entry.id, pdf_att, tex_att)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn entry_lcir_versions_sorts_tex_first(pool: SqlitePool) {
+        let (entry_id, _pdf_att, tex_att) = setup_two_source_entry(&pool).await;
+        let versions = entry_lcir_versions(&pool, entry_id).await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(
+            versions[0].extractor_name,
+            document_ir::schema::TEX_EXTRACTOR_NAME,
+            "read 優先度は tex > pdfium"
+        );
+        assert_eq!(versions[0].attachment_id, tex_att);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_entry_lcir_prefers_tex_and_honors_wanted(pool: SqlitePool) {
+        let (entry_id, pdf_att, tex_att) = setup_two_source_entry(&pool).await;
+
+        // 未指定 → tex 版。
+        let (found, versions) = load_entry_lcir(&pool, entry_id, None).await.unwrap();
+        let (att, doc) = found.expect("tex 版が読める");
+        assert_eq!(att, tex_att);
+        assert_eq!(doc.source.extractor_name, document_ir::schema::TEX_EXTRACTOR_NAME);
+        assert_eq!(versions.len(), 2);
+
+        // pdf 指定 → pdfium 版に限定。
+        let wanted = source_to_extractor("pdf").unwrap();
+        let (found, _) = load_entry_lcir(&pool, entry_id, Some(wanted)).await.unwrap();
+        let (att, doc) = found.expect("pdf 版が読める");
+        assert_eq!(att, pdf_att);
+        assert_eq!(doc.source.extractor_name, document_ir::schema::EXTRACTOR_NAME);
+
+        // 未知 source はエラー文言を返す。
+        assert!(source_to_extractor("html").is_err());
+        assert_eq!(short_source_name(document_ir::schema::TEX_EXTRACTOR_NAME), "tex");
+        assert_eq!(short_source_name(document_ir::schema::EXTRACTOR_NAME), "pdf");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn load_entry_lcir_returns_versions_even_when_wanted_missing(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Tex Only".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let tex_att = add_attachment(&pool, entry.id, "attachments/y/s.gz", "s.gz", TEX_SOURCE_MIME)
+            .await
+            .unwrap()
+            .id;
+        let ver = insert_completed_version(
+            &pool,
+            tex_att,
+            document_ir::schema::TEX_EXTRACTOR_NAME,
+            "ck-tex-only",
+        )
+        .await;
+        insert_root_node(&pool, ver).await;
+
+        let wanted = source_to_extractor("pdf").unwrap();
+        let (found, versions) = load_entry_lcir(&pool, entry.id, Some(wanted)).await.unwrap();
+        assert!(found.is_none(), "pdf 版は無い");
+        assert_eq!(versions.len(), 1, "案内文用に併存一覧は返る");
+        assert_eq!(short_source_name(&versions[0].extractor_name), "tex");
     }
 }

@@ -281,6 +281,9 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   const [indexNote, setIndexNote] = useState<string | null>(null);
   // arXiv TeX ソース取得（LCIR Phase 4）。
   const [texBusy, setTexBusy] = useState(false);
+  // LCIR エクスポート（Phase 9a）。フラグ ON のときだけボタンを出す。
+  const [lcirEnabled, setLcirEnabled] = useState(false);
+  const [lcirExportBusy, setLcirExportBusy] = useState(false);
   // ダウンロード中にユーザーが別エントリへ移った場合、完了時の表示更新を捨てるための現在値参照
   // （texBusy 自体はリセットしない — 同一エントリへの二重ダウンロード防止のため）。
   const entryIdRef = useRef<number | null>(null);
@@ -296,6 +299,22 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setTagInput("");
     setAttachError(null);
     setIndexNote(null);
+  }, [entry?.id]);
+
+  // LCIR フラグ（Phase 9a: エクスポートボタンの表示可否）。設定モーダルでの切替を
+  // 拾えるよう、エントリ切替のたびに再取得する（ローカル invoke で安価）。
+  useEffect(() => {
+    let cancelled = false;
+    invoke<boolean>("get_lcir_enabled")
+      .then(v => {
+        if (!cancelled) setLcirEnabled(v);
+      })
+      .catch(() => {
+        if (!cancelled) setLcirEnabled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [entry?.id]);
 
   // 添付の全文索引状態を取得する（エントリ切替・添付増減で再取得）。PDF のみが対象。
@@ -438,6 +457,30 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
       }
     } finally {
       setTexBusy(false);
+    }
+  };
+
+  // LCIR を JSON / Markdown に書き出す（Phase 9a）。保存ダイアログのキャンセルは無言で戻る。
+  // ダイアログを開いたまま別エントリへ移った場合、完了/エラー表示は捨てる（TeX 取得と同じ契約）。
+  const handleExportLcir = async (format: "json" | "markdown") => {
+    if (!entry || lcirExportBusy) return;
+    const startedFor = entry.id;
+    const stillHere = () => entryIdRef.current === startedFor;
+    setLcirExportBusy(true);
+    setAttachError(null);
+    setIndexNote(null);
+    try {
+      const path = await invoke<string | null>(
+        format === "json" ? "export_lcir_json" : "export_lcir_markdown",
+        { entryId: startedFor },
+      );
+      if (path && stillHere()) setIndexNote(t("detailPanel.lcirExportDone", { path }));
+    } catch (e: any) {
+      if (stillHere()) {
+        setAttachError(t("detailPanel.lcirExportFailed", { error: e?.message ?? String(e) }));
+      }
+    } finally {
+      setLcirExportBusy(false);
     }
   };
 
@@ -769,6 +812,27 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                       {texBusy ? t("detailPanel.texSourceBusy") : t("detailPanel.texSource")}
                     </button>
                   )}
+                  {lcirEnabled && (["markdown", "json"] as const).map(format => (
+                    <button
+                      key={format}
+                      onClick={() => handleExportLcir(format)}
+                      disabled={lcirExportBusy}
+                      title={t(format === "json" ? "detailPanel.lcirExportJsonTitle" : "detailPanel.lcirExportMdTitle")}
+                      style={{
+                        display: "inline-flex", alignItems: "center", gap: 3,
+                        padding: "2px 8px", borderRadius: 5,
+                        border: "1px dashed var(--border-strong)",
+                        background: "transparent", color: "var(--text-faint)",
+                        fontSize: 11, cursor: lcirExportBusy ? "default" : "pointer",
+                        opacity: lcirExportBusy ? 0.5 : 1,
+                      }}
+                    >
+                      <Icon name="download" size={9} color="var(--text-faint)" />
+                      {lcirExportBusy
+                        ? t("detailPanel.lcirExportBusy")
+                        : t(format === "json" ? "detailPanel.lcirExportJson" : "detailPanel.lcirExportMd")}
+                    </button>
+                  ))}
                 </div>
                 {attachError && (
                   <div style={{ fontSize: 11, color: "var(--danger-strong)", marginTop: 2 }}>
