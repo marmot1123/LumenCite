@@ -347,8 +347,15 @@ CLI（読取＋書込）が揃ったので、LaTeX 執筆支援の `lumencite-bi
 - **理由**: LCIR はフラグ既定 OFF でリリースを止める理由にならない／main に既にユーザー価値（特に信頼性修正）が溜まっている／拡張 zip は GitHub Release 添付でしか配布できない。
 - **以後のリリース間引き**: LCIR フェーズはフラグ付きで main に積み、リリースは **2〜3 フェーズごと**（例: v0.9.0 = Phase 5+6）。署名・notarize 等のリリース作業コストと配信頻度のバランスを取る。
 - **v1.0.0 の看板 = LCIR 完成**: Phase 9/10 到達 + `lcir.enabled` 既定 ON 化のタイミングで「機械可読文献基盤の完成」として 1.0 を名乗る。
+- **フェーズ順序の変更と Phase 9 の分割（2026-07-23 決定）**: Phase 6 完了後の実装順は **9a → 8 → 7 → 9b/10**。Phase 9 を **9a（エクスポート第一段 = LCIR JSON + Markdown 書き出し・v0.10.0 予定）**と **9b（JATS/TEI/HTML+MathML — Presentation MathML を出す Phase 7 が本質的前提）**に分割する。9a を前倒しする理由: ①中身（`LcirDocument` 派生ビュー・validation・`get_lcir_document`）は Phase 6b 時点で実質完成しており、残作業はファイル書き出しと Markdown レンダラのみ（migration 不要・依存追加なし・ヒューリスティックなし＝「誤検出より欠損」を構造的に満たす）。②フラグ OFF で main に積んできた Phase 4〜6b の成果（原文 LaTeX 数式・定理番号・cite key）を初めて目に見えるユーザー価値（Obsidian 論文ノート直行の Markdown）に変換できる。③Phase 9 のうち Phase 7 に本質依存するのは 9b だけなので、分割すれば二度手間は生じない。**v1.0.0 の「Phase 9 到達」は 9a を指し、9b は post-1.0 でもよい。**
 
-### 1エントリ複数 PDF 添付（本文＋補助資料）— Phase 1
+### LCIR エクスポート（Phase 9a・v0.10.0 予定）
+
+エントリ単位で LCIR を **LCIR JSON**（`LcirDocument` 派生ビューそのまま・validation 通過必須）と **構造付き Markdown**（節見出し・段落・原文 LaTeX 数式・定理/証明・参考文献）へ書き出す。読み出しは MCP と同じ**エントリ→版解決（tex > pdfium 優先・`source` で明示切替）**を共有する。
+
+- **経路は 3 つ**: 詳細パネルのボタン（保存ダイアログ・`lcir.enabled` ON のときのみ表示）／CLI `export-lcir <id_or_key> [--format json|md] [--source tex|pdf] [-o <path>]`（stdout 既定・読取専用）／既存 MCP read ツール（変更なし）。
+- **Markdown の品質は由来に依存**: TeX 版は原文 LaTeX（`$..$` インライン温存・display は `$$..$$`）・定理番号・cite key まで出る。PDF 版は surface-only（数式は Unicode 線形のまま・`$$` を付けない）。出力の YAML フロントマターに `lcir_source`（抽出器名・版）を記録し、由来を常に区別する（roadmap §16）。
+- **やらないこと（9b へ）**: JATS/TEI/HTML+MathML。embedding・ノードチャンク API は Phase 10。
 
 同じ DOI の論文に **本文 PDF** と **supplemental material（SI）等の補助 PDF** が別ファイルで存在するとき、両方を同じエントリに添付して閲覧・全文検索できるようにする。「同一 DOI ＝同一の著作」という前提に立ち、補助 PDF は**別エントリ（別文献）ではなく、本文論文に紐づく添付ファイルの一つ**として扱う（Zotero が添付を item の子として複数ぶら下げるのと同型のモデル）。
 
