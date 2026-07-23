@@ -1185,6 +1185,26 @@ async fn save_text_via_dialog(
     .map_err(|e| e.to_string())?
 }
 
+/// 保存ダイアログの既定ファイル名に使う stem。cite key は `:` `/` `+` を許すため
+/// （DBLP 形式 `DBLP:conf/stoc/Shor97` 等）、OS のファイル名禁止文字を `-` に置換する。
+fn export_file_stem(citation_key: Option<&str>, entry_id: i64) -> String {
+    let sanitized: String = citation_key
+        .unwrap_or_default()
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            c if (c as u32) < 0x20 => '-',
+            c => c,
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(|c: char| c == '-' || c.is_whitespace());
+    if trimmed.is_empty() {
+        format!("entry-{entry_id}")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// LCIR（実験・Phase 9a）: エントリの LCIR を JSON 派生ビューとして保存ダイアログで書き出す。
 /// validation 通過必須。`source` は "tex"/"pdf"（未指定 = tex 優先）。
 #[tauri::command]
@@ -1196,10 +1216,7 @@ async fn export_lcir_json(
 ) -> Result<Option<String>, String> {
     let (doc, detail) = load_lcir_for_export(&state.db, entry_id, source.as_deref()).await?;
     let json = export::lcir_json_pretty(&doc)?;
-    let stem = detail
-        .citation_key
-        .clone()
-        .unwrap_or_else(|| format!("entry-{entry_id}"));
+    let stem = export_file_stem(detail.citation_key.as_deref(), entry_id);
     save_text_via_dialog(app, format!("{stem}-lcir.json"), "JSON", &["json"], json).await
 }
 
@@ -1221,10 +1238,7 @@ async fn export_lcir_markdown(
         citation_key: detail.citation_key.clone(),
     };
     let md = export::render_markdown(&doc, Some(&header));
-    let stem = detail
-        .citation_key
-        .clone()
-        .unwrap_or_else(|| format!("entry-{entry_id}"));
+    let stem = export_file_stem(detail.citation_key.as_deref(), entry_id);
     save_text_via_dialog(app, format!("{stem}.md"), "Markdown", &["md"], md).await
 }
 
@@ -3973,5 +3987,23 @@ mod chat_command_tests {
         // セッション 2 の承認待ちは残っている → 明示的に許可できる
         rt.resolve_approval(2, "b-call", true);
         assert!(rx_b.await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod export_file_stem_tests {
+    use super::export_file_stem;
+
+    #[test]
+    fn keeps_plain_keys_and_sanitizes_os_reserved_chars() {
+        assert_eq!(export_file_stem(Some("smith2020a"), 7), "smith2020a");
+        // DBLP 形式（cite key として合法）は OS 禁止文字を '-' に。
+        assert_eq!(
+            export_file_stem(Some("DBLP:conf/stoc/Shor97"), 7),
+            "DBLP-conf-stoc-Shor97"
+        );
+        // 空・記号のみ・未設定は entry-{id} に degrade。
+        assert_eq!(export_file_stem(Some("::"), 7), "entry-7");
+        assert_eq!(export_file_stem(None, 7), "entry-7");
     }
 }

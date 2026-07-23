@@ -249,9 +249,27 @@ fn push_frontmatter(out: &mut String, h: &MarkdownHeader, doc: &LcirDocument) {
     out.push_str("---\n\n");
 }
 
-/// YAML の double-quoted scalar（`\` と `"` のみエスケープ。LaTeX 混じりの題名に耐える）。
+/// YAML の double-quoted scalar。`\`/`"` に加え、改行・制御文字も YAML エスケープに落とす —
+/// 生の改行が値に混じると「1 キー = 1 行」が崩れてフロントマター全体が不正 YAML になり、
+/// Obsidian が全プロパティを失うため（BibTeX の折返し題名・LLM/CLI 由来の題名で実際に起きる）。
 fn yaml_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn text(n: &LcirNode) -> Option<String> {
@@ -507,5 +525,38 @@ mod tests {
     fn empty_document_renders_empty_string() {
         let d = doc(vec![node(1, None, 0, "document", None)]);
         assert_eq!(render_markdown(&d, None), "");
+    }
+
+    #[test]
+    fn frontmatter_survives_newlines_and_control_chars_in_fields() {
+        let d = doc(vec![
+            node(1, None, 0, "document", None),
+            node(2, Some(1), 0, "paragraph", Some("Body.")),
+        ]);
+        let header = MarkdownHeader {
+            title: "Wrapped\ntitle with\r\nCRLF and \x0c form feed".to_string(),
+            authors: vec!["A.\nAuthor".to_string()],
+            year: None,
+            doi: None,
+            arxiv_id: None,
+            citation_key: None,
+        };
+        let md = render_markdown(&d, Some(&header));
+        // フロントマター内は「1 キー = 1 行」を維持する（生の改行・制御文字を残さない）。
+        let fm: Vec<&str> = md.splitn(3, "---").collect();
+        let inner = fm[1];
+        assert!(!inner.contains('\x0c'), "制御文字は \\u エスケープ: {inner:?}");
+        assert!(
+            inner.lines().all(|l| l.is_empty()
+                || l.starts_with("title:")
+                || l.starts_with("authors:")
+                || l.starts_with("  - ")
+                || l.contains(": ")),
+            "全行がキー行またはリスト行: {inner:?}"
+        );
+        assert!(md.contains(r"Wrapped\ntitle"), "改行は \\n に: {md}");
+        assert!(md.contains(r"with\r\nCRLF"), "CR も \\r に: {md}");
+        assert!(md.contains("\\u000C"), "その他制御文字は \\u00XX に: {md}");
+        assert!(md.contains(r#"  - "A.\nAuthor""#), "{md}");
     }
 }

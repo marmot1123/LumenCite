@@ -357,6 +357,8 @@ CLI（読取＋書込）が揃ったので、LaTeX 執筆支援の `lumencite-bi
 - **Markdown の品質は由来に依存**: TeX 版は原文 LaTeX（`$..$` インライン温存・display は `$$..$$`）・定理番号・cite key まで出る。PDF 版は surface-only（数式は Unicode 線形のまま・`$$` を付けない）。出力の YAML フロントマターに `lcir_source`（抽出器名・版）を記録し、由来を常に区別する（roadmap §16）。
 - **やらないこと（9b へ）**: JATS/TEI/HTML+MathML。embedding・ノードチャンク API は Phase 10。
 
+### 1エントリ複数 PDF 添付（本文＋補助資料）— Phase 1
+
 同じ DOI の論文に **本文 PDF** と **supplemental material（SI）等の補助 PDF** が別ファイルで存在するとき、両方を同じエントリに添付して閲覧・全文検索できるようにする。「同一 DOI ＝同一の著作」という前提に立ち、補助 PDF は**別エントリ（別文献）ではなく、本文論文に紐づく添付ファイルの一つ**として扱う（Zotero が添付を item の子として複数ぶら下げるのと同型のモデル）。
 
 **設計方針（モデル A）:**
