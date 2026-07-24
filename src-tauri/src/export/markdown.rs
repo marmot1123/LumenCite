@@ -119,6 +119,15 @@ fn render_node(
                 push_block(out, &format!("*{t}*"));
             }
         }
+        // table（Phase 8b・TeX 由来）: payload のセル構造を GFM パイプテーブルに描画。
+        // payload が無い/形が違う table ノードは plain_text の段落に degrade（既存規則）。
+        "table" => {
+            if !push_table(n, out) {
+                if let Some(t) = text(n) {
+                    push_block(out, &t);
+                }
+            }
+        }
         "list" => {
             let mut items = String::new();
             for c in children.get(&Some(n.id)).cloned().unwrap_or_default() {
@@ -364,6 +373,177 @@ fn payload_i64(n: &LcirNode, key: &str) -> Option<i64> {
     n.payload.as_ref()?.get(key)?.as_i64()
 }
 
+/// table ノードを GFM パイプテーブルとして描画する。描画できたら true（できない形は
+/// 呼び出し側が plain_text 段落に degrade）。GFM の構造要件: ヘッダ行 = 第 1 行（意味論の
+/// 主張ではない）・全行を n_columns まで空セルでパディング（ヘッダとデリミタのセル数不一致は
+/// 表ごと非認識になるため）。アライメントは build 時に確定した `alignments`（列型レター）を
+/// 使い、ここで column_spec を再パースしない。
+fn push_table(n: &LcirNode, out: &mut String) -> bool {
+    let Some(payload) = n.payload.as_ref() else {
+        return false;
+    };
+    let Some(rows) = payload.get("rows").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if rows.is_empty() {
+        return false;
+    }
+    // 防御: payload の n_columns が欠けても、実際の最長行より狭くても、GFM のヘッダ/デリミタ/
+    // データ行のセル数が一致するよう最長行に合わせて広げる（狭いと表ごと非認識になる）。
+    let widest = rows
+        .iter()
+        .filter_map(|r| r.get("cells").and_then(|v| v.as_array()))
+        .map(|cells| {
+            cells
+                .iter()
+                .map(|c| c.get("colspan").and_then(|v| v.as_i64()).unwrap_or(1).max(1) as usize)
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    let n_columns = payload_i64(n, "n_columns").unwrap_or(0).max(1).max(widest as i64) as usize;
+    let alignments: Option<Vec<String>> = payload.get("alignments").and_then(|v| {
+        v.as_array().map(|a| {
+            a.iter()
+                .map(|x| x.as_str().unwrap_or("").to_string())
+                .collect()
+        })
+    });
+
+    let mut grid: Vec<Vec<String>> = Vec::new();
+    for row in rows {
+        let Some(cells) = row.get("cells").and_then(|v| v.as_array()) else {
+            return false;
+        };
+        let mut line: Vec<String> = Vec::new();
+        for cell in cells {
+            let text = cell.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            line.push(escape_cell(text));
+            // colspan セルは content + 空セルで桁を合わせる（GFM に結合セルは無い）。
+            let span = cell.get("colspan").and_then(|v| v.as_i64()).unwrap_or(1);
+            for _ in 1..span {
+                line.push(String::new());
+            }
+        }
+        while line.len() < n_columns {
+            line.push(String::new());
+        }
+        grid.push(line);
+    }
+
+    let delimiter: Vec<String> = (0..n_columns)
+        .map(|i| {
+            match alignments
+                .as_ref()
+                .and_then(|a| a.get(i))
+                .map(|s| s.as_str())
+            {
+                Some("l") => ":--".to_string(),
+                Some("c") => ":-:".to_string(),
+                Some("r") => "--:".to_string(),
+                _ => "---".to_string(),
+            }
+        })
+        .collect();
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut it = grid.into_iter();
+    if let Some(header) = it.next() {
+        lines.push(format!("| {} |", header.join(" | ")));
+        lines.push(format!("| {} |", delimiter.join(" | ")));
+    }
+    for row in it {
+        lines.push(format!("| {} |", row.join(" | ")));
+    }
+    push_block(out, &lines.join("\n"));
+    true
+}
+
+/// セル内のパイプ文字だけを保護する（それ以外は verbatim 温存）。数式区間
+/// （`$..$` / `$$..$$` / `\(..\)` / `\[..\]`）の外は `\|`（GFM のエスケープ）、中は数式として
+/// 同義の `\vert ` に置換する — `\|` は LaTeX では `‖`（\Vert）であり `$P(A|B)$` の意味を
+/// 変えてしまうため。既に `\|` と書かれたものはパリティ判定（逐次バックスラッシュ計数）で
+/// 触らない。区間検出は build 側（tabular.rs）が verbatim 温存する全ての数式デリミタを扱う。
+fn escape_cell(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    // 数式区間の種類（閉じデリミタが異なる）。
+    #[derive(PartialEq)]
+    enum Math {
+        None,
+        Dollar,
+        DoubleDollar,
+        Paren,
+        Bracket,
+    }
+    let mut math = Math::None;
+    let mut backslashes = 0usize; // 直前の連続バックスラッシュ数（逐次更新・O(n)）。
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let escaped = backslashes % 2 == 1;
+        match bytes[i] {
+            b'\\' => {
+                backslashes += 1;
+                out.push('\\');
+                i += 1;
+                continue;
+            }
+            b'$' if !escaped && math == Math::None => {
+                if bytes.get(i + 1) == Some(&b'$') {
+                    math = Math::DoubleDollar;
+                    out.push_str("$$");
+                    i += 2;
+                } else {
+                    math = Math::Dollar;
+                    out.push('$');
+                    i += 1;
+                }
+                backslashes = 0;
+                continue;
+            }
+            b'$' if !escaped && math == Math::Dollar => {
+                math = Math::None;
+                out.push('$');
+                i += 1;
+                backslashes = 0;
+                continue;
+            }
+            b'$' if !escaped && math == Math::DoubleDollar => {
+                if bytes.get(i + 1) == Some(&b'$') {
+                    math = Math::None;
+                    out.push_str("$$");
+                    i += 2;
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
+                backslashes = 0;
+                continue;
+            }
+            b'(' if escaped && math == Math::None => math = Math::Paren,
+            b')' if escaped && math == Math::Paren => math = Math::None,
+            b'[' if escaped && math == Math::None => math = Math::Bracket,
+            b']' if escaped && math == Math::Bracket => math = Math::None,
+            b'|' if !escaped => {
+                if math == Math::None {
+                    out.push_str("\\|");
+                } else {
+                    out.push_str("\\vert ");
+                }
+                backslashes = 0;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+        backslashes = 0;
+    }
+    out
+}
+
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -476,6 +656,84 @@ mod tests {
         assert!(md.contains("## References"), "{md}");
         assert!(md.contains("- \\[author2020\\] A. Author, Title."), "{md}");
         assert!(md.ends_with('\n') && !md.ends_with("\n\n"), "末尾は単一改行: {md:?}");
+    }
+
+    // ── Phase 8b: table ──
+
+    #[test]
+    fn table_renders_as_gfm_pipe_table_with_alignment_and_colspan() {
+        let mut cap = node(2, Some(1), 0, "table_caption", Some("Masses."));
+        cap.payload = serde_json::json!({"labels": ["tab:m"]}).into();
+        let mut tab = node(3, Some(1), 1, "table", Some("Particle | Mass\ne | 0.511"));
+        tab.payload = serde_json::json!({
+            "column_spec": "lcr",
+            "n_columns": 3,
+            "n_rows": 3,
+            "alignments": ["l", "c", "r"],
+            "rows": [
+                // 短いヘッダ行 → n_columns まで空セルでパディングされる（GFM の認識条件）。
+                {"cells": [{"text": "Name"}, {"text": "Value"}]},
+                {"cells": [{"text": "span"}, {"text": "wide", "colspan": 2}], "rule_above": true},
+                {"cells": [{"text": "$P(A|B)$"}, {"text": "x|y"}, {"text": "z"}]},
+            ],
+        })
+        .into();
+        let d = doc(vec![node(1, None, 0, "document", None), cap, tab]);
+        let md = render_markdown(&d, None);
+
+        assert!(md.contains("*Masses.*"), "{md}");
+        assert!(md.contains("| Name | Value |  |"), "短行はパディング: {md}");
+        assert!(md.contains("| :-- | :-: | --: |"), "アライメント行: {md}");
+        assert!(md.contains("| span | wide |  |"), "colspan は空セルで桁合わせ: {md}");
+        // パイプの二層エスケープ: 数式内は \vert（意味保存）・外は \|（GFM エスケープ）。
+        assert!(md.contains("$P(A\\vert B)$"), "{md}");
+        assert!(md.contains("x\\|y"), "{md}");
+    }
+
+    #[test]
+    fn table_without_alignments_uses_plain_delimiter() {
+        let mut tab = node(2, Some(1), 0, "table", None);
+        tab.payload = serde_json::json!({
+            "column_spec": "lS",
+            "n_columns": 2,
+            "n_rows": 1,
+            "rows": [{"cells": [{"text": "a"}, {"text": "b"}]}],
+        })
+        .into();
+        let d = doc(vec![node(1, None, 0, "document", None), tab]);
+        let md = render_markdown(&d, None);
+        assert!(md.contains("| a | b |"), "{md}");
+        assert!(md.contains("| --- | --- |"), "未検証 spec は素のデリミタ: {md}");
+    }
+
+    #[test]
+    fn table_without_payload_degrades_to_paragraph() {
+        let tab = node(2, Some(1), 0, "table", Some("a | b\nc | d"));
+        let d = doc(vec![node(1, None, 0, "document", None), tab]);
+        let md = render_markdown(&d, None);
+        assert!(md.contains("a | b\nc | d"), "plain_text 段落へ degrade: {md}");
+        assert!(!md.contains("| --- |"), "{md}");
+    }
+
+    #[test]
+    fn table_cell_double_dollar_and_bracket_math_use_vert() {
+        // wip 修正の回帰: 従来 `$$` で数式フラグが 2 回反転し内側の `|` が `\|`（=‖）に化けた。
+        // `$$..$$` と `\[..\]` も数式区間として追跡し、内側の `|` を意味を保つ `\vert ` にする。
+        let mut tab = node(2, Some(1), 0, "table", None);
+        tab.payload = serde_json::json!({
+            "column_spec": "cc",
+            "n_columns": 2,
+            "n_rows": 1,
+            "rows": [{"cells": [
+                {"text": "$$P(A|B)$$"},
+                {"text": "\\[P(A|B)\\]"},
+            ]}],
+        })
+        .into();
+        let d = doc(vec![node(1, None, 0, "document", None), tab]);
+        let md = render_markdown(&d, None);
+        assert!(md.contains("$$P(A\\vert B)$$"), "$$ 数式内は \\vert: {md}");
+        assert!(md.contains("\\[P(A\\vert B)\\]"), "\\[ 数式内は \\vert: {md}");
     }
 
     #[test]
