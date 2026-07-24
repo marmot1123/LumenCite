@@ -354,6 +354,34 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
         }
     }));
 
+    tools.push(json!({
+        "name": "get_tables",
+        "description": "Return the structured tables (LCIR) of a paper — by entry_id or \
+            citation_key. **TeX-only**: cells are parsed from tabular/tabular*/tabularx \
+            environments in the arXiv TeX source (origin tex_source), so PDF-only entries return \
+            has_lcir:false and papers whose tables use longtable/tabu or nested layouts \
+            legitimately yield zero or fewer tables — an empty list does NOT mean the paper has \
+            no tables. Each table carries its caption (via the caption_of edge), the verbatim \
+            LaTeX column_spec, n_rows/n_columns, per-column alignments (letters l/c/r/p/m/b/X, \
+            present only when the column spec was fully parsed), and rows as \
+            {cells:[{text, colspan?, rowspan?}], rule_above?} where cell text keeps LaTeX \
+            verbatim (inline math as $..$). rule_above records a full-width rule above the row \
+            (a fact from the source; header detection is NOT performed). Use it to answer \
+            \"what tables does this paper have\", \"read Table 2's cells\", \"which column \
+            holds the masses\". Returns {has_lcir, source, available_sources, count, truncated, \
+            tables:[{node_id, caption:{node_id, text}?, column_spec, n_columns, n_rows, \
+            alignments?, rows}]}.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "entry_id": { "type": "integer", "description": "Entry id." },
+                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
+                "max_tables": { "type": "integer", "description": "Max tables to return (default 20)." },
+                "max_chars": { "type": "integer", "description": "Approximate budget over cell text (default 24000); further tables are truncated." }
+            }
+        }
+    }));
+
     // write 系（Phase 2・ゲート有効時のみ）。`mutate` の定義を流用し、許可リスト
     // （`WRITE_TOOLS`）に絞る。delete_entry はリストに無いので公開されない。
     if write_on {
@@ -532,6 +560,7 @@ async fn exec_tool(
         "get_node_relations" => exec_get_node_relations(pool, &args).await,
         "get_symbol_definitions" => exec_get_symbol_definitions(pool, &args).await,
         "get_figures" => exec_get_figures(pool, &args).await,
+        "get_tables" => exec_get_tables(pool, &args).await,
         // それ以外（delete_entry / ocr_* / 無効化中の write 等）は非公開。
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
@@ -1010,6 +1039,12 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         };
+        let payload_i64 = |key: &str| {
+            n.payload
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_i64())
+        };
         let section_number = payload_str("section_number");
         // 定理系ノード（Phase 5）: 番号・付記名を surface して "定理 2.3 の証明" 取得に使えるようにする。
         let theorem_number = payload_str("theorem_number");
@@ -1022,6 +1057,11 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
         } else {
             Some(n.assets.len())
         };
+        // table ノード（Phase 8b）: text はセルを " | " 結合した可読形。寸法だけ付けて
+        // セル構造（rows/alignments）は get_tables に誘導する。
+        let column_spec = payload_str("column_spec");
+        let n_columns = payload_i64("n_columns");
+        let n_rows = payload_i64("n_rows");
         out.push(json!({
             "index": i,
             "kind": n.kind,
@@ -1031,6 +1071,9 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
             "note": note,
             "figure_number": figure_number,
             "asset_count": asset_count,
+            "column_spec": column_spec,
+            "n_columns": n_columns,
+            "n_rows": n_rows,
             "equation_label": equation_label,
             "latex": latex,
             "text": text,
@@ -1377,6 +1420,120 @@ async fn exec_get_figures(pool: &SqlitePool, args: &Value) -> Result<String, Too
         "note": "figure regions come from embedded raster images (origin layout_model); vector \
             figures (TikZ/pgf) legitimately yield zero. asset relative_path is metadata only — \
             file existence is not guaranteed and no image bytes are returned.",
+    }))
+    .unwrap_or_default())
+}
+
+/// Phase 8b: 構造化テーブル（TeX 版のみ — tabular は TeX ソースからしかセル構造化できない）。
+/// caption は caption_of 辺（from=caption / to=table）から解決する。rows は payload の
+/// セル構造をそのまま返すが、原文スニペット `latex_source` は返さない（rows が構造を持ち、
+/// 二重送出でレスポンスが肥大するため）。`max_chars` はセル文字量の概算予算（最低 1 表は返す）。
+async fn exec_get_tables(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    let entry_id = resolve_entry_id(pool, args).await?;
+    let (loaded, versions) = load_entry_lcir(pool, entry_id, Some("tex")).await?;
+    let Some((attachment_id, doc)) = loaded else {
+        return Ok(serde_json::to_string(&json!({
+            "entry_id": entry_id,
+            "has_lcir": false,
+            "source": "tex",
+            "message": "no TeX-derived LCIR for this entry. Tables are cell-structured from the \
+                arXiv TeX source only; fetch the TeX source and build LCIR in the app first \
+                (PDF-only entries have no structured tables).",
+        }))
+        .unwrap_or_default());
+    };
+    let max_tables = args
+        .get("max_tables")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20)
+        .max(1) as usize;
+    let max_chars = args
+        .get("max_chars")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(24_000)
+        .clamp(1_000, 200_000) as usize;
+
+    let mut caption_by_table: std::collections::HashMap<i64, i64> =
+        std::collections::HashMap::new();
+    for r in &doc.relations {
+        if r.relation_type == "caption_of" {
+            caption_by_table.insert(r.to_node_id, r.from_node_id);
+        }
+    }
+    let node_by_id: std::collections::HashMap<i64, &crate::document_ir::LcirNode> =
+        doc.nodes.iter().map(|n| (n.id, n)).collect();
+
+    let mut tables: Vec<Value> = Vec::new();
+    let mut total = 0usize;
+    let mut chars = 0usize;
+    let mut truncated = false;
+    for n in &doc.nodes {
+        if n.kind != "table" {
+            continue;
+        }
+        total += 1;
+        // セル文字量の概算 = plain_text（セルを " | " 結合したもの）の長さ。予算・件数超過後は
+        // 以降を**すべて**打ち切る（途中の大きい表だけ飛ばすと歯抜けの一覧になり、truncated の
+        // 意味が「先頭から N 個」でなくなるため）。
+        let approx = n.plain_text.as_deref().map_or(0, |t| t.chars().count());
+        if truncated
+            || tables.len() >= max_tables
+            || (!tables.is_empty() && chars + approx > max_chars)
+        {
+            truncated = true;
+            continue;
+        }
+        chars += approx;
+        let payload = n.payload.as_ref();
+        let caption = caption_by_table
+            .get(&n.id)
+            .and_then(|cid| node_by_id.get(cid))
+            .map(|c| {
+                json!({
+                    "node_id": c.id,
+                    "text": c.plain_text,
+                })
+            });
+        let get = |key: &str| payload.and_then(|p| p.get(key)).cloned();
+        tables.push(json!({
+            "node_id": n.id,
+            "caption": caption,
+            "column_spec": get("column_spec"),
+            "n_columns": get("n_columns"),
+            "n_rows": get("n_rows"),
+            "alignments": get("alignments"),
+            "rows": get("rows"),
+        }));
+    }
+
+    // 旧抽出器版（8b 前）の LCIR は table ノード自体を持たない — 「表が無い論文」と
+    // 誤読させないため、count 0 かつ版が古いときは再構築を明示的に案内する。
+    let outdated = doc.source.extractor_version != crate::document_ir::schema::TEX_EXTRACTOR_VERSION;
+    let note = if total == 0 && outdated {
+        format!(
+            "no table nodes, but this LCIR was built by lumencite-tex {} (tables need {}). \
+             Rebuild outdated LCIR in the app (Settings → Data) and retry.",
+            doc.source.extractor_version,
+            crate::document_ir::schema::TEX_EXTRACTOR_VERSION
+        )
+    } else {
+        "tables come from tabular/tabular*/tabularx in the TeX source (origin tex_source); \
+         longtable/tabu and nested layouts are intentionally not structured, so zero/fewer \
+         tables does not mean the paper has none. Cell text keeps LaTeX verbatim. rule_above \
+         records a full-width rule above the row; header rows are not inferred."
+            .to_string()
+    };
+    Ok(serde_json::to_string(&json!({
+        "entry_id": entry_id,
+        "attachment_id": attachment_id,
+        "has_lcir": true,
+        "source": short_source_name(&doc.source.extractor_name),
+        "extractor_version": doc.source.extractor_version,
+        "available_sources": sources_json(&versions),
+        "count": total,
+        "truncated": truncated,
+        "tables": tables,
+        "note": note,
     }))
     .unwrap_or_default())
 }
@@ -2180,6 +2337,7 @@ mod tests {
             "get_node_relations",
             "get_symbol_definitions",
             "get_figures",
+            "get_tables",
         ] {
             assert!(names.contains(&expected), "missing read tool: {expected}");
         }
@@ -2817,6 +2975,394 @@ mod tests {
 
         let j = tool_json(&call_tool(&pool, "get_figures", json!({ "entry_id": entry.id })).await);
         assert_eq!(j["has_lcir"], false);
+    }
+
+    /// Phase 8b: get_tables が table ノードをセル構造・caption（caption_of 辺から）つきで返し、
+    /// latex_source は返さないこと。blocks 経由では寸法（n_rows/n_columns）が付くこと。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_tables_returns_structured_rows_with_caption(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Table paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/s.gz", entry.id),
+            "s.gz",
+            "application/gzip",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-tab",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/gzip",
+                extractor_name: schema::TEX_EXTRACTOR_NAME,
+                extractor_version: schema::TEX_EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("tex_source"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let caption = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::TableCaption.as_str(),
+                ordinal: 0,
+                plain_text: Some("Particle masses."),
+                language: None,
+                confidence: Some(0.95),
+                origin: Some("tex_source"),
+                payload_json: Some(r#"{"labels":["tab:m"]}"#),
+            },
+        )
+        .await
+        .unwrap();
+        let payload = serde_json::json!({
+            "column_spec": "lc",
+            "n_columns": 2,
+            "n_rows": 2,
+            "alignments": ["l", "c"],
+            "rows": [
+                {"cells": [{"text": "Particle"}, {"text": "Mass"}]},
+                {"cells": [{"text": "e"}, {"text": "$0.511$"}], "rule_above": true},
+            ],
+            "latex_source": "\\begin{tabular}{lc}...\\end{tabular}",
+        })
+        .to_string();
+        let table = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::Table.as_str(),
+                ordinal: 1,
+                plain_text: Some("Particle | Mass\ne | $0.511$"),
+                language: None,
+                confidence: Some(0.9),
+                origin: Some("tex_source"),
+                payload_json: Some(&payload),
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::node_relations::insert_relation(
+            &pool,
+            &crate::db::node_relations::NewNodeRelation {
+                document_version_id: vid,
+                from_node_id: caption,
+                relation_type: "caption_of",
+                to_node_id: table,
+                confidence: Some(0.95),
+                origin: Some("tex_source"),
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let j = tool_json(&call_tool(&pool, "get_tables", json!({ "entry_id": entry.id })).await);
+        assert_eq!(j["has_lcir"], true);
+        assert_eq!(j["source"], "tex");
+        assert_eq!(j["count"], 1);
+        assert_eq!(j["truncated"], false);
+        let t = &j["tables"][0];
+        assert_eq!(t["node_id"], table);
+        assert_eq!(t["caption"]["node_id"], caption);
+        assert_eq!(t["caption"]["text"], "Particle masses.");
+        assert_eq!(t["column_spec"], "lc");
+        assert_eq!(t["n_columns"], 2);
+        assert_eq!(t["n_rows"], 2);
+        assert_eq!(t["alignments"], json!(["l", "c"]));
+        assert_eq!(t["rows"][0]["cells"][0]["text"], "Particle");
+        assert_eq!(t["rows"][1]["cells"][1]["text"], "$0.511$");
+        assert_eq!(t["rows"][1]["rule_above"], true);
+        // 原文スニペットは返さない（rows が構造を持つ・二重送出の抑制）。
+        assert!(t.get("latex_source").is_none());
+
+        // blocks 経由では寸法つきの可読テキストとして流れる（セル構造は get_tables へ誘導）。
+        let blocks = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_blocks",
+                json!({ "entry_id": entry.id, "kinds": ["table"] }),
+            )
+            .await,
+        );
+        assert_eq!(blocks["returned"], 1);
+        assert_eq!(blocks["blocks"][0]["n_columns"], 2);
+        assert_eq!(blocks["blocks"][0]["n_rows"], 2);
+        assert_eq!(blocks["blocks"][0]["column_spec"], "lc");
+        assert_eq!(blocks["blocks"][0]["text"], "Particle | Mass\ne | $0.511$");
+    }
+
+    /// Phase 8b: TeX 版が無い（PDF のみ）エントリでは get_tables は has_lcir:false を返すこと。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_tables_requires_tex_version(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Pdf only".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/p.pdf", entry.id),
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-pdf",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: schema::EXTRACTOR_NAME,
+                extractor_version: schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let j = tool_json(&call_tool(&pool, "get_tables", json!({ "entry_id": entry.id })).await);
+        assert_eq!(j["has_lcir"], false);
+        assert!(j["message"].as_str().unwrap().contains("TeX"));
+    }
+
+    /// Phase 8b (wip 修正): 予算打ち切りは**連続**であること（途中の大表だけ飛ばして後続の小表を
+    /// 拾う歯抜けを作らない）。小・大・小の 3 表で 2 番目に予算超過したら 3 番目も返さない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_tables_truncation_is_contiguous(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Many tables".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/s.gz", entry.id),
+            "s.gz",
+            "application/gzip",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-many",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/gzip",
+                extractor_name: schema::TEX_EXTRACTOR_NAME,
+                extractor_version: schema::TEX_EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("tex_source"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let big = "x".repeat(4000);
+        let payload = r#"{"n_columns":1,"n_rows":1,"rows":[]}"#;
+        let plains = ["a | b", big.as_str(), "c | d"];
+        let mut ids = Vec::new();
+        for (i, pt) in plains.iter().enumerate() {
+            let id = crate::db::document_nodes::insert_node(
+                &pool,
+                &crate::db::document_nodes::NewDocumentNode {
+                    document_version_id: vid,
+                    parent_id: Some(root),
+                    node_kind: NodeKind::Table.as_str(),
+                    ordinal: (i + 1) as i64,
+                    plain_text: Some(pt),
+                    language: None,
+                    confidence: Some(0.9),
+                    origin: Some("tex_source"),
+                    payload_json: Some(payload),
+                },
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+
+        let j = tool_json(
+            &call_tool(
+                &pool,
+                "get_tables",
+                json!({ "entry_id": entry.id, "max_chars": 1000 }),
+            )
+            .await,
+        );
+        assert_eq!(j["count"], 3, "総数は 3");
+        assert_eq!(j["truncated"], true);
+        let tables = j["tables"].as_array().unwrap();
+        assert_eq!(tables.len(), 1, "打ち切りは連続 — 先頭の小表 1 個のみ");
+        assert_eq!(tables[0]["node_id"], ids[0]);
+    }
+
+    /// Phase 8b (wip 修正): 8b 前の LCIR は table ノードを持たない。count 0 かつ抽出器版が古いとき
+    /// は「表が無い論文」と誤読させず、再構築を案内する note を返す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_tables_notes_outdated_extractor_when_empty(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Old lcir".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            &pool,
+            entry.id,
+            &format!("attachments/{}/s.gz", entry.id),
+            "s.gz",
+            "application/gzip",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-old",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/gzip",
+                extractor_name: schema::TEX_EXTRACTOR_NAME,
+                extractor_version: "0.4.0", // 8b 前の版（table ノード無し）
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("tex_source"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let j = tool_json(&call_tool(&pool, "get_tables", json!({ "entry_id": entry.id })).await);
+        assert_eq!(j["has_lcir"], true);
+        assert_eq!(j["count"], 0);
+        assert_eq!(j["extractor_version"], "0.4.0");
+        let note = j["note"].as_str().unwrap();
+        assert!(note.contains("Rebuild"), "{note}");
+        assert!(note.contains("0.4.0"), "{note}");
     }
 
     /// Phase 6b: get_symbol_definitions が TeX 版の記号定義を defined_at/scope/occurrences つきで返し、

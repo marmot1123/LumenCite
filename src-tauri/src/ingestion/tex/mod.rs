@@ -19,6 +19,7 @@
 //! - 任意マクロ展開（preamble の自明な `\be`→`\begin{equation}` 型エイリアスのみ対応）。
 
 pub mod source;
+pub mod tabular;
 
 use crate::document_ir::NodeKind;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,10 +41,12 @@ const VERBATIM_ENVS: &[&str] = &[
     "verbatim", "verbatim*", "lstlisting", "Verbatim", "BVerbatim", "LVerbatim", "minted",
     "alltt",
 ];
-/// 中身を丸ごと捨てる環境（機械ノイズになるだけのもの）。
-const DROP_ENVS: &[&str] = &[
-    "tikzpicture", "pgfpicture", "picture", "tabular", "tabular*", "tabularx", "tabu",
-];
+/// 中身を丸ごと捨てる環境（機械ノイズになるだけのもの）。`tabu` は deprecated パッケージ・
+/// 独自 spec のため 8b でも捨てたまま（誤検出より欠損）。
+const DROP_ENVS: &[&str] = &["tikzpicture", "pgfpicture", "picture", "tabu"];
+/// セル構造化を試みる表環境（Phase 8b）。パースできなければ従来どおり本体破棄に degrade。
+/// `longtable` は独自プロトコル（`\endhead` 等）のため対象外（TABLE_ENVS で caption のみ）。
+const TABULAR_ENVS: &[&str] = &["tabular", "tabular*", "tabularx"];
 /// `\caption` だけ取り出して残りは捨てる環境（図・表）。
 const FIGURE_ENVS: &[&str] = &["figure", "figure*", "wrapfigure", "sidewaysfigure"];
 const TABLE_ENVS: &[&str] = &["table", "table*", "sidewaystable", "longtable"];
@@ -75,6 +78,10 @@ pub struct TexBlock {
     pub cite_key: Option<String>,
     /// 定理系のみ: `\begin{theorem}[note]` の付記名（Phase 5）。
     pub note: Option<String>,
+    /// table のみ: セル構造（Phase 8b）。
+    pub table: Option<tabular::TexTable>,
+    /// 同一 figure/table 環境由来のブロック同士を結ぶグループ id（Phase 8b・caption_of 用）。
+    pub env_group: Option<u32>,
     pub confidence: f64,
 }
 
@@ -212,6 +219,31 @@ fn skip_optional_inline(s: &str, i: usize) -> usize {
         return i;
     }
     skip_optional(s, i)
+}
+
+/// 任意文字列内で `from` から対応する `\end{env}` を探す（同名入れ子対応・`find_env_end` の実体。
+/// Phase 8b で float content 内の部分文字列にも使うため自由関数化）。
+fn find_env_end_in(s: &str, from: usize, env: &str) -> Option<(usize, usize)> {
+    let begin_marker = format!("\\begin{{{env}}}");
+    let end_marker = format!("\\end{{{env}}}");
+    let mut depth = 1i64;
+    let mut i = from;
+    loop {
+        let next_end = find_unescaped(s, i, &end_marker)?;
+        let next_begin = find_unescaped(s, i, &begin_marker);
+        if let Some(nb) = next_begin {
+            if nb < next_end {
+                depth += 1;
+                i = nb + begin_marker.len();
+                continue;
+            }
+        }
+        depth -= 1;
+        if depth == 0 {
+            return Some((next_end, next_end + end_marker.len()));
+        }
+        i = next_end + end_marker.len();
+    }
 }
 
 /// `from` 以降で最初にパリティ条件を満たす `pat`（`\]` や `$$` 等）の開始位置。
@@ -731,6 +763,8 @@ struct Parser<'a> {
     end_aliases: BTreeMap<String, String>,
     /// 定理系環境名 → ノード種別（Phase 5）。標準名 + `\newtheorem` で宣言された独自名。
     theorem_envs: BTreeMap<String, NodeKind>,
+    /// figure/table 環境の通し番号（Phase 8b・`TexBlock.env_group` の払い出し）。
+    env_group_counter: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -748,6 +782,7 @@ impl<'a> Parser<'a> {
             begin_aliases: BTreeMap::new(),
             end_aliases: BTreeMap::new(),
             theorem_envs: default_theorem_envs(),
+            env_group_counter: 0,
         }
     }
 
@@ -798,6 +833,8 @@ impl<'a> Parser<'a> {
                     heading_level: None,
                     cite_key: None,
                     note: None,
+                    table: None,
+                    env_group: None,
                     confidence: 0.95,
                 });
             }
@@ -943,6 +980,8 @@ impl<'a> Parser<'a> {
             heading_level: None,
             cite_key: None,
             note: None,
+            table: None,
+            env_group: None,
             confidence: 0.9,
         });
     }
@@ -964,6 +1003,8 @@ impl<'a> Parser<'a> {
             heading_level: None,
             cite_key: None,
             note: None,
+            table: None,
+            env_group: None,
             confidence: 0.9,
         });
     }
@@ -1158,6 +1199,8 @@ impl<'a> Parser<'a> {
                         heading_level: None,
                         cite_key: None,
                         note: None,
+                        table: None,
+                        env_group: None,
                         confidence: 0.95,
                     });
                     self.i = end;
@@ -1447,6 +1490,8 @@ impl<'a> Parser<'a> {
             heading_level: Some(level),
             cite_key: None,
             note: None,
+            table: None,
+            env_group: None,
             confidence: 0.95,
         });
     }
@@ -1493,6 +1538,8 @@ impl<'a> Parser<'a> {
                     heading_level: None,
                     cite_key: None,
                     note: None,
+                    table: None,
+                    env_group: None,
                     confidence: 0.95,
                 });
                 self.i = after_end;
@@ -1504,8 +1551,24 @@ impl<'a> Parser<'a> {
             let is_table = TABLE_ENVS.contains(&env);
             if let Some((content_end, after_end)) = self.find_env_end(self.i, env) {
                 let content = &s[self.i..content_end];
+                // Phase 8b: table float 内の tabular をセル構造化する（figure 内はレイアウト用途が
+                // 多く対象外・longtable は独自プロトコルで caption のみ）。caption と同一環境由来
+                // であることを env_group で結び、caption_of 辺（ingestion 側）にする。
+                let table = if is_table && env != "longtable" {
+                    self.structured_table_in_float(content)
+                } else {
+                    None
+                };
+                let group = if table.is_some() {
+                    self.env_group_counter += 1;
+                    Some(self.env_group_counter)
+                } else {
+                    None
+                };
+                let mut caption_emitted = false;
                 if let Some(pos) = find_control_word(content, 0, "caption") {
                     if let Some((cap, _)) = read_command_arg(content, pos) {
+                        caption_emitted = true;
                         self.push_block(TexBlock {
                             kind: if is_table {
                                 NodeKind::TableCaption
@@ -1520,9 +1583,35 @@ impl<'a> Parser<'a> {
                             heading_level: None,
                             cite_key: None,
                             note: None,
+                            table: None,
+                            env_group: group,
                             confidence: 0.95,
                         });
                     }
+                }
+                if let Some(table) = table {
+                    // labels は caption 側に付くのが既存動作（graph 6a の refers_to_table が
+                    // TableCaption 照合で成立している）。caption が無い環境でだけ table 側へ。
+                    let labels = if caption_emitted {
+                        Vec::new()
+                    } else {
+                        collect_labels(content)
+                    };
+                    let confidence = if table.spec_verified() { 0.9 } else { 0.8 };
+                    self.push_block(TexBlock {
+                        kind: NodeKind::Table,
+                        text: tabular::table_plain_text(&table),
+                        latex: None,
+                        equation_label: None,
+                        labels,
+                        section_number: None,
+                        heading_level: None,
+                        cite_key: None,
+                        note: None,
+                        table: Some(table),
+                        env_group: group,
+                        confidence,
+                    });
                 }
                 self.i = after_end;
             }
@@ -1549,6 +1638,8 @@ impl<'a> Parser<'a> {
                         heading_level: None,
                         cite_key: None,
                         note: None,
+                        table: None,
+                        env_group: None,
                         confidence: 0.9,
                     });
                 }
@@ -1573,6 +1664,8 @@ impl<'a> Parser<'a> {
                         heading_level: None,
                         cite_key: None,
                         note: None,
+                        table: None,
+                        env_group: None,
                         confidence: 0.95,
                     });
                     self.i = self.i + rel + end_marker.len();
@@ -1604,6 +1697,8 @@ impl<'a> Parser<'a> {
                     heading_level: None,
                     cite_key: None,
                     note: None,
+                    table: None,
+                    env_group: None,
                     confidence: 0.95,
                 });
                 for (key, text) in split_bibitems(content) {
@@ -1617,10 +1712,47 @@ impl<'a> Parser<'a> {
                         heading_level: None,
                         cite_key: Some(key),
                         note: None,
+                        table: None,
+                        env_group: None,
                         confidence: 0.9,
                     });
                 }
                 self.i = after_end;
+            }
+            return;
+        }
+        // Phase 8b: 裸の（float 外の）tabular 系はセル構造化を試み、失敗したら従来どおり
+        // 本体破棄に degrade する（誤検出より欠損）。caption は無いので `\label` は table 側へ。
+        if TABULAR_ENVS.contains(&env) {
+            self.flush_paragraph();
+            match self.find_env_end(self.i, env) {
+                Some((content_end, after_end)) => {
+                    let inner = &s[self.i..content_end];
+                    let snippet = &s[marker_start..after_end];
+                    // パース失敗は warning 済み・従来どおり drop に degrade。
+                    if let Some(table) = self.parse_tabular_snippet(env, inner, snippet) {
+                        let confidence = if table.spec_verified() { 0.9 } else { 0.8 };
+                        self.push_block(TexBlock {
+                            kind: NodeKind::Table,
+                            text: tabular::table_plain_text(&table),
+                            latex: None,
+                            equation_label: None,
+                            labels: collect_labels(inner),
+                            section_number: None,
+                            heading_level: None,
+                            cite_key: None,
+                            note: None,
+                            table: Some(table),
+                            env_group: None,
+                            confidence,
+                        });
+                    }
+                    self.i = after_end;
+                }
+                None => {
+                    self.warnings.push(format!("unterminated environment '{env}'"));
+                    self.i = s.len();
+                }
             }
             return;
         }
@@ -1675,6 +1807,8 @@ impl<'a> Parser<'a> {
                         heading_level: None,
                         cite_key: None,
                         note,
+                        table: None,
+                        env_group: None,
                         confidence: 0.95,
                     });
                     self.i = after_end;
@@ -1699,26 +1833,79 @@ impl<'a> Parser<'a> {
     /// 返り値は (中身の終端, `\end{env}` の直後)。既知の限界: `\end {env}` のような
     /// 空白入りの終端は見つけられず unterminated 警告になる（誤対応より欠損を選ぶ）。
     fn find_env_end(&self, from: usize, env: &str) -> Option<(usize, usize)> {
-        let s = self.s;
-        let begin_marker = format!("\\begin{{{env}}}");
-        let end_marker = format!("\\end{{{env}}}");
-        let mut depth = 1i64;
-        let mut i = from;
-        loop {
-            let next_end = find_unescaped(s, i, &end_marker)?;
-            let next_begin = find_unescaped(s, i, &begin_marker);
-            if let Some(nb) = next_begin {
-                if nb < next_end {
-                    depth += 1;
-                    i = nb + begin_marker.len();
-                    continue;
+        find_env_end_in(self.s, from, env)
+    }
+
+    /// Phase 8b: table float の content から先頭の tabular 系環境を探してセル構造化する。
+    /// subtable/subfigure/`\subfloat` 混在（caption ↔ tabular の対応が曖昧になる）と
+    /// 2 個目以降の tabular は構造化しない（warning のみ・誤ペアより欠損）。
+    fn structured_table_in_float(&mut self, content: &str) -> Option<tabular::TexTable> {
+        for marker in ["\\begin{subtable", "\\begin{subfigure", "\\subfloat"] {
+            if find_unescaped(content, 0, marker).is_some() {
+                self.warnings.push(
+                    "table with subfloats; cells not structured (ambiguous caption pairing)"
+                        .to_string(),
+                );
+                return None;
+            }
+        }
+        // verbatim（lstlisting 等）の中に例示された tabular を「この表の構造」と誤確定しない。
+        // 中身を字句解釈しない環境なので、含まれていたら構造化せず caption のみに degrade する。
+        for env in VERBATIM_ENVS {
+            if find_unescaped(content, 0, &format!("\\begin{{{env}}}")).is_some() {
+                self.warnings
+                    .push("table with verbatim content; cells not structured".to_string());
+                return None;
+            }
+        }
+        let (env, pos) = TABULAR_ENVS
+            .iter()
+            .filter_map(|e| {
+                find_unescaped(content, 0, &format!("\\begin{{{e}}}")).map(|p| (*e, p))
+            })
+            .min_by_key(|(_, p)| *p)?;
+        let marker_len = format!("\\begin{{{env}}}").len();
+        let (inner_end, after_end) = find_env_end_in(content, pos + marker_len, env)?;
+        let inner = &content[pos + marker_len..inner_end];
+        let snippet = &content[pos..after_end];
+        let table = self.parse_tabular_snippet(env, inner, snippet);
+        if table.is_some()
+            && TABULAR_ENVS
+                .iter()
+                .any(|e| find_unescaped(content, after_end, &format!("\\begin{{{e}}}")).is_some())
+        {
+            self.warnings
+                .push("multiple tabulars in one table; only the first is structured".to_string());
+        }
+        table
+    }
+
+    /// tabular 系スニペット 1 個のセル構造化。サイズガードとパース失敗は warning + None
+    /// （呼び出し側が従来の破棄に degrade する）。成功時は原文スニペットを
+    /// `latex_source` に載せる（40k 超は構造のみ保持）。
+    fn parse_tabular_snippet(
+        &mut self,
+        env: &str,
+        inner: &str,
+        snippet: &str,
+    ) -> Option<tabular::TexTable> {
+        if snippet.len() > tabular::MAX_TABULAR_SNIPPET_BYTES {
+            self.warnings
+                .push(format!("{env} skipped: snippet exceeds size guard"));
+            return None;
+        }
+        match tabular::parse_tabular(env, inner) {
+            Ok(mut table) => {
+                if snippet.len() <= tabular::MAX_LATEX_SOURCE_BYTES {
+                    table.latex_source = Some(snippet.trim().to_string());
                 }
+                Some(table)
             }
-            depth -= 1;
-            if depth == 0 {
-                return Some((next_end, next_end + end_marker.len()));
+            Err(reason) => {
+                self.warnings
+                    .push(format!("{env} not structured: {reason}"));
+                None
             }
-            i = next_end + end_marker.len();
         }
     }
 
@@ -1786,6 +1973,8 @@ impl<'a> Parser<'a> {
             heading_level: None,
             cite_key: None,
             note: None,
+            table: None,
+            env_group: None,
             confidence: 0.98,
         });
     }
@@ -2327,9 +2516,179 @@ mod tests {
         let tabs = find(&doc, NodeKind::TableCaption);
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].text, "Data table.");
-        // tikz/tabular の中身が段落に漏れない。
+        // tikz の中身が段落に漏れない。tabular は Phase 8b で table ノードとして構造化され、
+        // 生の "a & b" はどのブロックにも残らない（セルは text "a | b" に正規化）。
         assert!(!doc.blocks.iter().any(|b| b.text.contains("\\draw")));
         assert!(!doc.blocks.iter().any(|b| b.text.contains("a & b")));
+        let tables = find(&doc, NodeKind::Table);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].text, "a | b\nc | d");
+    }
+
+    // ── Phase 8b: tabular セル構造化 ──
+
+    #[test]
+    fn table_env_tabular_becomes_structured_table_with_caption_group() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{table}[htbp]\n\
+             \\caption{Results.}\\label{tab:res}\n\
+             \\begin{tabular}{lc}\\toprule Name & $\\alpha$ \\\\ \\midrule a & 1 \\\\ \\bottomrule\\end{tabular}\n\
+             \\end{table}\n\
+             \\end{document}",
+        )]);
+        let caps = find(&doc, NodeKind::TableCaption);
+        let tables = find(&doc, NodeKind::Table);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(tables.len(), 1);
+        // caption と table は同一環境由来 → 同じ env_group（caption_of の材料）。
+        assert!(caps[0].env_group.is_some());
+        assert_eq!(caps[0].env_group, tables[0].env_group);
+        // labels は caption 側（graph 6a の refers_to_table 照合を不変に保つ）。
+        assert_eq!(caps[0].labels, vec!["tab:res"]);
+        assert!(tables[0].labels.is_empty());
+        let t = tables[0].table.as_ref().expect("cell structure");
+        assert_eq!(t.n_columns, 2);
+        assert!(t.spec_verified());
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0].cells[1].text, "$\\alpha$");
+        assert!(t.rows[1].rule_above);
+        assert!(t.latex_source.as_deref().unwrap().starts_with("\\begin{tabular}"));
+        assert!((tables[0].confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bare_tabular_is_rescued_with_labels_on_table() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{center}\\begin{tabular}{cc}\\label{tab:bare} a & b \\\\ c & d \\end{tabular}\\end{center}\n\
+             \\end{document}",
+        )]);
+        let tables = find(&doc, NodeKind::Table);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].labels, vec!["tab:bare"]);
+        assert!(tables[0].env_group.is_none());
+        assert_eq!(tables[0].text, "a | b\nc | d");
+    }
+
+    #[test]
+    fn broken_bare_tabular_degrades_to_drop_with_warning() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             Before.\n\n\
+             \\begin{tabular}{cc} a & b & c \\end{tabular}\n\
+             After.\n\
+             \\end{document}",
+        )]);
+        assert!(find(&doc, NodeKind::Table).is_empty());
+        assert!(doc.warnings.iter().any(|w| w.contains("not structured")));
+        // 中身は段落に漏れない（従来の drop と同じ）。
+        assert!(!doc.blocks.iter().any(|b| b.text.contains("a & b")));
+    }
+
+    #[test]
+    fn figure_env_tabular_is_not_structured() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{figure}\\begin{tabular}{cc} a & b \\end{tabular}\\caption{F.}\\end{figure}\n\
+             \\end{document}",
+        )]);
+        assert!(find(&doc, NodeKind::Table).is_empty());
+        assert_eq!(find(&doc, NodeKind::FigureCaption).len(), 1);
+    }
+
+    #[test]
+    fn longtable_stays_caption_only_even_with_nested_tabular() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{longtable}{ll}\\caption{Long.}\\\\ a & \\begin{tabular}{c} x \\end{tabular} \\\\ b & c \\end{longtable}\n\
+             \\end{document}",
+        )]);
+        // longtable は独自プロトコルのため構造化しない。セル内のネスト tabular を
+        // 「この表の構造」として誤確定しない（批評パネル major の回帰テスト）。
+        assert!(find(&doc, NodeKind::Table).is_empty());
+        assert_eq!(find(&doc, NodeKind::TableCaption).len(), 1);
+    }
+
+    #[test]
+    fn tabu_env_stays_dropped() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{tabu}{X[2,c]X} a & b \\end{tabu}\n\
+             \\end{document}",
+        )]);
+        assert!(find(&doc, NodeKind::Table).is_empty());
+        assert!(!doc.blocks.iter().any(|b| b.text.contains("a & b")));
+    }
+
+    #[test]
+    fn second_tabular_in_table_env_warns_and_is_not_structured() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{table}\\caption{Two.}\n\
+             \\begin{tabular}{c} a \\end{tabular}\\quad\\begin{tabular}{c} b \\end{tabular}\n\
+             \\end{table}\n\
+             \\end{document}",
+        )]);
+        let tables = find(&doc, NodeKind::Table);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].text, "a");
+        assert!(doc.warnings.iter().any(|w| w.contains("only the first")));
+    }
+
+    #[test]
+    fn subfloat_table_is_not_structured() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{table}\\caption{Sub.}\n\
+             \\begin{subtable}{.5\\textwidth}\\begin{tabular}{c} a \\end{tabular}\\end{subtable}\n\
+             \\end{table}\n\
+             \\end{document}",
+        )]);
+        assert!(find(&doc, NodeKind::Table).is_empty());
+        assert!(doc.warnings.iter().any(|w| w.contains("subfloats")));
+        assert_eq!(find(&doc, NodeKind::TableCaption).len(), 1);
+    }
+
+    #[test]
+    fn table_with_verbatim_content_is_not_structured() {
+        // float に lstlisting 等の verbatim があれば、その中の例示 tabular を「この表の構造」
+        // として誤確定しない（構造化せず warning + caption のみ）。
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{table}\\caption{Code.}\n\
+             \\begin{lstlisting}\n\
+             \\begin{tabular}{c} not_a_cell \\end{tabular}\n\
+             \\end{lstlisting}\n\
+             \\end{table}\n\
+             \\end{document}",
+        )]);
+        assert!(find(&doc, NodeKind::Table).is_empty());
+        assert!(doc.warnings.iter().any(|w| w.contains("verbatim")));
+        assert_eq!(find(&doc, NodeKind::TableCaption).len(), 1);
+    }
+
+    #[test]
+    fn table_env_without_caption_still_structures_with_labels_on_table() {
+        let doc = extract(&[(
+            "main.tex",
+            "\\documentclass{article}\\begin{document}\n\
+             \\begin{table}\\label{tab:nocap}\\begin{tabular}{cc} a & b \\end{tabular}\\end{table}\n\
+             \\end{document}",
+        )]);
+        let tables = find(&doc, NodeKind::Table);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].labels, vec!["tab:nocap"]);
+        assert!(find(&doc, NodeKind::TableCaption).is_empty());
     }
 
     #[test]
@@ -2871,6 +3230,40 @@ mod tests {
                     .as_deref()
                     .map(|d| d.chars().take(60).collect::<String>())
             );
+        }
+
+        // Phase 8b: tabular セル構造化の集計（skip 率と warning 種別を実データで目視確認）。
+        let tables: Vec<&TexBlock> =
+            doc.blocks.iter().filter(|b| b.kind == NodeKind::Table).collect();
+        let tabular_warnings: Vec<&String> = doc
+            .warnings
+            .iter()
+            .filter(|w| w.contains("tabular") || w.contains("subfloat"))
+            .collect();
+        eprintln!(
+            "  [phase8b] tables = {} (skip warnings = {})",
+            tables.len(),
+            tabular_warnings.len()
+        );
+        for b in tables.iter().take(6) {
+            let t = b.table.as_ref().unwrap();
+            eprintln!(
+                "    [table] {}x{} spec={:?} verified={} group={:?} conf={} first_row={:?}",
+                t.rows.len(),
+                t.n_columns,
+                t.column_spec,
+                t.spec_verified(),
+                b.env_group,
+                b.confidence,
+                t.rows[0]
+                    .cells
+                    .iter()
+                    .map(|c| c.text.chars().take(24).collect::<String>())
+                    .collect::<Vec<_>>()
+            );
+        }
+        for w in tabular_warnings.iter().take(6) {
+            eprintln!("    [table-skip] {w}");
         }
 
         assert!(doc.blocks.iter().any(|b| b.kind == NodeKind::Section));

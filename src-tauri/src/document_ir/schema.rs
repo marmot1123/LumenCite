@@ -43,7 +43,10 @@ pub const TEX_EXTRACTOR_NAME: &str = "lumencite-tex";
 ///   旧版は `rebuild_outdated_lcir` で張り直せるよう版を上げる。
 /// - `0.4.0`: Phase 6b。定義文（"let $U$ be ...", "$H := ...$"）からインライン数式を記号として抽出し
 ///   `symbols`/`symbol_occurrences` を作る。出力（記号）が増えるので旧版は張り直せるよう版を上げる。
-pub const TEX_EXTRACTOR_VERSION: &str = "0.4.0";
+/// - `0.5.0`: Phase 8b。`tabular`/`tabular*`/`tabularx` をセル構造化して `table` ノード
+///   （payload に rows/alignments/原文スニペット）+ table_caption との `caption_of` 辺を作る。
+///   出力（ノード・辺）が増えるので旧版は `rebuild_outdated_lcir` で張り直せるよう版を上げる。
+pub const TEX_EXTRACTOR_VERSION: &str = "0.5.0";
 
 /// read 面で複数表現からどれを既定採用するかの優先度（大きいほど優先）。
 /// 原資料に近い TeX（生 LaTeX・原文構造）を PDF 抽出（推定構造・表層数式）より優先する。

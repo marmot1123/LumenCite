@@ -746,10 +746,16 @@ async fn build_tex_version(
     };
 
     // TeX には座標が無いので coordinate_space は記録しない。
+    let table_count = doc
+        .blocks
+        .iter()
+        .filter(|b| b.kind == NodeKind::Table)
+        .count();
     let metadata = serde_json::json!({
         "main_file": doc.main_file,
         "source_file_count": doc.source_file_count,
         "block_count": doc.blocks.len(),
+        "table_count": table_count,
     })
     .to_string();
     let warnings_json = if doc.warnings.is_empty() {
@@ -807,6 +813,10 @@ async fn build_tex_version(
     // 参照グラフ / 記号系用に block ノードの軽量ビューを集める（TeX はフラットなので ordinal = 読み順）。
     let mut graph_nodes: Vec<graph::GraphNode> = Vec::new();
     let mut symbol_nodes: Vec<symbols::SymbolNode> = Vec::new();
+    // Phase 8b: 同一 table 環境由来の (table_caption, table) を env_group で結んで caption_of 辺に
+    // する（PDF 8a の幾何ペアリングと違い構造的事実なので高信頼）。BTreeMap で挿入順を決定的に。
+    let mut caption_by_group: std::collections::BTreeMap<u32, i64> = std::collections::BTreeMap::new();
+    let mut table_by_group: std::collections::BTreeMap<u32, i64> = std::collections::BTreeMap::new();
     for (bi, block) in doc.blocks.iter().enumerate() {
         let payload_json = tex_block_payload_json(block);
         let node_id = document_nodes::insert_node(
@@ -843,6 +853,17 @@ async fn build_tex_version(
             plain_text: block.text.clone(),
             latex: block.latex.clone(),
         });
+        if let Some(g) = block.env_group {
+            match block.kind {
+                NodeKind::TableCaption => {
+                    caption_by_group.insert(g, node_id);
+                }
+                NodeKind::Table => {
+                    table_by_group.insert(g, node_id);
+                }
+                _ => {}
+            }
+        }
 
         if block.kind == NodeKind::DisplayMath {
             math_expressions::insert_math(
@@ -860,6 +881,26 @@ async fn build_tex_version(
                     semantic_status: document_ir::MathSemanticStatus::SourceProvided.as_str(),
                     confidence: Some(block.confidence),
                     origin: Some(Origin::TexSource.as_str()),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Phase 8b: caption_of 辺（from=caption → to=table・同一環境由来の構造的事実・原文由来）。
+    for (g, table_node_id) in &table_by_group {
+        if let Some(caption_node_id) = caption_by_group.get(g) {
+            node_relations::insert_relation(
+                &mut *tx,
+                &node_relations::NewNodeRelation {
+                    document_version_id: version_id,
+                    from_node_id: *caption_node_id,
+                    relation_type: document_ir::RelationType::CaptionOf.as_str(),
+                    to_node_id: *table_node_id,
+                    confidence: Some(0.95),
+                    origin: Some(Origin::TexSource.as_str()),
+                    metadata_json: None,
                 },
             )
             .await
@@ -904,6 +945,60 @@ fn tex_block_payload_json(b: &tex::TexBlock) -> Option<String> {
     }
     if let Some(ref note) = b.note {
         map.insert("note".to_string(), serde_json::Value::from(note.clone()));
+    }
+    // Phase 8b: table ノードのセル構造。追加式スキーマ（colspan/rowspan/rule_above/alignments/
+    // latex_source は値があるときだけ出す）。下流（markdown・MCP）は column_spec を再パースせず
+    // alignments を見る。
+    if let Some(ref t) = b.table {
+        map.insert(
+            "column_spec".to_string(),
+            serde_json::Value::from(t.column_spec.clone()),
+        );
+        map.insert("n_columns".to_string(), serde_json::Value::from(t.n_columns));
+        map.insert(
+            "n_rows".to_string(),
+            serde_json::Value::from(t.rows.len() as i64),
+        );
+        if let Some(ref aligns) = t.alignments {
+            map.insert(
+                "alignments".to_string(),
+                serde_json::Value::from(aligns.clone()),
+            );
+        }
+        let rows: Vec<serde_json::Value> = t
+            .rows
+            .iter()
+            .map(|r| {
+                let cells: Vec<serde_json::Value> = r
+                    .cells
+                    .iter()
+                    .map(|c| {
+                        let mut m = serde_json::Map::new();
+                        m.insert("text".to_string(), serde_json::Value::from(c.text.clone()));
+                        if let Some(n) = c.colspan {
+                            m.insert("colspan".to_string(), serde_json::Value::from(n));
+                        }
+                        if let Some(n) = c.rowspan {
+                            m.insert("rowspan".to_string(), serde_json::Value::from(n));
+                        }
+                        serde_json::Value::Object(m)
+                    })
+                    .collect();
+                let mut m = serde_json::Map::new();
+                m.insert("cells".to_string(), serde_json::Value::from(cells));
+                if r.rule_above {
+                    m.insert("rule_above".to_string(), serde_json::Value::from(true));
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        map.insert("rows".to_string(), serde_json::Value::from(rows));
+        if let Some(ref src) = t.latex_source {
+            map.insert(
+                "latex_source".to_string(),
+                serde_json::Value::from(src.clone()),
+            );
+        }
     }
     if map.is_empty() {
         None
@@ -1811,6 +1906,9 @@ mod tests {
                    \\begin{abstract}\nAbout transformers.\n\\end{abstract}\n\
                    \\section{Intro}\nBody text here. Let $E$ be the total energy of the system.\n\
                    \\begin{equation}\\label{eq:e}E=mc^2\\end{equation}\n\
+                   \\begin{table}\\caption{Masses.}\\label{tab:m}\n\
+                   \\begin{tabular}{lc}\\hline Particle & Mass \\\\ \\hline e & 0.511 \\\\ \\hline\\end{tabular}\n\
+                   \\end{table}\n\
                    \\end{document}";
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(tex.as_bytes()).unwrap();
@@ -1850,6 +1948,48 @@ mod tests {
             sym.occurrences.iter().any(|o| o.node_id == math.id),
             "記号 E は display 数式 E=mc^2 に出現する"
         );
+
+        // Phase 8b: tabular がセル構造つき table ノードになり、caption_of 辺で結ばれる。
+        let table = doc
+            .nodes
+            .iter()
+            .find(|n| n.kind == "table")
+            .expect("table node from tabular");
+        assert_eq!(table.origin.as_deref(), Some("tex_source"));
+        assert_eq!(table.plain_text.as_deref(), Some("Particle | Mass\ne | 0.511"));
+        let payload = table.payload.as_ref().expect("table payload");
+        assert_eq!(payload.get("n_columns").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(payload.get("n_rows").and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(
+            payload.get("column_spec").and_then(|v| v.as_str()),
+            Some("lc")
+        );
+        let rows = payload.get("rows").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1]["cells"][1].get("text").and_then(|v| v.as_str()),
+            Some("0.511")
+        );
+        assert_eq!(rows[1].get("rule_above").and_then(|v| v.as_bool()), Some(true));
+        assert!(payload
+            .get("latex_source")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .starts_with("\\begin{tabular}"));
+        let caption = doc
+            .nodes
+            .iter()
+            .find(|n| n.kind == "table_caption")
+            .expect("table caption");
+        let cap_edge = doc
+            .relations
+            .iter()
+            .find(|r| r.relation_type == "caption_of" && r.to_node_id == table.id)
+            .expect("caption_of edge for table");
+        assert_eq!(cap_edge.from_node_id, caption.id);
+        assert_eq!(cap_edge.origin.as_deref(), Some("tex_source"));
+        // labels は caption 側 → \ref{tab:m} は refers_to_table として解決される想定
+        //（この文書には \ref が無いので辺は張られない）。metadata に table_count が載る。
 
         // TeX 版は node-FTS に載らない。
         let fts_rows: i64 =

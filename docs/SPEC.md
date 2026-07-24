@@ -365,7 +365,17 @@ Phase 8（図表機械可読化）の最小スライス。**PDF 版のみ**（`l
 - **ページ crop アセット**: 図領域をページレンダリング（幅 1600px・OCR と同値）から切り出した PNG として `attachments/<entry_id>/.lcir/` 配下に保存し、`assets`/`node_assets`（migration 0019）で参照する。バイナリは FS・DB は相対パス + SHA-256（ADR #3）。
 - **caption 関連付け**: 同一ページの figure caption と幾何ペアリング（相互最近のみ・曖昧なら張らない）して `caption_of` 辺を張り、caption の番号（"Figure 2" → "2"）を figure ノードの `figure_number` に載せる。
 - **読み出し**: MCP `get_figures`（図番号 → 画像パス・caption・本文位置を一問い合わせ）+ `LcirDocument` に `assets` が透過で載る（JSON エクスポート含む）。
-- **やらないこと**: 表のセル構造化（8b・TeX tabular 救出）／XObjectForm 内画像（誤配置 crop 回避を優先）／plot 軸・凡例・alt text（8c・Vision opt-in）／TeX tarball 内画像の取込。
+- **やらないこと**: XObjectForm 内画像（誤配置 crop 回避を優先）／plot 軸・凡例・alt text（8c・Vision opt-in）／TeX tarball 内画像の取込。表のセル構造化は 8b で実装済（次節）。
+
+### LCIR 表セル構造化（Phase 8b・v0.10.0 同梱候補）
+
+Phase 8（図表機械可読化）の表スライス。**TeX 版のみ**（`lumencite-tex` 0.4.0→0.5.0・pdfium 抽出器は不変・migration 不要 — セル構造は `document_nodes.payload_json`）。
+
+- **セル構造化**: table float 内および裸の `tabular`/`tabular*`/`tabularx` を行 × セルの grid にし、`table` ノード（`origin='tex_source'`・confidence 0.9、列仕様が検証できない表は 0.8）を作る。payload に `column_spec`（原文 verbatim）・`n_rows`/`n_columns`・`alignments`（列型レター・検証成功時のみ）・`rows`（セル text は LaTeX 温存・`colspan`/`rowspan`・`rule_above`）・`latex_source`（原文スニペット・40k 以下）。
+- **誤検出より欠損**: パースに確信が持てない表（ネスト環境・列数超過・`longtable`/`tabu`/subfloat 混在・verbatim（`lstlisting` 等）内の例示 tabular など）は構造化せず従来どおり破棄し warning に理由を残す。`\cline` 等の部分罫線は `rule_above` に数えない。ヘッダ行の推定はしない。
+- **caption 関連付け**: 同一 table 環境由来という構造的事実で `caption_of` 辺（caption → table・conf 0.95・origin=tex_source）を張る。`\label` は従来どおり caption 側（caption の無い環境のみ table 側）で、`\ref{tab:..}` は `refers_to_table` として解決される。
+- **読み出し**: MCP `get_tables`（caption・rows・alignments を一問い合わせ・TeX 版固定）＋ `get_document_blocks` に表の寸法（`n_rows`/`n_columns`/`column_spec`）。Markdown エクスポートは GFM パイプテーブルとして描画（セル内 `|` は数式内 `\vert `・数式外 `\|` の二層エスケープで LaTeX の意味を変えない）。
+- **やらないこと**: PDF 側の表認識／`longtable`・`tabu` のセル構造化／multirow の grid 再解釈（下行の空セルは原文どおり）／単位（siunitx `S` 列）・表脚注（`\tnote`）の意味抽出／CSV アセット化。
 
 ### 1エントリ複数 PDF 添付（本文＋補助資料）— Phase 1
 

@@ -380,7 +380,8 @@ fn relation_type_for_target(kind: NodeKind) -> RelationType {
             RelationType::RefersToEquation
         }
         NodeKind::FigureCaption => RelationType::RefersToFigure,
-        NodeKind::TableCaption => RelationType::RefersToTable,
+        // Table = Phase 8b の table ノード（caption なし環境では \label が table 側に付く）。
+        NodeKind::TableCaption | NodeKind::Table => RelationType::RefersToTable,
         k if is_theorem_family(k) => RelationType::RefersToTheorem,
         NodeKind::Section | NodeKind::Subsection => RelationType::RefersToSection,
         _ => RelationType::RefersTo,
@@ -732,6 +733,26 @@ mod tests {
         let edges = resolve_relations(&[sec, fig, para], RefStrategy::Tex);
         assert!(find(&edges, 4, RelationType::RefersToSection, 2).is_some());
         assert!(find(&edges, 4, RelationType::RefersToFigure, 3).is_some());
+    }
+
+    #[test]
+    fn tex_ref_to_table_node_uses_refers_to_table() {
+        // Phase 8b: caption なし環境では \label が table ノード側に付く。
+        let mut tab = node(2, NodeKind::Table, 1, "a | b\nc | d");
+        tab.labels = vec!["tab:bare".to_string()];
+        let para = node(3, NodeKind::Paragraph, 2, "See \\ref{tab:bare}.");
+        let edges = resolve_relations(&[tab, para], RefStrategy::Tex);
+        assert!(find(&edges, 3, RelationType::RefersToTable, 2).is_some());
+    }
+
+    #[test]
+    fn tex_cite_inside_table_cell_creates_edge_from_table_node() {
+        // Phase 8b: セル内の \cite は table ノードを出典とする cites 辺になる（原文由来）。
+        let mut bib = node(2, NodeKind::BibliographyEntry, 1, "A. Author, Paper.");
+        bib.cite_key = Some("author2020".to_string());
+        let tab = node(3, NodeKind::Table, 2, "method | \\cite{author2020}");
+        let edges = resolve_relations(&[bib, tab], RefStrategy::Tex);
+        assert!(find(&edges, 3, RelationType::Cites, 2).is_some());
     }
 
     #[test]
