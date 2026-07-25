@@ -377,6 +377,17 @@ Phase 8（図表機械可読化）の表スライス。**TeX 版のみ**（`lume
 - **読み出し**: MCP `get_tables`（caption・rows・alignments を一問い合わせ・TeX 版固定）＋ `get_document_blocks` に表の寸法（`n_rows`/`n_columns`/`column_spec`）。Markdown エクスポートは GFM パイプテーブルとして描画（セル内 `|` は数式内 `\vert `・数式外 `\|` の二層エスケープで LaTeX の意味を変えない）。
 - **やらないこと**: PDF 側の表認識／`longtable`・`tabu` のセル構造化／multirow の grid 再解釈（下行の空セルは原文どおり）／単位（siunitx `S` 列）・表脚注（`\tnote`）の意味抽出／CSV アセット化。
 
+### LCIR 図の代替テキスト（Phase 8c・v0.10.0 同梱候補）
+
+Phase 8（図表機械可読化）の alt text スライス。8a が作った `figure` ノードのページ crop PNG を LLM Vision に説明させ、`node_alt_texts`（migration 0020）へ保存する。**PDF 版のみ**（TeX 版に `figure` ノードは無い）。
+
+- **AI 推定であることを型で示す**: alt text は原資料に無い**生成物**なので `origin='llm_inference'` + `confidence` + `model`（使ったモデル名）を必ず持たせる。原文 caption は**上書きしない**（別テーブル・別 provenance で併存）。全文検索（`fulltext` / `document_nodes_fts`）には**書かない** — 生成文が原文と混ざって検索結果の由来が曖昧になるため。
+- **build の外・opt-in の後追いバッチ**: 生成は `generate_vision_alt_texts`（設定 → データの明示ボタン）だけで走る。**build に混ぜない**（Vision は非同期・課金・非決定的なので、混ぜると content_key の冪等性と「同一 PDF → 同一 version」が壊れる）。1 図ずつ best-effort（1 図の失敗で全体を捨てない）。ただし**連続 3 件失敗したら打ち切る** — キー不正・レート制限・画像非対応モデルのような系統的失敗で残り全図を叩き続けないため（未処理の図は対象のまま残り次回に拾える）。
+- **独立した同意面**: フラグ `lcir.vision_alt_text.enabled`（既定 **off**）は `lcir.enabled` とは別に持つ。**画像 1 枚ごとに外部 API へ送信して課金される**操作を、LCIR の実験フラグ ON だけで暗黙に許可しないため（`clipper.enabled` と同じ考え方）。両方 ON のときだけバッチが動く。UI（設定 → データ）は同意チェックボックスの下に**押す前の生成対象件数**を表示する（課金の規模を知らせてから同意させる）。プロバイダ・モデル・API キーは OCR の設定を共用する（Vision 用の設定面を増やさない）。
+- **版を上げても再課金しない**: 抽出器版を上げて再構築（`rebuild_outdated_lcir`）すると `figure` ノードの row id は変わるが、crop PNG の SHA-256 が同一なら**同じ絵**なので、過去の全版から指紋一致の alt text を新版へ引き継ぐ（`carried_from_version_id` に由来を記録）。引き継ぎ後、旧版の `llm_inference` 行は刈る（crop PNG 自体も 8a の GC で trash 済）。手編集（`user_edited`）は引き継ぎ・再生成の対象外で絶対に触らない。
+- **読み出し**: MCP `get_figures` に `alt_text {text, origin, confidence, model}` が付く（`LcirNode.alt_text` として `get_lcir_document` / LCIR JSON エクスポートにも透過）。
+- **やらないこと**: SVG/ベクター図の構造化・plot の軸/凡例抽出・diagram のノード/辺認識・PDF 表画像の認識・ページ全体の OCR 全文化（8d 以降 or 非目標）。手編集 UI も初回は作らない（`origin` 列は最初から持つ）。Markdown エクスポートへの alt text 出力も初回は据置（MCP のみ）。
+
 ### 1エントリ複数 PDF 添付（本文＋補助資料）— Phase 1
 
 同じ DOI の論文に **本文 PDF** と **supplemental material（SI）等の補助 PDF** が別ファイルで存在するとき、両方を同じエントリに添付して閲覧・全文検索できるようにする。「同一 DOI ＝同一の著作」という前提に立ち、補助 PDF は**別エントリ（別文献）ではなく、本文論文に紐づく添付ファイルの一つ**として扱う（Zotero が添付を item の子として複数ぶら下げるのと同型のモデル）。

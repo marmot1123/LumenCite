@@ -4,6 +4,7 @@
 //! `document_nodes` / `source_fragments`）で、`LcirDocument` はその派生ビュー。
 //! ここは pdfium にも sqlx にも依存しないので CI で完全にテストできる。
 
+pub mod alt_text;
 pub mod asset;
 pub mod math;
 pub mod node;
@@ -13,6 +14,7 @@ pub mod source;
 pub mod symbol;
 pub mod validation;
 
+pub use alt_text::LcirAltText;
 pub use asset::LcirAsset;
 pub use math::{LcirMath, MathDisplayMode, MathSemanticStatus};
 pub use node::{
@@ -136,6 +138,7 @@ mod tests {
                     math: None,
                     source_fragments: vec![],
                     assets: vec![],
+                    alt_text: None,
                 },
                 LcirNode {
                     id: 2,
@@ -153,6 +156,7 @@ mod tests {
                         fragment_type: Some("page".to_string()),
                     }],
                     assets: vec![],
+                    alt_text: None,
                 },
             ],
             relations: vec![],
@@ -201,6 +205,7 @@ mod tests {
                     math: None,
                     source_fragments: vec![],
                     assets: vec![],
+                    alt_text: None,
                 },
                 LcirNode {
                     id: 2,
@@ -214,6 +219,7 @@ mod tests {
                     math: None,
                     source_fragments: vec![page_frag("page", BBox::new(0.0, 0.0, 595.0, 842.0))],
                     assets: vec![],
+                    alt_text: None,
                 },
                 LcirNode {
                     id: 3,
@@ -227,6 +233,7 @@ mod tests {
                     math: None,
                     source_fragments: vec![page_frag("block", heading_bbox)],
                     assets: vec![],
+                    alt_text: None,
                 },
                 LcirNode {
                     id: 4,
@@ -240,6 +247,7 @@ mod tests {
                     math: None,
                     source_fragments: vec![page_frag("line", heading_bbox)],
                     assets: vec![],
+                    alt_text: None,
                 },
                 LcirNode {
                     id: 5,
@@ -253,6 +261,7 @@ mod tests {
                     math: None,
                     source_fragments: vec![page_frag("block", para_bbox)],
                     assets: vec![],
+                    alt_text: None,
                 },
                 LcirNode {
                     id: 6,
@@ -266,6 +275,7 @@ mod tests {
                     math: None,
                     source_fragments: vec![page_frag("line", para_bbox)],
                     assets: vec![],
+                    alt_text: None,
                 },
             ],
             relations: vec![],

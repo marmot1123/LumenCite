@@ -582,6 +582,7 @@ mod tests {
             math: None,
             source_fragments: Vec::new(),
             assets: Vec::new(),
+            alt_text: None,
         }
     }
 

@@ -246,6 +246,10 @@ pub struct LcirNode {
     /// `relative_path` はメタデータ参照でファイルの存在は保証しない（欠損許容）。無ければ省略。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assets: Vec<super::asset::LcirAsset>,
+    /// 代替テキスト（Phase 8c・figure ノードのみ）。**LLM Vision の生成物**（または手編集）で、
+    /// 原文 caption とは別物。正本は `node_alt_texts`。バッチ未実行なら省略（欠損許容）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_text: Option<super::alt_text::LcirAltText>,
 }
 
 /// LCIR ドキュメント（派生ビュー）。正本は SQLite の document_versions/nodes/fragments。
@@ -370,6 +374,7 @@ mod tests {
                     fragment_type: Some("page".to_string()),
                 }],
                 assets: vec![],
+                alt_text: None,
             }],
             relations: vec![],
             symbols: vec![],

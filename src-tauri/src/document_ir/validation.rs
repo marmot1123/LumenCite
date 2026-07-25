@@ -85,6 +85,7 @@ mod tests {
             math: None,
             source_fragments: vec![],
             assets: vec![],
+            alt_text: None,
         }
     }
 

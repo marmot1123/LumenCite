@@ -373,6 +373,17 @@ async fn insert_pdf_version_tx(
         ExtractionStatus::CompletedWithWarnings
     };
 
+    // Phase 8c: 版跨ぎの alt text 引き継ぎ材料。crop PNG の SHA-256（= バイト同一画像の指紋）を
+    // キーに、同一添付の過去の全版から生成済み alt text を引く。抽出器版を上げるたびに Vision を
+    // 再課金しないための carry（tx の外で読むだけ・アセットが無い抽出では引かない）。
+    let carry_alt_texts = if asset_total > 0 {
+        crate::db::node_alt_texts::alt_texts_by_asset_sha256(pool, attachment_id)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        HashMap::new()
+    };
+
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
     let version_id = document_versions::insert_version(
@@ -689,6 +700,30 @@ async fn insert_pdf_version_tx(
                     )
                     .await
                     .map_err(|e| e.to_string())?;
+                    // Phase 8c: 同じ crop（バイト同一画像）を説明済みなら、その alt text を
+                    // 新版のこのノードへ引き継ぐ（Vision の再課金を避ける）。由来版を
+                    // carried_from_version_id に残し、生成物であることは origin/model が示す。
+                    if let Some(prev) = carry_alt_texts.get(&file.sha256) {
+                        crate::db::node_alt_texts::insert_alt_text(
+                            &mut *tx,
+                            &crate::db::node_alt_texts::NewAltText {
+                                node_id: figure_node_id,
+                                document_version_id: version_id,
+                                source_asset_sha256: &file.sha256,
+                                text: &prev.text,
+                                origin: &prev.origin,
+                                confidence: prev.confidence,
+                                model: prev.model.as_deref(),
+                                // 既に引き継がれた行を再度引き継ぐときも「最初の生成版」を指す。
+                                carried_from_version_id: Some(
+                                    prev.carried_from_version_id
+                                        .unwrap_or(prev.document_version_id),
+                                ),
+                            },
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    }
                 }
                 if let Some(ci) = paired {
                     node_relations::insert_relation(
@@ -712,6 +747,22 @@ async fn insert_pdf_version_tx(
 
     // 参照グラフ（本文→数式/定理、proof→theorem）を解決して張る（Phase 6a・PDF は番号一致）。
     insert_relations_for_version(&mut tx, version_id, &graph_nodes, graph::RefStrategy::Pdf).await?;
+
+    // Phase 8c: carry と同じ tx で旧版の生成 alt text を刈る（crop PNG は commit 後の GC で
+    // trash されるので、行だけ残しても参照されず肥大化するだけ）。**新版にアセットが 1 つも
+    // 無いときは刈らない** — 抽出の一時的な不調で 0 件になったときに過去の生成物を永久に
+    // 失わないため。手編集（user_edited）はアクセサ側で対象外。
+    if asset_total > 0 {
+        let pruned =
+            crate::db::node_alt_texts::prune_carried_alt_texts(&mut *tx, attachment_id, version_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        if pruned > 0 {
+            eprintln!(
+                "LCIR: pruned {pruned} superseded alt text row(s) for attachment {attachment_id}"
+            );
+        }
+    }
 
     // 新版採用: 同一添付の旧 completed を superseded に。
     document_versions::mark_superseded_for_attachment(&mut *tx, attachment_id, version_id)
@@ -1381,12 +1432,37 @@ pub async fn load_lcir_document(
         }
     }
 
+    // 代替テキスト（Phase 8c）をノードに紐づける。1 ノードに生成 1 件 + 手編集 1 件までなので、
+    // **手編集を優先**して 1 つだけ載せる（AI 生成が人の記述を隠さない）。
+    let mut alt_text_by_node: HashMap<i64, crate::models::NodeAltText> = HashMap::new();
+    for a in crate::db::node_alt_texts::alt_texts_for_version(pool, version.id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        match alt_text_by_node.get(&a.node_id) {
+            Some(prev) if prev.origin == document_ir::Origin::UserEdited.as_str() => {}
+            _ => {
+                alt_text_by_node.insert(a.node_id, a);
+            }
+        }
+    }
+
     let lcir_nodes = nodes
         .into_iter()
         .map(|n| document_ir::LcirNode {
             source_fragments: by_node.remove(&n.id).unwrap_or_default(),
             math: math_by_node.remove(&n.id),
             assets: assets_by_node.remove(&n.id).unwrap_or_default(),
+            alt_text: alt_text_by_node
+                .remove(&n.id)
+                .map(|a| document_ir::LcirAltText {
+                    text: a.text,
+                    origin: a.origin,
+                    confidence: a.confidence,
+                    model: a.model,
+                    source_asset_sha256: a.source_asset_sha256,
+                    carried_from_version_id: a.carried_from_version_id,
+                }),
             payload: n
                 .payload_json
                 .as_deref()
@@ -2539,6 +2615,78 @@ mod tests {
             }
         }
 
+        // Phase 8c: 代替テキスト。**Vision 呼び出し（課金）は smoke では行わない** — 代わりに
+        // バッチ対象クエリが実データで何を拾うか（crop 付きの図がすべて対象・生成済みは除外）を
+        // 検証する。carry / prune は DB テストで網羅済み。
+        let targets = crate::db::node_alt_texts::figures_missing_alt_text(&pool)
+            .await
+            .unwrap();
+        let mine: Vec<_> = targets
+            .iter()
+            .filter(|t| t.document_version_id == doc.version_id)
+            .collect();
+        eprintln!(
+            "[phase8c] alt text targets: this version={} / library-wide={}",
+            mine.len(),
+            targets.len()
+        );
+        assert_eq!(
+            mine.len(),
+            asset_rows as usize,
+            "crop を持つ図はすべて生成バッチの対象になる（まだ alt text が無い）"
+        );
+        for t in mine.iter().take(3) {
+            eprintln!(
+                "  [target] node={} sha={}… {}",
+                t.node_id,
+                t.asset_sha256.chars().take(8).collect::<String>(),
+                t.relative_path
+            );
+        }
+        // 生成済みを 1 件だけ模擬 → 同じ図は二度と対象にならない（再実行で再課金しない）。
+        if let Some(t) = mine.first() {
+            crate::db::node_alt_texts::insert_alt_text(
+                &pool,
+                &crate::db::node_alt_texts::NewAltText {
+                    node_id: t.node_id,
+                    document_version_id: t.document_version_id,
+                    source_asset_sha256: &t.asset_sha256,
+                    text: "(smoke) simulated description",
+                    origin: document_ir::Origin::LlmInference.as_str(),
+                    confidence: Some(0.5),
+                    model: Some("smoke"),
+                    carried_from_version_id: None,
+                },
+            )
+            .await
+            .unwrap();
+            let after = crate::db::node_alt_texts::figures_missing_alt_text(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                after
+                    .iter()
+                    .filter(|x| x.document_version_id == doc.version_id)
+                    .count(),
+                mine.len() - 1,
+                "生成済みの図はバッチ対象から外れる"
+            );
+            // read 面: 最新版の figure ノードに alt_text が載る（origin/model つき）。
+            let reread = load_lcir_document(&pool, att).await.unwrap().unwrap();
+            let with_alt = reread
+                .nodes
+                .iter()
+                .find(|n| n.alt_text.is_some())
+                .expect("alt_text を持つノードがある");
+            let alt = with_alt.alt_text.as_ref().unwrap();
+            eprintln!(
+                "  [alt_text] node={} origin={} model={:?} text={:?}",
+                with_alt.id, alt.origin, alt.model, alt.text
+            );
+            assert_eq!(with_alt.kind, "figure");
+            assert_eq!(alt.origin, "llm_inference");
+        }
+
         // 冪等性: 同一 PDF を再 build → 再抽出せず reuse（同一 content_key）。
         let again = build_lcir_for_attachment(&pool, &build_root, att)
             .await
@@ -2704,6 +2852,196 @@ mod tests {
         // figure 以外のノード（root）には assets が付かない。
         let root = doc.nodes.iter().find(|n| n.kind == "document").unwrap();
         assert!(root.assets.is_empty());
+    }
+
+    // ---- Phase 8c: 版跨ぎの alt text carry / prune（pdfium 不要・抽出結果を手組みして tx を回す） ----
+
+    /// crop PNG 1 枚を持つ 1 ページの抽出結果を作る。`sha` を変えると「別の絵」になる。
+    fn extracted_with_crop(sha: &str) -> pdf::ExtractedDocument {
+        pdf::ExtractedDocument {
+            pages: vec![pdf::ExtractedPage {
+                page_number: 1,
+                width_pt: 595.0,
+                height_pt: 842.0,
+                rotation_deg: 0.0,
+                plain_text: "page text".to_string(),
+                blocks: Vec::new(),
+                image_regions: vec![pdf::ExtractedImageRegion {
+                    bbox: document_ir::BBox::new(100.0, 400.0, 300.0, 200.0),
+                    file: Some(pdf::ExtractedAssetFile {
+                        file_name: "fig-p001-00.png".to_string(),
+                        width_px: 800,
+                        height_px: 534,
+                        sha256: sha.to_string(),
+                        size_bytes: 4321,
+                    }),
+                }],
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
+    /// 抽出結果を 1 版として挿入する（`build_pdf_version` のうち pdfium と FS を除いた部分）。
+    async fn insert_version_from(
+        pool: &SqlitePool,
+        attachment_id: i64,
+        ckey: &str,
+        parent: Option<i64>,
+        doc: &pdf::ExtractedDocument,
+    ) -> i64 {
+        let ctx = PdfBuildCtx {
+            attachment_id,
+            abs_path: Path::new("/nonexistent/p.pdf"),
+            mime_type: "application/pdf",
+            source_sha256: "sha",
+            ckey,
+            parent_version_id: parent,
+            app_data_dir: Path::new("/nonexistent"),
+            asset_rel_dir: &format!("attachments/x/.lcir/{attachment_id}/{}", &ckey[..4]),
+        };
+        insert_pdf_version_tx(pool, &ctx, doc).await.unwrap().0
+    }
+
+    async fn figure_node_of(pool: &SqlitePool, version_id: i64) -> i64 {
+        sqlx::query_scalar(
+            "SELECT id FROM document_nodes WHERE document_version_id = ? AND node_kind = 'figure'",
+        )
+        .bind(version_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn add_generated_alt_text(pool: &SqlitePool, node_id: i64, version_id: i64, sha: &str) {
+        crate::db::node_alt_texts::insert_alt_text(
+            pool,
+            &crate::db::node_alt_texts::NewAltText {
+                node_id,
+                document_version_id: version_id,
+                source_asset_sha256: sha,
+                text: "Diagram of two coupled cavities.",
+                origin: document_ir::Origin::LlmInference.as_str(),
+                confidence: Some(0.5),
+                model: Some("gpt-4o-mini"),
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// 抽出器版を上げて再構築しても、crop が**バイト同一**なら alt text を引き継ぎ（再課金しない）、
+    /// 旧版の生成行は刈られること。由来は `carried_from_version_id` に残る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn alt_text_is_carried_when_crop_fingerprint_matches(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let doc = extracted_with_crop("cropsha-same");
+        let v1 = insert_version_from(&pool, att, "ck1-aaaa", None, &doc).await;
+        let fig1 = figure_node_of(&pool, v1).await;
+        add_generated_alt_text(&pool, fig1, v1, "cropsha-same").await;
+
+        // 同じ絵のまま再構築（別 content_key = 抽出器版を上げた想定）。
+        let v2 = insert_version_from(&pool, att, "ck2-bbbb", Some(v1), &doc).await;
+        let fig2 = figure_node_of(&pool, v2).await;
+        assert_ne!(fig1, fig2, "新版のノードは別 id");
+
+        let carried = crate::db::node_alt_texts::alt_texts_for_version(&pool, v2)
+            .await
+            .unwrap();
+        assert_eq!(carried.len(), 1, "新版へ 1 件引き継がれる");
+        assert_eq!(carried[0].node_id, fig2);
+        assert_eq!(carried[0].text, "Diagram of two coupled cavities.");
+        assert_eq!(carried[0].origin, "llm_inference");
+        assert_eq!(carried[0].model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(carried[0].carried_from_version_id, Some(v1), "由来版が残る");
+        assert!(
+            crate::db::node_alt_texts::alt_texts_for_version(&pool, v1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "旧版の生成行は刈られる"
+        );
+
+        // read 面: 最新版の figure ノードに alt_text が載る。
+        let lcir = load_lcir_document(&pool, att).await.unwrap().unwrap();
+        let fig = lcir.nodes.iter().find(|n| n.kind == "figure").unwrap();
+        let alt = fig.alt_text.as_ref().expect("alt_text が載る");
+        assert_eq!(alt.origin, "llm_inference");
+        assert_eq!(alt.source_asset_sha256, "cropsha-same");
+
+        // さらに再構築しても「最初の生成版」を指し続ける（carry の連鎖で由来を失わない）。
+        let v3 = insert_version_from(&pool, att, "ck3-cccc", Some(v2), &doc).await;
+        let again = crate::db::node_alt_texts::alt_texts_for_version(&pool, v3)
+            .await
+            .unwrap();
+        assert_eq!(again[0].carried_from_version_id, Some(v1));
+    }
+
+    /// 絵が変わった（crop の sha256 が違う）図には引き継がない — 別の絵に古い説明を付けない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn alt_text_is_not_carried_when_crop_changes(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let v1 = insert_version_from(&pool, att, "ck1-aaaa", None, &extracted_with_crop("old-sha"))
+            .await;
+        let fig1 = figure_node_of(&pool, v1).await;
+        add_generated_alt_text(&pool, fig1, v1, "old-sha").await;
+
+        let v2 = insert_version_from(
+            &pool,
+            att,
+            "ck2-bbbb",
+            Some(v1),
+            &extracted_with_crop("new-sha"),
+        )
+        .await;
+        assert!(
+            crate::db::node_alt_texts::alt_texts_for_version(&pool, v2)
+                .await
+                .unwrap()
+                .is_empty(),
+            "別の絵には引き継がない"
+        );
+        let lcir = load_lcir_document(&pool, att).await.unwrap().unwrap();
+        let fig = lcir.nodes.iter().find(|n| n.kind == "figure").unwrap();
+        assert!(fig.alt_text.is_none());
+    }
+
+    /// 手編集（user_edited）は carry の対象外だが、刈られもしない（人の記述を勝手に消さない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn user_edited_alt_text_survives_rebuild_without_being_carried(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let doc = extracted_with_crop("cropsha-same");
+        let v1 = insert_version_from(&pool, att, "ck1-aaaa", None, &doc).await;
+        let fig1 = figure_node_of(&pool, v1).await;
+        crate::db::node_alt_texts::insert_alt_text(
+            &pool,
+            &crate::db::node_alt_texts::NewAltText {
+                node_id: fig1,
+                document_version_id: v1,
+                source_asset_sha256: "cropsha-same",
+                text: "Hand written description.",
+                origin: document_ir::Origin::UserEdited.as_str(),
+                confidence: None,
+                model: None,
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let v2 = insert_version_from(&pool, att, "ck2-bbbb", Some(v1), &doc).await;
+        assert!(
+            crate::db::node_alt_texts::alt_texts_for_version(&pool, v2)
+                .await
+                .unwrap()
+                .is_empty(),
+            "手編集は carry しない"
+        );
+        let old = crate::db::node_alt_texts::alt_texts_for_version(&pool, v1)
+            .await
+            .unwrap();
+        assert_eq!(old.len(), 1, "手編集は刈られない");
+        assert_eq!(old[0].origin, "user_edited");
     }
 
     #[sqlx::test(migrations = "./migrations")]

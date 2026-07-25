@@ -677,8 +677,17 @@ function DataTab() {
   // 描画されず素通りすることがあるため）。
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [lcirEnabled, setLcirEnabled] = useState(false);
+  // 図の代替テキスト生成（Phase 8c）は画像 1 枚ごとに課金されるので、LCIR とは別の同意フラグ。
+  const [altTextEnabled, setAltTextEnabled] = useState(false);
+  // 代替テキスト未生成の図の件数（課金される前に規模を見せる）。
+  const [altTextPending, setAltTextPending] = useState<number | null>(null);
+  const refreshAltTextPending = () => {
+    invoke<number>("count_figures_missing_alt_text").then(setAltTextPending).catch(() => {});
+  };
   useEffect(() => {
     invoke<boolean>("get_lcir_enabled").then(setLcirEnabled).catch(() => {});
+    invoke<boolean>("get_lcir_vision_alt_text_enabled").then(setAltTextEnabled).catch(() => {});
+    refreshAltTextPending();
   }, []);
   // arXiv TeX 一括取得の進捗（数分かかるので「固まって見える」のを避ける）。
   // 実行中フラグは共有 `busy` と別に持つ — 数分の実行中に他の Data タブ操作が busy を
@@ -688,6 +697,19 @@ function DataTab() {
   useEffect(() => {
     const un = listen<{ done: number; total: number }>("tex-fetch-progress", (e) =>
       setTexProgress(e.payload),
+    );
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
+  // 代替テキスト一括生成の進捗（図の数だけ Vision 呼び出しが走るので長時間になる）。
+  const [altTextRunning, setAltTextRunning] = useState(false);
+  const [altTextProgress, setAltTextProgress] = useState<{ done: number; total: number } | null>(
+    null,
+  );
+  useEffect(() => {
+    const un = listen<{ done: number; total: number }>("vision-alt-text-progress", (e) =>
+      setAltTextProgress(e.payload),
     );
     return () => {
       void un.then((f) => f());
@@ -826,6 +848,57 @@ function DataTab() {
     }
   };
 
+  const toggleAltText = async (next: boolean) => {
+    try {
+      await invoke("set_lcir_vision_alt_text_enabled", { enabled: next });
+      setAltTextEnabled(next);
+    } catch (e) {
+      setError(errMsg(e));
+    }
+  };
+
+  const handleGenerateAltTexts = async () => {
+    setAltTextRunning(true);
+    setMessage(null);
+    setError(null);
+    setAltTextProgress(null);
+    try {
+      const r = await invoke<{
+        enabled: boolean;
+        total: number;
+        generated: number;
+        skipped: number;
+        failed: number;
+        aborted: boolean;
+      }>("generate_vision_alt_texts");
+      if (!r.enabled) {
+        setMessage(t("settings.data.altTextDisabled"));
+      } else if (r.total === 0) {
+        setMessage(t("settings.data.altTextNone"));
+      } else {
+        const done = t("settings.data.altTextDone", {
+          total: r.total,
+          generated: r.generated,
+          skipped: r.skipped,
+          failed: r.failed,
+        });
+        // 連続失敗で打ち切られたときは原因の当たりを付けられるよう明示する。
+        setMessage(r.aborted ? `${done} ${t("settings.data.altTextAborted")}` : done);
+      }
+    } catch (e) {
+      const s = errMsg(e);
+      setError(
+        s.includes("already_running")
+          ? t("settings.data.altTextRunning")
+          : t("settings.data.altTextError", { error: s }),
+      );
+    } finally {
+      setAltTextRunning(false);
+      setAltTextProgress(null);
+      refreshAltTextPending();
+    }
+  };
+
   const handleFetchTex = async () => {
     setFetchTexRunning(true);
     setMessage(null);
@@ -944,6 +1017,38 @@ function DataTab() {
                   })
                 : t("settings.data.texFetchBusy")
               : t("settings.data.texFetch")}
+          </SecondaryBtn>
+        </div>
+        {/* 図の代替テキスト生成（Phase 8c）: 画像ごとに外部 API 課金が発生するため、
+            LCIR とは独立のチェックボックスで明示同意を取る。 */}
+        <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 0 0", cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={altTextEnabled}
+            disabled={!lcirEnabled}
+            onChange={(e) => void toggleAltText(e.target.checked)}
+          />
+          <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.data.altTextEnable")}</span>
+        </label>
+        <div style={{ fontSize: 11, color: "var(--text-mute)", marginTop: 4, lineHeight: 1.55 }}>
+          {t("settings.data.altTextConsent")}
+          {altTextPending !== null && (
+            <> {t("settings.data.altTextPending", { pending: altTextPending })}</>
+          )}
+        </div>
+        <div style={{ marginTop: 6 }}>
+          <SecondaryBtn
+            onClick={handleGenerateAltTexts}
+            disabled={!lcirEnabled || !altTextEnabled || altTextRunning}
+          >
+            {altTextRunning
+              ? altTextProgress
+                ? t("settings.data.altTextBusyProgress", {
+                    done: altTextProgress.done,
+                    total: altTextProgress.total,
+                  })
+                : t("settings.data.altTextBusy")
+              : t("settings.data.altText")}
           </SecondaryBtn>
         </div>
       </Section>
