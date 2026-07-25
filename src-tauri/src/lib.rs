@@ -1174,8 +1174,11 @@ struct VisionAltTextResult {
     skipped: i64,
     /// API エラー等で失敗した図の数（次回の再実行で拾える）。
     failed: i64,
-    /// 連続失敗が続いて途中で打ち切ったか（キー不正・レート制限などの系統的な失敗）。
+    /// 途中で打ち切ったか。理由は `abort_reason`。
     aborted: bool,
+    /// 打ち切りの理由: `"failures"`（連続失敗 = キー不正・レート制限など）/
+    /// `"consent_withdrawn"`（実行中に同意フラグが外された = 実質のキャンセル）。
+    abort_reason: Option<String>,
 }
 
 /// [`VISION_ALT_TEXT_RUNNING`] を Drop で必ず解除する RAII ガード。
@@ -1199,7 +1202,9 @@ const VISION_ALT_TEXT_MAX_CHARS: usize = 4000;
 
 /// 連続失敗でバッチを打ち切る閾値。1 図ずつ best-effort だが、キー不正・レート制限・Vision 非対応
 /// モデルのような**系統的な失敗**では残り全図を叩き続けても無駄なので早めに止める（未処理の図は
-/// 対象のまま残り、次回の実行で拾える）。
+/// 対象のまま残り、次回の実行で拾える）。**そのランで 1 件も生成できていないときだけ**打ち切る:
+/// 対象順序は決定的なので、「必ず失敗する図」が閾値ぶん溜まると以後どの実行もその手前で
+/// 止まり、後ろの図に永久に到達しなくなる（成功が 1 件でもあれば系統的失敗ではない）。
 const VISION_ALT_TEXT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// LCIR（実験・Phase 8c）: 代替テキストがまだ無い図の件数。**課金される前に規模を見せる**ための
@@ -1231,6 +1236,7 @@ async fn generate_vision_alt_texts(
         skipped: 0,
         failed: 0,
         aborted: false,
+        abort_reason: None,
     };
     // 課金する操作なので、LCIR 実験フラグと Vision 同意フラグの両方を要求する。
     if !ingestion::lcir_enabled(&state.db).await || !vision_alt_text_enabled(&state.db).await {
@@ -1261,11 +1267,73 @@ async fn generate_vision_alt_texts(
     let total = targets.len() as i64;
     let (mut generated, mut skipped, mut failed) = (0i64, 0i64, 0i64);
     let mut consecutive_failures = 0u32;
-    let mut aborted = false;
+    let mut abort_reason: Option<&'static str> = None;
+    // 実際に API を呼んだ回数（スロットルの判定に使う。skip/複製では呼ばない）。
+    let mut api_calls = 0u32;
+    // 同一 crop（バイト同一画像）を 1 ラン内で二度課金しないためのメモ。carry と同じ
+    // 「指紋が同じなら同じ絵 = 同じ説明で良い」という前提（ページ毎に出るロゴ等で効く）。
+    let mut described_by_sha: HashMap<String, String> = HashMap::new();
 
     for (i, target) in targets.into_iter().enumerate() {
-        // 先頭以外はリクエスト前に 1 秒待つ（レート制限にバーストで当たらないため）。
-        if i > 0 {
+        // 実行中に同意を外したら止まる（cancel UI は非目標だが、ユーザーに見える唯一の
+        // 「止めそうに見える操作」が黙って無効なのは不誠実なので、毎回の再評価で実現する）。
+        if !vision_alt_text_enabled(&state.db).await {
+            abort_reason = Some("consent_withdrawn");
+            break;
+        }
+        // その版がまだ当該添付の最新 completed か確認する（**Vision を呼ぶ前**に）。
+        // 長いループ中に再構築されると、旧版のノードへ書いた行はどの read 面にも現れず
+        // 課金だけが無駄になる。新版の図は次回の実行で対象になる。
+        let still_latest = db::document_versions::latest_completed_for_attachment(
+            &state.db,
+            target.attachment_id,
+        )
+        .await
+        .map(|v| v.map(|v| v.id) == Some(target.document_version_id))
+        .unwrap_or(false);
+        if !still_latest {
+            skipped += 1;
+            let _ = app.emit(
+                "vision-alt-text-progress",
+                serde_json::json!({ "done": i as i64 + 1, "total": total }),
+            );
+            continue;
+        }
+        // 同一ランで同じ画像を既に説明済みなら API を呼ばずに複製する（課金しない）。
+        if let Some(text) = described_by_sha.get(&target.asset_sha256) {
+            match db::node_alt_texts::insert_alt_text(
+                &state.db,
+                &db::node_alt_texts::NewAltText {
+                    node_id: target.node_id,
+                    document_version_id: target.document_version_id,
+                    source_asset_sha256: &target.asset_sha256,
+                    text,
+                    origin: document_ir::Origin::LlmInference.as_str(),
+                    confidence: Some(VISION_ALT_TEXT_CONFIDENCE),
+                    model: Some(&model),
+                    carried_from_version_id: None,
+                },
+            )
+            .await
+            {
+                Ok(_) => generated += 1,
+                Err(e) => {
+                    eprintln!(
+                        "LCIR: failed to save reused alt text for node {} (attachment {}): {e}",
+                        target.node_id, target.attachment_id
+                    );
+                    failed += 1;
+                }
+            }
+            let _ = app.emit(
+                "vision-alt-text-progress",
+                serde_json::json!({ "done": i as i64 + 1, "total": total }),
+            );
+            continue;
+        }
+        // ここから先は実際に API を呼ぶ。2 回目以降はリクエスト前に 1 秒待つ
+        // （レート制限にバーストで当たらないため）。
+        if api_calls > 0 {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         let abs = state.app_data_dir.join(&target.relative_path);
@@ -1277,6 +1345,7 @@ async fn generate_vision_alt_texts(
                     use base64::Engine;
                     base64::engine::general_purpose::STANDARD.encode(&bytes)
                 };
+                api_calls += 1;
                 match llm::ocr::describe_image(&provider, &model, &api_key, &target.mime_type, &b64)
                     .await
                 {
@@ -1306,6 +1375,8 @@ async fn generate_vision_alt_texts(
                             Ok(_) => {
                                 generated += 1;
                                 consecutive_failures = 0;
+                                described_by_sha
+                                    .insert(target.asset_sha256.clone(), text.clone());
                             }
                             Err(e) => {
                                 eprintln!(
@@ -1336,12 +1407,13 @@ async fn generate_vision_alt_texts(
             "vision-alt-text-progress",
             serde_json::json!({ "done": i as i64 + 1, "total": total }),
         );
-        if consecutive_failures >= VISION_ALT_TEXT_MAX_CONSECUTIVE_FAILURES {
+        // 系統的失敗（このランで 1 件も生成できないまま連続失敗）だけで打ち切る。
+        if consecutive_failures >= VISION_ALT_TEXT_MAX_CONSECUTIVE_FAILURES && generated == 0 {
             eprintln!(
                 "LCIR: aborting alt text batch after {consecutive_failures} consecutive failures \
                  (check the API key, rate limits, and that the model supports images)"
             );
-            aborted = true;
+            abort_reason = Some("failures");
             break;
         }
     }
@@ -1352,7 +1424,8 @@ async fn generate_vision_alt_texts(
         generated,
         skipped,
         failed,
-        aborted,
+        aborted: abort_reason.is_some(),
+        abort_reason: abort_reason.map(|r| r.to_string()),
     })
 }
 

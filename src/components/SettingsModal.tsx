@@ -845,6 +845,8 @@ function DataTab() {
       setError(t("settings.data.lcirError", { error: errMsg(e) }));
     } finally {
       setBusy(null);
+      // 構築で figure + crop が増えるので、課金前に見せる件数を取り直す。
+      refreshAltTextPending();
     }
   };
 
@@ -870,6 +872,7 @@ function DataTab() {
         skipped: number;
         failed: number;
         aborted: boolean;
+        abort_reason: string | null;
       }>("generate_vision_alt_texts");
       if (!r.enabled) {
         setMessage(t("settings.data.altTextDisabled"));
@@ -882,8 +885,13 @@ function DataTab() {
           skipped: r.skipped,
           failed: r.failed,
         });
-        // 連続失敗で打ち切られたときは原因の当たりを付けられるよう明示する。
-        setMessage(r.aborted ? `${done} ${t("settings.data.altTextAborted")}` : done);
+        // 打ち切られたときは理由を明示する（同意を外して止めた場合と、系統的失敗を区別）。
+        const reason = !r.aborted
+          ? null
+          : r.abort_reason === "consent_withdrawn"
+            ? t("settings.data.altTextStopped")
+            : t("settings.data.altTextAborted");
+        setMessage(reason ? `${done} ${reason}` : done);
       }
     } catch (e) {
       const s = errMsg(e);
@@ -936,6 +944,7 @@ function DataTab() {
     } finally {
       setFetchTexRunning(false);
       setTexProgress(null);
+      refreshAltTextPending();
     }
   };
 

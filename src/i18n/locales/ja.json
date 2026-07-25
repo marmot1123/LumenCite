@@ -877,7 +877,7 @@
       "texFetchDone": "{{total}} 件中 {{fetched}} 件取得・{{built}} 件を LCIR 化しました（TeX 未公開 {{pdfOnly}} 件・失敗 {{failed}} 件）。",
       "texFetchError": "一括取得に失敗しました: {{error}}",
       "altTextEnable": "図の代替テキストを LLM Vision で生成することを許可する",
-      "altTextConsent": "図 1 枚ごとに画像を外部の LLM API へ送信し、画像単位で課金されます。生成文は AI 推定（origin=llm_inference）として保存され、原文キャプションは上書きされません（全文検索にも入りません）。プロバイダ・モデルは OCR の設定を共用します。",
+      "altTextConsent": "図 1 枚ごとに画像を外部の LLM API へ送信し、画像単位で課金されます。実行中にこのチェックを外すと停止します。生成文は AI 推定（origin=llm_inference）として保存され、原文キャプションは上書きされません（全文検索にも入りません）。プロバイダ・モデルは OCR の設定を共用します。",
       "altTextPending": "現在の生成対象は {{pending}} 件です。",
       "altText": "代替テキストが無い図を一括生成",
       "altTextBusy": "生成中…",
@@ -887,6 +887,7 @@
       "altTextNone": "代替テキストが無い図はありません（PDF の LCIR を構築済みか確認してください）。",
       "altTextDone": "{{total}} 件中 {{generated}} 件を生成しました（スキップ {{skipped}} 件・失敗 {{failed}} 件）。",
       "altTextAborted": "連続で失敗したため途中で打ち切りました（API キー・レート制限・モデルが画像に対応しているかを確認してください）。残りは次回の実行で処理されます。",
+      "altTextStopped": "同意チェックが外されたため途中で停止しました。残りは次回の実行で処理されます。",
       "altTextError": "一括生成に失敗しました: {{error}}"
     },
     "about": {

@@ -533,10 +533,10 @@ paragraph/theorem/proof 等のノードから、それが参照する equation/t
 
 **生成と版跨ぎのライフサイクル**:
 
-- 生成は build の外の opt-in 後追いバッチ `generate_vision_alt_texts` のみ（`lcir.enabled` と `lcir.vision_alt_text.enabled` の**両方** ON のときだけ）。対象 = 最新 completed 版の `figure` ノードで `page_crop` アセットを持ち、まだ alt text 行が無いもの。既に行があるノードは再生成しない（**再課金を構造的に防ぐ**）。
+- 生成は build の外の opt-in 後追いバッチ `generate_vision_alt_texts` のみ（`lcir.enabled` と `lcir.vision_alt_text.enabled` の**両方** ON のときだけ）。対象 = 最新 completed 版の `figure` ノードで `page_crop` アセットを持ち、まだ alt text 行が無いもの（**ゴミ箱のエントリは除外** — 他の一括バッチ対象クエリと同じ規約）。既に行があるノードは再生成しない（**再課金を構造的に防ぐ**）。ただし応答が空だった図は行を作らないので次回も対象に残る（誤った説明より欠損を選ぶ代わりに、その図は再試行で再課金される）。同一ラン内で crop の指紋が一致する図は API を呼ばず説明を複製する。
 - **build に混ぜない**: Vision 呼び出しは非同期・課金・非決定的なので、build 経路に入れると content_key の冪等性（同一 PDF → 同一 version）が壊れる。
 - **版跨ぎ carry**: 新版 build の tx 内で、新 `figure` ノードの crop PNG SHA-256 と一致する `llm_inference` 行を**同一添付の過去の全版**から探し（一致中で最新を採用）、新版へコピーする（`carried_from_version_id` に由来版）。指紋一致 = バイト同一画像なのでどの版由来でも有効。同一 crop が複数 `figure` ノードに対応する場合は同じ alt text が両方に載る（同じ絵なら同じ説明で実害なし）。
-- **GC**: carry と同じ tx で、その添付の**現版以外**の `llm_inference` 行を削除する（crop PNG は 8a の GC で trash 済なので、行だけ残しても履歴価値が薄く肥大化するだけ）。`user_edited` 行は削除・上書きの対象外。
+- **GC**: carry と同じ tx で、その添付の**現版以外**の `llm_inference` 行のうち、**その画像（`source_asset_sha256`）が新版の `assets` にも存在するもの**＝ carry 済みのものだけを削除する（crop PNG は 8a の GC で trash 済なので、引き継げた行を旧版に残しても履歴価値が薄く肥大化するだけ）。**新版に同一指紋の画像が無い行は残す** — crop の書き出しは領域単位で失敗しうる（失敗領域は `file: None` + warning で継続）ため、その図は carry されず新版では `page_crop` を持たないので再生成対象にもならない。ここで消すと課金済みの説明が復旧不能に失われる。`user_edited` 行は常に削除・上書きの対象外（ただし carry もしないため、再構築後は最新版の read には現れない。手編集 UI を入れるフェーズで carry 対象に含める）。
 
 ---
 
