@@ -142,7 +142,11 @@ pub async fn run_ocr(
     ))
 }
 
-async fn resolve_ocr_provider(pool: &sqlx::SqlitePool) -> Result<(String, String), ToolError> {
+/// OCR / Vision 用のプロバイダとモデル（未設定なら chat 用にフォールバック）。
+/// Phase 8c の alt text 生成バッチも同じ設定を共有する（Vision 用の設定面を増やさない）。
+pub(crate) async fn resolve_ocr_provider(
+    pool: &sqlx::SqlitePool,
+) -> Result<(String, String), ToolError> {
     use crate::db::settings::{
         get_setting, LLM_MODEL_KEY, LLM_OCR_MODEL_KEY, LLM_OCR_PROVIDER_KEY, LLM_PROVIDER_KEY,
     };

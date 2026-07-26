@@ -384,6 +384,7 @@ OS キーチェーン側のサービス名: `com.lumencite.app`、アカウン�
 - **Phase 6a（参照グラフ）**: **新規ノード型なし**。ノード間の参照を `node_relations`（migration 0017・下記）に有向辺として張る。`extractor_version` を pdfium 0.4.0→**0.5.0** / TeX 0.2.0→**0.3.0** に上げる（派生の関係辺が出力に増えるため）。
 - **Phase 8a（図表アセット基盤）**: block 型に `figure` を追加（`table` は 8b・下記）。**PDF 版のみ**。ページ内の埋込画像オブジェクト（トップレベルの Image のみ・XObjectForm 内は誤配置 crop を避けるため対象外）の bbox を近接マージした「図領域」ごとに `figure` ノード（`origin='layout_model'`・confidence 0.6・`payload_json` に `{figure_index, figure_number?}`・plain_text 無し）+ 領域 bbox の `source_fragments` 行を作り、領域のページ crop PNG を `assets`/`node_assets`（migration 0019・下記）に紐づける。図領域と同一ページの figure caption を幾何ペアリング（垂直ギャップ ≤60pt・水平重なり ≥30%・**相互最近のみ**・"Algorithm"/"Listing" ラベルの caption は除外）し、`node_relations` に `caption_of`（caption → figure・conf 0.6）を張る。caption ブロックの `payload_json` に `{caption_label, caption_number}`（"Figure 2:" → "Figure"/"2"）を追加。`extractor_version` pdfium 0.5.0→**0.6.0**（TeX は不変）。**tikz/pgf 等のベクター図は Image オブジェクトを持たないためアセット 0 件が正当**（欠損許容）。回転ページ（`/Rotate` ≠ 0）は誤 crop を避けるためスキップ + warning。
 - **Phase 8b（表セル構造化）**: block 型に `table` を追加（**新規テーブルなし**・migration 不要）。**TeX 版のみ**（`lumencite-tex` 0.4.0→**0.5.0**・pdfium 不変）。table float 内および裸の `tabular`/`tabular*`/`tabularx` をセル構造化し、`table` ノード（`origin='tex_source'`・confidence 0.9 / 列仕様未検証 0.8・plain_text = セルを " \| " 結合した可読形）の `payload_json` に `{column_spec, n_columns, n_rows, alignments?, rows:[{cells:[{text, colspan?, rowspan?}], rule_above?}], latex_source?}` を載せる。セル text は LaTeX 温存（`$..$` verbatim・`\label` のみ除去）。`rule_above` は全幅罫線（`\hline`/booktabs）の事実記録で、部分罫線（`\cline`/`\cmidrule`）は数えずヘッダ推定もしない。**確信の持てない表は構造化せず従来どおり破棄**（ネスト環境・spec 検証済みでの列数超過・`longtable`/`tabu`/subtable 混在・verbatim（`lstlisting` 等）内の例示 tabular・行 512/列 64/スニペット 100k 超 — warning に理由を残す）。同一環境由来の table_caption とは `node_relations` の `caption_of`（caption → table・conf 0.95・origin=tex_source）で結ぶ。`\label` は従来どおり caption 側（caption の無い環境のみ table 側に付き、`refers_to_table` として解決）。
+- **Phase 8c（図の代替テキスト）**: **新規ノード型なし・抽出器版も不変**（生成は build の外）。8a が作った `figure` ノードのページ crop PNG を LLM Vision に説明させ、`node_alt_texts`（migration 0020・下記）へ `origin='llm_inference'` + `confidence` + `model` で保存する。**PDF 版のみ**（TeX 版に `figure` ノードは無い）。原文 caption（`figure_caption` ノード）は**上書きしない**し、生成文は `fulltext` / `document_nodes_fts` にも**書かない**（原文由来と生成物を混ぜない）。
 
 | カラム | 型 | 備考 |
 |--------|-----|------|
@@ -510,6 +511,32 @@ paragraph/theorem/proof 等のノードから、それが参照する equation/t
 - 書き込みは **tmp 名 + `sync_all()` + `fs::rename` の原子的パターン**（並行 build の truncate 窓・電源断の torn file を防ぐ）。content_key でディレクトリが決まるため**決定的・冪等**（同一 content_key の再 build は同一パスに上書き）。
 - **GC**: build 成功 commit 後に `.lcir/<attachment_id>/` 直下の現 content_key 以外のサブディレクトリを trash（superseded 版のファイル回収。DB の assets 行は provenance として残す＝読み出しは latest completed のみなので参照されない）。build 失敗時は書いたファイルを best-effort 削除。添付単体削除時は `.lcir/<attachment_id>/` を trash。削除と build の競合で残る孤児はエントリ purge で回収（許容）。
 - **reuse 経路の self-heal**: content_key 一致で reuse する際、当該版の assets 行のファイル存在を確認し、欠損があれば再抽出してファイルのみ再生成（DB 行は sha256/width/height/size_bytes を更新）。それでも `relative_path` の**存在は保証しない**（欠損許容・読み手はファイル欠損に耐えること）。
+
+#### `node_alt_texts` — 図の代替テキスト（Phase 8c / migration 0020）
+
+`figure` ノードの LLM Vision 生成 alt text。**ノード本体（`document_nodes`）とは別の satellite 表**にする: `figure` ノードの `origin`/`confidence` は既に図領域検出（`layout_model` / 0.6）に使われており、そこへ相乗りすると「どの値がどの主張の確からしさか」が opaque になるため（`payload_json` 案を却下した理由）。
+
+| カラム | 型 | 備考 |
+|--------|-----|------|
+| `id` | INTEGER PK | AUTOINCREMENT |
+| `node_id` | INTEGER FK → document_nodes | ON DELETE CASCADE。通常 `figure` ノード |
+| `document_version_id` | INTEGER FK → document_versions | ON DELETE CASCADE。版スコープの読み出し・GC 用 |
+| `source_asset_sha256` | TEXT NOT NULL | 説明した crop PNG の SHA-256。**provenance（どの画像を見たか）と版跨ぎ引き継ぎのキー**を兼ねる |
+| `text` | TEXT NOT NULL | 生成された説明文 |
+| `origin` | TEXT NOT NULL | `llm_inference`（生成）/ 将来 `user_edited`（手編集） |
+| `confidence` | REAL | AI 推定であることの表明（原文由来と区別するための値・意味の正しさの尺度ではない） |
+| `model` | TEXT | 生成に使ったモデル名（`llm.ocr_model` 等で解決した値） |
+| `carried_from_version_id` | INTEGER FK → document_versions | ON DELETE SET NULL。NULL = この版で生成 / 値 = その版から指紋一致で引き継いだ |
+| `created_at` | TEXT | `datetime('now')` |
+
+`UNIQUE (node_id, origin)`（新規テーブルなので migration 内で張る）— 1 ノードにつき生成 1 件 + 手編集 1 件まで。読み出しは `user_edited` を優先する。索引 = `document_version_id` / `source_asset_sha256` / `node_id`。
+
+**生成と版跨ぎのライフサイクル**:
+
+- 生成は build の外の opt-in 後追いバッチ `generate_vision_alt_texts` のみ（`lcir.enabled` と `lcir.vision_alt_text.enabled` の**両方** ON のときだけ）。対象 = 最新 completed 版の `figure` ノードで `page_crop` アセットを持ち、まだ alt text 行が無いもの（**ゴミ箱のエントリは除外** — 他の一括バッチ対象クエリと同じ規約）。既に行があるノードは再生成しない（**再課金を構造的に防ぐ**）。ただし応答が空だった図は行を作らないので次回も対象に残る（誤った説明より欠損を選ぶ代わりに、その図は再試行で再課金される）。同一ラン内で crop の指紋が一致する図は API を呼ばず説明を複製する。
+- **build に混ぜない**: Vision 呼び出しは非同期・課金・非決定的なので、build 経路に入れると content_key の冪等性（同一 PDF → 同一 version）が壊れる。
+- **版跨ぎ carry**: 新版 build の tx 内で、新 `figure` ノードの crop PNG SHA-256 と一致する `llm_inference` 行を**同一添付の過去の全版**から探し（一致中で最新を採用）、新版へコピーする（`carried_from_version_id` に由来版）。指紋一致 = バイト同一画像なのでどの版由来でも有効。同一 crop が複数 `figure` ノードに対応する場合は同じ alt text が両方に載る（同じ絵なら同じ説明で実害なし）。
+- **GC**: carry と同じ tx で、その添付の**現版以外**の `llm_inference` 行のうち、**その画像（`source_asset_sha256`）が新版の `assets` にも存在するもの**＝ carry 済みのものだけを削除する（crop PNG は 8a の GC で trash 済なので、引き継げた行を旧版に残しても履歴価値が薄く肥大化するだけ）。**新版に同一指紋の画像が無い行は残す** — crop の書き出しは領域単位で失敗しうる（失敗領域は `file: None` + warning で継続）ため、その図は carry されず新版では `page_crop` を持たないので再生成対象にもならない。ここで消すと課金済みの説明が復旧不能に失われる。`user_edited` 行は常に削除・上書きの対象外（ただし carry もしないため、再構築後は最新版の read には現れない。手編集 UI を入れるフェーズで carry 対象に含める）。
 
 ---
 

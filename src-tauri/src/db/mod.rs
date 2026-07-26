@@ -11,6 +11,7 @@ pub mod fulltext;
 pub mod highlights;
 pub mod math_expressions;
 pub mod mcp_audit;
+pub mod node_alt_texts;
 pub mod node_relations;
 pub mod settings;
 pub mod source_fragments;

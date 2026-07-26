@@ -84,6 +84,11 @@ pub const FTS_FULLTEXT_REBUILT_KEY: &str = "fts.fulltext_rebuilt";
 /// document_versions/nodes/source_fragments を追加構築する。OFF なら既存挙動は byte-for-byte 不変。
 pub const LCIR_ENABLED_KEY: &str = "lcir.enabled";
 
+/// LCIR Phase 8c: 図の代替テキストを LLM Vision で生成することへの同意フラグ（"1" で有効・
+/// 既定 off）。`lcir.enabled` とは**独立の同意面**にする — 画像 1 枚ごとに外部 API へ送信して
+/// 課金が発生するため、LCIR の実験フラグ ON だけで暗黙に許可しない（`clipper.enabled` と同型）。
+pub const LCIR_VISION_ALT_TEXT_ENABLED_KEY: &str = "lcir.vision_alt_text.enabled";
+
 #[cfg(test)]
 mod tests {
     use super::*;

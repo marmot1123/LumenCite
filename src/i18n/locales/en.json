@@ -875,7 +875,20 @@
       "texFetchRunning": "A bulk fetch is already running. Please wait for it to finish.",
       "texFetchNone": "No arXiv entries are missing TeX sources.",
       "texFetchDone": "Fetched {{fetched}} of {{total}}, built LCIR for {{built}} ({{pdfOnly}} PDF-only, {{failed}} failed).",
-      "texFetchError": "Bulk fetch failed: {{error}}"
+      "texFetchError": "Bulk fetch failed: {{error}}",
+      "altTextEnable": "Allow generating figure alt text with an LLM vision model",
+      "altTextConsent": "Each figure image is sent to an external LLM API and billed per image. Clearing this checkbox while a run is in progress stops it. Generated text is stored as an AI inference (origin=llm_inference); it never overwrites the paper's caption and is not added to full-text search. The provider and model are shared with the OCR settings.",
+      "altTextPending": "{{pending}} figure(s) currently pending.",
+      "altText": "Generate alt text for figures that have none",
+      "altTextBusy": "Generating…",
+      "altTextBusyProgress": "Generating… ({{done}}/{{total}})",
+      "altTextRunning": "A bulk generation is already running. Please wait for it to finish.",
+      "altTextDisabled": "Enable both LCIR and alt text generation first.",
+      "altTextNone": "No figures are missing alt text (check that LCIR is built for your PDFs).",
+      "altTextDone": "Generated {{generated}} of {{total}} ({{skipped}} skipped, {{failed}} failed).",
+      "altTextAborted": "Stopped early after repeated failures (check the API key, rate limits, and that the model accepts images). The rest will be picked up on the next run.",
+      "altTextStopped": "Stopped because the consent checkbox was cleared. The rest will be picked up on the next run.",
+      "altTextError": "Bulk generation failed: {{error}}"
     },
     "about": {
       "appTitle": "LumenCite",

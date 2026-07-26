@@ -1130,6 +1130,305 @@ async fn set_lcir_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(
     .map_err(|e| e.to_string())
 }
 
+/// LCIR Phase 8c フラグ `lcir.vision_alt_text.enabled` の現在値。
+#[tauri::command]
+async fn get_lcir_vision_alt_text_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(vision_alt_text_enabled(&state.db).await)
+}
+
+/// LCIR Phase 8c フラグ `lcir.vision_alt_text.enabled` を設定する。
+#[tauri::command]
+async fn set_lcir_vision_alt_text_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    db::settings::set_setting(
+        &state.db,
+        db::settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 図の代替テキスト生成への同意フラグ（既定 off）。`lcir.enabled` とは独立に評価する。
+async fn vision_alt_text_enabled(pool: &SqlitePool) -> bool {
+    db::settings::get_setting(pool, db::settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1")
+}
+
+/// `generate_vision_alt_texts`（図の代替テキスト一括生成）の結果サマリ。
+/// `enabled` は `lcir.enabled` と `lcir.vision_alt_text.enabled` の**両方** ON のときだけ true。
+#[derive(serde::Serialize)]
+struct VisionAltTextResult {
+    enabled: bool,
+    /// 対象（最新版の figure で crop があり alt text が無いもの）の総数。
+    total: i64,
+    /// 生成して保存できた図の数。
+    generated: i64,
+    /// crop ファイルが無い / 応答が空で「説明できなかった」図の数（欠損許容）。
+    skipped: i64,
+    /// API エラー等で失敗した図の数（次回の再実行で拾える）。
+    failed: i64,
+    /// 途中で打ち切ったか。理由は `abort_reason`。
+    aborted: bool,
+    /// 打ち切りの理由: `"failures"`（連続失敗 = キー不正・レート制限など）/
+    /// `"consent_withdrawn"`（実行中に同意フラグが外された = 実質のキャンセル）。
+    abort_reason: Option<String>,
+}
+
+/// [`VISION_ALT_TEXT_RUNNING`] を Drop で必ず解除する RAII ガード。
+struct VisionAltTextGuard;
+impl Drop for VisionAltTextGuard {
+    fn drop(&mut self) {
+        VISION_ALT_TEXT_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `generate_vision_alt_texts` の多重起動ガード（課金する操作を二重に走らせない）。
+static VISION_ALT_TEXT_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// alt text 生成が推定であることを示す confidence。値そのものの序列に意味はなく、
+/// 「原資料由来ではない」ことを read 側が判別できるようにするための表明（roadmap §16）。
+const VISION_ALT_TEXT_CONFIDENCE: f64 = 0.5;
+
+/// 1 図あたりの alt text 上限（文字数）。プロンプトは 1〜3 文を求めるが、モデルが暴走しても
+/// DB を膨らませないための保険。
+const VISION_ALT_TEXT_MAX_CHARS: usize = 4000;
+
+/// 連続失敗でバッチを打ち切る閾値。1 図ずつ best-effort だが、キー不正・レート制限・Vision 非対応
+/// モデルのような**系統的な失敗**では残り全図を叩き続けても無駄なので早めに止める（未処理の図は
+/// 対象のまま残り、次回の実行で拾える）。**そのランで 1 件も生成できていないときだけ**打ち切る:
+/// 対象順序は決定的なので、「必ず失敗する図」が閾値ぶん溜まると以後どの実行もその手前で
+/// 止まり、後ろの図に永久に到達しなくなる（成功が 1 件でもあれば系統的失敗ではない）。
+const VISION_ALT_TEXT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// LCIR（実験・Phase 8c）: 代替テキストがまだ無い図の件数。**課金される前に規模を見せる**ための
+/// 読み取り専用カウント（フラグに関係なく引ける）。
+#[tauri::command]
+async fn count_figures_missing_alt_text(state: State<'_, AppState>) -> Result<i64, String> {
+    db::node_alt_texts::figures_missing_alt_text(&state.db)
+        .await
+        .map(|v| v.len() as i64)
+        .map_err(|e| e.to_string())
+}
+
+/// LCIR（実験・Phase 8c）: alt text がまだ無い `figure` ノードの crop PNG を LLM Vision に
+/// 説明させ、`node_alt_texts` に `origin='llm_inference'` で保存する後追いバッチ。
+///
+/// **build には混ぜない**（Vision は非同期・課金・非決定的なので content_key の冪等性を壊す）。
+/// `lcir.enabled` と `lcir.vision_alt_text.enabled` の両方 ON のときだけ動き、**1 図ずつ
+/// best-effort**（1 図の失敗で全体を捨てない）。既に alt text がある図は対象外なので、
+/// 再実行しても再課金しない。進捗は `vision-alt-text-progress` イベントで通知する。
+#[tauri::command]
+async fn generate_vision_alt_texts(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<VisionAltTextResult, String> {
+    let disabled = VisionAltTextResult {
+        enabled: false,
+        total: 0,
+        generated: 0,
+        skipped: 0,
+        failed: 0,
+        aborted: false,
+        abort_reason: None,
+    };
+    // 課金する操作なので、LCIR 実験フラグと Vision 同意フラグの両方を要求する。
+    if !ingestion::lcir_enabled(&state.db).await || !vision_alt_text_enabled(&state.db).await {
+        return Ok(disabled);
+    }
+    if VISION_ALT_TEXT_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("already_running".to_string());
+    }
+    let _guard = VisionAltTextGuard;
+
+    // プロバイダ・モデル・API キーは OCR と同じ設定を共有する（Vision 用の設定面を増やさない）。
+    // キー未設定で全図ぶん叩かないよう、対象取得の前に一度だけ解決する。
+    let (provider, model) = llm::tools::ocr::resolve_ocr_provider(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let account = keychain::account_for_api_key(&provider);
+    let api_key = keychain::get(&account)
+        .map_err(|e| e.to_string())?
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| format!("API key for {provider} is not configured"))?;
+
+    let targets = db::node_alt_texts::figures_missing_alt_text(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let total = targets.len() as i64;
+    let (mut generated, mut skipped, mut failed) = (0i64, 0i64, 0i64);
+    let mut consecutive_failures = 0u32;
+    let mut abort_reason: Option<&'static str> = None;
+    // 実際に API を呼んだ回数（スロットルの判定に使う。skip/複製では呼ばない）。
+    let mut api_calls = 0u32;
+    // 同一 crop（バイト同一画像）を 1 ラン内で二度課金しないためのメモ。carry と同じ
+    // 「指紋が同じなら同じ絵 = 同じ説明で良い」という前提（ページ毎に出るロゴ等で効く）。
+    let mut described_by_sha: HashMap<String, String> = HashMap::new();
+
+    for (i, target) in targets.into_iter().enumerate() {
+        // 実行中に同意を外したら止まる（cancel UI は非目標だが、ユーザーに見える唯一の
+        // 「止めそうに見える操作」が黙って無効なのは不誠実なので、毎回の再評価で実現する）。
+        if !vision_alt_text_enabled(&state.db).await {
+            abort_reason = Some("consent_withdrawn");
+            break;
+        }
+        // その版がまだ当該添付の最新 completed か確認する（**Vision を呼ぶ前**に）。
+        // 長いループ中に再構築されると、旧版のノードへ書いた行はどの read 面にも現れず
+        // 課金だけが無駄になる。新版の図は次回の実行で対象になる。
+        let still_latest = db::document_versions::latest_completed_for_attachment(
+            &state.db,
+            target.attachment_id,
+        )
+        .await
+        .map(|v| v.map(|v| v.id) == Some(target.document_version_id))
+        .unwrap_or(false);
+        if !still_latest {
+            skipped += 1;
+            let _ = app.emit(
+                "vision-alt-text-progress",
+                serde_json::json!({ "done": i as i64 + 1, "total": total }),
+            );
+            continue;
+        }
+        // 同一ランで同じ画像を既に説明済みなら API を呼ばずに複製する（課金しない）。
+        if let Some(text) = described_by_sha.get(&target.asset_sha256) {
+            match db::node_alt_texts::insert_alt_text(
+                &state.db,
+                &db::node_alt_texts::NewAltText {
+                    node_id: target.node_id,
+                    document_version_id: target.document_version_id,
+                    source_asset_sha256: &target.asset_sha256,
+                    text,
+                    origin: document_ir::Origin::LlmInference.as_str(),
+                    confidence: Some(VISION_ALT_TEXT_CONFIDENCE),
+                    model: Some(&model),
+                    carried_from_version_id: None,
+                },
+            )
+            .await
+            {
+                Ok(_) => generated += 1,
+                Err(e) => {
+                    eprintln!(
+                        "LCIR: failed to save reused alt text for node {} (attachment {}): {e}",
+                        target.node_id, target.attachment_id
+                    );
+                    failed += 1;
+                }
+            }
+            let _ = app.emit(
+                "vision-alt-text-progress",
+                serde_json::json!({ "done": i as i64 + 1, "total": total }),
+            );
+            continue;
+        }
+        // ここから先は実際に API を呼ぶ。2 回目以降はリクエスト前に 1 秒待つ
+        // （レート制限にバーストで当たらないため）。
+        if api_calls > 0 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let abs = state.app_data_dir.join(&target.relative_path);
+        // crop ファイルの読み込み。無い（バックアップ復元の部分欠損等）ならスキップ — LCIR を
+        // 再構築すれば 8a の self-heal がファイルを作り直すので次回の実行で拾える。
+        match tokio::task::spawn_blocking(move || std::fs::read(&abs)).await {
+            Ok(Ok(bytes)) => {
+                let b64 = {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.encode(&bytes)
+                };
+                api_calls += 1;
+                match llm::ocr::describe_image(&provider, &model, &api_key, &target.mime_type, &b64)
+                    .await
+                {
+                    // 空応答 = 「説明できなかった」。誤った説明より欠損を選ぶので行は作らない。
+                    Ok(text) if text.trim().is_empty() => {
+                        skipped += 1;
+                        consecutive_failures = 0;
+                    }
+                    Ok(text) => {
+                        let text: String =
+                            text.trim().chars().take(VISION_ALT_TEXT_MAX_CHARS).collect();
+                        match db::node_alt_texts::insert_alt_text(
+                            &state.db,
+                            &db::node_alt_texts::NewAltText {
+                                node_id: target.node_id,
+                                document_version_id: target.document_version_id,
+                                source_asset_sha256: &target.asset_sha256,
+                                text: &text,
+                                origin: document_ir::Origin::LlmInference.as_str(),
+                                confidence: Some(VISION_ALT_TEXT_CONFIDENCE),
+                                model: Some(&model),
+                                carried_from_version_id: None,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                generated += 1;
+                                consecutive_failures = 0;
+                                described_by_sha
+                                    .insert(target.asset_sha256.clone(), text.clone());
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "LCIR: failed to save alt text for node {} (attachment {}): {e}",
+                                    target.node_id, target.attachment_id
+                                );
+                                failed += 1;
+                                consecutive_failures += 1;
+                            }
+                        }
+                    }
+                    // per-figure best-effort: 1 図の API 失敗で残りを捨てない。
+                    Err(e) => {
+                        eprintln!(
+                            "LCIR: vision alt text failed for node {} (attachment {}): {e}",
+                            target.node_id, target.attachment_id
+                        );
+                        failed += 1;
+                        consecutive_failures += 1;
+                    }
+                }
+            }
+            // ファイル欠損は系統的失敗ではないので連続失敗には数えない。
+            _ => skipped += 1,
+        }
+        // 進捗をフロントへ（図の数だけ Vision 呼び出しが走るので長時間になる）。
+        let _ = app.emit(
+            "vision-alt-text-progress",
+            serde_json::json!({ "done": i as i64 + 1, "total": total }),
+        );
+        // 系統的失敗（このランで 1 件も生成できないまま連続失敗）だけで打ち切る。
+        if consecutive_failures >= VISION_ALT_TEXT_MAX_CONSECUTIVE_FAILURES && generated == 0 {
+            eprintln!(
+                "LCIR: aborting alt text batch after {consecutive_failures} consecutive failures \
+                 (check the API key, rate limits, and that the model supports images)"
+            );
+            abort_reason = Some("failures");
+            break;
+        }
+    }
+
+    Ok(VisionAltTextResult {
+        enabled: true,
+        total,
+        generated,
+        skipped,
+        failed,
+        aborted: abort_reason.is_some(),
+        abort_reason: abort_reason.map(|r| r.to_string()),
+    })
+}
+
 /// LCIR（実験・Phase 9a）: エクスポート用にエントリの LCIR と書誌情報を読む。
 /// `source` 未指定は read 優先度（tex > pdfium）。未構築は併存一覧つきのエラー文言。
 async fn load_lcir_for_export(
@@ -3701,6 +4000,10 @@ pub fn run() {
             get_lcir_node_region,
             get_lcir_enabled,
             set_lcir_enabled,
+            get_lcir_vision_alt_text_enabled,
+            set_lcir_vision_alt_text_enabled,
+            count_figures_missing_alt_text,
+            generate_vision_alt_texts,
             export_lcir_json,
             export_lcir_markdown,
             download_arxiv_source,

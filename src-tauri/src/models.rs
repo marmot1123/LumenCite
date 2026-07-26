@@ -257,6 +257,23 @@ pub struct NodeAsset {
     pub created_at: String,
 }
 
+/// 図の代替テキスト（migration 0020・Phase 8c）。LLM Vision の**生成物**なので
+/// `origin='llm_inference'` + `confidence` + `model` で原資料由来と区別する。
+/// `source_asset_sha256` は説明した crop PNG の指紋（provenance ＋ 版跨ぎ carry のキー）。
+#[derive(Debug, serde::Serialize, serde::Deserialize, sqlx::FromRow, Clone)]
+pub struct NodeAltText {
+    pub id: i64,
+    pub node_id: i64,
+    pub document_version_id: i64,
+    pub source_asset_sha256: String,
+    pub text: String,
+    pub origin: String,
+    pub confidence: Option<f64>,
+    pub model: Option<String>,
+    pub carried_from_version_id: Option<i64>,
+    pub created_at: String,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct EntrySummary {
     pub id: i64,
