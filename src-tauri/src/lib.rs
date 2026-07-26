@@ -1063,20 +1063,71 @@ async fn get_lcir_document(
     ingestion::load_lcir_document(&state.db, attachment_id).await
 }
 
+/// LCIR の一括構築バッチ（`build_missing_lcir` / `rebuild_outdated_lcir`）の多重起動ガード。
+/// どちらも同じ添付・同じ表を触る長時間処理（既存コーパスの再構築は PDF 1 本ごとに pdfium 抽出 +
+/// ページレンダ + crop 書き出し）なので、設定モーダルを閉じ→開いて 2 本目を起動できないよう
+/// プロセス全体で 1 本に絞る（`fetch_missing_arxiv_sources` と同型）。
+static LCIR_BATCH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// [`LCIR_BATCH_RUNNING`] を Drop で必ず解除する RAII ガード。
+struct LcirBatchGuard;
+impl Drop for LcirBatchGuard {
+    fn drop(&mut self) {
+        LCIR_BATCH_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 一括構築バッチの開始（多重起動なら `already_running`）。返り値のガードが Drop で解除する。
+fn begin_lcir_batch() -> Result<LcirBatchGuard, String> {
+    if LCIR_BATCH_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("already_running".to_string());
+    }
+    Ok(LcirBatchGuard)
+}
+
+/// 一括構築の進捗を `lcir-build-progress` イベントでフロントへ流すコールバック。
+fn lcir_progress_emitter(app: &tauri::AppHandle) -> impl Fn(i64, i64) + '_ {
+    move |done, total| {
+        let _ = app.emit(
+            "lcir-build-progress",
+            serde_json::json!({ "done": done, "total": total }),
+        );
+    }
+}
+
 /// LCIR（実験）: 完了 LCIR がまだ無い PDF 添付を一括構築する（過去分の後追い）。
 #[tauri::command]
 async fn build_missing_lcir(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ingestion::LcirBatchResult, String> {
-    ingestion::build_missing_lcir(&state.db, &state.app_data_dir).await
+    let _guard = begin_lcir_batch()?;
+    ingestion::build_missing_lcir(
+        &state.db,
+        &state.app_data_dir,
+        lcir_progress_emitter(&app),
+    )
+    .await
 }
 
 /// LCIR（実験）: 旧い抽出器版で作られた LCIR を現行版へ再構築する（抽出ロジック更新後の後追い）。
+/// **既存ライブラリに新フェーズの成果（定理・参照グラフ・記号・図・表）を行き渡らせる唯一の経路**
+/// で、対象が数百本になりうるので進捗イベントを流し、多重起動を弾く。
 #[tauri::command]
 async fn rebuild_outdated_lcir(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ingestion::LcirBatchResult, String> {
-    ingestion::rebuild_outdated_lcir(&state.db, &state.app_data_dir).await
+    let _guard = begin_lcir_batch()?;
+    ingestion::rebuild_outdated_lcir(
+        &state.db,
+        &state.app_data_dir,
+        lcir_progress_emitter(&app),
+    )
+    .await
 }
 
 /// LCIR（実験・Phase 2）: ノード単位（段落・見出し・caption 等）の全文検索。ヒットは

@@ -1177,9 +1177,10 @@ fn block_payload_json(b: &structure::StructuredBlock) -> Option<String> {
 
 /// 完了 LCIR がまだ無い PDF 添付を洗い出し、順に構築する（過去分・失敗分の後追い）。
 /// フラグ OFF なら `enabled: false` で即返す。既存 `index_missing_attachments` の LCIR 版。
-pub async fn build_missing_lcir(
+pub async fn build_missing_lcir<F: Fn(i64, i64)>(
     pool: &SqlitePool,
     app_data_dir: &Path,
+    on_progress: F,
 ) -> Result<LcirBatchResult, String> {
     if !lcir_enabled(pool).await {
         return Ok(disabled_batch());
@@ -1187,7 +1188,7 @@ pub async fn build_missing_lcir(
     let targets = document_versions::attachments_without_completed_lcir(pool)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(run_build_batch(pool, app_data_dir, targets).await)
+    Ok(run_build_batch(pool, app_data_dir, targets, on_progress).await)
 }
 
 /// 現行より古い抽出器版（例 Phase 1 の 0.1.0）で作られた LCIR を、現行版へ再構築する。
@@ -1196,9 +1197,10 @@ pub async fn build_missing_lcir(
 /// **抽出器と mime フィルタは必ずペアで渡す**（Phase 4）: 「outdated」は同一抽出器系列の
 /// 中でだけ意味を持つ。pdfium 版で構築済みの PDF を「TeX 版が無いから outdated」と誤判定
 /// して全コーパス再抽出する事故を防ぐ。フラグ OFF なら `enabled: false` で即返す。
-pub async fn rebuild_outdated_lcir(
+pub async fn rebuild_outdated_lcir<F: Fn(i64, i64)>(
     pool: &SqlitePool,
     app_data_dir: &Path,
+    on_progress: F,
 ) -> Result<LcirBatchResult, String> {
     if !lcir_enabled(pool).await {
         return Ok(disabled_batch());
@@ -1221,7 +1223,7 @@ pub async fn rebuild_outdated_lcir(
         .await
         .map_err(|e| e.to_string())?,
     );
-    Ok(run_build_batch(pool, app_data_dir, targets).await)
+    Ok(run_build_batch(pool, app_data_dir, targets, on_progress).await)
 }
 
 fn disabled_batch() -> LcirBatchResult {
@@ -1235,20 +1237,28 @@ fn disabled_batch() -> LcirBatchResult {
 }
 
 /// 対象添付を順に build して集計する。`build_missing_lcir` / `rebuild_outdated_lcir` が共有。
-async fn run_build_batch(
+/// `on_progress(done, total)` は 1 添付ぶん処理するたびに呼ぶ。**数十分かかりうる**バッチ
+/// （既存コーパスの再構築は PDF 1 本ごとに pdfium 抽出 + ページレンダ + crop 書き出し）なので、
+/// 呼び出し側が進捗イベントに変換して「固まって見える」のを避けられるようにする。
+async fn run_build_batch<F: Fn(i64, i64)>(
     pool: &SqlitePool,
     app_data_dir: &Path,
     targets: Vec<(i64, String)>,
+    on_progress: F,
 ) -> LcirBatchResult {
     let total = targets.len() as i64;
     let (mut built, mut reused, mut failed) = (0i64, 0i64, 0i64);
-    for (att_id, _path) in targets {
+    for (i, (att_id, _path)) in targets.into_iter().enumerate() {
         match build_lcir_for_attachment(pool, app_data_dir, att_id).await {
             Ok(r) if r.built => built += 1,
             Ok(r) if r.reused => reused += 1,
             Ok(_) => {}
-            Err(_) => failed += 1,
+            Err(e) => {
+                eprintln!("LCIR: batch build failed for attachment {att_id}: {e}");
+                failed += 1;
+            }
         }
+        on_progress(i as i64 + 1, total);
     }
     LcirBatchResult {
         enabled: true,
@@ -1659,6 +1669,31 @@ mod tests {
             .id
     }
 
+    /// 一括バッチは 1 添付ぶん処理するたびに進捗コールバックを呼ぶ（存在しない添付でも
+    /// 失敗として数えて前進する = 1 件の失敗でバッチ全体を止めない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_batch_reports_progress_and_survives_failures(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let seen = std::sync::Mutex::new(Vec::<(i64, i64)>::new());
+        let res = run_build_batch(
+            &pool,
+            Path::new("/nonexistent"),
+            vec![(9001, "a.pdf".to_string()), (9002, "b.pdf".to_string())],
+            |done, total| seen.lock().unwrap().push((done, total)),
+        )
+        .await;
+        assert_eq!(res.total, 2);
+        assert_eq!(res.failed, 2, "存在しない添付は失敗として数える");
+        assert_eq!(res.built, 0);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(1, 2), (2, 2)],
+            "1 添付ごとに (done, total) が通知される"
+        );
+    }
+
     /// フラグ未設定時、build は何もせず（DB に 0 行）`enabled: false` を返す。
     /// pdfium も触らないので添付ファイルが実在しなくても OK。
     #[sqlx::test(migrations = "./migrations")]
@@ -1679,7 +1714,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn build_missing_is_disabled_when_flag_off(pool: SqlitePool) {
         setup_attachment(&pool).await;
-        let r = build_missing_lcir(&pool, Path::new("/nonexistent"))
+        let r = build_missing_lcir(&pool, Path::new("/nonexistent"), |_, _| {})
             .await
             .unwrap();
         assert!(!r.enabled);
@@ -1712,7 +1747,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = build_missing_lcir(&pool, Path::new("/nonexistent"))
+        let r = build_missing_lcir(&pool, Path::new("/nonexistent"), |_, _| {})
             .await
             .unwrap();
         assert!(r.enabled);

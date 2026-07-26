@@ -377,6 +377,14 @@ Phase 8（図表機械可読化）の表スライス。**TeX 版のみ**（`lume
 - **読み出し**: MCP `get_tables`（caption・rows・alignments を一問い合わせ・TeX 版固定）＋ `get_document_blocks` に表の寸法（`n_rows`/`n_columns`/`column_spec`）。Markdown エクスポートは GFM パイプテーブルとして描画（セル内 `|` は数式内 `\vert `・数式外 `\|` の二層エスケープで LaTeX の意味を変えない）。
 - **やらないこと**: PDF 側の表認識／`longtable`・`tabu` のセル構造化／multirow の grid 再解釈（下行の空セルは原文どおり）／単位（siunitx `S` 列）・表脚注（`\tnote`）の意味抽出／CSV アセット化。
 
+### LCIR の再構築 UI（v0.10.0）
+
+抽出器の版を上げても既存ライブラリは自動では作り直されないため、**旧版の LCIR に新フェーズの成果（定理・参照グラフ・記号・図・表・代替テキストの前提となる crop）が入らない**。この経路を UI から踏めるようにする。
+
+- **設定 → データ**: 「旧版の LCIR を現行版へ再構築」ボタン（`rebuild_outdated_lcir`）。従来の「未構築の PDF を一括で LCIR 化」（`build_missing_lcir` = 未構築のみ）と並べる。対象は数百本になりうるので **1 添付ごとの進捗**（`lcir-build-progress`）を表示し、**多重起動を弾く**（2 本目は「既に実行中」）。実行中は同じ添付を触る TeX 一括取得も無効化する。
+- **詳細パネルの添付行**: 添付 1 件だけを現行版で構築/再構築するボタン（`lcir.enabled` ON のときだけ表示）。`build_lcir_for_attachment` は content_key が変われば新版を作って旧版を supersede するので、「未構築」と「旧版」で操作は同じ。1 本で結果を確かめたいとき（新フェーズの動作確認）用。
+- 完了後は代替テキストの生成対象件数を取り直す（図が増えるため）。
+
 ### LCIR 図の代替テキスト（Phase 8c・v0.10.0 同梱候補）
 
 Phase 8（図表機械可読化）の alt text スライス。8a が作った `figure` ノードのページ crop PNG を LLM Vision に説明させ、`node_alt_texts`（migration 0020）へ保存する。**PDF 版のみ**（TeX 版に `figure` ノードは無い）。
