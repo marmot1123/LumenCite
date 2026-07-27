@@ -284,6 +284,8 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   // LCIR エクスポート（Phase 9a）。フラグ ON のときだけボタンを出す。
   const [lcirEnabled, setLcirEnabled] = useState(false);
   const [lcirExportBusy, setLcirExportBusy] = useState(false);
+  // 添付 1 件の LCIR 構築 / 再構築（Phase 8c 以降: 旧抽出器版のままだと図・定理・記号が入らない）。
+  const [lcirBuildBusy, setLcirBuildBusy] = useState<Record<number, boolean>>({});
   // ダウンロード中にユーザーが別エントリへ移った場合、完了時の表示更新を捨てるための現在値参照
   // （texBusy 自体はリセットしない — 同一エントリへの二重ダウンロード防止のため）。
   const entryIdRef = useRef<number | null>(null);
@@ -353,6 +355,41 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     } catch (e: any) {
       setIndexStatus(s => ({ ...s, [attId]: "none" }));
       setIndexNote(e?.message ?? String(e));
+    }
+  };
+
+  // 添付 1 件を現行の抽出器版で LCIR 構築する。`build_lcir_for_attachment` は content_key が
+  // 変わっていれば新版を作って旧版を supersede するので、未構築でも旧版でも同じボタンで足りる。
+  const handleBuildLcirForAttachment = async (attId: number) => {
+    // 抽出は数十秒かかりうるので、完了時に別エントリへ移っていたら表示更新は捨てる
+    // （TeX ソース取得と同じ stale closure ガード）。
+    const startedFor = entry?.id ?? null;
+    const stillHere = () => entryIdRef.current === startedFor;
+    setIndexNote(null);
+    setLcirBuildBusy(b => ({ ...b, [attId]: true }));
+    try {
+      const r = await invoke<{
+        enabled: boolean;
+        built: boolean;
+        reused: boolean;
+        page_count: number;
+        message: string;
+      }>("build_lcir_for_attachment", { attachmentId: attId });
+      if (!stillHere()) return;
+      setIndexNote(
+        !r.enabled
+          ? t("detailPanel.lcirBuildDisabled")
+          : r.built
+            ? t("detailPanel.lcirBuildDone")
+            : t("detailPanel.lcirBuildReused"),
+      );
+      if (r.built) onAttachmentsChanged?.();
+    } catch (e: any) {
+      if (stillHere()) {
+        setIndexNote(t("detailPanel.lcirBuildFailed", { error: e?.message ?? String(e) }));
+      }
+    } finally {
+      setLcirBuildBusy(b => ({ ...b, [attId]: false }));
     }
   };
 
@@ -763,6 +800,23 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                           background: "var(--accent-soft)", color: "var(--accent-strong)",
                         }}
                       >TeX</span>
+                    )}
+                    {lcirEnabled && (
+                      <button
+                        onClick={() => handleBuildLcirForAttachment(att.id)}
+                        disabled={lcirBuildBusy[att.id]}
+                        style={{
+                          width: 16, height: 16, padding: 0, border: "none",
+                          background: "transparent",
+                          cursor: lcirBuildBusy[att.id] ? "default" : "pointer",
+                          display: "inline-flex", alignItems: "center", justifyContent: "center",
+                          borderRadius: 3, color: "var(--text-faint)",
+                          opacity: lcirBuildBusy[att.id] ? 0.5 : 1,
+                        }}
+                        title={t("detailPanel.lcirBuildTitle")}
+                      >
+                        <Icon name="grid" size={11} color="var(--text-faint)" />
+                      </button>
                     )}
                     <button
                       onClick={() => handleDeleteAttachment(att.id)}

@@ -702,6 +702,19 @@ function DataTab() {
       void un.then((f) => f());
     };
   }, []);
+  // LCIR 一括構築 / 再構築の進捗（PDF 1 本ごとに pdfium 抽出 + ページレンダなので長時間）。
+  // 実行中フラグは共有 busy と別に持つ（数十分の実行中に他の操作が busy を書き換えても
+  // このボタンのラベル・活性が誤って戻らないようにするため）。
+  const [lcirBatch, setLcirBatch] = useState<"build" | "rebuild" | null>(null);
+  const [lcirProgress, setLcirProgress] = useState<{ done: number; total: number } | null>(null);
+  useEffect(() => {
+    const un = listen<{ done: number; total: number }>("lcir-build-progress", (e) =>
+      setLcirProgress(e.payload),
+    );
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
   // 代替テキスト一括生成の進捗（図の数だけ Vision 呼び出しが走るので長時間になる）。
   const [altTextRunning, setAltTextRunning] = useState(false);
   const [altTextProgress, setAltTextProgress] = useState<{ done: number; total: number } | null>(
@@ -822,8 +835,12 @@ function DataTab() {
     }
   };
 
-  const handleBuildLcir = async () => {
-    setBusy("build_lcir");
+  // 未構築の一括 LCIR 化（build）と、旧抽出器版の現行版への再構築（rebuild）。
+  // 後者は既存ライブラリに新フェーズの成果（定理・参照グラフ・記号・図・表）を行き渡らせる
+  // 唯一の経路で、対象が数百本になりうる。
+  const handleLcirBatch = async (kind: "build" | "rebuild") => {
+    setLcirBatch(kind);
+    setLcirProgress(null);
     setMessage(null);
     setError(null);
     try {
@@ -833,19 +850,34 @@ function DataTab() {
         built: number;
         reused: number;
         failed: number;
-      }>("build_missing_lcir");
+      }>(kind === "build" ? "build_missing_lcir" : "rebuild_outdated_lcir");
       if (!r.enabled) {
         setMessage(t("settings.data.lcirDisabled"));
       } else if (r.total === 0) {
-        setMessage(t("settings.data.lcirNone"));
+        setMessage(
+          kind === "build" ? t("settings.data.lcirNone") : t("settings.data.lcirRebuildNone"),
+        );
       } else {
-        setMessage(t("settings.data.lcirDone", { total: r.total, built: r.built, failed: r.failed }));
+        setMessage(
+          t(kind === "build" ? "settings.data.lcirDone" : "settings.data.lcirRebuildDone", {
+            total: r.total,
+            built: r.built,
+            reused: r.reused,
+            failed: r.failed,
+          }),
+        );
       }
     } catch (e) {
-      setError(t("settings.data.lcirError", { error: errMsg(e) }));
+      const s = errMsg(e);
+      setError(
+        s.includes("already_running")
+          ? t("settings.data.lcirBatchRunning")
+          : t("settings.data.lcirError", { error: s }),
+      );
     } finally {
-      setBusy(null);
-      // 構築で figure + crop が増えるので、課金前に見せる件数を取り直す。
+      setLcirBatch(null);
+      setLcirProgress(null);
+      // 構築・再構築で figure + crop が増えるので、課金前に見せる件数を取り直す。
       refreshAltTextPending();
     }
   };
@@ -1014,10 +1046,36 @@ function DataTab() {
           <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.data.lcirEnable")}</span>
         </label>
         <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <SecondaryBtn onClick={handleBuildLcir} disabled={!lcirEnabled || busy === "build_lcir"}>
-            {busy === "build_lcir" ? t("settings.data.lcirBusy") : t("settings.data.lcirBuild")}
+          <SecondaryBtn
+            onClick={() => handleLcirBatch("build")}
+            disabled={!lcirEnabled || lcirBatch !== null}
+          >
+            {lcirBatch === "build"
+              ? lcirProgress
+                ? t("settings.data.lcirBusyProgress", {
+                    done: lcirProgress.done,
+                    total: lcirProgress.total,
+                  })
+                : t("settings.data.lcirBusy")
+              : t("settings.data.lcirBuild")}
           </SecondaryBtn>
-          <SecondaryBtn onClick={handleFetchTex} disabled={!lcirEnabled || fetchTexRunning}>
+          <SecondaryBtn
+            onClick={() => handleLcirBatch("rebuild")}
+            disabled={!lcirEnabled || lcirBatch !== null}
+          >
+            {lcirBatch === "rebuild"
+              ? lcirProgress
+                ? t("settings.data.lcirRebuildBusyProgress", {
+                    done: lcirProgress.done,
+                    total: lcirProgress.total,
+                  })
+                : t("settings.data.lcirRebuildBusy")
+              : t("settings.data.lcirRebuild")}
+          </SecondaryBtn>
+          <SecondaryBtn
+            onClick={handleFetchTex}
+            disabled={!lcirEnabled || fetchTexRunning || lcirBatch !== null}
+          >
             {fetchTexRunning
               ? texProgress
                 ? t("settings.data.texFetchBusyProgress", {
