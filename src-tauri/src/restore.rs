@@ -220,7 +220,8 @@ pub async fn stage_restore(
     }
 
     // 安全網: 復元前に現行状態を完全バックアップする。ここが失敗するなら復元も中止する。
-    let safety_backup = match crate::backup::run_backup(pool, app_dir, 14).await {
+    let safety_backup =
+        match crate::backup::run_backup(pool, app_dir, crate::backup::DEFAULT_KEEP).await {
         Ok(p) => p,
         Err(e) => {
             let _ = fs::remove_dir_all(&pending);

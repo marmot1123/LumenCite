@@ -2781,7 +2781,8 @@ async fn run_backup_now(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let path = backup::run_backup(&state.db, &dir, 14).await?;
+    // 手動実行は間引かない（ユーザーが「今すぐ」と言っている）。
+    let path = backup::run_backup(&state.db, &dir, backup::DEFAULT_KEEP).await?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -3832,11 +3833,18 @@ pub fn run() {
 
             // 起動時に添付 trash を sweep する（前回の削除でロック等により消せず
             // 残った孤立ファイル/ディレクトリを回収する・CR-008 永続 retry queue）。
+            // バックアップの作業ファイル（VACUUM 中間 DB / 書きかけアーカイブ）も同時に
+            // 回収する。中間 DB は DB と同サイズあり、途中終了のたびに溜まると
+            // ディスクを食い潰す（実際に 220 ファイル・95GB 溜まった事例あり）。
             let trash_dir = data_dir.clone();
             std::thread::spawn(move || {
                 let n = attachment_trash::sweep_trash(&trash_dir);
                 if n > 0 {
                     eprintln!("attachment trash: swept {n} leftover item(s) at startup");
+                }
+                let m = backup::sweep_backup_workdir(&trash_dir, backup::DEFAULT_KEEP);
+                if m > 0 {
+                    eprintln!("backup: swept {m} leftover work file(s) at startup");
                 }
             });
 
@@ -3911,7 +3919,10 @@ pub fn run() {
                         }
                     }
 
-                    // 起動は復号した env で行う。
+                    // 起動は復号した env で行う。1 本ずつ待つと、応答の遅いサーバーの
+                    // ハンドシェイク待ち（initialize / tools/list で各 15s）が後続に積み上がり、
+                    // 最後のサーバーが使えるようになるまで分単位かかり得る。並行で起動する。
+                    let mut handles = Vec::new();
                     for cfg in servers {
                         let cfg = match decrypt_server_env(cfg) {
                             Ok(c) => c,
@@ -3920,9 +3931,17 @@ pub fn run() {
                                 continue;
                             }
                         };
-                        if let Err(e) = mcp.start(cfg).await {
-                            eprintln!("MCP server start failed: {e}");
-                        }
+                        let mcp = Arc::clone(&mcp);
+                        handles.push(tauri::async_runtime::spawn(async move {
+                            let id = cfg.id.clone();
+                            if let Err(e) = mcp.start(cfg).await {
+                                // どのサーバーが落ちたか分かるよう id を添える。
+                                eprintln!("MCP server start failed [{id}]: {e}");
+                            }
+                        }));
+                    }
+                    for h in handles {
+                        let _ = h.await;
                     }
                 }
             });
@@ -3931,20 +3950,52 @@ pub fn run() {
             // 標準的なショートカット ⌘+, (macOS) / Ctrl+, (他 OS) を割り当てる。
             install_app_menu(app.handle())?;
 
-            // バックアップ: 起動時に 1 回 + 24h 間隔で実行。
+            // バックアップ: 起動時に 1 回 + 24h 間隔で実行。ただし前回成功から 24h 未満なら
+            // 起動時の 1 回は間引く。フルバックアップ（VACUUM + zip）はライブラリが育つと
+            // 分単位でディスクと CPU を占有し、起動のたびに走らせると MCP サーバーの
+            // ハンドシェイク（15s でタイムアウト）や初期描画を巻き添えにする。
+            //
+            // dev ビルドは再ビルドのたびにプロセスが再起動するので既定で走らせない
+            // （`LUMENCITE_STARTUP_BACKUP=1` で明示的に有効化できる）。
             // エラーは log のみで握り潰し、本体ループは止めない。
+            let auto_backup_enabled = !cfg!(debug_assertions)
+                || matches!(std::env::var("LUMENCITE_STARTUP_BACKUP").as_deref(), Ok("1"));
+            if !auto_backup_enabled {
+                eprintln!(
+                    "backup: auto backup disabled in dev build \
+                     (set LUMENCITE_STARTUP_BACKUP=1 to enable)"
+                );
+            }
             let backup_pool = pool.clone();
             let backup_dir = data_dir.clone();
             tauri::async_runtime::spawn(async move {
-                const RETENTION: usize = 14;
-                if let Err(e) = backup::run_backup(&backup_pool, &backup_dir, RETENTION).await {
-                    eprintln!("startup backup failed: {}", e);
+                if !auto_backup_enabled {
+                    return;
+                }
+                match backup::run_backup_if_due(
+                    &backup_pool,
+                    &backup_dir,
+                    backup::DEFAULT_KEEP,
+                    backup::AUTO_INTERVAL_SECS,
+                )
+                .await
+                {
+                    Ok(None) => eprintln!("backup: skipped at startup (last run < 24h ago)"),
+                    Ok(Some(_)) => {}
+                    Err(e) => eprintln!("startup backup failed: {}", e),
                 }
                 let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
                 interval.tick().await; // 起動直後の重複 tick を消費
                 loop {
                     interval.tick().await;
-                    if let Err(e) = backup::run_backup(&backup_pool, &backup_dir, RETENTION).await {
+                    if let Err(e) = backup::run_backup_if_due(
+                        &backup_pool,
+                        &backup_dir,
+                        backup::DEFAULT_KEEP,
+                        backup::AUTO_INTERVAL_SECS,
+                    )
+                    .await
+                    {
                         eprintln!("scheduled backup failed: {}", e);
                     }
                 }
