@@ -2653,9 +2653,27 @@ mod tests {
         // Phase 8c: 代替テキスト。**Vision 呼び出し（課金）は smoke では行わない** — 代わりに
         // バッチ対象クエリが実データで何を拾うか（crop 付きの図がすべて対象・生成済みは除外）を
         // 検証する。carry / prune は DB テストで網羅済み。
-        let targets = crate::db::node_alt_texts::figures_missing_alt_text(&pool)
+        let all_crops = crate::db::node_alt_texts::AltTextTargetFilter {
+            min_crop_px: 0,
+            ..Default::default()
+        };
+        let targets = crate::db::node_alt_texts::figures_missing_alt_text(&pool, all_crops)
             .await
             .unwrap();
+        // 既定しきい値（短辺 200px）で実際に課金対象になる件数も見せる（小片が落ちる）。
+        let default_targets = crate::db::node_alt_texts::figures_missing_alt_text(
+            &pool,
+            crate::db::node_alt_texts::AltTextTargetFilter::default(),
+        )
+        .await
+        .unwrap();
+        eprintln!(
+            "[phase8c] default filter (min 200px) targets: this version={}",
+            default_targets
+                .iter()
+                .filter(|t| t.document_version_id == doc.version_id)
+                .count()
+        );
         let mine: Vec<_> = targets
             .iter()
             .filter(|t| t.document_version_id == doc.version_id)
@@ -2695,7 +2713,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let after = crate::db::node_alt_texts::figures_missing_alt_text(&pool)
+            let after = crate::db::node_alt_texts::figures_missing_alt_text(&pool, all_crops)
                 .await
                 .unwrap();
             assert_eq!(

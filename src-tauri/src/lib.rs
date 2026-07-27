@@ -1258,14 +1258,34 @@ const VISION_ALT_TEXT_MAX_CHARS: usize = 4000;
 /// 止まり、後ろの図に永久に到達しなくなる（成功が 1 件でもあれば系統的失敗ではない）。
 const VISION_ALT_TEXT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+/// Vision 生成バッチの対象絞り込み（`entry_id` / `attachment_id` は任意・極小 crop は既定で除外）。
+fn alt_text_filter(
+    entry_id: Option<i64>,
+    attachment_id: Option<i64>,
+) -> db::node_alt_texts::AltTextTargetFilter {
+    db::node_alt_texts::AltTextTargetFilter {
+        entry_id,
+        attachment_id,
+        min_crop_px: db::node_alt_texts::DEFAULT_MIN_CROP_PX,
+    }
+}
+
 /// LCIR（実験・Phase 8c）: 代替テキストがまだ無い図の件数。**課金される前に規模を見せる**ための
-/// 読み取り専用カウント（フラグに関係なく引ける）。
+/// 読み取り専用カウント（フラグに関係なく引ける）。`entry_id`/`attachment_id` で絞れるので
+/// 詳細パネルは「この文献に何件あるか」を出せる。
 #[tauri::command]
-async fn count_figures_missing_alt_text(state: State<'_, AppState>) -> Result<i64, String> {
-    db::node_alt_texts::figures_missing_alt_text(&state.db)
-        .await
-        .map(|v| v.len() as i64)
-        .map_err(|e| e.to_string())
+async fn count_figures_missing_alt_text(
+    state: State<'_, AppState>,
+    entry_id: Option<i64>,
+    attachment_id: Option<i64>,
+) -> Result<i64, String> {
+    db::node_alt_texts::figures_missing_alt_text(
+        &state.db,
+        alt_text_filter(entry_id, attachment_id),
+    )
+    .await
+    .map(|v| v.len() as i64)
+    .map_err(|e| e.to_string())
 }
 
 /// LCIR（実験・Phase 8c）: alt text がまだ無い `figure` ノードの crop PNG を LLM Vision に
@@ -1275,10 +1295,14 @@ async fn count_figures_missing_alt_text(state: State<'_, AppState>) -> Result<i6
 /// `lcir.enabled` と `lcir.vision_alt_text.enabled` の両方 ON のときだけ動き、**1 図ずつ
 /// best-effort**（1 図の失敗で全体を捨てない）。既に alt text がある図は対象外なので、
 /// 再実行しても再課金しない。進捗は `vision-alt-text-progress` イベントで通知する。
+/// `entry_id`/`attachment_id` を渡すとその範囲だけを生成する（**まず 1 本で品質と費用を
+/// 確かめてから広げる**ため）。短辺 200px 未満の crop（ロゴ・装飾等）は既定で対象外。
 #[tauri::command]
 async fn generate_vision_alt_texts(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+    entry_id: Option<i64>,
+    attachment_id: Option<i64>,
 ) -> Result<VisionAltTextResult, String> {
     let disabled = VisionAltTextResult {
         enabled: false,
@@ -1312,9 +1336,12 @@ async fn generate_vision_alt_texts(
         .filter(|k| !k.trim().is_empty())
         .ok_or_else(|| format!("API key for {provider} is not configured"))?;
 
-    let targets = db::node_alt_texts::figures_missing_alt_text(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
+    let targets = db::node_alt_texts::figures_missing_alt_text(
+        &state.db,
+        alt_text_filter(entry_id, attachment_id),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let total = targets.len() as i64;
     let (mut generated, mut skipped, mut failed) = (0i64, 0i64, 0i64);
     let mut consecutive_failures = 0u32;

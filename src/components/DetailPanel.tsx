@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -286,6 +286,11 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   const [lcirExportBusy, setLcirExportBusy] = useState(false);
   // 添付 1 件の LCIR 構築 / 再構築（Phase 8c 以降: 旧抽出器版のままだと図・定理・記号が入らない）。
   const [lcirBuildBusy, setLcirBuildBusy] = useState<Record<number, boolean>>({});
+  // 図の代替テキスト生成（Phase 8c）。**課金操作なので同意フラグ ON のときだけ出す**。
+  // このエントリの生成対象件数を先に見せ、0 件ならボタンを出さない。
+  const [altTextEnabled, setAltTextEnabled] = useState(false);
+  const [altTextPending, setAltTextPending] = useState(0);
+  const [altTextBusy, setAltTextBusy] = useState(false);
   // ダウンロード中にユーザーが別エントリへ移った場合、完了時の表示更新を捨てるための現在値参照
   // （texBusy 自体はリセットしない — 同一エントリへの二重ダウンロード防止のため）。
   const entryIdRef = useRef<number | null>(null);
@@ -314,10 +319,78 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
       .catch(() => {
         if (!cancelled) setLcirEnabled(false);
       });
+    invoke<boolean>("get_lcir_vision_alt_text_enabled")
+      .then(v => {
+        if (!cancelled) setAltTextEnabled(v);
+      })
+      .catch(() => {
+        if (!cancelled) setAltTextEnabled(false);
+      });
     return () => {
       cancelled = true;
     };
   }, [entry?.id]);
+
+  // このエントリの「代替テキストが無い図」の件数（課金前に規模を見せる・0 件ならボタンを隠す）。
+  // 添付の増減・LCIR 再構築・生成の後に取り直す。
+  const refreshAltTextPending = useCallback(() => {
+    if (!entry?.id) return;
+    invoke<number>("count_figures_missing_alt_text", { entryId: entry.id })
+      .then(setAltTextPending)
+      .catch(() => setAltTextPending(0));
+  }, [entry?.id]);
+  useEffect(() => {
+    if (!lcirEnabled || !altTextEnabled) {
+      setAltTextPending(0);
+      return;
+    }
+    refreshAltTextPending();
+  }, [lcirEnabled, altTextEnabled, refreshAltTextPending, entry?.attachments?.length]);
+
+  // このエントリの図だけに代替テキストを生成する（ライブラリ全体は設定 → データから）。
+  const handleGenerateAltTexts = async () => {
+    if (!entry?.id || altTextBusy) return;
+    const startedFor = entry.id;
+    const stillHere = () => entryIdRef.current === startedFor;
+    setAltTextBusy(true);
+    setIndexNote(null);
+    try {
+      const r = await invoke<{
+        enabled: boolean;
+        total: number;
+        generated: number;
+        skipped: number;
+        failed: number;
+        aborted: boolean;
+        abort_reason: string | null;
+      }>("generate_vision_alt_texts", { entryId: startedFor });
+      if (!stillHere()) return;
+      setIndexNote(
+        !r.enabled
+          ? t("detailPanel.altTextDisabled")
+          : r.total === 0
+            ? t("detailPanel.altTextNone")
+            : t("detailPanel.altTextDone", {
+                total: r.total,
+                generated: r.generated,
+                skipped: r.skipped,
+                failed: r.failed,
+              }),
+      );
+    } catch (e: any) {
+      if (stillHere()) {
+        const msg = e?.message ?? String(e);
+        setIndexNote(
+          String(msg).includes("already_running")
+            ? t("detailPanel.altTextRunning")
+            : t("detailPanel.altTextFailed", { error: msg }),
+        );
+      }
+    } finally {
+      setAltTextBusy(false);
+      refreshAltTextPending();
+    }
+  };
 
   // 添付の全文索引状態を取得する（エントリ切替・添付増減で再取得）。PDF のみが対象。
   useEffect(() => {
@@ -383,7 +456,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
             ? t("detailPanel.lcirBuildDone")
             : t("detailPanel.lcirBuildReused"),
       );
-      if (r.built) onAttachmentsChanged?.();
+      if (r.built) {
+        onAttachmentsChanged?.();
+        refreshAltTextPending();
+      }
     } catch (e: any) {
       if (stillHere()) {
         setIndexNote(t("detailPanel.lcirBuildFailed", { error: e?.message ?? String(e) }));
@@ -887,6 +963,28 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                         : t(format === "json" ? "detailPanel.lcirExportJson" : "detailPanel.lcirExportMd")}
                     </button>
                   ))}
+                  {/* 図の代替テキスト生成（Phase 8c）: 課金操作なので同意フラグ ON かつ
+                      対象が 1 件以上あるときだけ出し、ラベルに件数を入れる。 */}
+                  {lcirEnabled && altTextEnabled && altTextPending > 0 && (
+                    <button
+                      onClick={handleGenerateAltTexts}
+                      disabled={altTextBusy}
+                      title={t("detailPanel.altTextTitle")}
+                      style={{
+                        display: "inline-flex", alignItems: "center", gap: 3,
+                        padding: "2px 8px", borderRadius: 5,
+                        border: "1px dashed var(--border-strong)",
+                        background: "transparent", color: "var(--text-faint)",
+                        fontSize: 11, cursor: altTextBusy ? "default" : "pointer",
+                        opacity: altTextBusy ? 0.5 : 1,
+                      }}
+                    >
+                      <Icon name="sparkle" size={9} color="var(--text-faint)" />
+                      {altTextBusy
+                        ? t("detailPanel.altTextBusy")
+                        : t("detailPanel.altText", { pending: altTextPending })}
+                    </button>
+                  )}
                 </div>
                 {attachError && (
                   <div style={{ fontSize: 11, color: "var(--danger-strong)", marginTop: 2 }}>
