@@ -113,6 +113,143 @@ mod tests {
         }
     }
 
+    /// Phase 8c: **実ライブラリの一括生成をヘッドレスで回す**手動ハーネス。アプリのボタン
+    /// （Tauri コマンド `generate_vision_alt_texts`）と同じ対象述語・同じプロンプト・同じアクセサを
+    /// 使うが Tauri ランタイム無しで動く（ターミナルから長時間バッチを流したいとき用）。
+    /// **1 図ごとに課金される。** 冪等（行がある図は対象外）なので中断しても再実行で続きから進む。
+    ///
+    /// 本番との差: ①版の陳腐化チェックは省略（実行中に再構築しない前提）②連続失敗の打ち切りを
+    /// 10 件に固定（長時間の無人実行で系統的失敗を焼き続けないため）。
+    ///
+    /// ```text
+    /// LCIR_ALT_TEXT_DB=<live.db> LCIR_ALT_TEXT_APPDIR=<app data dir> \
+    ///   LCIR_ALT_TEXT_KEY=<api key> [LCIR_ALT_TEXT_LIMIT=N] \
+    ///   cargo test --lib generate_alt_texts_for_library -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "manual billed batch; needs LCIR_ALT_TEXT_* env"]
+    async fn generate_alt_texts_for_library() {
+        use base64::Engine;
+        use std::collections::HashMap;
+        use std::time::Duration;
+        let (Ok(db), Ok(appdir), Ok(key)) = (
+            std::env::var("LCIR_ALT_TEXT_DB"),
+            std::env::var("LCIR_ALT_TEXT_APPDIR"),
+            std::env::var("LCIR_ALT_TEXT_KEY"),
+        ) else {
+            eprintln!("skip: set LCIR_ALT_TEXT_DB / LCIR_ALT_TEXT_APPDIR / LCIR_ALT_TEXT_KEY");
+            return;
+        };
+        let limit: usize = std::env::var("LCIR_ALT_TEXT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX);
+
+        // 稼働中アプリと同居するので busy_timeout を長めに取る（WAL で読み書きは併存できる）。
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(30));
+        let pool = sqlx::SqlitePool::connect_with(opts).await.expect("open db");
+
+        let (provider, model) = crate::llm::tools::ocr::resolve_ocr_provider(&pool)
+            .await
+            .expect("resolve provider/model");
+        let targets = crate::db::node_alt_texts::figures_missing_alt_text(
+            &pool,
+            crate::db::node_alt_texts::AltTextTargetFilter::default(),
+        )
+        .await
+        .expect("targets");
+        let total = targets.len().min(limit);
+        eprintln!("[8c-batch] provider={provider} model={model} targets={total}");
+
+        let (mut generated, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+        let mut consecutive_failures = 0u32;
+        let mut api_calls = 0u32;
+        let mut described_by_sha: HashMap<String, String> = HashMap::new();
+
+        for (i, t) in targets.into_iter().take(limit).enumerate() {
+            let abs = std::path::Path::new(&appdir).join(&t.relative_path);
+            // 同一ラン内でバイト同一 crop を二度課金しない（本番と同じ指紋メモ）。
+            let cached = described_by_sha.get(&t.asset_sha256).cloned();
+            let text = match cached {
+                Some(text) => Some(text),
+                None => {
+                    let Ok(bytes) = std::fs::read(&abs) else {
+                        skipped += 1;
+                        eprintln!("[{}/{total}] skip (crop missing) node={}", i + 1, t.node_id);
+                        continue;
+                    };
+                    if api_calls > 0 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    api_calls += 1;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    match describe_image(&provider, &model, &key, &t.mime_type, &b64).await {
+                        Ok(text) if text.trim().is_empty() => {
+                            skipped += 1;
+                            consecutive_failures = 0;
+                            eprintln!("[{}/{total}] skip (empty) node={}", i + 1, t.node_id);
+                            continue;
+                        }
+                        Ok(text) => {
+                            let text: String = text.trim().chars().take(4000).collect();
+                            described_by_sha.insert(t.asset_sha256.clone(), text.clone());
+                            Some(text)
+                        }
+                        Err(e) => {
+                            failed += 1;
+                            consecutive_failures += 1;
+                            eprintln!("[{}/{total}] FAIL node={} {e}", i + 1, t.node_id);
+                            if consecutive_failures >= 10 {
+                                eprintln!("[8c-batch] aborting after 10 consecutive failures");
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            };
+            let text = text.expect("text");
+            match crate::db::node_alt_texts::insert_alt_text(
+                &pool,
+                &crate::db::node_alt_texts::NewAltText {
+                    node_id: t.node_id,
+                    document_version_id: t.document_version_id,
+                    source_asset_sha256: &t.asset_sha256,
+                    text: &text,
+                    origin: crate::document_ir::Origin::LlmInference.as_str(),
+                    confidence: Some(0.5),
+                    model: Some(&model),
+                    carried_from_version_id: None,
+                },
+            )
+            .await
+            {
+                Ok(_) => {
+                    generated += 1;
+                    consecutive_failures = 0;
+                    eprintln!(
+                        "[{}/{total}] ok node={} {}",
+                        i + 1,
+                        t.node_id,
+                        text.chars().take(70).collect::<String>()
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    consecutive_failures += 1;
+                    eprintln!("[{}/{total}] SAVE FAIL node={} {e}", i + 1, t.node_id);
+                }
+            }
+        }
+        eprintln!(
+            "[8c-batch] done: generated={generated} skipped={skipped} failed={failed} (api_calls={api_calls})"
+        );
+    }
+
     /// Phase 8c の手動スモーク: 実際の crop PNG 1 枚で alt text 生成プロンプトを確かめる。
     /// **API キーは env で渡す**（テストバイナリから keychain を触らない）・**1 枚だけ課金される**。
     ///
