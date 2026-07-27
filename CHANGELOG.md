@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-28
+
+This release completes **Phase 8** of **LCIR** — the experimental, machine-readable intermediate representation for papers — and adds its first **export** path. Papers can now be written out as LCIR JSON or as structured Markdown; figures are detected and cropped out of PDFs, TeX tables are structured cell by cell, and figures can optionally be described by an LLM Vision model as alt text. Everything stays gated behind the off-by-default `lcir.enabled` flag, so default behaviour is **unchanged**. Two additive migrations (`0019`, `0020`) create new tables that remain empty unless the flag is on — no data migration, and existing libraries upgrade unchanged. The Web Clipper extension is unchanged from v0.8.0 (v0.2.0).
+
+### Added
+
+- **LCIR — export (Phase 9a, experimental)** — write an entry out as **LCIR JSON** (the validated structure, with provenance, coordinates and confidence) or as **structured Markdown** (sections, raw LaTeX math, theorems and proofs, GFM tables, and a reference list carrying cite keys). Available from two buttons in the detail panel, and from the CLI as `lumencite export-lcir <id|key> [--format json|md] [--source tex|pdf]`.
+- **LCIR — figures from PDFs (Phase 8a, experimental)** — detects figure regions on each page, saves a cropped PNG per figure, records them as `figure` nodes, and links each one to its caption (`caption_of`). Adds migration `0019` (`assets`, `node_assets`).
+- **LCIR — structured tables from TeX (Phase 8b, experimental)** — parses `tabular` / `tabular*` / `tabularx` into a row-by-cell grid (`table` nodes) with column spec, alignments, `\multicolumn` spans and rules, keeping LaTeX inside cells intact. Markdown export renders these as GFM pipe tables. No new tables.
+- **LCIR — figure alt text via LLM Vision (Phase 8c, opt-in, incurs API cost)** — describes figure crops with a Vision model and stores the result in `node_alt_texts`. Gated behind its own consent flag, `lcir.vision_alt_text.enabled`, which is **separate from `lcir.enabled` and also off by default**; both must be on. Runs as an explicit batch (never during a build), can be scoped to a single entry or attachment, skips very small crops, and shows the target count before you start. Generated text is stored as `origin='llm_inference'` with a confidence and model name — it never overwrites the author's caption and never enters full-text search. Descriptions carry across extractor versions by crop fingerprint, so a rebuild does not re-bill. Adds migration `0020`.
+- **Rebuilding LCIR for an existing library** — raising an extractor version no longer leaves old documents behind: Settings → Data gains a **"rebuild outdated LCIR"** batch (with progress and a guard against concurrent runs), and each attachment row in the detail panel gains a per-attachment build/rebuild button.
+- **New LCIR read tools over MCP** — `get_figures` (bounding boxes, figure numbers, captions, crop paths and alt text) and `get_tables` (captions and cell grids), available when `lcir.enabled` is on.
+
+### Notes
+
+- **Disk usage grows when LCIR is enabled and rebuilt.** Figure crops are written as PNGs under `attachments/<entry>/.lcir/` and are **included in backup archives**. On the development library, 888 figures came to roughly 529 MB, taking the backup set from 531 MB to 726 MB. Check free space before enabling and rebuilding a large library.
+- **Set the OCR model to `claude-sonnet-5` before generating alt text.** Vision alt text reuses the OCR provider/model settings (`llm.ocr_provider` / `llm.ocr_model`), and description quality differs sharply between models — in our testing only `claude-sonnet-5` was reliably accurate about shapes, mappings and edge labels, while smaller models misread figures or asserted relationships that were not there. For scale, generating alt text for 888 figures with `claude-sonnet-5` cost about **$6**.
+- **Default behaviour is unchanged.** All `lcir.*` flags are off by default; full-text search, BibTeX, the Web Clipper and existing CLI commands are unaffected.
+
 ## [0.9.0] - 2026-07-23
 
 This release advances **LCIR** — the experimental, machine-readable intermediate representation for papers introduced in v0.8.0 — with three more phases: typed theorem/definition/proof nodes, a cross-reference graph, and symbol definitions. Everything stays gated behind the off-by-default `lcir.enabled` flag, so default behaviour is **byte-for-byte unchanged** and the Web Clipper extension is unchanged from v0.8.0. Two additive migrations (`0017`, `0018`) create new tables that remain empty unless the flag is on — no data migration, and existing libraries upgrade unchanged.
