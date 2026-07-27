@@ -634,7 +634,7 @@ APIキーはOSキーチェーン（`keyring` クレート経由）に保存す�
 type BackupInfo = { path: string; file_name: string; created_at: string; size_bytes: number };
 ```
 
-**完全バックアップ（CR-018）**: `run_backup_now` は `<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.zip` を作る。アーカイブ内レイアウトは `db.sqlite`（DB 全体＝highlights/chat/settings/fulltext 込み）＋ `attachments/<entry_id>/<file_name>`（添付本体）。deflate 圧縮。14 世代保持。自動バックアップは Rust 側で起動時 + 24h 間隔のタイマーから呼ばれる。
+**完全バックアップ（CR-018）**: `run_backup_now` は `<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.zip` を作る。アーカイブ内レイアウトは `db.sqlite`（DB 全体＝highlights/chat/settings/fulltext 込み）＋ `attachments/<entry_id>/<file_name>`（添付本体）。deflate 圧縮。14 世代保持。自動バックアップは Rust 側で起動時 + 24h 間隔のタイマーから呼ばれ、前回成功（`settings.backup.last_run`）から 24h 未満なら間引かれる（`run_backup_if_due`）。`run_backup_now` は間引かず常に実行する。アーカイブは `<stem>.zip.partial` に書いてから `<stem>.zip` へ rename するため、途中終了しても中身の欠けたアーカイブが一覧・世代管理に混ざらない。
 
 - **復元（CR-018）**: `restore_from_archive(path)` はライブ DB を握ったまま差し替える危険を避けるため **2 フェーズ**で動く。①稼働中に `.zip` を検証（`db.sqlite` 存在・`PRAGMA integrity_check`・スキーマ版がアプリ以下か）し、**復元前に現行状態を自動フルバックアップ**したうえで `<app_data_dir>/pending-restore/` へ展開＋マーカー設置。②次回起動時、pool を開く前に現行 DB（＋ `-wal`/`-shm`）と `attachments/` を `<app_data_dir>/pre-restore/` へ退避し、staged を所定位置へ移す（失敗時は退避物から自動ロールバックし、旧 DB のまま起動継続）。フロントは `restore_from_archive` 成功後に `@tauri-apps/plugin-process` の `relaunch()` で再起動する。
 - `export_database_json` / `export_database_markdown` は再インポート不可の**メタデータ書き出し**（PDF・ハイライト・チャット・設定は含まない）。

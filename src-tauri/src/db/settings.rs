@@ -80,6 +80,11 @@ pub const FTS_AUTHORS_V030_REBUILT_KEY: &str = "fts.authors_v030_rebuilt";
 /// 索引を作り直す。値は "1"（再構築済み）のみで、未設定なら未実施扱い。
 pub const FTS_FULLTEXT_REBUILT_KEY: &str = "fts.fulltext_rebuilt";
 
+/// 直近のバックアップ成功時刻（RFC3339）。自動バックアップ（起動時 / 24h タイマー）が
+/// 前回からの経過時間を見て間引くために使う。手動実行（`run_backup_now`）は間引かないが、
+/// 成功時にはこの値を更新する。未設定なら「未実施」＝次の自動実行で走る。
+pub const BACKUP_LAST_RUN_KEY: &str = "backup.last_run";
+
 /// LCIR（機械可読中間形式）の実験フラグ（"1" で有効・既定 off）。ON の間だけ pdfium 抽出で
 /// document_versions/nodes/source_fragments を追加構築する。OFF なら既存挙動は byte-for-byte 不変。
 pub const LCIR_ENABLED_KEY: &str = "lcir.enabled";

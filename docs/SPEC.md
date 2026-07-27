@@ -50,7 +50,7 @@
   - 詳細は `DATA_MODEL.md` の `citation_key` 節 / `API_SPEC.md` 参照
 
 ### データ保全 / 配布
-- **自動バックアップ（CR-018: 添付本体込み）**: アプリ起動時 + 1日1回、`<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.zip` に**完全バックアップ**を作成。アーカイブは `db.sqlite`（`VACUUM INTO` によるクリーンコピー。highlights/chat/settings/fulltext 込み）＋ `attachments/<entry_id>/<file_name>`（添付本体）を deflate 圧縮で束ねる。14世代まで保持（旧 `.db` バックアップも世代管理・一覧の対象）
+- **自動バックアップ（CR-018: 添付本体込み）**: アプリ起動時 + 1日1回、`<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.zip` に**完全バックアップ**を作成。起動時の実行は前回成功（`settings.backup.last_run`）から 24h 未満なら**間引く**（フルバックアップは分単位でディスクと CPU を占有し、起動のたびに走ると MCP サーバーの起動や初期描画を巻き添えにするため）。手動実行（`run_backup_now`）は間引かない。dev ビルドでは再ビルドのたびに再起動するため自動バックアップは既定で無効（`LUMENCITE_STARTUP_BACKUP=1` で有効化）。作業ファイル（`.vacuum-*.db.tmp` / 書きかけの `*.zip.partial`）は途中終了時に残るため起動時に回収する。アーカイブは `db.sqlite`（`VACUUM INTO` によるクリーンコピー。highlights/chat/settings/fulltext 込み）＋ `attachments/<entry_id>/<file_name>`（添付本体）を deflate 圧縮で束ねる。14世代まで保持（旧 `.db` バックアップも世代管理・一覧の対象）
 - **復元（CR-018）**: 設定 → データの「復元」から backup `.zip` を選ぶと、①稼働中に検証（`db.sqlite`・`PRAGMA integrity_check`・スキーマ版）＋復元前の自動フルバックアップ → `pending-restore/` へ展開、②アプリ再起動、③起動時に pool を開く前へ現行 DB＋添付を `pre-restore/` へ退避してから staged を差し替え（失敗時は自動ロールバックして旧 DB のまま起動継続）。ライブ DB を握ったままの上書きを避ける「次回起動時適用」方式
 - **手動エクスポート**（CR-018 で範囲を明確化）: いずれも**エントリのメタデータ書き出し**であり、PDF 添付・ハイライト・チャット履歴・設定は含まず、再インポートによる復元もできない。
   - JSON: エントリのメタデータ（`EntryDetail[]`）
