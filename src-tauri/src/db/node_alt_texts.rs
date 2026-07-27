@@ -22,6 +22,34 @@ pub struct NewAltText<'a> {
     pub carried_from_version_id: Option<i64>,
 }
 
+/// 極小 crop を対象から外す既定しきい値（px・**短辺**に適用）。ページ内の埋込画像には
+/// ロゴ・装飾・数式の一部のような小片が混ざり（8a の短辺 16pt フィルタは通ってしまう）、
+/// 説明する価値が薄いのに 1 件ずつ課金対象になるため既定で落とす。実蔵書の実測では
+/// 1198 crop のうち 310 件（26%）が短辺 200px 未満だった。
+pub const DEFAULT_MIN_CROP_PX: i64 = 200;
+
+/// バッチ対象の絞り込み。エントリ / 添付単位で試せるようにし（まず 1 本で品質と費用を
+/// 確かめてから広げる）、極小 crop はしきい値で落とす。
+#[derive(Debug, Clone, Copy)]
+pub struct AltTextTargetFilter {
+    /// 指定するとそのエントリの図だけを対象にする。
+    pub entry_id: Option<i64>,
+    /// 指定するとその添付の図だけを対象にする（`entry_id` と併用可）。
+    pub attachment_id: Option<i64>,
+    /// crop の**短辺**がこの px 未満なら対象外（寸法が不明な crop は落とさない = 欠損許容）。
+    pub min_crop_px: i64,
+}
+
+impl Default for AltTextTargetFilter {
+    fn default() -> Self {
+        Self {
+            entry_id: None,
+            attachment_id: None,
+            min_crop_px: DEFAULT_MIN_CROP_PX,
+        }
+    }
+}
+
 /// バッチ（`generate_vision_alt_texts`）の対象 1 件。alt text がまだ無い `figure` ノードと、
 /// 説明させる crop PNG の参照。
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -141,9 +169,11 @@ where
 /// 課金しないため。他の一括バッチ対象クエリ `attachments_without_completed_lcir` /
 /// `attachments_without_fulltext` と同じ規約）。既に行があるノードは返さない（`user_edited` も
 /// 含めて尊重 = 手編集を Vision で上書きしない・再実行で再課金しない）。1 ノードに複数
-/// `page_crop` がある場合は最初の 1 枚だけを対象にする。
+/// `page_crop` がある場合は最初の 1 枚だけを対象にする。`filter` でエントリ / 添付に絞り込め、
+/// **短辺が `min_crop_px` 未満の crop は対象外**（ロゴ・装飾等の小片に課金しない）。
 pub async fn figures_missing_alt_text(
     pool: &SqlitePool,
+    filter: AltTextTargetFilter,
 ) -> Result<Vec<AltTextTarget>, sqlx::Error> {
     sqlx::query_as::<_, AltTextTarget>(
         "SELECT dn.id AS node_id, dv.id AS document_version_id, dv.attachment_id,
@@ -155,6 +185,10 @@ pub async fn figures_missing_alt_text(
          JOIN node_assets na ON na.node_id = dn.id AND na.role = 'page_crop'
          JOIN assets a ON a.id = na.asset_id
          WHERE e.deleted_at IS NULL
+           AND (?1 IS NULL OR att.entry_id = ?1)
+           AND (?2 IS NULL OR dv.attachment_id = ?2)
+           AND (a.width IS NULL OR a.width >= ?3)
+           AND (a.height IS NULL OR a.height >= ?3)
            AND dn.node_kind = 'figure'
            AND dv.extraction_status IN ('completed', 'completed_with_warnings')
            AND dv.id = (
@@ -171,6 +205,9 @@ pub async fn figures_missing_alt_text(
            )
          ORDER BY dv.attachment_id, dn.id",
     )
+    .bind(filter.entry_id)
+    .bind(filter.attachment_id)
+    .bind(filter.min_crop_px)
     .fetch_all(pool)
     .await
 }
@@ -185,6 +222,14 @@ mod tests {
     use crate::db::entries::create_entry;
     use crate::document_ir::{schema, ExtractionStatus, NodeKind, Origin};
     use crate::models::EntryInput;
+
+    /// サイズしきい値を効かせない filter（対象の有無そのものを見るテスト用）。
+    fn all_sizes() -> AltTextTargetFilter {
+        AltTextTargetFilter {
+            min_crop_px: 0,
+            ..Default::default()
+        }
+    }
 
     async fn setup_attachment(pool: &SqlitePool) -> i64 {
         let entry = create_entry(
@@ -563,7 +608,7 @@ mod tests {
         .await
         .unwrap();
 
-        let targets = figures_missing_alt_text(&pool).await.unwrap();
+        let targets = figures_missing_alt_text(&pool, all_sizes()).await.unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].node_id, want);
         assert_eq!(targets[0].asset_sha256, "sha-want");
@@ -578,7 +623,7 @@ mod tests {
         let att = setup_attachment(&pool).await;
         let vid = insert_pdf_version(&pool, att, "ck1").await;
         insert_figure_with_crop(&pool, vid, 0, "sha").await;
-        assert_eq!(figures_missing_alt_text(&pool).await.unwrap().len(), 1);
+        assert_eq!(figures_missing_alt_text(&pool, all_sizes()).await.unwrap().len(), 1);
 
         // エントリをゴミ箱へ（soft delete: attachments / LCIR 行はそのまま残る）。
         sqlx::query("UPDATE entries SET deleted_at = datetime('now') WHERE id = 1")
@@ -586,8 +631,157 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            figures_missing_alt_text(&pool).await.unwrap().is_empty(),
+            figures_missing_alt_text(&pool, all_sizes()).await.unwrap().is_empty(),
             "ゴミ箱のエントリの図は課金対象にならない"
+        );
+    }
+
+    /// **短辺がしきい値未満の crop は対象外**（ロゴ・装飾等の小片に課金しない）。
+    /// 寸法が不明（NULL）な crop は落とさない（欠損許容）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn targets_exclude_crops_below_min_size(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let vid = insert_pdf_version(&pool, att, "ck1").await;
+        // 通常サイズ（800x600・insert_figure_with_crop の既定）。
+        let big = insert_figure_with_crop(&pool, vid, 0, "sha-big").await;
+        // 細長い小片（1000x40）と極小（41x41）と寸法不明（NULL）。
+        for (i, sha, dims) in [
+            (1i64, "sha-banner", Some((1000i64, 40i64))),
+            (2, "sha-tiny", Some((41, 41))),
+            (3, "sha-unknown", None),
+        ] {
+            let node = insert_node(
+                &pool,
+                &NewDocumentNode {
+                    document_version_id: vid,
+                    parent_id: None,
+                    node_kind: NodeKind::Figure.as_str(),
+                    ordinal: i + 10,
+                    plain_text: None,
+                    language: None,
+                    confidence: Some(0.6),
+                    origin: Some(Origin::LayoutModel.as_str()),
+                    payload_json: None,
+                },
+            )
+            .await
+            .unwrap();
+            let asset = insert_asset(
+                &pool,
+                &NewAsset {
+                    document_version_id: vid,
+                    sha256: sha,
+                    mime_type: "image/png",
+                    relative_path: &format!("attachments/1/.lcir/1/abc/fig-p001-{i:02}.png"),
+                    width: dims.map(|d| d.0),
+                    height: dims.map(|d| d.1),
+                    size_bytes: Some(100),
+                    metadata_json: None,
+                },
+            )
+            .await
+            .unwrap();
+            insert_node_asset(&pool, &NewNodeAsset { node_id: node, asset_id: asset }, "page_crop")
+                .await
+                .unwrap();
+        }
+
+        let shas = |v: Vec<AltTextTarget>| {
+            let mut s: Vec<String> = v.into_iter().map(|t| t.asset_sha256).collect();
+            s.sort();
+            s
+        };
+        // 既定しきい値（200px）: 小片 2 件は落ち、寸法不明は残る。
+        assert_eq!(
+            shas(figures_missing_alt_text(&pool, AltTextTargetFilter::default())
+                .await
+                .unwrap()),
+            vec!["sha-big".to_string(), "sha-unknown".to_string()]
+        );
+        // しきい値 0 なら全件。
+        assert_eq!(figures_missing_alt_text(&pool, all_sizes()).await.unwrap().len(), 4);
+        // 大きいしきい値なら通常サイズも落ちる（寸法不明は残る）。
+        assert_eq!(
+            shas(figures_missing_alt_text(
+                &pool,
+                AltTextTargetFilter { min_crop_px: 900, ..Default::default() }
+            )
+            .await
+            .unwrap()),
+            vec!["sha-unknown".to_string()]
+        );
+        assert!(big > 0);
+    }
+
+    /// entry / attachment で絞り込める（まず 1 本で品質と費用を確かめてから広げるため）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn targets_can_be_scoped_to_entry_or_attachment(pool: SqlitePool) {
+        // エントリ 1 に添付 2 本、エントリ 2 に添付 1 本。それぞれ図 1 件。
+        let att1 = setup_attachment(&pool).await;
+        let att2 = add_attachment(&pool, 1, "attachments/1/b.pdf", "b.pdf", "application/pdf")
+            .await
+            .unwrap()
+            .id;
+        let other_entry = create_entry(
+            &pool,
+            &crate::models::EntryInput {
+                title: "Other".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att3 = add_attachment(
+            &pool,
+            other_entry.id,
+            "attachments/2/c.pdf",
+            "c.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        for (i, att) in [att1, att2, att3].into_iter().enumerate() {
+            let vid = insert_pdf_version(&pool, att, &format!("ck{i}")).await;
+            insert_figure_with_crop(&pool, vid, 0, &format!("sha{i}")).await;
+        }
+
+        async fn count(pool: &SqlitePool, f: AltTextTargetFilter) -> usize {
+            figures_missing_alt_text(pool, f).await.unwrap().len()
+        }
+        assert_eq!(count(&pool, AltTextTargetFilter::default()).await, 3, "既定は全件");
+        assert_eq!(
+            count(&pool, AltTextTargetFilter { entry_id: Some(1), ..Default::default() }).await,
+            2,
+            "エントリ 1 は添付 2 本ぶん"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                AltTextTargetFilter { entry_id: Some(other_entry.id), ..Default::default() }
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(&pool, AltTextTargetFilter { attachment_id: Some(att2), ..Default::default() })
+                .await,
+            1,
+            "添付単位でも絞れる"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                AltTextTargetFilter {
+                    entry_id: Some(other_entry.id),
+                    attachment_id: Some(att1),
+                    ..Default::default()
+                }
+            )
+            .await,
+            0,
+            "entry と attachment の併用は AND"
         );
     }
 
@@ -612,6 +806,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(figures_missing_alt_text(&pool).await.unwrap().is_empty());
+        assert!(figures_missing_alt_text(&pool, all_sizes()).await.unwrap().is_empty());
     }
 }
