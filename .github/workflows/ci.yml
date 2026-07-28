@@ -65,13 +65,45 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # 依存の既知脆弱性を可視化する（CR-031）。現状 quick-xml 0.39.3 が wayland-scanner
-      # のビルド時 proc-macro 経由で残る（Linux 限定・信頼済み Wayland プロトコル XML を
-      # ビルド時に解析するのみ・実行時の未信頼入力面なし）。upstream 更新までは PR を
-      # 止めないよう continue-on-error にしておき、内容はログで確認する。
+      # 依存の既知脆弱性を可視化する（CR-031）。
+      #
+      # 既知・評価済みの advisory は --ignore で明示的に除外する。理由は「exit 1 を
+      # 意味のあるシグナルに戻す」ため: 恒常的に exit 1 だと continue-on-error でも
+      # GitHub UI に `Process completed with exit code 1.` の failure アノテーションが
+      # 出続け、**新しい advisory が増えても見分けがつかない**。除外した後は
+      # 「赤 = 未評価の新しい advisory」になる。
+      #
+      # **2 パスで回す**: `--ignore` した advisory は出力からも完全に消えるため、
+      # 1 回目に除外なしで全件をログへ出し（exit code は捨てる）、2 回目の除外つき実行を
+      # ステップの exit code にする。可視性（CR-031 の「内容はログで確認する」）と
+      # シグナル性を両立させるため。
+      #
+      # 除外中の advisory（棚卸し: 2026-07-28）:
+      #   RUSTSEC-2026-0194 / RUSTSEC-2026-0195 — quick-xml 0.39.3（いずれも 7.5 high・DoS）
+      #     経路: wayland-scanner(proc-macro) → wayland-client → … → arboard →
+      #     tauri-plugin-clipboard-manager。**Linux 限定のビルド時依存**で、解析対象は
+      #     同梱の信頼済み Wayland プロトコル XML のみ。実行時に未信頼入力を食わせる面が無い。
+      #     Solution は >=0.41.0 で、tauri 側（plist 経由）は既に 0.41.0 を使っている。
+      #     wayland-scanner の upstream 更新待ち。
+      #   RUSTSEC-2023-0071 — rsa 0.9.10（5.9 medium・Marvin Attack・**修正版なし**）
+      #     経路: sqlx-mysql のみ。本アプリは sqlx の backend に sqlite しか有効化していない
+      #     （Cargo.toml の features = ["sqlite","runtime-tokio","macros","migrate"]）ため
+      #     `cargo tree -i rsa --target all` は 0 件＝**コンパイルも link もされない**。
+      #     Cargo.lock には optional backend として名前だけ残っている。
+      #
+      # unmaintained / unsound / yanked は warning 扱いで exit code に影響しないため除外不要。
+      # 除外リストは依存を大きく動かしたときに棚卸しする（消えた ID は削る）。
+      # PR を止めない方針は据え置き（continue-on-error のまま）。
       - name: cargo audit (advisory, non-blocking)
         working-directory: src-tauri
         continue-on-error: true
         run: |
           cargo install cargo-audit --locked || true
-          cargo audit
+          echo "::group::cargo audit (全件・除外なし・情報表示)"
+          cargo audit || true
+          echo "::endgroup::"
+          # 除外つきの結果がこのステップの exit code になる（赤 = 未評価の新しい advisory）
+          cargo audit \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2023-0071

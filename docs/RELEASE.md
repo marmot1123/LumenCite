@@ -181,13 +181,52 @@ v0.2.0 で **macOS のみ** auto-updater を有効化した。Windows updater �
 
 ---
 
-## 4. pdfium（OCR 用ネイティブライブラリ）
+## 4. pdfium（OCR / LCIR 用ネイティブライブラリ）
 
-OCR（スキャン PDF の Vision 文字起こし）は実行時に **pdfium 動的ライブラリ**を必要とする（`pdfium-render` がロード）。
+**OCR**（スキャン PDF の Vision 文字起こし）と **LCIR 抽出**（`lumencite-pdfium`）は、どちらも実行時に
+**pdfium 動的ライブラリ**を必要とする（`pdfium-render` がロード）。両者は
+`ingestion::pdf::pdfium::bind_pdfium()` という単一の入口を共有するため、**pdfium が同梱されていない OS では
+LCIR も動かない**。`lcir.enabled` を既定 ON にする前提として 3 OS すべてに同梱する。
 
-- **配布 (.dmg)**: `release.yml` の macOS ジョブが [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) の `pdfium-mac-univ.tgz` を取得し `src-tauri/pdfium/libpdfium.dylib` に置く。`tauri.release-macos.conf.json`（`--config` でマージ）の `bundle.macOS.frameworks` で `.app/Contents/Frameworks/` に同梱され、`bind_pdfium` がそこを探す。**base の `tauri.conf.json` には frameworks を入れない**（dylib 不在で `cargo build`/`tauri dev` が壊れるため）。
-- **ローカル開発で OCR を試す**: `pdfium-mac-univ.tgz` を展開し `lib/libpdfium.dylib` を `src-tauri/pdfium/libpdfium.dylib` に置く（`bind_pdfium` がカレント `pdfium/` も探す）。未配置でも OCR 以外は動く。
-- `src-tauri/pdfium/` は gitignore 済み（バイナリは非コミット）。Windows / Linux の pdfium 同梱は OCR を各 OS で配布する段階で別途対応。
+取得元は [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)。
+**サプライチェーン対策（CR-004）としてタグを固定し、展開前に SHA-256 を検証する**（`latest` は使わない）。
+
+### 同梱先と探索パス
+
+| OS | 取得アセット | 置き場所 | 同梱の仕組み | 実行時の探索先 |
+|----|--------------|----------|--------------|----------------|
+| macOS | `pdfium-mac-univ.tgz` | `src-tauri/pdfium/libpdfium.dylib` | `tauri.release-macos.conf.json` の `bundle.macOS.frameworks` | `.app/Contents/Frameworks/`（`<exe>/../Frameworks`） |
+| Linux | `pdfium-linux-x64.tgz` | `src-tauri/pdfium/libpdfium.so` | `tauri.release-linux.conf.json` の `bundle.resources` | `<exe>/../lib/<name>`（deb/rpm は `/usr/lib/<name>/`、AppImage は `$APPDIR/usr/lib/<name>/`）。`<name>` は配布形態により productName / crate 名 / バイナリ名のいずれかになるため **3 つとも探索する** |
+| Windows | `pdfium-win-x64.tgz`（`bin/pdfium.dll`） | `src-tauri/pdfium/pdfium.dll` | `tauri.release-windows.conf.json` の `bundle.resources` | exe と同じディレクトリ |
+
+探索順は `bind_pdfium()` のドキュメントコメントを参照（単体テストで固定してある）。
+Tauri のリソース配置規則そのものは `tauri-utils` の `resource_dir_from` に一致させている。
+
+- **macOS と Linux は `release.yml` が CI で自動取得する**（`Download and verify pdfium (macOS)` /
+  `(Linux)` ステップ）。**base の `tauri.conf.json` には同梱設定を入れない**
+  （ライブラリ不在で `cargo build` / `tauri dev` が壊れるため。オーバーレイは `--config` でのみマージする）。
+- **Windows は CI 非対象**（Certum SimplySign の対話ログイン要件・§2 参照）なので、VM 上で手動配置する:
+
+  ```powershell
+  # VM 上、リポジトリルートで（タグは release.yml の PDFIUM_TAG と揃える）
+  curl -fL -o pdfium.tgz https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7934/pdfium-win-x64.tgz
+  # 期待値: c2c05e752ef41a1af21ad24f7f09e75e6e24c3d2cf84bbc88f11efa42edd341c
+  certutil -hashfile pdfium.tgz SHA256
+  tar -xzf pdfium.tgz
+  mkdir src-tauri\pdfium
+  copy bin\pdfium.dll src-tauri\pdfium\pdfium.dll
+  ```
+
+  そのうえで `pnpm tauri build --config src-tauri/tauri.release-windows.conf.json` を実行する。
+  **`--config` を忘れると署名設定も pdfium 同梱も両方落ちる**ので、生成物の中に `pdfium.dll` があることを
+  インストーラ展開後に確認すること。
+
+- **ローカル開発で試す**: 各 OS 用アセットを展開し、上表の「置き場所」へ置く（`bind_pdfium` は
+  カレントの `pdfium/` も探すので `src-tauri/` で `pnpm tauri dev` すれば拾う）。未配置でも OCR / LCIR 以外は動く。
+- `src-tauri/pdfium/` は gitignore 済み（バイナリは非コミット）。
+- **pdfium を更新するときは 3 OS 分をまとめて上げる**: `release.yml` の `PDFIUM_TAG` と 2 つの
+  `PDFIUM_SHA256`、および本節の Windows 用ハッシュを同じタグで揃える。
+  値は `curl -fsSL <url> | shasum -a 256` で求める（GitHub API の asset digest とも一致する）。
 
 ---
 
