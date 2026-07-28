@@ -1386,6 +1386,16 @@ pub async fn load_lcir_document(
         Some(v) => v,
         None => return Ok(None),
     };
+    load_lcir_document_for_version(pool, version).await.map(Some)
+}
+
+/// 版を指定して LCIR 派生ビューを組む。`load_lcir_document` の実体で、node 起点の read 面
+/// （Phase 10a）は「呼び出し側が持っているノードが載っている版」をこちらで直接読む
+/// （添付の最新版に読み替えると、superseded 版のノード id が引けなくなるため）。
+pub async fn load_lcir_document_for_version(
+    pool: &SqlitePool,
+    version: crate::models::DocumentVersion,
+) -> Result<document_ir::LcirDocument, String> {
     let nodes = document_nodes::nodes_for_version(pool, version.id)
         .await
         .map_err(|e| e.to_string())?;
@@ -1565,7 +1575,7 @@ pub async fn load_lcir_document(
     } else {
         None
     };
-    Ok(Some(document_ir::LcirDocument {
+    Ok(document_ir::LcirDocument {
         schema: document_ir::schema::SCHEMA_URI.to_string(),
         schema_version: version.schema_version,
         version_id: version.id,
@@ -1580,7 +1590,37 @@ pub async fn load_lcir_document(
         nodes: lcir_nodes,
         relations,
         symbols: symbol_list,
-    }))
+    })
+}
+
+/// ノード id 起点で LCIR を読む（Phase 10a の入口）。返すのは `(version, entry_id, doc)`
+/// （`attachment_id` は `version` が持つ）。ノードが存在しなければ `None`。
+///
+/// `load_entry_lcir`（エントリ起点・tex > pdf 優先）と対になる関数だが、**優先度で版を
+/// 選ばない** — ノード id がどの版の話かをすでに決めているため。`source` 引数も要らない。
+pub async fn load_node_lcir(
+    pool: &SqlitePool,
+    node_id: i64,
+) -> Result<Option<(crate::models::DocumentVersion, i64, document_ir::LcirDocument)>, String> {
+    let Some(version_id) = document_nodes::version_id_for_node(pool, node_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some(version) = document_versions::find_by_id(pool, version_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let attachment_id = version.attachment_id;
+    let entry_id = crate::db::attachments::get_attachment(pool, attachment_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .entry_id;
+    let doc = load_lcir_document_for_version(pool, version.clone()).await?;
+    Ok(Some((version, entry_id, doc)))
 }
 
 // ---- エントリ→版解決（Phase 4 の read 優先度。MCP / エクスポート / CLI で共有） ----

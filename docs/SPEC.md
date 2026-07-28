@@ -396,6 +396,17 @@ Phase 8（図表機械可読化）の alt text スライス。8a が作った `f
 - **読み出し**: MCP `get_figures` に `alt_text {text, origin, confidence, model}` が付く（`LcirNode.alt_text` として `get_lcir_document` / LCIR JSON エクスポートにも透過）。
 - **やらないこと**: SVG/ベクター図の構造化・plot の軸/凡例抽出・diagram のノード/辺認識・PDF 表画像の認識・ページ全体の OCR 全文化（8d 以降 or 非目標）。手編集 UI も初回は作らない（`origin` 列は最初から持つ）。Markdown エクスポートへの alt text 出力も初回は据置（MCP のみ）。
 
+### LCIR 文脈バンドル（Phase 10a）
+
+Phase 10（LLM・エージェント向け利用）の第一段。**1 ブロックを読んで引用するのに要るものを 1 回で返す** read 面（`get_node_context`）。migration なし・新表なし・**新しい永続推定なし**（既存 7 表からの導出のみ）。
+
+- **なぜ要るか**: PDF 版の定理ノードは主張の**先頭 1 レイアウトブロック**しか持たない（実測 平均 168 字。TeX 版は環境本文が丸ごと 1 ノードで 975 字）。続きの式や "where …" は theorem の子ではなく **page 直下の兄弟**に落ち、theorem の 33% / proof の 53% で**ページをまたぐ**。`get_document_blocks` でノードを 1 つ読んでも定理を読んだことにならない。
+- **入口はノード id だけ**（`entry_id` も `source` も取らない）。ノードがどの版の話かを既に決めているので、エントリ起点の read 優先度（tex > pdfium）で選び直すと呼び出し側が握っている id が引けない版に化ける。superseded 版のノードも読める。
+- **返すもの**: `focus` / `section_path` / `before` / `continuation`（読み順で次の構造境界の手前まで＝ページ境界で切れない）/ `continuation_stopped_at` / `proofs` / `proves` / `premises` / `equations` / `figures` / `citations` / `references` / `notes`。全要素に `origin` + `confidence`、PDF 版は `page` + `bbox`（既存ツールと同じ 4 要素配列）。**どこで・なぜ続きを止めたかを必ず返す** — 「主張が終わった」「フロートのキャプションに割り込まれた」「上限で切った」は意味が違うので、黙って空にしない。
+- **前提定義は導出経路を明示する**: 辺（`refers_to_theorem` → `definition`）だけでは実測 1.4% しか埋まらないので、`via` で `reference` / `occurrence`（`symbol_occurrences` の記録）/ `symbol`（記号の表層が本文に `$X$` で現れ、定義が読み順で前にある・読み側の照合で保存はしない）を**区別したまま**返す。後 2 者は TeX 版のみ。
+- **図表参照は caption_of を解決して返す**: `{node（辺の指し先）, figure（領域・crop・alt text の持ち主）, caption（原文）}`。実測で caption の 3/4 は実体に到達できないので `figure` の欠落は常態で、`notes` に出す。
+- **やらないこと**: 2 ホップの畳み込み（証明の参照まで含めるとバンドル長が予測不能になる。`proofs` の node_id で呼び直す）／チャットへの露出（10b）／embedding・ベクトル検索・文献横断グラフ（10c・post-1.0）。
+
 ### 1エントリ複数 PDF 添付（本文＋補助資料）— Phase 1
 
 同じ DOI の論文に **本文 PDF** と **supplemental material（SI）等の補助 PDF** が別ファイルで存在するとき、両方を同じエントリに添付して閲覧・全文検索できるようにする。「同一 DOI ＝同一の著作」という前提に立ち、補助 PDF は**別エントリ（別文献）ではなく、本文論文に紐づく添付ファイルの一つ**として扱う（Zotero が添付を item の子として複数ぶら下げるのと同型のモデル）。

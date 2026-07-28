@@ -71,6 +71,18 @@ pub async fn find_completed(
     .await
 }
 
+/// id 指定でバージョン 1 行。**status で絞らない** — 呼び出し側が既にそのバージョンの
+/// ノード id を握っている場合（Phase 10a）、その版が superseded でも読めるべきだから。
+pub async fn find_by_id(
+    pool: &SqlitePool,
+    version_id: i64,
+) -> Result<Option<DocumentVersion>, sqlx::Error> {
+    sqlx::query_as::<_, DocumentVersion>("SELECT * FROM document_versions WHERE id = ?")
+        .bind(version_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// 添付の最新の completed 系バージョン（read 面 / FTS 再生成用）。
 pub async fn latest_completed_for_attachment(
     pool: &SqlitePool,
