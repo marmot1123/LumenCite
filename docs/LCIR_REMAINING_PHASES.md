@@ -27,9 +27,9 @@
 | **8d-4** | 図の分類（plot / diagram / photo） | **M** | — | 0021 | 未着手 |
 | **8d-5** | plot 軸・凡例・系列 / diagram の node-edge | **L** | 8d-4 | 8d-4 と共有 | 未着手 |
 | **8d-6** | PDF 側の表認識 | **L**（Vision）/ **XL**（幾何復元） | 8d-2 | 不要 | 未着手 |
-| **8d-7** | 本文 → 図表参照の解決（PDF `refers_to_figure`） | **S** | — | 不要 | 部分実装 |
+| **8d-7** | 本文 → 図表参照の解決（PDF `refers_to_figure`/`refers_to_table`） | **S** | — | 不要 | **実装済**（2026-07-28） |
 | **8d-8** | 8a の既知の穴（XObjectForm・回転ページ） | **M** | — | 不要 | 意図的未対応 |
-| **9b-0** | 共有基盤（XML エスケープ・平坦木→包含再構成・欠落警告） | **M** | 9a | 不要 | 未着手 |
+| **9b-0** | 共有基盤（XML エスケープ・平坦木→包含再構成・`ExportHeader`） | **M** | 9a | 不要 | 未着手（欠落警告は debt-8 で実装済） |
 | **9b-M** | Presentation MathML の供給元決定 | **S〜XL** | (7a) | 不要 | **分岐点** |
 | **9b-1** | HTML + MathML | **M〜L** | 9b-0 | 不要 | 未着手 |
 | **9b-2** | JATS XML | **L** | 9b-0 | 不要 | 未着手 |
@@ -99,10 +99,19 @@ INSERT も 12 列すべてを bind 済み（`db/math_expressions.rs:30-46`）。
 **pdfium 版 138 件中 69 件（50%）が figure ノード 0 件**、
 **PDF 側 figure_caption 904 件に対し `caption_of` 辺は 262 件のみ**（642 件のキャプションが図に結びついていない）。
 
-**費用対効果が最も高いのは 8d-7（S）。** `ingestion/graph.rs:534` の `RefCategory` は
-Theorem / Equation の 2 つだけで、PDF 側の "Figure 3" / "Table 2" を拾わない。
-TeX 側の `refers_to_figure` も **figure ノードではなく caption ノード宛**（`graph.rs:377-388`）。
-`RefCategory::Figure/Table` 追加 + `graph_nodes` に figure ノードを push で約 250 行。
+**8d-7 は実装済（2026-07-28）。** `RefCategory::{Figure,Table}` + `FloatTargets` 索引 + `graph_nodes` への
+figure ノード push で、PDF 本文の "Figure 3" / "Fig. 3" / "Table 2" を図表番号と照合するようになった
+（`extractor_version` 0.6.0 → 0.7.0・migration 不要）。詳細は `LCIR_design_overview.md` の「Phase 8d-7 実装状況」。
+
+**実測で分かった重心**: 解決先は **caption ノード宛が主経路**（`figure` ノードの図番号保有率は 261/1198 = 21.8%・
+PDF 側に `table` ノードは 0 件）。全体の約 65% が caption 宛になる。**解決率の実測上限は約 93%** で、
+残り 7% は被参照キャプションが `figure_caption` と認識されず paragraph に落ちているケース（下記 debt-12）。
+参照スキャナ側では回収できない。
+
+**TeX 側の `refers_to_figure` は caption ノード宛のままで正**（`graph.rs` の `relation_type_for_target`）。
+TeX 経路は `figure` ノードを作らないので他に指す先が無い。TeX の `\ref{tab:..}` を `table` ノードへ
+リダイレクトする案は却下した — `resolve_relations` は純関数で `caption_of` を知らず（`env_group` は `GraphNode` に無い）、
+出荷済みの `to_node_id` が変わるうえ、LLM には本文を持つ caption の方が有用なため。
 
 | 分割 | 内容 | 難易度 | 概算行数 | 備考 |
 |------|------|--------|----------|------|
@@ -112,7 +121,7 @@ TeX 側の `refers_to_figure` も **figure ノードではなく caption ノー�
 | 8d-4 | 図の分類（plot/diagram/photo） | M | ~450 | `llm/ocr.rs:16-24` の alt text プロンプトが既に図種別を第 1 文で要求済み。satellite 表が要る |
 | 8d-5 | plot 軸/凡例/系列・diagram node-edge | L | ~700 | 8d-4 と同一 migration を共有 |
 | 8d-6 | PDF 側の表認識 | L（Vision）/ XL（幾何） | 700 / 1,200+ | 8b の `table` payload 契約にそのまま合わせられる。実 DB の table ノード 15 件は全て TeX 版・PDF 側は 0 件（table_caption は 68 件ある） |
-| 8d-7 | 本文 → 図表参照の解決 | S | ~250 | 上記 |
+| 8d-7 | 本文 → 図表参照の解決 | S | ~250 | **実装済**（上記） |
 | 8d-8 | XObjectForm 内画像・回転ページ | M | ~400 | form の `matrix()` 連鎖を子矩形に適用してページ空間へ変換（pdfium-render 0.8.37 に `matrix()` あり）。回転ページは現在 skip + warning |
 
 8d-3（SVG）は §16 の非目標に最も近い。**部分的に非目標として明文化する**判断もありうる。
@@ -133,7 +142,7 @@ TeX 側の `refers_to_figure` も **figure ノードではなく caption ノー�
 
 | 分割 | 内容 | 難易度 | 概算行数 | 依存 |
 |------|------|--------|----------|------|
-| 9b-0 | XML エスケープ・包含再構成・欠落警告チャネル・`ExportHeader` | M | 250–350 + テスト 200–250 | 9a |
+| 9b-0 | XML エスケープ・包含再構成・`ExportHeader` | M | 200–280 + テスト 160–200 | 9a |
 | 9b-M | Presentation MathML の供給元決定 | S〜XL | 0–120 | (7a) |
 | 9b-1 | HTML + MathML（単一ファイル・図つき） | M〜L | 350–500 + テスト 250–350 | 9b-0 |
 | 9b-2 | JATS XML | L | 450–650 + テスト 300–400 | 9b-0 |
@@ -245,12 +254,14 @@ supersede は status を更新するだけで行は永久に残る。`document_n
 | debt-3 | `TextBlock` ノード型が未使用（実際の木は `document > page > block > line`） | S | — |
 | debt-4 | JATS / HTML / LaTeXML 取込なし（`ingestion/{jats,tei,html}` 不在）・手動 `.tex` 添付もスコープ外 | L | 9b と対称 |
 | debt-5 | PDF 側の記号抽出なし（6b は TeX のみ）・記号スコープの厳密化 | L / M | 7c の曖昧性解消 |
-| debt-6 | 9a Markdown で **figure が完全に落ちている**（`figure` は `plain_text: None` で未知型 degrade の `_` 分岐に落ち無出力） | S | 9b-1 |
-| debt-7 | 8c の alt text が Markdown エクスポートに出ない・手編集 UI なし（`origin` 列だけ用意済み） | S | — |
-| debt-8 | 9a の「LCIR 固有情報が失われる場合の警告」未実装（ロードマップ §10 Phase 9 完了条件） | S | 9b-0 で一緒に |
+| ~~debt-6~~ | ~~9a Markdown で figure が完全に落ちている~~ **解消**（2026-07-28・存在マーカー + alt text。画像リンクは張らない） | S | 9b-1 |
+| debt-7 | ~~8c の alt text が Markdown エクスポートに出ない~~（2026-07-28 解消）・**手編集 UI なし**（`origin` 列だけ用意済み。UI が入ると `user_edited` の出し分けが実データで初めて発火する） | S | — |
+| ~~debt-8~~ | ~~9a の「LCIR 固有情報が失われる場合の警告」未実装~~ **解消**（2026-07-28・`export/warning.rs`・6 コード・9b と共有） | S | 9b-0 で一緒に |
 | debt-9 | 回転ページは図領域を skip。設計概観 §6 の「要検証」（非ゼロ `/Rotate` での pdfium bounds）が未消化 | M | 8d-8 |
 | debt-10 | 8b の longtable / tabu / siunitx S 列 / 表脚注 | M | — |
 | debt-11 | 数式検索は trigram 部分一致のみ。**TeX 版は node-FTS 対象外**なので原文 LaTeX は検索対象ですらない | — | 7b の動機 |
+| debt-13 | 実蔵書では `figure` 1,198 件のうち 523 件（43.7%）、alt text 888 件のうち 523 件（58.9%）が**スキャン本 1 冊**由来で、その alt text は図ではなく「スキャン頁」の説明。8c の課金の 6 割弱がここに費やされた計算になり、debt-6 の Markdown 出力もこの 1 冊では 523 個のマーカーになる。判定候補は「ページに block が 0 件」「crop が MediaBox のほぼ全面」。レンダラ側では解かない（ヒューリスティックを持ち込まない）ので 8a（領域検出）か 8c（生成対象の絞り込み）の担当 | M | 8c の費用対効果 |
+| debt-12 | ローマ数字番号・全大文字の表 caption を `detect_caption` が拾わない（`lower.starts_with("table")` は通るが直後 6 文字以内に ASCII 数字が要るため `TABLE I. …` が paragraph 落ち・実測 60 件）。同種の穴で `Fig. 8.3 …` 形も落ちており、これが 8d-7 の解決率上限 93% の実体 | S〜M | 8d-7 の回収率 |
 
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
 `ListItem` / `Footnote` / `Citation` / `InlineMath` / `EquationGroup` / `TextBlock` はどちらも生成しない。
@@ -264,13 +275,13 @@ supersede は status を更新するだけで行は永久に残る。`document_n
 7 は最大の XL であり、かつ入力となる原文 LaTeX が 645 行しかない。
 
 1. ~~**v1.0.0-p0（pdfium 同梱）**~~ — **2026-07-28 実装済**。他すべての前提だった
-2. **8d-7（S）+ debt-6（S）+ debt-8（S）** — 安い穴埋め。9b-1 と 10a の質が上がる
+2. ~~**8d-7（S）+ debt-6（S）+ debt-8（S）**~~ — **2026-07-28 すべて実装済**。9b-1 と 10a の質が上がる
 3. **10a（M）→ 10b（M）** — v1.0.0 の「Phase 10 到達」はここ
 4. **v1.0.0-p1 → p2 → p3（各 M）** — 既定 ON 化。p4（GC）は並行可
 5. **8d-2（L）** — 実ライブラリの半数が figure 0 件という実害の解消。再構築 1 回で 8d-1 / 8d-8 と束ねる
 6. post-1.0: **9b-4（S）→ 9b-0 → 9b-1 → 9b-2**、そして **Phase 7a → 7b → 7c**
 
-**v1.0.0 までの最短経路** = p0 → 安い債務 3 件 → 10a/10b → p1/p2/p3。いずれも M 以下。
+**v1.0.0 までの最短経路** = ~~p0 → 安い債務 3 件~~（済） → **10a/10b** → p1/p2/p3。いずれも M 以下。
 **post-1.0 に回すもの** = Phase 7 一式・8d-3・8d-6・10c・9b（9b-4 を除く）。
 
 ---

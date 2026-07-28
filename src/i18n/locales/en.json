@@ -544,6 +544,15 @@
     "lcirExportBusy": "Exporting…",
     "lcirExportDone": "Exported to {{path}}",
     "lcirExportFailed": "LCIR export failed: {{error}}",
+    "lcirExportWarnings": "LCIR-specific information this format cannot carry:",
+    "lcirExportWarn": {
+      "relations_dropped": "{{count}} cross-reference edge(s)",
+      "symbols_dropped": "{{count}} symbol definition(s)",
+      "inferred_provenance_dropped": "AI-inferred provenance markers on {{count}} node(s)",
+      "source_fragments_dropped": "{{count}} PDF region coordinate(s)",
+      "assets_not_embedded": "{{count}} figure image(s) (the image files are not embedded)",
+      "table_cell_spans_flattened": "{{count}} merged table cell(s) (flattened on export)"
+    },
     "tagsLabel2": "Tags",
     "addTag": "Add",
     "tagsPlaceholder2": "Tag name…",

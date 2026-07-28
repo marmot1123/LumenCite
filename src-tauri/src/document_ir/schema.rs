@@ -26,7 +26,12 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 /// - `0.6.0`: Phase 8a。埋込画像（トップレベル Image オブジェクト）から図領域を検出して
 ///   `figure` ノード + ページ crop PNG アセット（`assets`/`node_assets`）+ `caption_of` 辺を
 ///   作り、caption の payload にラベル語・番号を載せる。出力が変わるので旧版は supersede される。
-pub const EXTRACTOR_VERSION: &str = "0.6.0";
+/// - `0.7.0`: Phase 8d-7。本文の "Figure 3"/"Fig. 3"/"Table 2" を図表番号と照合して
+///   `refers_to_figure`/`refers_to_table` 辺を張る（実体 `figure` ノード優先・無ければ
+///   `figure_caption`/`table_caption` に解決し `metadata.resolved_via` で区別）。
+///   出力（派生の関係辺）が増えるので、既存コーパスは `rebuild_outdated_lcir` で
+///   張り直せるよう版を上げる（**再構築は必須ではない。辺は次回再構築時に付く**）。
+pub const EXTRACTOR_VERSION: &str = "0.7.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。

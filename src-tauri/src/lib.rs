@@ -1592,6 +1592,15 @@ fn export_file_stem(citation_key: Option<&str>, entry_id: i64) -> String {
     }
 }
 
+/// LCIR エクスポートの結果。`path` は保存先（ダイアログをキャンセルすると None）。
+/// `warnings` は「**この形式では運べなかった LCIR 固有情報**」（Phase 9 完了条件・debt-8）で、
+/// **エラーではない** — 書き出しは成功している。キャンセル時も返す（次に何が落ちるか分かる）。
+#[derive(serde::Serialize)]
+struct LcirExportResult {
+    path: Option<String>,
+    warnings: Vec<export::ExportWarning>,
+}
+
 /// LCIR（実験・Phase 9a）: エントリの LCIR を JSON 派生ビューとして保存ダイアログで書き出す。
 /// validation 通過必須。`source` は "tex"/"pdf"（未指定 = tex 優先）。
 #[tauri::command]
@@ -1600,11 +1609,17 @@ async fn export_lcir_json(
     state: State<'_, AppState>,
     entry_id: i64,
     source: Option<String>,
-) -> Result<Option<String>, String> {
+) -> Result<LcirExportResult, String> {
     let (doc, detail) = load_lcir_for_export(&state.db, entry_id, source.as_deref()).await?;
-    let json = export::lcir_json_pretty(&doc)?;
+    let report = export::lcir_json_pretty(&doc)?;
     let stem = export_file_stem(detail.citation_key.as_deref(), entry_id);
-    save_text_via_dialog(app, format!("{stem}-lcir.json"), "JSON", &["json"], json).await
+    let path =
+        save_text_via_dialog(app, format!("{stem}-lcir.json"), "JSON", &["json"], report.text)
+            .await?;
+    Ok(LcirExportResult {
+        path,
+        warnings: report.warnings,
+    })
 }
 
 /// LCIR（実験・Phase 9a）: エントリの LCIR を構造付き Markdown として保存ダイアログで書き出す。
@@ -1614,7 +1629,7 @@ async fn export_lcir_markdown(
     state: State<'_, AppState>,
     entry_id: i64,
     source: Option<String>,
-) -> Result<Option<String>, String> {
+) -> Result<LcirExportResult, String> {
     let (doc, detail) = load_lcir_for_export(&state.db, entry_id, source.as_deref()).await?;
     let header = export::MarkdownHeader {
         title: detail.title.clone(),
@@ -1624,9 +1639,14 @@ async fn export_lcir_markdown(
         arxiv_id: detail.arxiv_id.clone(),
         citation_key: detail.citation_key.clone(),
     };
-    let md = export::render_markdown(&doc, Some(&header));
+    let report = export::render_markdown(&doc, Some(&header));
     let stem = export_file_stem(detail.citation_key.as_deref(), entry_id);
-    save_text_via_dialog(app, format!("{stem}.md"), "Markdown", &["md"], md).await
+    let path =
+        save_text_via_dialog(app, format!("{stem}.md"), "Markdown", &["md"], report.text).await?;
+    Ok(LcirExportResult {
+        path,
+        warnings: report.warnings,
+    })
 }
 
 /// クリップ／AddSheet 重複時に欠落（PDF / TeX）を確認なしで自動補完するか（`clipper.complete_missing`）。

@@ -3184,6 +3184,8 @@ mod tests {
                 equation_label: b.equation_label.clone(),
                 theorem_number: None,
                 cite_key: b.cite_key.clone(),
+                caption_label: None,
+                caption_number: None,
             })
             .collect();
         let edges = resolve_relations(&graph_nodes, RefStrategy::Tex);

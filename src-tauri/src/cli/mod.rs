@@ -735,7 +735,7 @@ async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOut
         });
     };
 
-    let text = match a.format.as_str() {
+    let report = match a.format.as_str() {
         "md" => {
             let detail = db::entries::get_entry(pool, entry_id)
                 .await
@@ -753,7 +753,7 @@ async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOut
         _ => crate::export::lcir_json_pretty(&doc)?,
     };
 
-    match &a.output {
+    let mut out = match &a.output {
         Some(path) => {
             // 同一ディレクトリの一時ファイル経由で原子的に置く（書込失敗時に
             // 出力先へ切り詰めたゴミを残さない）。
@@ -763,16 +763,33 @@ async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOut
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "export-lcir".to_string())
             ));
-            std::fs::write(&tmp, &text)
+            std::fs::write(&tmp, &report.text)
                 .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
             std::fs::rename(&tmp, path).map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);
                 format!("failed to write {}: {e}", path.display())
             })?;
-            Ok(CmdOutput::new(format!("wrote {}", path.display())))
+            CmdOutput::new(format!("wrote {}", path.display()))
         }
-        None => Ok(CmdOutput::new(text)),
+        None => CmdOutput::new(report.text),
+    };
+    // LCIR 固有情報の欠落（debt-8）は **stderr**（`CmdOutput.warnings`）へ。stdout は
+    // エクスポート本文そのものなので、`--format json` のパイプ利用を壊さない。
+    // 警告はエラーではないので終了コードは 0 のまま。
+    for w in &report.warnings {
+        let detail = w
+            .detail
+            .as_deref()
+            .map(|d| format!(": {d}"))
+            .unwrap_or_default();
+        out.warnings.push(format!(
+            "lcir export [{}] {} ({}){detail}",
+            w.severity.as_str(),
+            w.code.as_str(),
+            w.count
+        ));
     }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1200,6 +1217,19 @@ mod tests {
         assert!(out.stdout.starts_with("wrote "), "{}", out.stdout);
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("## Abstract"), "{written}");
+        // debt-8: `-o` でファイルに書いても欠落警告は返る（stdout は保存先の通知に変わる）。
+        // 警告はエラーではないので export 自体は成功している。
+        assert!(
+            out.warnings.iter().any(|w| w.contains("symbols_dropped")),
+            "TeX 版の記号定義は Markdown では落ちる: {:?}",
+            out.warnings
+        );
+        // 狼少年にしない: この fixture は参照グラフを持たないので relations の警告は出ない。
+        assert!(
+            !out.warnings.iter().any(|w| w.contains("relations_dropped")),
+            "存在しないデータの損失は報告しない: {:?}",
+            out.warnings
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1267,6 +1297,60 @@ mod tests {
         )
         .await;
         insert(Some(root), 3, "proof", Some("Proof. Consider the union."), None).await;
+        // Phase 8a/8c（debt-6/7）: figure ノード + 領域 + crop アセット + 生成 alt text。
+        // DB → load_lcir_document → レンダラで assets/alt_text が運ばれる通し経路を守る。
+        insert(
+            Some(root),
+            4,
+            "figure_caption",
+            Some("Figure 3: The overall pipeline."),
+            Some(r#"{"caption_label": "Figure", "caption_number": "3"}"#),
+        )
+        .await;
+        let fig = insert(
+            Some(root),
+            5,
+            "figure",
+            None,
+            Some(r#"{"figure_index": 7, "figure_number": "3"}"#),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO source_fragments (node_id, page_number, x, y, width, height, fragment_type)
+             VALUES (?, 5, 72.0, 400.0, 300.0, 200.0, 'block')",
+        )
+        .bind(fig)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let asset_id: i64 = sqlx::query(
+            "INSERT INTO assets
+                (document_version_id, sha256, mime_type, relative_path, width, height, size_bytes)
+             VALUES (?, 'deadbeef', 'image/png', 'attachments/z/.lcir/1/deadbeef/fig-p005-00.png',
+                     800, 600, 1234)",
+        )
+        .bind(ver)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("INSERT INTO node_assets (node_id, asset_id, role) VALUES (?, ?, 'page_crop')")
+            .bind(fig)
+            .bind(asset_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO node_alt_texts
+                (node_id, document_version_id, source_asset_sha256, text, origin, confidence, model)
+             VALUES (?, ?, 'deadbeef', 'A 3D wireframe surface plot of the loss landscape.',
+                     'llm_inference', 0.5, 'claude-sonnet-5')",
+        )
+        .bind(fig)
+        .bind(ver)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let out = cmd_export_lcir(
             &pool,
@@ -1279,12 +1363,54 @@ mod tests {
         assert_eq!(md.matches("## Abstract").count(), 1, "{md}");
         assert_eq!(md.matches("Theorem 2.3").count(), 1, "見出し二重化しない: {md}");
         assert_eq!(md.matches("Proof.").count(), 1, "{md}");
+        // debt-6/7: 図が落ちず、alt text が生成物として識別でき、画像リンクは張られない。
+        assert!(md.contains("**[Figure 3]** (p. 5)"), "figure が落ちない: {md}");
+        assert!(
+            md.contains("**AI-generated description** (model: claude-sonnet-5)."),
+            "alt text は生成物として識別できる: {md}"
+        );
+        assert!(!md.contains("!["), "画像リンクは張らない: {md}");
+        assert_eq!(
+            md.matches("The overall pipeline.").count(),
+            1,
+            "caption を二重に出さない: {md}"
+        );
+        // debt-8: 欠落警告は stderr（CmdOutput.warnings）へ。stdout は本文のまま。
+        assert!(
+            out.warnings.iter().any(|w| w.contains("source_fragments_dropped")),
+            "PDF 座標の欠落を報告する: {:?}",
+            out.warnings
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("assets_not_embedded")),
+            "アセット実体の非同梱を報告する: {:?}",
+            out.warnings
+        );
+        assert!(
+            !out.stdout.contains("assets_not_embedded"),
+            "警告は stdout に混ぜない: {}",
+            out.stdout
+        );
+
         // 既定（source 未指定）は tex 優先のまま。
         let out = cmd_export_lcir(&pool, &export_lcir_args(&entry_id.to_string(), "md", None))
             .await
             .unwrap();
         assert!(out.stdout.contains("lcir_source: \"lumencite-tex"), "{}", out.stdout);
     }
+
+    /// debt-8: `--format json` の stdout は警告があっても生 JSON のままで、パイプ利用を壊さない。
+    /// LCIR JSON は無損失なのでアセットが無い文書では警告 0 件（狼少年にしない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_lcir_json_stdout_stays_parseable_and_quiet(pool: SqlitePool) {
+        let entry_id = build_tex_lcir_fixture(&pool, "warnjson").await;
+        let out = cmd_export_lcir(&pool, &export_lcir_args(&entry_id.to_string(), "json", None))
+            .await
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&out.stdout).expect("stdout は生 JSON のまま");
+        assert!(out.warnings.is_empty(), "LCIR JSON は無損失: {:?}", out.warnings);
+    }
+
 
     #[sqlx::test(migrations = "./migrations")]
     async fn export_lcir_errors_without_lcir_and_lists_available_sources(pool: SqlitePool) {

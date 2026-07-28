@@ -269,18 +269,25 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
         "description": "Return the cross-reference graph (LCIR) of a paper — typed directed edges \
             between its blocks — by entry_id or citation_key. Edges are resolved from the source: \
             \"tex\" (from \\ref/\\eqref/\\cite matched against \\label and \\bibitem keys — high \
-            confidence, origin tex_source) or \"pdf\" (from \"Theorem 2.3\"/\"Eq. (2.1)\" strings \
-            matched against theorem/equation numbers — approximate, origin layout_model). tex is \
+            confidence, origin tex_source) or \"pdf\" (from \"Theorem 2.3\"/\"Eq. (2.1)\"/\"Figure \
+            3\"/\"Fig. 3\"/\"Table 2\" strings matched against theorem/equation/figure/table \
+            numbers — approximate, origin layout_model). tex is \
             preferred when built; pass `source` to switch. Relation types: cites, \
             refers_to_equation, refers_to_theorem, refers_to_figure, refers_to_table, \
             refers_to_section, refers_to, proves (proof → the theorem it proves), and caption_of \
             (a figure caption → its detected figure region, pdf only). Use it to \
             answer \"what does this proof prove\", \"what cites/uses equation (2.1)\", \"which \
-            results does this section reference\". Filter with `relation_type` and/or `node_id` \
+            results does this section reference\". Figure/table edges point at the figure region \
+            only when one was detected; otherwise they point at the caption block — \
+            metadata.resolved_via is \"node\" or \"caption\", and caption_of gets you from the \
+            caption to the region in one hop. Plural and range mentions (\"Figures 3 and 4\", \
+            \"Figs. 1-3\") are deliberately left unresolved, so an absent edge does not mean the \
+            text has no reference. Filter with `relation_type` and/or `node_id` \
             (edges touching that block, either direction). Returns {has_lcir, source, \
             available_sources, count, counts_by_type, relations:[{relation_type, confidence, \
             origin, from:{node_id,kind,page,snippet}, to:{node_id,kind,page,snippet, \
-            theorem_number?, equation_label?, section_number?, labels?}, metadata}]}. If has_lcir \
+            theorem_number?, equation_label?, section_number?, labels?, figure_number?, \
+            caption_number?}, metadata}]}. If has_lcir \
             is false nothing is built (build it in the app).",
         "inputSchema": {
             "type": "object",
@@ -1152,7 +1159,15 @@ fn relation_node_json(n: &crate::document_ir::LcirNode) -> Value {
         obj.insert("snippet".to_string(), json!(relation_snippet(t, 160)));
     }
     if let Some(p) = &n.payload {
-        for key in ["theorem_number", "section_number", "labels"] {
+        // Phase 8d-7: 図表参照の端点がどの図表かを示す（figure ノードは figure_number、
+        // caption ノードは caption_number を payload に持つ）。
+        for key in [
+            "theorem_number",
+            "section_number",
+            "labels",
+            "figure_number",
+            "caption_number",
+        ] {
             if let Some(v) = p.get(key) {
                 obj.insert(key.to_string(), v.clone());
             }

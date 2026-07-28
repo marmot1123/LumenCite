@@ -567,6 +567,20 @@ fn detect_caption(first: &str) -> Option<CaptionHit> {
     Some(CaptionHit { kind, label, number })
 }
 
+/// caption のラベル語が「図（figure）の caption」か。`detect_caption` は Algorithm / Listing も
+/// `figure_caption` にするので、図領域ペアリング（Phase 8a）と図番号参照（Phase 8d-7）は
+/// この述語で絞る。ラベル語のリテラルを 1 箇所に集約し、両者が同じ集合を見ることを保証する。
+pub fn is_figure_caption_label(label: Option<&str>) -> bool {
+    matches!(label, Some("Figure") | Some("Fig"))
+}
+
+/// 同上・表（table）の caption か。`detect_caption` が `TableCaption` にするラベル語は
+/// "Table" だけなので現状は kind と等価だが、参照側（Phase 8d-7）と対で持たせて
+/// ラベル語の追加時に両方が同時に効くようにする。
+pub fn is_table_caption_label(label: Option<&str>) -> bool {
+    matches!(label, Some("Table"))
+}
+
 /// 定理系ブロックの検出結果（Phase 5・PDF ヒューリスティック）。
 struct TheoremHit {
     kind: NodeKind,
@@ -928,6 +942,22 @@ mod tests {
         assert_eq!(blocks[1].caption_number.as_deref(), Some("1"));
         assert_eq!(blocks[2].caption_label.as_deref(), Some("Table"));
         assert_eq!(blocks[2].caption_number.as_deref(), Some("2"));
+    }
+
+    /// Phase 8a の図領域ペアリングと Phase 8d-7 の図番号参照は同じラベル述語で絞る。
+    /// Algorithm / Listing は `figure_caption` だが図番号ではないので両方から外れること。
+    #[test]
+    fn figure_caption_label_predicates_exclude_algorithm_and_listing() {
+        assert!(is_figure_caption_label(Some("Figure")));
+        assert!(is_figure_caption_label(Some("Fig")));
+        assert!(!is_figure_caption_label(Some("Algorithm")));
+        assert!(!is_figure_caption_label(Some("Listing")));
+        assert!(!is_figure_caption_label(Some("Table")));
+        assert!(!is_figure_caption_label(None));
+
+        assert!(is_table_caption_label(Some("Table")));
+        assert!(!is_table_caption_label(Some("Figure")));
+        assert!(!is_table_caption_label(None));
     }
 
     #[test]
