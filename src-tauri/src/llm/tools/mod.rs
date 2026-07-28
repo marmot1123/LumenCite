@@ -11,6 +11,7 @@
 //!   返す `String` は LLM に渡すツール結果テキスト（人間可読 or JSON 文字列）。
 
 pub mod approval;
+pub mod document;
 pub mod mutate;
 pub mod ocr;
 pub mod search;
@@ -92,8 +93,22 @@ impl From<sqlx::Error> for ToolError {
 }
 
 /// LLM に提示する全（組み込み）ツールの定義。MCP ツールは呼び出し側でこれに追加する。
-pub fn all_tool_specs() -> Vec<ToolSpec> {
+///
+/// `lcir_available` が false のとき、LCIR に依存する 8 ツール（[`document::LCIR_TOOLS`]）を
+/// 一覧から外す。**判定は「フラグが ON か」ではなく「読める LCIR が実在するか」**で行う
+/// （`lcir.enabled` を ON にしただけでは何も構築されないので、フラグだけで出すと
+/// `has_lcir:false` しか返さないツールの定義でコンテキストを食う）。呼び出し側は
+/// [`crate::ingestion::lcir_readable`] を渡す。`get_fulltext` は LCIR と無関係なので常に出す。
+///
+/// 一覧から外しても [`execute_tool`] は名前で実行できる（過去ターンの履歴に残った
+/// ツール呼び出しが再送されても壊れないようにするため）。
+pub fn all_tool_specs(lcir_available: bool) -> Vec<ToolSpec> {
     let mut specs = search::specs();
+    specs.extend(
+        document::specs()
+            .into_iter()
+            .filter(|s| lcir_available || !document::LCIR_TOOLS.contains(&s.name.as_str())),
+    );
     specs.extend(mutate::specs());
     specs.extend(ocr::specs());
     specs
@@ -127,6 +142,9 @@ pub async fn execute_tool(ctx: &ToolContext<'_>, call: &ToolCallSpec) -> Result<
         };
     }
     if let Some(r) = search::try_execute(ctx, call).await {
+        return r;
+    }
+    if let Some(r) = document::try_execute(ctx, call).await {
         return r;
     }
     if let Some(r) = mutate::try_execute(ctx, call).await {

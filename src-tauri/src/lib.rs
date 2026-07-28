@@ -1141,12 +1141,14 @@ async fn search_lcir_nodes(
     tag_id: Option<i64>,
     view: Option<String>,
 ) -> Result<Vec<crate::models::NodeFtsHit>, String> {
+    // UI は結果を自前でページングするので上限なし（LLM ツール経路とは違い履歴に積まれない）。
     db::document_nodes_fts::search_nodes(
         &state.db,
         &query,
         collection_id,
         tag_id,
         view.as_deref(),
+        None,
     )
     .await
     .map_err(|e| e.to_string())
@@ -2693,7 +2695,10 @@ async fn chat_send_message(
             return Err(e.to_string());
         }
     };
-    let mut tools = llm::tools::all_tool_specs();
+    // LCIR 系ツールは「読める版が実在する」ときだけ一覧に出す（Phase 10b）。
+    // メッセージ毎に評価するので、設定トグルや一括構築の結果が次の発言から効く。
+    let lcir_available = ingestion::lcir_readable(&pool).await;
+    let mut tools = llm::tools::all_tool_specs(lcir_available);
     tools.extend(state.mcp.tool_specs().await);
 
     // 同一セッションで run が進行中なら拒否する（CR-014）。二重実行や cancel フラグ上書きを防ぐ。

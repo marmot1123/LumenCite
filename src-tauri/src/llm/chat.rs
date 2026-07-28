@@ -412,7 +412,7 @@ mod tests {
             mcp: None,
             app_data_dir: std::path::Path::new(""),
         };
-        let tools = tools::all_tool_specs();
+        let tools = tools::all_tool_specs(true);
         run_chat_loop(
             provider,
             &ctx,
@@ -663,7 +663,7 @@ mod tests {
             mcp: None,
             app_data_dir: std::path::Path::new(""),
         };
-        let tools = tools::all_tool_specs();
+        let tools = tools::all_tool_specs(true);
         let p = ChatLoopParams {
             max_turns: 3,
             ..params()
