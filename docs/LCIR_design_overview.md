@@ -64,6 +64,8 @@ LCIR はこれらを失わずに保存する基盤を作る。**最優先は高�
 
 **リリースとの対応（2026-07-19 決定・2026-07-23 改訂・詳細は SPEC.md「v0.8.0 > リリース方針」）**: v0.8.0 = 取得整備と同時（Phase 5 前）。以後はフラグ付きで main に積み、リリースは 2〜3 フェーズごとに間引く。**Phase 9a/10 到達 + `lcir.enabled` 既定 ON 化 = v1.0.0 の看板**（9b は post-1.0 可）。
 
+**残 Phase の詳細な棚卸しは `docs/LCIR_REMAINING_PHASES.md`**（2026-07-28・v0.10.0 出荷時点）。分割（7a/7b/7c・8d-1〜8d-8・9b-0〜9b-4・10a/10b/10c）ごとの難易度・概算行数・migration 要否・実測値・積み残し債務・推奨着手順序をそこに置く。**`lcir.enabled` 既定 ON には pdfium の Windows/Linux 同梱が hard blocker** だった（LCIR 抽出は OCR と同じ `bind_pdfium()` を通るため）— **2026-07-28 に対応済**（`docs/RELEASE.md` §4）。
+
 ---
 
 ## 4. 設計判断（ADR） — ロードマップ §17「重要な判断事項」への回答
@@ -369,6 +371,7 @@ LumenCite の内部構造を、単なる PDF 全文データベースではな�
 ## 関連ドキュメント
 
 - `docs/LumenCite_machine_readable_document_roadmap.md` — 元ロードマップ（vision）
+- `docs/LCIR_REMAINING_PHASES.md` — 残 Phase の棚卸し（難易度・依存・積み残し債務・着手順序）
 - `docs/DATA_MODEL.md` — 既存 DB スキーマ（第一段実装時に新3表を追記）
 - `docs/API_SPEC.md` — Tauri コマンド仕様（第一段実装時に新コマンドを追記）
 - `docs/SPEC.md` — 機能要件・フェーズ
