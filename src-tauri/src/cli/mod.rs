@@ -1267,6 +1267,60 @@ mod tests {
         )
         .await;
         insert(Some(root), 3, "proof", Some("Proof. Consider the union."), None).await;
+        // Phase 8a/8c（debt-6/7）: figure ノード + 領域 + crop アセット + 生成 alt text。
+        // DB → load_lcir_document → レンダラで assets/alt_text が運ばれる通し経路を守る。
+        insert(
+            Some(root),
+            4,
+            "figure_caption",
+            Some("Figure 3: The overall pipeline."),
+            Some(r#"{"caption_label": "Figure", "caption_number": "3"}"#),
+        )
+        .await;
+        let fig = insert(
+            Some(root),
+            5,
+            "figure",
+            None,
+            Some(r#"{"figure_index": 7, "figure_number": "3"}"#),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO source_fragments (node_id, page_number, x, y, width, height, fragment_type)
+             VALUES (?, 5, 72.0, 400.0, 300.0, 200.0, 'block')",
+        )
+        .bind(fig)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let asset_id: i64 = sqlx::query(
+            "INSERT INTO assets
+                (document_version_id, sha256, mime_type, relative_path, width, height, size_bytes)
+             VALUES (?, 'deadbeef', 'image/png', 'attachments/z/.lcir/1/deadbeef/fig-p005-00.png',
+                     800, 600, 1234)",
+        )
+        .bind(ver)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+        sqlx::query("INSERT INTO node_assets (node_id, asset_id, role) VALUES (?, ?, 'page_crop')")
+            .bind(fig)
+            .bind(asset_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO node_alt_texts
+                (node_id, document_version_id, source_asset_sha256, text, origin, confidence, model)
+             VALUES (?, ?, 'deadbeef', 'A 3D wireframe surface plot of the loss landscape.',
+                     'llm_inference', 0.5, 'claude-sonnet-5')",
+        )
+        .bind(fig)
+        .bind(ver)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let out = cmd_export_lcir(
             &pool,
@@ -1279,6 +1333,18 @@ mod tests {
         assert_eq!(md.matches("## Abstract").count(), 1, "{md}");
         assert_eq!(md.matches("Theorem 2.3").count(), 1, "見出し二重化しない: {md}");
         assert_eq!(md.matches("Proof.").count(), 1, "{md}");
+        // debt-6/7: 図が落ちず、alt text が生成物として識別でき、画像リンクは張られない。
+        assert!(md.contains("**[Figure 3]** (p. 5)"), "figure が落ちない: {md}");
+        assert!(
+            md.contains("**AI-generated description** (model: claude-sonnet-5)."),
+            "alt text は生成物として識別できる: {md}"
+        );
+        assert!(!md.contains("!["), "画像リンクは張らない: {md}");
+        assert_eq!(
+            md.matches("The overall pipeline.").count(),
+            1,
+            "caption を二重に出さない: {md}"
+        );
         // 既定（source 未指定）は tex 優先のまま。
         let out = cmd_export_lcir(&pool, &export_lcir_args(&entry_id.to_string(), "md", None))
             .await

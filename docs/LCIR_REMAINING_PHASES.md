@@ -254,12 +254,13 @@ supersede は status を更新するだけで行は永久に残る。`document_n
 | debt-3 | `TextBlock` ノード型が未使用（実際の木は `document > page > block > line`） | S | — |
 | debt-4 | JATS / HTML / LaTeXML 取込なし（`ingestion/{jats,tei,html}` 不在）・手動 `.tex` 添付もスコープ外 | L | 9b と対称 |
 | debt-5 | PDF 側の記号抽出なし（6b は TeX のみ）・記号スコープの厳密化 | L / M | 7c の曖昧性解消 |
-| debt-6 | 9a Markdown で **figure が完全に落ちている**（`figure` は `plain_text: None` で未知型 degrade の `_` 分岐に落ち無出力） | S | 9b-1 |
-| debt-7 | 8c の alt text が Markdown エクスポートに出ない・手編集 UI なし（`origin` 列だけ用意済み） | S | — |
+| ~~debt-6~~ | ~~9a Markdown で figure が完全に落ちている~~ **解消**（2026-07-28・存在マーカー + alt text。画像リンクは張らない） | S | 9b-1 |
+| debt-7 | ~~8c の alt text が Markdown エクスポートに出ない~~（2026-07-28 解消）・**手編集 UI なし**（`origin` 列だけ用意済み。UI が入ると `user_edited` の出し分けが実データで初めて発火する） | S | — |
 | debt-8 | 9a の「LCIR 固有情報が失われる場合の警告」未実装（ロードマップ §10 Phase 9 完了条件） | S | 9b-0 で一緒に |
 | debt-9 | 回転ページは図領域を skip。設計概観 §6 の「要検証」（非ゼロ `/Rotate` での pdfium bounds）が未消化 | M | 8d-8 |
 | debt-10 | 8b の longtable / tabu / siunitx S 列 / 表脚注 | M | — |
 | debt-11 | 数式検索は trigram 部分一致のみ。**TeX 版は node-FTS 対象外**なので原文 LaTeX は検索対象ですらない | — | 7b の動機 |
+| debt-13 | 実蔵書では `figure` 1,198 件のうち 523 件（43.7%）、alt text 888 件のうち 523 件（58.9%）が**スキャン本 1 冊**由来で、その alt text は図ではなく「スキャン頁」の説明。8c の課金の 6 割弱がここに費やされた計算になり、debt-6 の Markdown 出力もこの 1 冊では 523 個のマーカーになる。判定候補は「ページに block が 0 件」「crop が MediaBox のほぼ全面」。レンダラ側では解かない（ヒューリスティックを持ち込まない）ので 8a（領域検出）か 8c（生成対象の絞り込み）の担当 | M | 8c の費用対効果 |
 | debt-12 | ローマ数字番号・全大文字の表 caption を `detect_caption` が拾わない（`lower.starts_with("table")` は通るが直後 6 文字以内に ASCII 数字が要るため `TABLE I. …` が paragraph 落ち・実測 60 件）。同種の穴で `Fig. 8.3 …` 形も落ちており、これが 8d-7 の解決率上限 93% の実体 | S〜M | 8d-7 の回収率 |
 
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
@@ -274,7 +275,7 @@ supersede は status を更新するだけで行は永久に残る。`document_n
 7 は最大の XL であり、かつ入力となる原文 LaTeX が 645 行しかない。
 
 1. ~~**v1.0.0-p0（pdfium 同梱）**~~ — **2026-07-28 実装済**。他すべての前提だった
-2. ~~**8d-7（S）**~~ — **2026-07-28 実装済**。残りは **debt-6（S）+ debt-8（S）** — 安い穴埋め。9b-1 と 10a の質が上がる
+2. ~~**8d-7（S）+ debt-6（S）**~~ — **2026-07-28 実装済**。残りは **debt-8（S）** — 安い穴埋め。9b-1 と 10a の質が上がる
 3. **10a（M）→ 10b（M）** — v1.0.0 の「Phase 10 到達」はここ
 4. **v1.0.0-p1 → p2 → p3（各 M）** — 既定 ON 化。p4（GC）は並行可
 5. **8d-2（L）** — 実ライブラリの半数が figure 0 件という実害の解消。再構築 1 回で 8d-1 / 8d-8 と束ねる
