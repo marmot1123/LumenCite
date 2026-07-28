@@ -1,9 +1,11 @@
 // ToolCallCard — 5 系統 (read/write/approve/delete/mcp) × 状態 (running/needs_approval/done/rejected)。
 // design handoff の ToolCallCard を実データ (UiToolCall) 向けに実装。
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
 import { ChatIcon, type ChatIconName } from "./ChatIcon";
-import type { UiToolCall } from "../../types";
+import { isReadOnlyTool, isRefBearingTool } from "../../chat/tools";
+import type { LcirNodeLocation, ToolResultRef, UiToolCall } from "../../types";
 
 export type ToolKind = "read" | "write" | "approve" | "delete" | "mcp";
 
@@ -15,12 +17,12 @@ export const KIND_META: Record<ToolKind, { fg: string; bg: string; bd: string; l
   mcp: { fg: "var(--tc-mcp-fg)", bg: "var(--tc-mcp-bg)", bd: "var(--tc-mcp-bd)", label: "mcp", glyph: "plug" },
 };
 
-/** tool_name から表示カテゴリを導出（承認ポリシーと同じ分類）。 */
+/** tool_name から表示カテゴリを導出（承認ポリシーと同じ分類・`chat/tools.ts` が正本）。 */
 export function toolKind(name: string): ToolKind {
   if (name.startsWith("mcp_")) return "mcp";
   if (name.startsWith("delete_")) return "delete";
   if (name === "create_entry" || name === "update_entry") return "approve";
-  if (name === "fulltext_search" || name === "get_entry" || name.startsWith("list_")) return "read";
+  if (isReadOnlyTool(name)) return "read";
   return "write";
 }
 
@@ -102,6 +104,7 @@ export function ToolCallCard({ tc, onApprove }: ToolCallCardProps) {
               <CodeBlock text={tc.result_summary} />
             </Section>
           )}
+          {tc.state === "done" && <EvidenceChips tc={tc} />}
 
           {pending && (
             <div style={{ marginTop: 2, display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 6, background: "color-mix(in oklch, " + k.fg + " 12%, var(--surface))", border: "1px solid " + k.bd }}>
@@ -207,4 +210,79 @@ function renderJson(v: unknown): React.ReactNode {
     );
   }
   return <span>{String(v)}</span>;
+}
+
+/**
+ * 根拠チップ（Phase 10b）。ツール結果が指す LCIR ノードを PDF 上で開く。
+ *
+ * refs はライブ配信時のみイベントで届くので、履歴から復元したカードでは
+ * `chat_tool_refs` で引き直す（結果全文は DB にあるが、ライブの result_summary は
+ * 500 文字で切られていてフロントでは JSON として読めない）。
+ * TeX 由来のノードは座標を持たないので、そもそも refs が空になる。
+ */
+function EvidenceChips({ tc }: { tc: UiToolCall }) {
+  const { t } = useTranslation();
+  const [refs, setRefs] = useState<ToolResultRef[]>(tc.refs ?? []);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (tc.refs !== undefined) { setRefs(tc.refs); return; }
+    if (!tc.result_summary || !isRefBearingTool(tc.tool_name)) return;
+    let cancelled = false;
+    invoke<ToolResultRef[]>("chat_tool_refs", {
+      toolName: tc.tool_name,
+      resultJson: tc.result_summary,
+    })
+      .then((r) => { if (!cancelled) setRefs(r); })
+      .catch(() => { /* 根拠が引けなくても本文の表示は妨げない */ });
+    return () => { cancelled = true; };
+  }, [tc.refs, tc.result_summary, tc.tool_name]);
+
+  if (refs.length === 0) return null;
+
+  const open = async (r: ToolResultRef) => {
+    setBusy(true);
+    try {
+      const loc = await invoke<LcirNodeLocation | null>("get_lcir_node_region", { nodeId: r.node_id });
+      if (!loc || loc.page == null) return;
+      await invoke("open_pdf_viewer", {
+        id: loc.attachment_id,
+        page: loc.page,
+        region: loc.bbox ?? null,
+      });
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Section label={t("chat.evidenceLabel")}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {refs.map((r) => (
+          <button
+            key={r.node_id}
+            onClick={() => void open(r)}
+            disabled={busy}
+            title={t("chat.evidenceOpen", { page: r.page })}
+            style={{
+              display: "inline-flex", alignItems: "center", gap: 5,
+              padding: "3px 8px", borderRadius: 5,
+              border: "1px solid var(--border-strong)",
+              background: "var(--surface)", color: "var(--text)",
+              fontSize: 11, fontWeight: 500,
+              cursor: busy ? "default" : "pointer",
+              opacity: busy ? 0.6 : 1,
+              fontVariantNumeric: "tabular-nums",
+            }}
+          >
+            <ChatIcon name="book" size={11} color="var(--text-mute)" />
+            <span style={{ color: "var(--text-mute)" }}>{r.kind}</span>
+            <span>p.{r.page}</span>
+          </button>
+        ))}
+      </div>
+    </Section>
+  );
 }

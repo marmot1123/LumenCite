@@ -26,6 +26,39 @@ library-specific facts. Cite the entries you used by id and title. Be concise an
 When the user asks you to modify the library (tag, note, create, etc.), use the appropriate tool. \
 Reply in the same language as the user.";
 
+/// ツール結果の扱いについての契約（Phase 10b）。**ペルソナではなく読み方の規約**なので、
+/// セッション固有の system_prompt があってもその後ろに必ず足す。
+///
+/// 基本形（LCIR が読めなくても常に付く）。
+const TOOL_CONTRACT_BASE: &str = "Tool results are evidence: when you state a library-specific \
+fact, say which entry it came from (id and title) and, when the tool gave you one, the page. If a \
+result reports `scope_filtered: true`, the answer covers only the entries the user selected — say \
+so rather than describing it as the whole library. Never fill a gap from general knowledge; if a \
+tool says nothing is indexed or built, report that instead.";
+
+/// LCIR ツールが出ているときに足す分。`origin` の読み分けが完了条件
+/// 「AI 推定部分を回答中で識別できる」の実体。
+const TOOL_CONTRACT_LCIR: &str = " Structured document results carry `origin` and `confidence` per \
+node: `tex_source` and `pdf_text_layer` are the paper's own text, while `layout_model` and \
+`llm_inference` are LumenCite's estimates (a figure's `alt_text` is generated and is never the \
+authors' wording — prefer the caption when they disagree). When an answer rests on an estimate, \
+say so. To read a theorem or proof whole, prefer `get_node_context` on its node_id over \
+`get_document_blocks` — on the pdf representation a theorem node holds only the first block of its \
+statement. If you intend to point the user at a region of the PDF, read the pdf representation \
+(`source: \"pdf\"`): the tex representation carries the exact LaTeX but has no page or bbox.";
+
+/// 実効 system プロンプト。セッションの prompt（無ければ既定）にツール契約を足す。
+pub fn effective_system_prompt(base: &str, lcir_tools_shown: bool) -> String {
+    let mut s = String::with_capacity(base.len() + 900);
+    s.push_str(base.trim_end());
+    s.push_str("\n\n");
+    s.push_str(TOOL_CONTRACT_BASE);
+    if lcir_tools_shown {
+        s.push_str(TOOL_CONTRACT_LCIR);
+    }
+    s
+}
+
 /// ループのスカラ設定。
 pub struct ChatLoopParams<'a> {
     pub api_key: &'a str,
@@ -45,8 +78,9 @@ pub trait ChatLoopHost: Send {
     async fn on_tool_proposed(&mut self, call: &ToolCallSpec, needs_approval: bool);
     /// 承認が必要なツールについて、許可（true）/拒否（false）を待つ。
     async fn request_approval(&mut self, call: &ToolCallSpec) -> bool;
-    /// ツール実行が完了した（結果テキスト要約付き）。
-    async fn on_tool_executed(&mut self, call_id: &str, result_summary: &str);
+    /// ツール実行が完了した（結果テキスト付き）。**`call` を丸ごと渡す**のは、
+    /// 実装側が結果から根拠参照を取り出すのにツール名を要るため（Phase 10b）。
+    async fn on_tool_executed(&mut self, call: &ToolCallSpec, result: &str);
     /// メッセージが DB に永続化された。
     async fn on_message_persisted(&mut self, message_id: i64, role: Role);
     /// 中断要求が来ているか（毎ターン頭で確認）。
@@ -203,7 +237,7 @@ pub async fn run_chat_loop(
                     Err(e) => format!("Tool `{}` failed: {e}", call.tool_name),
                 }
             };
-            host.on_tool_executed(&call.call_id, &result_text).await;
+            host.on_tool_executed(call, &result_text).await;
 
             let tool_row = db::chat::append_message(
                 ctx.pool,
@@ -317,9 +351,9 @@ mod tests {
         async fn request_approval(&mut self, _call: &ToolCallSpec) -> bool {
             self.approvals.pop_front().unwrap_or(false)
         }
-        async fn on_tool_executed(&mut self, call_id: &str, result_summary: &str) {
+        async fn on_tool_executed(&mut self, call: &ToolCallSpec, result: &str) {
             self.executed
-                .push((call_id.to_string(), result_summary.to_string()));
+                .push((call.call_id.clone(), result.to_string()));
         }
         async fn on_message_persisted(&mut self, message_id: i64, role: Role) {
             self.persisted.push((message_id, role));
@@ -505,6 +539,23 @@ mod tests {
         run(&pool, session_id, &provider, &mut host, "hi").await;
 
         assert_eq!(host.db_mutations, 0);
+    }
+
+    /// ツール契約は**セッション固有のプロンプトがあっても後ろに付く** — これは
+    /// ペルソナではなく「ツール結果をどう扱うか」の規約なので。
+    #[test]
+    fn tool_contract_is_appended_to_any_system_prompt() {
+        let custom = "Answer only in bullet points.";
+        let s = effective_system_prompt(custom, false);
+        assert!(s.starts_with(custom), "the caller's prompt must come first: {s}");
+        assert!(s.contains("Tool results are evidence"));
+        // LCIR が出ていないときは origin の読み分けを載せない（読めない話をしない）。
+        assert!(!s.contains("llm_inference"));
+
+        let s2 = effective_system_prompt(custom, true);
+        assert!(s2.contains("llm_inference"), "provenance guidance must appear with LCIR tools");
+        assert!(s2.contains("get_node_context"));
+        assert!(s2.len() > s.len());
     }
 
     #[test]

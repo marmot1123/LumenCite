@@ -416,6 +416,10 @@ async fn exec_get_fulltext(ctx: &ToolContext<'_>, args: &Value) -> Result<String
         },
     };
 
+    // スコープ（CR-024）。**このツールは resolve_entry_id を通らない**（未知キーの返し方が
+    // 違うので共有していない）ので、検査を独立に置く。
+    ctx.ensure_entry_in_scope(entry_id)?;
+
     let pages = crate::db::fulltext::get_entry_fulltext(pool, entry_id).await?;
     if pages.is_empty() {
         return Ok(serde_json::to_string(&json!({
@@ -566,6 +570,7 @@ fn no_lcir_response(entry_id: i64, source: Option<&str>) -> String {
 async fn exec_get_document_structure(ctx: &ToolContext<'_>, args: &Value) -> Result<String, ToolError> {
     let pool = ctx.pool;
     let entry_id = resolve_entry_id(pool, args).await?;
+    ctx.ensure_entry_in_scope(entry_id)?;
     let source_arg = args.get("source").and_then(|v| v.as_str());
     let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
     let Some((attachment_id, doc)) = loaded else {
@@ -652,6 +657,7 @@ async fn exec_get_document_structure(ctx: &ToolContext<'_>, args: &Value) -> Res
 async fn exec_get_document_blocks(ctx: &ToolContext<'_>, args: &Value) -> Result<String, ToolError> {
     let pool = ctx.pool;
     let entry_id = resolve_entry_id(pool, args).await?;
+    ctx.ensure_entry_in_scope(entry_id)?;
     let source_arg = args.get("source").and_then(|v| v.as_str());
     let page_filter = args.get("page").and_then(|v| v.as_i64());
 
@@ -946,6 +952,7 @@ fn relation_node_json(n: &crate::document_ir::LcirNode) -> Value {
 async fn exec_get_node_relations(ctx: &ToolContext<'_>, args: &Value) -> Result<String, ToolError> {
     let pool = ctx.pool;
     let entry_id = resolve_entry_id(pool, args).await?;
+    ctx.ensure_entry_in_scope(entry_id)?;
     let source_arg = args.get("source").and_then(|v| v.as_str());
     let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
     let Some((_attachment_id, doc)) = loaded else {
@@ -1018,6 +1025,7 @@ async fn exec_get_node_relations(ctx: &ToolContext<'_>, args: &Value) -> Result<
 async fn exec_get_symbol_definitions(ctx: &ToolContext<'_>, args: &Value) -> Result<String, ToolError> {
     let pool = ctx.pool;
     let entry_id = resolve_entry_id(pool, args).await?;
+    ctx.ensure_entry_in_scope(entry_id)?;
     let source_arg = args.get("source").and_then(|v| v.as_str());
     let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
     let Some((_attachment_id, doc)) = loaded else {
@@ -1122,6 +1130,7 @@ async fn exec_get_symbol_definitions(ctx: &ToolContext<'_>, args: &Value) -> Res
 async fn exec_get_figures(ctx: &ToolContext<'_>, args: &Value) -> Result<String, ToolError> {
     let pool = ctx.pool;
     let entry_id = resolve_entry_id(pool, args).await?;
+    ctx.ensure_entry_in_scope(entry_id)?;
     let (loaded, versions) = load_entry_lcir(pool, entry_id, Some("pdf")).await?;
     let Some((attachment_id, doc)) = loaded else {
         return Ok(no_lcir_response(entry_id, Some("pdf")));
@@ -1234,6 +1243,7 @@ async fn exec_get_figures(ctx: &ToolContext<'_>, args: &Value) -> Result<String,
 async fn exec_get_tables(ctx: &ToolContext<'_>, args: &Value) -> Result<String, ToolError> {
     let pool = ctx.pool;
     let entry_id = resolve_entry_id(pool, args).await?;
+    ctx.ensure_entry_in_scope(entry_id)?;
     let (loaded, versions) = load_entry_lcir(pool, entry_id, Some("tex")).await?;
     let Some((attachment_id, doc)) = loaded else {
         return Ok(serde_json::to_string(&json!({
@@ -1367,6 +1377,9 @@ async fn exec_get_node_context(ctx: &ToolContext<'_>, args: &Value) -> Result<St
         }))
         .unwrap_or_default());
     };
+    // スコープ（CR-024）。**引数は node_id だけなので、entry が判るのはここが最初**。
+    // バンドルを組む前に落とす（組んでから返す形にすると、後の編集 1 つで本文が漏れる）。
+    ctx.ensure_entry_in_scope(entry_id)?;
 
     // 上限つきで読む。**上限が要る理由はチャット側にある** — 応答は会話履歴に永続化されて
     // 以後のターンで毎回再送されるので、`max_continuation: 1_000_000` の 1 回でセッションが
@@ -1419,4 +1432,615 @@ async fn exec_get_node_context(ctx: &ToolContext<'_>, args: &Value) -> Result<St
     );
     obj.insert("available_sources".to_string(), sources_json(&versions));
     Ok(serde_json::to_string(&Value::Object(obj)).unwrap_or_default())
+}
+
+// ─── 根拠参照（Phase 10b・UI 用） ────────────────────────────────────────────
+
+/// ツール結果が指し示す「PDF 上の根拠」1 件。UI のチップになる。
+///
+/// **`page` を持つものだけを作る** — TeX 版のノードには座標が無いので、チップを出しても
+/// 飛び先が無い。飛べない UI を出すより出さない方がよい（TeX 版が既定になる arXiv 論文では
+/// チップは出ない。これは既知の制限で、tex → pdf の位置解決は post-1.0）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolResultRef {
+    pub node_id: i64,
+    pub kind: String,
+    pub page: i64,
+}
+
+/// 1 つのツール結果から取り出す根拠の上限。カード 1 枚がチップで埋まらない程度。
+const MAX_REFS_PER_RESULT: usize = 5;
+
+/// ツール結果 JSON から根拠参照を取り出す**決定的な純関数**。
+///
+/// なぜ Rust 側でやるか: ライブ配信の `result_summary` は 500 文字で切られるので
+/// （`clip_text`）、フロントでは JSON として読めない。
+///
+/// なぜ再パースか: `try_execute` の契約が `String` を返すことなので、結果は一度 JSON 文字列に
+/// なる。型付きの値を返す設計に変えると MCP と共有している契約が壊れる。
+/// **`tool_name` で先に振り分ける**ので、JSON でない結果（`export_bibtex` の生 .bib、
+/// `"Tool \`x\` failed: …"`、`"The user denied…"`）は `from_str` に到達しない。
+///
+/// 各ツールで鍵名が違う（`node_kind` / `kind` / 種別なし）ので、汎用の走査ではなく
+/// 明示的な分岐で書く。
+pub fn provenance_refs(tool_name: &str, result_json: &str) -> Vec<ToolResultRef> {
+    // 対象外のツールは JSON を読まない。
+    if !matches!(
+        tool_name,
+        "search_document_nodes" | "get_document_blocks" | "get_figures" | "get_node_context"
+    ) {
+        return Vec::new();
+    }
+    let Ok(v) = serde_json::from_str::<Value>(result_json) else {
+        return Vec::new();
+    };
+
+    // `page` は「鍵が無い」（`get_node_context` の ContextNode）と「null」
+    // （`get_document_blocks` の tex 版）の両方がありうるので as_i64 で判定する。
+    fn one(node: &Value, kind_key: Option<&str>, fallback_kind: &str) -> Option<ToolResultRef> {
+        let node_id = node.get("node_id").and_then(Value::as_i64)?;
+        let page = node.get("page").and_then(Value::as_i64)?;
+        let kind = kind_key
+            .and_then(|k| node.get(k))
+            .and_then(Value::as_str)
+            .unwrap_or(fallback_kind)
+            .to_string();
+        Some(ToolResultRef {
+            node_id,
+            kind,
+            page,
+        })
+    }
+
+    let mut out: Vec<ToolResultRef> = Vec::new();
+    match tool_name {
+        "search_document_nodes" => {
+            if let Some(items) = v.get("results").and_then(Value::as_array) {
+                for it in items {
+                    if let Some(r) = one(it, Some("node_kind"), "block") {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        "get_document_blocks" => {
+            if let Some(items) = v.get("blocks").and_then(Value::as_array) {
+                for it in items {
+                    if let Some(r) = one(it, Some("kind"), "block") {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        "get_figures" => {
+            // 図の応答には種別の鍵が無い（全部 figure なので）。
+            if let Some(items) = v.get("figures").and_then(Value::as_array) {
+                for it in items {
+                    if let Some(r) = one(it, None, "figure") {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        "get_node_context" => {
+            // 焦点だけ。continuation まで出すとチップが並びすぎて「どれが答えか」が消える。
+            if let Some(r) = v.get("focus").and_then(|f| one(f, Some("kind"), "block")) {
+                out.push(r);
+            }
+        }
+        _ => {}
+    }
+
+    // 同じノードを 2 回出さない（`get_document_blocks` の重複は無いが、契約として持つ）。
+    out.dedup_by_key(|r| r.node_id);
+    out.truncate(MAX_REFS_PER_RESULT);
+    out
+}
+
+// ─── テスト ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::attachments::add_attachment;
+    use crate::db::document_nodes::{insert_node, NewDocumentNode};
+    use crate::db::document_versions::{insert_version, NewDocumentVersion};
+    use crate::db::entries::create_entry;
+    use crate::db::fulltext::index_attachment;
+    use crate::db::source_fragments::{insert_fragment, NewSourceFragment};
+    use crate::db::document_nodes_fts::{index_nodes, NodeFtsInput};
+    use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+    use crate::models::EntryInput;
+    use sqlx::SqlitePool;
+
+    // fixture は mcp_server のテストとは共有しない（あちらは移設の回帰ハーネスなので、
+    // 被験モジュールと可変なテストコードを共有させない）。ここは routing とスコープを
+    // 見るだけなので最小で足りる。
+
+    fn call(tool: &str, args: Value) -> ToolCallSpec {
+        ToolCallSpec {
+            call_id: "c1".to_string(),
+            tool_name: tool.to_string(),
+            arguments: args,
+        }
+    }
+
+    fn ctx_all(pool: &SqlitePool) -> ToolContext<'_> {
+        ToolContext {
+            pool,
+            session_id: 1,
+            scope_mode: "all",
+            scope_entry_ids: &[],
+            mcp: None,
+            app_data_dir: std::path::Path::new(""),
+        }
+    }
+
+    fn ctx_scoped<'a>(pool: &'a SqlitePool, ids: &'a [i64]) -> ToolContext<'a> {
+        ToolContext {
+            pool,
+            session_id: 1,
+            scope_mode: "entries",
+            scope_entry_ids: ids,
+            mcp: None,
+            app_data_dir: std::path::Path::new(""),
+        }
+    }
+
+    async fn make_entry(pool: &SqlitePool, title: &str) -> i64 {
+        create_entry(
+            pool,
+            &EntryInput {
+                title: title.to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// 索引済み PDF を 1 つ持つエントリ。
+    async fn entry_with_fulltext(pool: &SqlitePool, title: &str, text: &str) -> i64 {
+        let eid = make_entry(pool, title).await;
+        let att = add_attachment(pool, eid, &format!("a/{eid}/p.pdf"), "p.pdf", "application/pdf")
+            .await
+            .unwrap();
+        index_attachment(pool, att.id, &[(1, text.to_string())])
+            .await
+            .unwrap();
+        eid
+    }
+
+    /// PDF 由来 LCIR（document > page > paragraph）を 1 本持つエントリ。
+    /// 戻り値は (entry_id, paragraph の node_id)。
+    async fn entry_with_lcir(pool: &SqlitePool, title: &str, text: &str) -> (i64, i64) {
+        let eid = make_entry(pool, title).await;
+        let att = add_attachment(pool, eid, &format!("a/{eid}/p.pdf"), "p.pdf", "application/pdf")
+            .await
+            .unwrap()
+            .id;
+        let vid = insert_version(
+            pool,
+            &NewDocumentVersion {
+                attachment_id: att,
+                content_key: &format!("ck-{eid}"),
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: schema::EXTRACTOR_NAME,
+                extractor_version: schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = insert_node(
+            pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: None,
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let page = insert_node(
+            pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::Page.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let para = insert_node(
+            pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(page),
+                node_kind: NodeKind::Paragraph.as_str(),
+                ordinal: 0,
+                plain_text: Some(text),
+                language: None,
+                confidence: Some(0.6),
+                origin: Some("layout_model"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        insert_fragment(
+            pool,
+            &NewSourceFragment {
+                node_id: para,
+                page_number: 1,
+                x: 72.0,
+                y: 500.0,
+                width: 300.0,
+                height: 12.0,
+                rotation: 0.0,
+                reading_order: Some(0),
+                fragment_type: Some("block"),
+            },
+        )
+        .await
+        .unwrap();
+        index_nodes(
+            pool,
+            att,
+            &[NodeFtsInput {
+                node_id: para,
+                page: 1,
+                node_kind: NodeKind::Paragraph.as_str().to_string(),
+                content: text.to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+        (eid, para)
+    }
+
+    // ── routing ─────────────────────────────────────────────────────────────
+
+    /// **チャットの入口から**引けること。`document::try_execute` を直接叩くテストだと、
+    /// `llm::tools::execute_tool` への配線漏れ（＝チャットからは全部 unknown tool）を
+    /// 見逃す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn every_document_tool_is_reachable_from_execute_tool(pool: SqlitePool) {
+        let ctx = ctx_all(&pool);
+        for name in DOCUMENT_TOOLS {
+            let args = match *name {
+                "get_node_context" => json!({ "node_id": 1 }),
+                "search_document_nodes" => json!({ "query": "x" }),
+                _ => json!({ "entry_id": 1 }),
+            };
+            let r = crate::llm::tools::execute_tool(&ctx, &call(name, args)).await;
+            assert!(
+                !matches!(r, Err(ToolError::UnknownTool(_))),
+                "{name} is advertised but not routed from execute_tool"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unknown_tool_returns_none(pool: SqlitePool) {
+        let ctx = ctx_all(&pool);
+        assert!(try_execute(&ctx, &call("nope", json!({}))).await.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn specs_cover_exactly_document_tools(_pool: SqlitePool) {
+        let names: Vec<String> = specs().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, DOCUMENT_TOOLS.to_vec());
+        // LCIR ツールは get_fulltext を含まない（あれは LCIR に依存しない）。
+        assert!(!LCIR_TOOLS.contains(&"get_fulltext"));
+        for n in LCIR_TOOLS {
+            assert!(DOCUMENT_TOOLS.contains(n), "{n}");
+        }
+    }
+
+    // ── スコープ（CR-024） ───────────────────────────────────────────────────
+
+    /// `get_fulltext` は `resolve_entry_id` を通らない独自の解決を持つ。
+    /// スコープ検査をそちらに足し忘れると、論文 1 本が丸ごと漏れる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_fulltext_refuses_out_of_scope_entry(pool: SqlitePool) {
+        let inside = entry_with_fulltext(&pool, "In scope", "alpha beta").await;
+        let outside = entry_with_fulltext(&pool, "Out of scope", "secret gamma").await;
+
+        let ids = vec![inside];
+        let ctx = ctx_scoped(&pool, &ids);
+
+        let ok = try_execute(&ctx, &call("get_fulltext", json!({ "entry_id": inside })))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ok.contains("alpha beta"), "in-scope entry must be readable: {ok}");
+
+        let denied = try_execute(&ctx, &call("get_fulltext", json!({ "entry_id": outside })))
+            .await
+            .unwrap();
+        match denied {
+            Err(ToolError::Execution(m)) => assert!(m.contains("outside the current chat scope"), "{m}"),
+            other => panic!("expected a scope error, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn entry_arg_tools_refuse_out_of_scope_entry(pool: SqlitePool) {
+        let inside = make_entry(&pool, "In scope").await;
+        let (outside, _) = entry_with_lcir(&pool, "Out of scope", "secret theorem").await;
+        let ids = vec![inside];
+        let ctx = ctx_scoped(&pool, &ids);
+
+        for name in [
+            "get_document_structure",
+            "get_document_blocks",
+            "get_node_relations",
+            "get_symbol_definitions",
+            "get_figures",
+            "get_tables",
+        ] {
+            let r = try_execute(&ctx, &call(name, json!({ "entry_id": outside })))
+                .await
+                .unwrap();
+            match r {
+                Err(ToolError::Execution(m)) => {
+                    assert!(m.contains("outside the current chat scope"), "{name}: {m}")
+                }
+                other => panic!("{name} must refuse out-of-scope entry, got {other:?}"),
+            }
+        }
+    }
+
+    /// `get_node_context` は entry を引数に取らない。node → entry を解決した直後に
+    /// 検査しないと本文が漏れる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_refuses_out_of_scope_node(pool: SqlitePool) {
+        let inside = make_entry(&pool, "In scope").await;
+        let (_outside, node_id) = entry_with_lcir(&pool, "Out of scope", "secret theorem body").await;
+        let ids = vec![inside];
+        let ctx = ctx_scoped(&pool, &ids);
+
+        let r = try_execute(&ctx, &call("get_node_context", json!({ "node_id": node_id })))
+            .await
+            .unwrap();
+        match r {
+            Err(ToolError::Execution(m)) => {
+                assert!(m.contains("outside the current chat scope"), "{m}");
+                assert!(!m.contains("secret theorem body"), "must not leak the text: {m}");
+            }
+            other => panic!("expected a scope error, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_reads_in_scope_node(pool: SqlitePool) {
+        let (eid, node_id) = entry_with_lcir(&pool, "Mine", "the statement").await;
+        let ids = vec![eid];
+        let ctx = ctx_scoped(&pool, &ids);
+        let s = try_execute(&ctx, &call("get_node_context", json!({ "node_id": node_id })))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["found"], true);
+        assert_eq!(v["entry_id"], eid);
+    }
+
+    /// 横断検索はスコープで落とすが、**落としたことを応答に出す** —
+    /// 黙って絞ると「ライブラリに無い」と読まれる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_document_nodes_reports_scope_filtering(pool: SqlitePool) {
+        let (inside, _) = entry_with_lcir(&pool, "Mine", "transformer architecture").await;
+        let _ = entry_with_lcir(&pool, "Theirs", "transformer architecture").await;
+
+        let all = try_execute(&ctx_all(&pool), &call("search_document_nodes", json!({ "query": "transformer" })))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(&all).unwrap();
+        assert_eq!(v["count"], 2);
+        assert!(v.get("scope_filtered").is_none(), "unscoped must not set the flag");
+
+        let ids = vec![inside];
+        let scoped = try_execute(
+            &ctx_scoped(&pool, &ids),
+            &call("search_document_nodes", json!({ "query": "transformer" })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let v2: Value = serde_json::from_str(&scoped).unwrap();
+        assert_eq!(v2["count"], 1);
+        assert_eq!(v2["scope_filtered"], true);
+    }
+
+    // ── 応答の大きさ ────────────────────────────────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_document_nodes_caps_results_and_reports_truncation(pool: SqlitePool) {
+        for i in 0..4 {
+            entry_with_lcir(&pool, &format!("Paper {i}"), "convergence theorem").await;
+        }
+        let ctx = ctx_all(&pool);
+
+        let s = try_execute(
+            &ctx,
+            &call("search_document_nodes", json!({ "query": "convergence", "max_results": 2 })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["truncated"], true);
+
+        let s2 = try_execute(&ctx, &call("search_document_nodes", json!({ "query": "convergence" })))
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_str(&s2).unwrap();
+        assert_eq!(v2["count"], 4);
+        assert_eq!(v2["truncated"], false);
+    }
+
+    /// 0 件のとき「一致しない」と「まだ索引が無い」を区別できること。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn search_document_nodes_distinguishes_empty_index_from_no_match(pool: SqlitePool) {
+        let ctx = ctx_all(&pool);
+        let s = try_execute(&ctx, &call("search_document_nodes", json!({ "query": "anything" })))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["index_built"], false);
+
+        entry_with_lcir(&pool, "Paper", "convergence theorem").await;
+        let s2 = try_execute(&ctx, &call("search_document_nodes", json!({ "query": "unrelated" })))
+            .await
+            .unwrap()
+            .unwrap();
+        let v2: Value = serde_json::from_str(&s2).unwrap();
+        assert_eq!(v2["count"], 0);
+        assert_eq!(v2["index_built"], true);
+    }
+
+    /// バンドルの大きさは呼び出し側が際限なく広げられない（履歴に残って毎ターン再送される）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_clamps_size_arguments(pool: SqlitePool) {
+        let (_eid, node_id) = entry_with_lcir(&pool, "Paper", "the statement").await;
+        let ctx = ctx_all(&pool);
+        // 上限を超える値を渡しても落ちず、応答が返る（clamp されるので巨大にならない）。
+        let s = try_execute(
+            &ctx,
+            &call(
+                "get_node_context",
+                json!({
+                    "node_id": node_id,
+                    "max_continuation": 10_000_000i64,
+                    "max_continuation_chars": 100_000_000i64,
+                    "max_related": 10_000i64,
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["found"], true);
+    }
+
+    // ── provenance ──────────────────────────────────────────────────────────
+
+    // ── 根拠参照（provenance_refs） ─────────────────────────────────────────
+
+    /// **実際のツール出力**を入力にする（手組み JSON だと鍵名の差異を取り違えたまま通る）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn provenance_refs_reads_each_real_tool_shape(pool: SqlitePool) {
+        let (eid, node_id) = entry_with_lcir(&pool, "Paper", "convergence theorem").await;
+        let ctx = ctx_all(&pool);
+
+        let s = try_execute(&ctx, &call("search_document_nodes", json!({ "query": "convergence" })))
+            .await
+            .unwrap()
+            .unwrap();
+        let refs = provenance_refs("search_document_nodes", &s);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].node_id, node_id);
+        assert_eq!(refs[0].kind, "paragraph");
+        assert_eq!(refs[0].page, 1);
+
+        let s = try_execute(&ctx, &call("get_document_blocks", json!({ "entry_id": eid })))
+            .await
+            .unwrap()
+            .unwrap();
+        let refs = provenance_refs("get_document_blocks", &s);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].node_id, node_id);
+        assert_eq!(refs[0].kind, "paragraph");
+
+        let s = try_execute(&ctx, &call("get_node_context", json!({ "node_id": node_id })))
+            .await
+            .unwrap()
+            .unwrap();
+        let refs = provenance_refs("get_node_context", &s);
+        assert_eq!(refs.len(), 1, "focus only");
+        assert_eq!(refs[0].node_id, node_id);
+
+        // 図は無いので空。has_lcir:true でも figures が空なら参照も空。
+        let s = try_execute(&ctx, &call("get_figures", json!({ "entry_id": eid })))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(provenance_refs("get_figures", &s).is_empty());
+    }
+
+    /// 座標を持たない版（TeX）のノードからはチップを作らない。飛び先が無いので。
+    #[test]
+    fn provenance_refs_skips_nodes_without_a_page() {
+        // tex 版の get_document_blocks は page を null で返す。
+        let tex = r#"{"has_lcir":true,"source":"tex","blocks":[
+            {"index":0,"node_id":7,"kind":"theorem","page":null,"text":"..."}]}"#;
+        assert!(provenance_refs("get_document_blocks", tex).is_empty());
+
+        // ContextNode は page の鍵ごと落とす。
+        let ctx_tex = r#"{"found":true,"source":"tex","focus":{"node_id":7,"kind":"theorem","text":"..."}}"#;
+        assert!(provenance_refs("get_node_context", ctx_tex).is_empty());
+    }
+
+    /// JSON でない結果や対象外のツールで落ちない（生 .bib・失敗メッセージ・拒否メッセージ）。
+    #[test]
+    fn provenance_refs_ignores_non_json_and_unrelated_tools() {
+        assert!(provenance_refs("export_bibtex", "@article{smith2020,\n  title={x}\n}").is_empty());
+        assert!(provenance_refs("get_document_blocks", "Tool `x` failed: db error").is_empty());
+        assert!(provenance_refs("get_node_context", "").is_empty());
+        assert!(provenance_refs("get_fulltext", r#"{"indexed":true,"text":"..."}"#).is_empty());
+        // 同名のツールを MCP クライアント経由で呼ぶと mcp_ 接頭辞が付くので対象外になる。
+        assert!(provenance_refs("mcp_lumencite_get_figures", r#"{"figures":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn provenance_refs_caps_the_number_of_chips() {
+        let blocks: Vec<String> = (1..=12)
+            .map(|i| format!(r#"{{"node_id":{i},"kind":"paragraph","page":1}}"#))
+            .collect();
+        let s = format!(r#"{{"blocks":[{}]}}"#, blocks.join(","));
+        assert_eq!(provenance_refs("get_document_blocks", &s).len(), MAX_REFS_PER_RESULT);
+    }
+
+    /// 完了条件「AI 推定部分を回答中で識別できる」は、まず**データ**が origin を運ぶこと。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn document_blocks_carry_origin_and_confidence(pool: SqlitePool) {
+        let (eid, _) = entry_with_lcir(&pool, "Paper", "a paragraph").await;
+        let ctx = ctx_all(&pool);
+        let s = try_execute(&ctx, &call("get_document_blocks", json!({ "entry_id": eid })))
+            .await
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        let b = &v["blocks"][0];
+        assert_eq!(b["origin"], "layout_model");
+        assert_eq!(b["confidence"], 0.6);
+    }
 }

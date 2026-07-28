@@ -866,24 +866,38 @@ async fn read_attachment_bytes(
     std::fs::read(&abs).map_err(|e| e.to_string())
 }
 
+/// `region` は `[x, y, width, height]`（PDF user space・左下原点・pt）で、指定すると
+/// ビューアがそのページの該当領域を一時的に強調する（チャットの根拠ジャンプ・Phase 10b）。
 #[tauri::command]
 async fn open_pdf_viewer(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: i64,
     page: Option<i64>,
+    region: Option<Vec<f64>>,
 ) -> Result<(), String> {
     let att = db::attachments::get_attachment_with_path(&state.db, id)
         .await
         .map_err(|e| e.to_string())?;
 
     let label = format!("pdf-viewer-{id}");
+    // 4 要素でなければ領域指定は無かったことにする（半端な矩形を描くより出さない）。
+    let region = region.filter(|r| r.len() == 4);
 
-    // 既に同じ添付のウィンドウが開いていればフォーカスし、page 指定があれば送る
+    // 既に同じ添付のウィンドウが開いていればフォーカスし、page 指定があれば送る。
+    // **`emit_to` で宛先ウィンドウを指定する** — `win.emit` は全ウィンドウへの broadcast なので、
+    // 別の PDF を開いている 2 枚目のビューアが同じページ・同じ矩形を強調してしまう
+    // （page だけの頃は余計なスクロールで済んだが、領域を描くと嘘の根拠表示になる）。
     if let Some(win) = app.get_webview_window(&label) {
         let _ = win.set_focus();
-        if let Some(p) = page {
-            let _ = win.emit("jump-to-page", p);
+        match (page, &region) {
+            (Some(p), Some(r)) => {
+                let _ = app.emit_to(&label, "jump-to-region", serde_json::json!({ "page": p, "region": r }));
+            }
+            (Some(p), None) => {
+                let _ = app.emit_to(&label, "jump-to-page", p);
+            }
+            _ => {}
         }
         return Ok(());
     }
@@ -891,6 +905,12 @@ async fn open_pdf_viewer(
     let mut url_str = format!("pdf-viewer.html?id={id}");
     if let Some(p) = page {
         url_str.push_str(&format!("&page={p}"));
+    }
+    if let Some(r) = &region {
+        url_str.push_str(&format!(
+            "&region={},{},{},{}",
+            r[0], r[1], r[2], r[3]
+        ));
     }
     let url = WebviewUrl::App(url_str.into());
     WebviewWindowBuilder::new(&app, label, url)
@@ -1154,16 +1174,55 @@ async fn search_lcir_nodes(
     .map_err(|e| e.to_string())
 }
 
-/// LCIR（実験・Phase 2）: ノードの代表領域（`block` fragment 優先）を返す。node 検索ヒットを
-/// PDF 上でハイライトする際に、必要になったときだけ引くための軽量取得。
+/// ノード 1 個の「PDF 上のどこか」（Phase 10b）。チャットの根拠チップがこれ 1 本で
+/// PDF ビューアを開けるように、添付 id と領域をまとめて返す。
+///
+/// TeX 由来の版には座標が無いので `page` / `bbox` は None になる（`attachment_id` は
+/// TeX ソース添付を指すので、PDF ビューアには渡せない）。呼び出し側は
+/// **`page` と `bbox` が揃っているときだけ**ジャンプできると判断すること。
+#[derive(serde::Serialize)]
+struct LcirNodeLocation {
+    node_id: i64,
+    attachment_id: i64,
+    /// "pdf" | "tex"（`ingestion::short_source_name`）。
+    source: String,
+    page: Option<i64>,
+    /// `[x, y, width, height]`（PDF user space・左下原点・pt）。既存ハイライトと同じ系。
+    bbox: Option<[f64; 4]>,
+}
+
+/// LCIR（Phase 2 → Phase 10b で拡張）: ノードの代表領域（`block` fragment 優先）と
+/// その所属添付を返す。node 検索ヒットやチャットの根拠を PDF 上で示すための軽量取得。
 #[tauri::command]
 async fn get_lcir_node_region(
     state: State<'_, AppState>,
     node_id: i64,
-) -> Result<Option<crate::models::SourceFragment>, String> {
-    db::source_fragments::primary_fragment_for_node(&state.db, node_id)
+) -> Result<Option<LcirNodeLocation>, String> {
+    let Some(version_id) = db::document_nodes::version_id_for_node(&state.db, node_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let Some(version) = db::document_versions::find_by_id(&state.db, version_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let fragment = db::source_fragments::primary_fragment_for_node(&state.db, node_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(Some(LcirNodeLocation {
+        node_id,
+        attachment_id: version.attachment_id,
+        source: ingestion::short_source_name(&version.extractor_name).to_string(),
+        page: fragment.as_ref().map(|f| f.page_number),
+        bbox: fragment
+            .as_ref()
+            .map(|f| [f.x, f.y, f.width, f.height]),
+    }))
 }
 
 /// LCIR（実験）フラグ `lcir.enabled` の現在値。
@@ -2143,6 +2202,9 @@ enum ChatStreamEvent {
     ToolCallExecuted {
         call_id: String,
         result_summary: String,
+        /// 結果が指す PDF 上の根拠（Phase 10b）。`result_summary` は 500 文字で切るので
+        /// フロントでは JSON として読めない ＝ 抽出は必ず backend でやる。
+        refs: Vec<llm::tools::document::ToolResultRef>,
     },
     MessagePersisted {
         message_id: i64,
@@ -2329,10 +2391,11 @@ impl llm::chat::ChatLoopHost for ChannelHost {
         }
     }
 
-    async fn on_tool_executed(&mut self, call_id: &str, result_summary: &str) {
+    async fn on_tool_executed(&mut self, call: &llm::ToolCallSpec, result: &str) {
         let _ = self.channel.send(ChatStreamEvent::ToolCallExecuted {
-            call_id: call_id.to_string(),
-            result_summary: clip_text(result_summary, 500),
+            call_id: call.call_id.clone(),
+            result_summary: clip_text(result, 500),
+            refs: llm::tools::document::provenance_refs(&call.tool_name, result),
         });
     }
 
@@ -2610,6 +2673,20 @@ async fn ocr_pdf(
         .map_err(|e| e.to_string())
 }
 
+/// ツール結果テキストから根拠参照を取り出す（Phase 10b）。
+///
+/// ライブ配信では `ChatStreamEvent::ToolCallExecuted` が `refs` を載せて来るが、
+/// **セッションを開き直したとき**はイベントが無く、フロントが持っているのは DB から
+/// 復元した結果テキストだけになる。抽出ロジックを TS に写さないために、同じ純関数を
+/// コマンドとして出す（DB も state も触らない）。
+#[tauri::command]
+fn chat_tool_refs(
+    tool_name: String,
+    result_json: String,
+) -> Vec<llm::tools::document::ToolResultRef> {
+    llm::tools::document::provenance_refs(&tool_name, &result_json)
+}
+
 #[tauri::command]
 async fn approve_tool_call(
     state: State<'_, AppState>,
@@ -2682,11 +2759,15 @@ async fn chat_send_message(
         .await
         .ok()
         .flatten();
-    let system = session
+    // LCIR 系ツールは「読める版が実在する」ときだけ一覧に出す（Phase 10b）。
+    // メッセージ毎に評価するので、設定トグルや一括構築の結果が次の発言から効く。
+    let lcir_available = ingestion::lcir_readable(&pool).await;
+    let base_system = session
         .system_prompt
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| llm::chat::DEFAULT_CHAT_SYSTEM_PROMPT.to_string());
+    let system = llm::chat::effective_system_prompt(&base_system, lcir_available);
 
     let provider = match llm::provider_for(&session.provider) {
         Ok(p) => p,
@@ -2695,9 +2776,6 @@ async fn chat_send_message(
             return Err(e.to_string());
         }
     };
-    // LCIR 系ツールは「読める版が実在する」ときだけ一覧に出す（Phase 10b）。
-    // メッセージ毎に評価するので、設定トグルや一括構築の結果が次の発言から効く。
-    let lcir_available = ingestion::lcir_readable(&pool).await;
     let mut tools = llm::tools::all_tool_specs(lcir_available);
     tools.extend(state.mcp.tool_specs().await);
 
@@ -4121,6 +4199,7 @@ pub fn run() {
             set_chat_session_model,
             chat_send_message,
             approve_tool_call,
+            chat_tool_refs,
             cancel_chat_stream,
             generate_chat_title,
             list_mcp_servers,

@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import * as pdfjsLib from "pdfjs-dist";
-import type { PDFDocumentProxy } from "pdfjs-dist";
+import type { PDFDocumentProxy, PageViewport } from "pdfjs-dist";
 import PdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = PdfWorker;
@@ -11,6 +11,14 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = PdfWorker;
 interface Props {
   attachmentId: number;
   initialPage?: number;
+  /** 一時強調する領域 [x, y, width, height]（PDF user space・左下原点・pt）。 */
+  initialRegion?: [number, number, number, number];
+}
+
+/** 強調中の領域（ページ + 矩形）。永続化しない。 */
+interface FocusRegion {
+  page: number;
+  rect: [number, number, number, number];
 }
 
 interface PageInfo {
@@ -22,7 +30,7 @@ interface PageInfo {
 const SCALE_STEPS = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
 const DEFAULT_SCALE = 1.25;
 
-export function PdfViewer({ attachmentId, initialPage }: Props) {
+export function PdfViewer({ attachmentId, initialPage, initialRegion }: Props) {
   const { t } = useTranslation();
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
   const [pages, setPages] = useState<PageInfo[]>([]);
@@ -31,6 +39,12 @@ export function PdfViewer({ attachmentId, initialPage }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const initialJumpDone = useRef(false);
+  // 根拠領域の強調（Phase 10b）。**initialPage のジャンプ処理とは独立に持つ** —
+  // あちらは `page > 1` かつ初回だけという条件付きなので、1 ページ目の根拠や
+  // 2 回目のジャンプで強調が出なくなる。
+  const [focus, setFocus] = useState<FocusRegion | null>(
+    initialRegion && initialPage ? { page: initialPage, rect: initialRegion } : null,
+  );
 
   const containerRef = useRef<HTMLDivElement>(null);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -132,10 +146,41 @@ export function PdfViewer({ attachmentId, initialPage }: Props) {
       if (Number.isFinite(p) && p >= 1 && p <= pages.length) {
         scrollToPage(p);
         setCurrentPage(p);
+        setFocus(null);
       }
     });
     return () => { unlistenPromise.then(fn => fn()); };
   }, [pages.length]);
+
+  // ── 根拠領域へのジャンプ（チャットのツール結果から・Phase 10b） ────────
+  useEffect(() => {
+    const win = getCurrentWebviewWindow();
+    const unlistenPromise = win.listen<{ page: number; region: number[] }>("jump-to-region", (e) => {
+      const p = Number(e.payload?.page);
+      const r = e.payload?.region;
+      if (!Number.isFinite(p) || p < 1 || p > pages.length) return;
+      scrollToPage(p);
+      setCurrentPage(p);
+      setFocus(
+        Array.isArray(r) && r.length === 4 && r.every(Number.isFinite)
+          ? { page: p, rect: r as [number, number, number, number] }
+          : null,
+      );
+    });
+    return () => { unlistenPromise.then(fn => fn()); };
+  }, [pages.length]);
+
+  // 初回ロード時に URL 由来の領域へスクロールする（`initialPage` の効果は
+  // page > 1 のときしか走らないので、1 ページ目の根拠のためにここでも面倒を見る）。
+  useEffect(() => {
+    if (!doc || !focus) return;
+    requestAnimationFrame(() => {
+      scrollToPage(focus.page, "auto");
+      setCurrentPage(focus.page);
+    });
+    // 初回だけ。以降は jump-to-region が自分でスクロールする。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc]);
 
   const zoomIn = () => {
     const next = SCALE_STEPS.find((s) => s > scale);
@@ -226,6 +271,7 @@ export function PdfViewer({ attachmentId, initialPage }: Props) {
             doc={doc}
             page={p.pageNumber}
             scale={scale}
+            focusRect={focus?.page === p.pageNumber ? focus.rect : null}
             registerRef={(el) => {
               if (el) pageRefs.current.set(p.pageNumber, el);
               else pageRefs.current.delete(p.pageNumber);
@@ -285,13 +331,18 @@ function PageInput({ value, total, onChange }: { value: number; total: number; o
   );
 }
 
-function PdfPage({ doc, page, scale, registerRef }: {
+function PdfPage({ doc, page, scale, focusRect, registerRef }: {
   doc: PDFDocumentProxy;
   page: number;
   scale: number;
+  /** 強調する領域 [x, y, width, height]（PDF pt・左下原点）。このページに無ければ null。 */
+  focusRect: [number, number, number, number] | null;
   registerRef: (el: HTMLDivElement | null) => void;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // CSS 座標へ変換するための viewport。DetailPane の PdfPane と同じく、
+  // pdf.js に y 反転・回転・CropBox 原点の面倒を見てもらう。
+  const [viewport, setViewport] = useState<PageViewport | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -320,6 +371,7 @@ function PdfPage({ doc, page, scale, registerRef }: {
       try {
         // @ts-ignore - render は { promise } を返す
         await renderTask.promise;
+        if (!cancelled) setViewport(cssViewport);
       } catch (_e) {
         // キャンセル時の例外は無視
       }
@@ -348,6 +400,7 @@ function PdfPage({ doc, page, scale, registerRef }: {
       }}
     >
       <canvas ref={canvasRef} style={{ display: "block" }} />
+      {viewport && focusRect && <FocusOverlay viewport={viewport} rect={focusRect} />}
       <div style={{
         position: "absolute", left: 8, bottom: 6,
         fontSize: 10, color: "rgba(0,0,0,0.4)",
@@ -355,5 +408,35 @@ function PdfPage({ doc, page, scale, registerRef }: {
         padding: "1px 6px", borderRadius: 3,
       }}>{page}</div>
     </div>
+  );
+}
+
+/**
+ * 根拠領域の一時強調（Phase 10b）。**永続ハイライトとは別物**なので枠線で描き、
+ * 塗りは薄くする。座標変換は `PdfPane` の highlights overlay と同一
+ * （LCIR の bbox は既存ハイライトと同じ PDF user space・左下原点・pt）。
+ */
+function FocusOverlay({ viewport, rect }: {
+  viewport: PageViewport;
+  rect: [number, number, number, number];
+}) {
+  const [x, y, w, h] = rect;
+  const r = viewport.convertToViewportRectangle([x, y, x + w, y + h]);
+  const left = Math.min(r[0], r[2]);
+  const top = Math.min(r[1], r[3]);
+  const width = Math.abs(r[2] - r[0]);
+  const height = Math.abs(r[3] - r[1]);
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left, top, width, height,
+        border: "2px solid oklch(0.72 0.17 60)",
+        background: "oklch(0.85 0.15 85 / 0.22)",
+        borderRadius: 2,
+        pointerEvents: "none",
+        boxShadow: "0 0 0 9999px oklch(0 0 0 / 0.06)",
+      }}
+    />
   );
 }

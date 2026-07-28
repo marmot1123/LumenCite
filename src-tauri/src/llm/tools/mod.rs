@@ -155,3 +155,37 @@ pub async fn execute_tool(ctx: &ToolContext<'_>, call: &ToolCallSpec) -> Result<
     }
     Err(ToolError::UnknownTool(call.tool_name.clone()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LCIR が読めないときは LCIR 系 8 種を LLM に見せない（未構築なら `has_lcir:false` しか
+    /// 返さないツールの定義でコンテキストを食うだけなので）。`get_fulltext` は LCIR と
+    /// 無関係なので常に出す。
+    #[test]
+    fn lcir_tools_are_hidden_when_no_lcir_is_readable() {
+        let off: Vec<String> = all_tool_specs(false).into_iter().map(|s| s.name).collect();
+        let on: Vec<String> = all_tool_specs(true).into_iter().map(|s| s.name).collect();
+
+        for name in document::LCIR_TOOLS {
+            assert!(!off.contains(&name.to_string()), "{name} must be hidden");
+            assert!(on.contains(&name.to_string()), "{name} must be shown");
+        }
+        assert!(off.contains(&"get_fulltext".to_string()));
+        assert!(off.contains(&"fulltext_search".to_string()));
+        assert_eq!(on.len(), off.len() + document::LCIR_TOOLS.len());
+    }
+
+    /// 一覧から隠れていても実行はできる（過去ターンの履歴に残った呼び出しが
+    /// 再送されても "unknown tool" にしない）。
+    #[test]
+    fn hidden_lcir_tools_are_still_routable() {
+        for name in document::LCIR_TOOLS {
+            assert!(
+                document::DOCUMENT_TOOLS.contains(name),
+                "{name} must stay routable"
+            );
+        }
+    }
+}

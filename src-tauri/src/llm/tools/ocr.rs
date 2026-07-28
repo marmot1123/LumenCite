@@ -14,9 +14,12 @@ use crate::llm::{ocr, ToolCallSpec, ToolSpec};
 pub fn specs() -> Vec<ToolSpec> {
     vec![ToolSpec {
         name: "ocr_pdf".to_string(),
-        description: "OCR a scanned PDF attachment that has no text layer: rasterize its pages, \
+        description: "OCR a scanned PDF attachment that has NO text layer: rasterize its pages, \
             transcribe them with the vision model, and index the text for full-text search. \
-            Use this when fulltext_search returns nothing for an entry that has a PDF attachment."
+            This costs money and REPLACES the attachment's existing index, so it is a last resort: \
+            first call get_fulltext, and only OCR when it answers `indexed: false`. An entry whose \
+            text is already indexed will refuse a full OCR. Note that fulltext_search finding \
+            nothing only means those words are absent — it does not mean the PDF is unindexed."
             .to_string(),
         parameters: json!({
             "type": "object",
@@ -63,6 +66,26 @@ pub async fn try_execute(
         return Some(Err(e));
     }
     let attachment_id = call.arguments.get("attachment_id").and_then(|v| v.as_i64());
+
+    // 索引済みの PDF を丸ごと OCR し直させない（issue #42）。全ページ OCR は
+    // `index_attachment` で添付の索引を**置き換える**ので、pdfium が抜いたテキスト層が
+    // Vision の出力で上書きされる。課金もかかる。既に読めるなら `get_fulltext` へ誘導する。
+    // **ユーザーが UI から明示的に押す経路（`run_ocr` 直呼び）はこの制限を受けない** —
+    // テキスト層が壊れている PDF を OCR し直すのは正当な操作なので。
+    if pages.is_none() {
+        let indexed = crate::db::fulltext::entry_fulltext_page_count(ctx.pool, entry_id)
+            .await
+            .unwrap_or(0);
+        if indexed > 0 {
+            return Some(Ok(format!(
+                "entry {entry_id} already has {indexed} indexed page(s) of full text — call \
+                 get_fulltext to read it. OCR is only for scanned PDFs with no text layer, and \
+                 re-running it would replace the existing text. To re-transcribe specific pages \
+                 anyway, pass `pages`."
+            )));
+        }
+    }
+
     Some(run_ocr(ctx.pool, ctx.app_data_dir, entry_id, attachment_id, pages).await)
 }
 
@@ -196,4 +219,102 @@ fn rasterize(path: &Path, pages: Option<&[i64]>) -> Result<Vec<(i64, String)>, T
         out.push((page_no, base64::engine::general_purpose::STANDARD.encode(&buf)));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::attachments::add_attachment;
+    use crate::db::entries::create_entry;
+    use crate::db::fulltext::index_attachment;
+    use crate::models::EntryInput;
+    use sqlx::SqlitePool;
+
+    /// issue #42: 索引済みの PDF を LLM に丸ごと OCR し直させない。
+    /// 全ページ OCR は添付の索引を置き換えるので、テキスト層が Vision 出力で消える。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refuses_full_ocr_of_an_already_indexed_entry(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Indexed paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = add_attachment(&pool, entry.id, "a/p.pdf", "p.pdf", "application/pdf")
+            .await
+            .unwrap();
+        index_attachment(&pool, att.id, &[(1, "existing text layer".to_string())])
+            .await
+            .unwrap();
+
+        let ctx = ToolContext {
+            pool: &pool,
+            session_id: 1,
+            scope_mode: "all",
+            scope_entry_ids: &[],
+            mcp: None,
+            app_data_dir: std::path::Path::new(""),
+        };
+        let call = ToolCallSpec {
+            call_id: "c1".to_string(),
+            tool_name: "ocr_pdf".to_string(),
+            arguments: json!({ "entry_id": entry.id }),
+        };
+        let out = try_execute(&ctx, &call).await.unwrap().unwrap();
+        assert!(out.contains("already has"), "{out}");
+        assert!(out.contains("get_fulltext"), "must point at the cheap path: {out}");
+
+        // 索引は無傷。
+        let pages = crate::db::fulltext::get_entry_fulltext(&pool, entry.id).await.unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].1, "existing text layer");
+    }
+
+    /// ページ指定の部分 OCR はこの制限を受けない（差し替えなので既存を消さない）。
+    /// ここでは API キーが無いので「キー未設定」まで進めば分岐を抜けたことになる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn partial_ocr_is_not_blocked_by_the_indexed_guard(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Indexed paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = add_attachment(&pool, entry.id, "a/p.pdf", "p.pdf", "application/pdf")
+            .await
+            .unwrap();
+        index_attachment(&pool, att.id, &[(1, "existing".to_string())])
+            .await
+            .unwrap();
+
+        let ctx = ToolContext {
+            pool: &pool,
+            session_id: 1,
+            scope_mode: "all",
+            scope_entry_ids: &[],
+            mcp: None,
+            app_data_dir: std::path::Path::new(""),
+        };
+        let call = ToolCallSpec {
+            call_id: "c1".to_string(),
+            tool_name: "ocr_pdf".to_string(),
+            arguments: json!({ "entry_id": entry.id, "pages": [2] }),
+        };
+        let out = try_execute(&ctx, &call).await.unwrap();
+        match out {
+            Ok(s) => assert!(!s.contains("already has"), "partial OCR must not be refused: {s}"),
+            Err(e) => {
+                let m = e.to_string();
+                assert!(!m.contains("already has"), "partial OCR must not be refused: {m}");
+            }
+        }
+    }
 }

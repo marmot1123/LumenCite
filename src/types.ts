@@ -436,10 +436,32 @@ export type ChatStreamEvent =
   | { kind: "session_started"; session_id: number }
   | { kind: "delta"; text: string }
   | { kind: "tool_call_proposed"; call_id: string; tool_name: string; args_preview: string; needs_approval: boolean }
-  | { kind: "tool_call_executed"; call_id: string; result_summary: string }
+  | { kind: "tool_call_executed"; call_id: string; result_summary: string; refs: ToolResultRef[] }
   | { kind: "message_persisted"; message_id: number; role: ChatRole }
   | { kind: "done" }
   | { kind: "error"; message: string };
+
+/**
+ * ツール結果が指す PDF 上の根拠 1 件（Phase 10b・Rust の `ToolResultRef` と 1:1）。
+ * **`page` を持つものしか作られない** — TeX 由来の LCIR には座標が無いので、
+ * arXiv 論文を TeX 版で読んだ場合は根拠チップが出ない（既知の制限）。
+ */
+export interface ToolResultRef {
+  node_id: number;
+  kind: string;
+  page: number;
+}
+
+/** `get_lcir_node_region` の戻り値。`page`/`bbox` が揃うときだけ PDF へ飛べる。 */
+export interface LcirNodeLocation {
+  node_id: number;
+  attachment_id: number;
+  /** "pdf" | "tex" */
+  source: string;
+  page: number | null;
+  /** [x, y, width, height]（PDF user space・左下原点・pt） */
+  bbox: [number, number, number, number] | null;
+}
 
 // ── Chat UI view models ──
 export type ToolCallState = "needs_approval" | "running" | "done" | "rejected";
@@ -452,6 +474,12 @@ export interface UiToolCall {
   needs_approval: boolean;
   state: ToolCallState;
   result_summary?: string;
+  /**
+   * 結果が指す PDF 上の根拠（Phase 10b）。ライブ配信ではイベントに載って来る。
+   * 履歴復元時は undefined のままで、カードが `chat_tool_refs` で引き直す
+   * （`result_summary` はライブでは 500 文字で切られており、TS では JSON として読めない）。
+   */
+  refs?: ToolResultRef[];
 }
 
 export interface UiChatMessage {
