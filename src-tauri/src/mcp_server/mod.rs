@@ -396,6 +396,51 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
         }
     }));
 
+    tools.push(json!({
+        "name": "get_node_context",
+        "description": "Assemble everything needed to READ AND CITE one block (LCIR) — by \
+            node_id. Give it a theorem's node id and you get the statement (reassembled across \
+            block and page breaks), the proof that proves it, the definitions it rests on, the \
+            equations/figures/works it references, and the PDF region of every piece — in one \
+            call. Node ids come from search_document_nodes, get_document_blocks, get_figures or \
+            get_node_relations; the node itself selects the representation, so there is no \
+            `source` argument. Why this exists: on the pdf representation a theorem node holds \
+            only its FIRST layout block (median ~168 chars) and the rest of the statement lands \
+            in sibling blocks that often continue onto the next page, so reading `focus` alone \
+            loses the statement — read `focus` then `continuation` (blocks in reading order up to \
+            the next structural boundary; on the tex representation the environment body is \
+            already whole, so continuation is the text that FOLLOWS it). `premises` carries the \
+            definitions the block depends on and each one states how it was derived in `via`: \
+            \"reference\" = an explicit \\ref/\"Definition 3.1\" edge (rare but exact), \
+            \"occurrence\" = a symbol recorded in a display equation, \"symbol\" = a symbol whose \
+            surface form appears verbatim in the text and is defined earlier (tex only; both \
+            symbol paths are heuristic associations — check confidence). Every node carries \
+            origin and confidence, so you can tell source text (tex_source, pdf_text_layer) from \
+            inference (layout_model, llm_inference) when you quote it. `proves` edges on the pdf \
+            representation come mostly from reading-order adjacency, so they can point at a \
+            remark or example — check node.kind. Figure/table references resolve the caption_of \
+            hop for you: `figure` is the region (bbox, crop asset, alt text) and is often absent, \
+            `caption` is the authors' wording. Read `notes` — it lists what this bundle could not \
+            reach. Returns {node_id, entry_id, citation_key?, attachment_id, version_id, source, \
+            available_sources, focus, section_path, before, continuation, proofs, proves, \
+            premises, equations, figures, citations, references, notes}. Nodes are \
+            {node_id, kind, text?, page?, bbox?, origin?, confidence?, identifiers?, math?, \
+            alt_text?, assets?} with bbox [x, y, width, height] in PDF points (bottom-left \
+            origin); the tex representation has no coordinates at all.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "node_id": { "type": "integer", "description": "Block id to center the bundle on (from search_document_nodes / get_document_blocks / get_node_relations / get_figures)." },
+                "max_before": { "type": "integer", "description": "Blocks of lead-in before the focus (default 2)." },
+                "max_continuation": { "type": "integer", "description": "Blocks after the focus, up to the next structural boundary (default 8)." },
+                "max_continuation_chars": { "type": "integer", "description": "Character budget over the continuation (default 6000)." },
+                "max_related": { "type": "integer", "description": "Max entries per relation list (default 12)." },
+                "max_premises": { "type": "integer", "description": "Max premise definitions (default 12)." }
+            },
+            "required": ["node_id"]
+        }
+    }));
+
     // write 系（Phase 2・ゲート有効時のみ）。`mutate` の定義を流用し、許可リスト
     // （`WRITE_TOOLS`）に絞る。delete_entry はリストに無いので公開されない。
     if write_on {
@@ -575,6 +620,7 @@ async fn exec_tool(
         "get_symbol_definitions" => exec_get_symbol_definitions(pool, &args).await,
         "get_figures" => exec_get_figures(pool, &args).await,
         "get_tables" => exec_get_tables(pool, &args).await,
+        "get_node_context" => exec_get_node_context(pool, &args).await,
         // それ以外（delete_entry / ocr_* / 無効化中の write 等）は非公開。
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
@@ -1574,6 +1620,80 @@ async fn exec_get_tables(pool: &SqlitePool, args: &Value) -> Result<String, Tool
     .unwrap_or_default())
 }
 
+/// Phase 10a: 文脈バンドル。**ノード id 起点**なので `entry_id`/`source` は取らない —
+/// ノードが載っている版がそのまま答えになる（エントリ起点の tex > pdf 優先で版を選び直すと、
+/// 呼び出し側が握っている id が引けない版に化ける）。組み立ては `context` の純関数が全部やる。
+async fn exec_get_node_context(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
+    let node_id = args
+        .get("node_id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| {
+            ToolError::InvalidArguments("missing required argument: node_id (integer)".to_string())
+        })?;
+
+    let loaded = crate::ingestion::load_node_lcir(pool, node_id)
+        .await
+        .map_err(ToolError::Execution)?;
+    let Some((version, entry_id, doc)) = loaded else {
+        return Ok(serde_json::to_string(&json!({
+            "node_id": node_id,
+            "found": false,
+            "message": "no LCIR node with this id. Node ids are per-representation and change \
+                when LCIR is rebuilt — re-run search_document_nodes / get_document_blocks to get \
+                current ids.",
+        }))
+        .unwrap_or_default());
+    };
+
+    let usize_arg = |key: &str, default: usize| -> usize {
+        args.get(key)
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n >= 0)
+            .map_or(default, |n| n as usize)
+    };
+    let d = crate::context::ContextOptions::default();
+    let opts = crate::context::ContextOptions {
+        max_before: usize_arg("max_before", d.max_before),
+        max_continuation: usize_arg("max_continuation", d.max_continuation),
+        max_continuation_chars: usize_arg("max_continuation_chars", d.max_continuation_chars)
+            .max(1),
+        max_related: usize_arg("max_related", d.max_related),
+        max_premises: usize_arg("max_premises", d.max_premises),
+    };
+
+    let Some(bundle) = crate::context::build_node_context(&doc, node_id, &opts) else {
+        // version_id_for_node が引けた以上ここには来ないが、木の読み込みと不整合な場合の保険。
+        return Err(ToolError::Execution(format!(
+            "node {node_id} is not present in its own document version"
+        )));
+    };
+
+    // 書誌側の見出し（エントリ・併存表現）を封筒として足す。既存 LCIR ツールと同じキー名。
+    let versions = crate::ingestion::entry_lcir_versions(pool, entry_id)
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    let citation_key = crate::bibtex::resolve_citation_key(pool, entry_id).await.ok();
+
+    let mut obj = match serde_json::to_value(&bundle) {
+        Ok(Value::Object(m)) => m,
+        _ => return Err(ToolError::Execution("failed to serialize bundle".to_string())),
+    };
+    obj.insert("found".to_string(), json!(true));
+    obj.insert("entry_id".to_string(), json!(entry_id));
+    obj.insert("citation_key".to_string(), json!(citation_key));
+    obj.insert("attachment_id".to_string(), json!(version.attachment_id));
+    obj.insert(
+        "source".to_string(),
+        json!(short_source_name(&version.extractor_name)),
+    );
+    obj.insert(
+        "extractor_version".to_string(),
+        json!(version.extractor_version),
+    );
+    obj.insert("available_sources".to_string(), sources_json(&versions));
+    Ok(serde_json::to_string(&Value::Object(obj)).unwrap_or_default())
+}
+
 // ─── 認可トークン ────────────────────────────────────────────────────────────
 
 /// SQLite の `randomblob` で 48 hex 文字（24 バイト）のトークンを生成する。
@@ -2374,6 +2494,7 @@ mod tests {
             "get_symbol_definitions",
             "get_figures",
             "get_tables",
+            "get_node_context",
         ] {
             assert!(names.contains(&expected), "missing read tool: {expected}");
         }
@@ -4507,6 +4628,261 @@ mod tests {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM entries WHERE id = ?")
             .bind(id).fetch_one(&pool).await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    // ── Phase 10a: 文脈バンドル ──────────────────────────────────────────
+
+    /// 定理（ページ 1）→ 数式 → 段落（ページ 2）→ 証明、という PDF 版の実データ形を作り、
+    /// `(entry_id, theorem_node_id, proof_node_id)` を返す。定理の主張が**ページをまたいで**
+    /// 続く形にしてあるのが要点（実測で theorem の 33% がこの形）。
+    async fn setup_theorem_across_pages(pool: &SqlitePool) -> (i64, i64, i64) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let entry = create_entry(
+            pool,
+            &EntryInput {
+                title: "Split theorem".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = crate::db::attachments::add_attachment(
+            pool,
+            entry.id,
+            &format!("attachments/{}/p.pdf", entry.id),
+            "p.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        let vid = crate::db::document_versions::insert_version(
+            pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-split",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: schema::EXTRACTOR_NAME,
+                extractor_version: schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let page_node = |ordinal: i64| {
+            let pool = pool.clone();
+            async move {
+                crate::db::document_nodes::insert_node(
+                    &pool,
+                    &crate::db::document_nodes::NewDocumentNode {
+                        document_version_id: vid,
+                        parent_id: None,
+                        node_kind: NodeKind::Page.as_str(),
+                        ordinal,
+                        plain_text: None,
+                        language: None,
+                        confidence: None,
+                        origin: Some("pdf_text_layer"),
+                        payload_json: None,
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let p1 = page_node(0).await;
+        let p2 = page_node(1).await;
+
+        let thm = add_block(
+            pool,
+            vid,
+            p1,
+            "theorem",
+            0,
+            "Theorem 2 (1D limit). Let (a, b) be in (0, 1). Then rho exists and",
+            Some(r#"{"theorem_number":"2","note":"1D limit"}"#),
+        )
+        .await;
+        add_block(pool, vid, p1, "display_math", 1, "rho = w f, (19)", None).await;
+        add_block(pool, vid, p2, "paragraph", 0, "where the weight w is in (E8).", None).await;
+        let proof = add_block(pool, vid, p2, "proof", 1, "Proof of Theorem 2. Omitted.", None).await;
+        crate::db::node_relations::insert_relation(
+            pool,
+            &crate::db::node_relations::NewNodeRelation {
+                document_version_id: vid,
+                from_node_id: proof,
+                relation_type: "proves",
+                to_node_id: thm,
+                confidence: Some(0.7),
+                origin: Some("layout_model"),
+                metadata_json: Some(r#"{"by":"number","number":"2"}"#),
+            },
+        )
+        .await
+        .unwrap();
+        (entry.id, thm, proof)
+    }
+
+    /// 定理の node_id 1 つで、主張の続き（ページ跨ぎ）・証明・書誌の見出しが 1 回で返る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_reassembles_a_theorem_split_across_pages(pool: SqlitePool) {
+        let (entry_id, thm, proof) = setup_theorem_across_pages(&pool).await;
+        let j = tool_json(&call_tool(&pool, "get_node_context", json!({ "node_id": thm })).await);
+
+        assert_eq!(j["found"], true);
+        assert_eq!(j["entry_id"], entry_id);
+        assert_eq!(j["source"], "pdf");
+        assert_eq!(j["focus"]["kind"], "theorem");
+        assert_eq!(j["focus"]["identifiers"]["theorem_number"], "2");
+        assert!(j["focus"]["bbox"].is_array(), "PDF 版は領域を返す");
+
+        // 主張の続きが page ノードをまたいで連結される（完了条件「ページ境界で切れない」）。
+        let cont = j["continuation"].as_array().unwrap();
+        assert_eq!(cont.len(), 2, "{cont:?}");
+        assert_eq!(cont[0]["kind"], "display_math");
+        assert_eq!(cont[1]["kind"], "paragraph");
+        assert_eq!(cont[1]["page"], 1, "add_block の fragment は全て page 1 に置いている");
+
+        // 証明は proves の入辺として付く。
+        let proofs = j["proofs"].as_array().unwrap();
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0]["node"]["node_id"], proof);
+        assert_eq!(proofs[0]["direction"], "incoming");
+        assert_eq!(proofs[0]["origin"], "layout_model", "推定由来であることが分かる");
+
+        // 併存表現の一覧は既存 LCIR ツールと同じ形。
+        assert_eq!(j["available_sources"][0]["source"], "pdf");
+    }
+
+    /// 証明側から呼ぶと向きが反転する（同じツールで往復できる）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_from_the_proof_points_back_at_the_theorem(pool: SqlitePool) {
+        let (_entry_id, thm, proof) = setup_theorem_across_pages(&pool).await;
+        let j = tool_json(&call_tool(&pool, "get_node_context", json!({ "node_id": proof })).await);
+        assert_eq!(j["proves"][0]["node"]["node_id"], thm);
+        assert_eq!(j["proves"][0]["direction"], "outgoing");
+        assert!(j["proofs"].is_null(), "空リストは省略される");
+    }
+
+    /// 上限は引数で絞れる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_honours_size_arguments(pool: SqlitePool) {
+        let (_entry_id, thm, _proof) = setup_theorem_across_pages(&pool).await;
+        let j = tool_json(
+            &call_tool(
+                &pool,
+                "get_node_context",
+                json!({ "node_id": thm, "max_continuation": 1 }),
+            )
+            .await,
+        );
+        assert_eq!(j["continuation"].as_array().unwrap().len(), 1);
+        let codes: Vec<&str> = j["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["code"].as_str().unwrap())
+            .collect();
+        assert!(codes.contains(&"continuation_truncated"), "{codes:?}");
+    }
+
+    /// 存在しないノードはエラーではなく `found:false`（再取得を促す案内つき）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_reports_an_unknown_node(pool: SqlitePool) {
+        let j = tool_json(&call_tool(&pool, "get_node_context", json!({ "node_id": 424242 })).await);
+        assert_eq!(j["found"], false);
+        assert!(j["message"].as_str().unwrap().contains("rebuilt"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_requires_node_id(pool: SqlitePool) {
+        let resp = call_tool(&pool, "get_node_context", json!({})).await;
+        assert_eq!(resp["result"]["isError"], true, "{resp}");
+    }
+
+    /// **版はノードが決める。** 同じエントリに TeX 版が併存していても（エントリ起点の
+    /// read 優先度では tex が勝つ）、PDF 版のノード id を渡したら PDF 版が返る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn get_node_context_uses_the_version_the_node_belongs_to(pool: SqlitePool) {
+        use crate::document_ir::{schema, ExtractionStatus, NodeKind};
+        let (entry_id, thm, _proof) = setup_theorem_across_pages(&pool).await;
+        let tex_att = crate::db::attachments::add_attachment(
+            &pool,
+            entry_id,
+            &format!("attachments/{entry_id}/s.gz"),
+            "s.gz",
+            "application/gzip",
+        )
+        .await
+        .unwrap()
+        .id;
+        let tex_vid = crate::db::document_versions::insert_version(
+            &pool,
+            &crate::db::document_versions::NewDocumentVersion {
+                attachment_id: tex_att,
+                content_key: "ck-tex",
+                schema_version: schema::SCHEMA_VERSION,
+                source_sha256: "sha2",
+                source_mime_type: "application/gzip",
+                extractor_name: schema::TEX_EXTRACTOR_NAME,
+                extractor_version: schema::TEX_EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let tex_thm = crate::db::document_nodes::insert_node(
+            &pool,
+            &crate::db::document_nodes::NewDocumentNode {
+                document_version_id: tex_vid,
+                parent_id: None,
+                node_kind: NodeKind::Theorem.as_str(),
+                ordinal: 0,
+                plain_text: Some("The operator $U$ is unitary."),
+                language: None,
+                confidence: Some(0.95),
+                origin: Some("tex_source"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // エントリ起点の既定は tex（優先度）。
+        let blocks = tool_json(
+            &call_tool(&pool, "get_document_blocks", json!({ "entry_id": entry_id })).await,
+        );
+        assert_eq!(blocks["source"], "tex");
+
+        // それでも PDF 版のノード id を渡したら PDF 版のバンドルが返る。
+        let pdf = tool_json(&call_tool(&pool, "get_node_context", json!({ "node_id": thm })).await);
+        assert_eq!(pdf["source"], "pdf");
+        assert!(pdf["focus"]["bbox"].is_array());
+
+        // TeX 版のノード id なら TeX 版。座標が無いことを注記する。
+        let tex =
+            tool_json(&call_tool(&pool, "get_node_context", json!({ "node_id": tex_thm })).await);
+        assert_eq!(tex["source"], "tex");
+        assert!(tex["focus"]["bbox"].is_null());
+        let codes: Vec<&str> = tex["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["code"].as_str().unwrap())
+            .collect();
+        assert!(codes.contains(&"no_regions_in_this_source"), "{codes:?}");
+        assert_eq!(tex["available_sources"].as_array().unwrap().len(), 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]

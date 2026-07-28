@@ -2,6 +2,7 @@ mod attachment_trash;
 mod backup;
 mod bibtex;
 pub mod cli;
+pub mod context;
 mod db;
 pub mod document_ir;
 pub mod export;

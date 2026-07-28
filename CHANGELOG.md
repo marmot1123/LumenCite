@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **LCIR — reading context around one block (Phase 10a, experimental)** — a new read tool, `get_node_context`, assembles everything needed to read and cite a single block in one call: the statement, the blocks that continue it, the proof that proves it, the definitions it rests on, the equations/figures/works it references, and the PDF region of every piece. This matters most for PDF-derived documents, where a theorem node holds only its first layout block and the rest of the statement continues into sibling blocks — often onto the next page. Every element carries its `origin` and `confidence`, so source text and inference stay distinguishable when quoted, and a `notes` list states what the bundle could not reach. Available over MCP as `get_node_context` and from the CLI as `lumencite node-context <node_id>`. No migration; nothing new is stored.
+
 ## [0.10.0] - 2026-07-28
 
 This release completes **Phase 8** of **LCIR** — the experimental, machine-readable intermediate representation for papers — and adds its first **export** path. Papers can now be written out as LCIR JSON or as structured Markdown; figures are detected and cropped out of PDFs, TeX tables are structured cell by cell, and figures can optionally be described by an LLM Vision model as alt text. Everything stays gated behind the off-by-default `lcir.enabled` flag, so default behaviour is **unchanged**. Two additive migrations (`0019`, `0020`) create new tables that remain empty unless the flag is on — no data migration, and existing libraries upgrade unchanged. The Web Clipper extension is unchanged from v0.8.0 (v0.2.0).

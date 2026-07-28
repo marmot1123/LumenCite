@@ -57,6 +57,19 @@ pub async fn nodes_for_version(
     .await
 }
 
+/// ノードが属するバージョン id。ノード id は版をまたいで一意なので、node 起点の read 面
+/// （Phase 10a の文脈バンドル）はこれで「そのノードが載っている版」を確定させる。
+/// エントリ起点の版解決（tex > pdf 優先）と違い、**呼び出し側が持っている id が正**。
+pub async fn version_id_for_node(
+    pool: &SqlitePool,
+    node_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT document_version_id FROM document_nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// バージョンの page ノードのみ（ordinal 昇順 = ページ順）。FTS 再生成・ページ数用。
 pub async fn page_nodes_for_version(
     pool: &SqlitePool,

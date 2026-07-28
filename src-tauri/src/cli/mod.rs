@@ -97,6 +97,8 @@ enum Command {
     Fulltext(FulltextArgs),
     /// Export an entry's LCIR (machine-readable document IR) as JSON or Markdown.
     ExportLcir(ExportLcirArgs),
+    /// Assemble the reading context around one LCIR block (statement + proof + premises + refs).
+    NodeContext(NodeContextArgs),
     /// Create a new entry (write).
     Add(AddArgs),
     /// Update fields of an existing entry by id or citation key (write).
@@ -269,6 +271,22 @@ struct ExportLcirArgs {
 }
 
 #[derive(Args, Debug)]
+struct NodeContextArgs {
+    /// LCIR node id (from `lumencite export-lcir` or the MCP read tools).
+    /// The node itself selects the representation, so there is no --source.
+    node_id: i64,
+    /// Blocks of lead-in before the focus.
+    #[arg(long, default_value_t = 2)]
+    before: usize,
+    /// Blocks after the focus, up to the next structural boundary.
+    #[arg(long, default_value_t = 8)]
+    continuation: usize,
+    /// Max entries per relation list.
+    #[arg(long, default_value_t = 12)]
+    max_related: usize,
+}
+
+#[derive(Args, Debug)]
 struct FulltextArgs {
     /// Search terms (joined with spaces).
     query: Vec<String>,
@@ -360,6 +378,7 @@ async fn execute(cli: Cli) -> Result<CmdOutput, String> {
             cmd_fulltext(&pool, &q, a.collection, a.tag, human).await
         }
         Command::ExportLcir(a) => cmd_export_lcir(&pool, &a).await,
+        Command::NodeContext(a) => cmd_node_context(&pool, &a).await,
         // ── write（ハイブリッド C ルーティング。詳細は cli::write） ──
         Command::Add(a) => match build_add_request(&a) {
             Ok(req) => write::dispatch_write(&db_path, &pool, req, force).await,
@@ -790,6 +809,42 @@ async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOut
         ));
     }
     Ok(out)
+}
+
+/// `node-context`（Phase 10a）: 1 ブロックの周りの読解文脈（主張の続き・証明・前提定義・
+/// 参照）を JSON で 1 回にまとめて出す。**版はノードが決める**ので `--source` は取らない。
+/// 出力は MCP `get_node_context` と同じ構造（書誌の封筒は付けない — CLI 側は `get` がある）。
+async fn cmd_node_context(pool: &SqlitePool, a: &NodeContextArgs) -> Result<CmdOutput, String> {
+    let Some((version, entry_id, doc)) = crate::ingestion::load_node_lcir(pool, a.node_id).await?
+    else {
+        return Err(format!(
+            "no LCIR node with id {} (node ids change when LCIR is rebuilt)",
+            a.node_id
+        ));
+    };
+    let d = crate::context::ContextOptions::default();
+    let opts = crate::context::ContextOptions {
+        max_before: a.before,
+        max_continuation: a.continuation,
+        max_related: a.max_related,
+        ..d
+    };
+    let bundle = crate::context::build_node_context(&doc, a.node_id, &opts)
+        .ok_or_else(|| format!("node {} is not present in its own version", a.node_id))?;
+
+    let mut value = serde_json::to_value(&bundle).map_err(|e| e.to_string())?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("entry_id".to_string(), serde_json::json!(entry_id));
+        obj.insert(
+            "attachment_id".to_string(),
+            serde_json::json!(version.attachment_id),
+        );
+        obj.insert(
+            "source".to_string(),
+            serde_json::json!(crate::ingestion::short_source_name(&version.extractor_name)),
+        );
+    }
+    Ok(CmdOutput::new(to_json(&value)?))
 }
 
 #[cfg(test)]
@@ -1231,6 +1286,79 @@ mod tests {
             out.warnings
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Phase 10a: `node-context` が実 build 済みの TeX 版ノードから文脈を組めること。
+    /// **`--source` を取らず版はノードが決める**ことと、記号定義（6b）が前提として付くことを見る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn node_context_assembles_from_a_built_tex_node(pool: SqlitePool) {
+        let entry_id = build_tex_lcir_fixture(&pool, "nodectx").await;
+        let (found, _versions) = crate::ingestion::load_entry_lcir(&pool, entry_id, None)
+            .await
+            .unwrap();
+        let (_att, doc) = found.expect("built LCIR");
+        // 数式ノード（\begin{equation} E=mc^2）を焦点にする。
+        let eq = doc
+            .nodes
+            .iter()
+            .find(|n| n.kind == "display_math")
+            .expect("display_math node");
+
+        let out = cmd_node_context(
+            &pool,
+            &NodeContextArgs {
+                node_id: eq.id,
+                before: 2,
+                continuation: 8,
+                max_related: 12,
+            },
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out.stdout).expect("valid JSON");
+
+        assert_eq!(v["source"], "tex");
+        assert_eq!(v["entry_id"], entry_id);
+        assert_eq!(v["node_id"], eq.id);
+        assert_eq!(v["focus"]["kind"], "display_math");
+        assert_eq!(
+            v["focus"]["math"]["latex"], "\\begin{equation}\\label{eq:e}E=mc^2\\end{equation}",
+            "TeX 版は原文 LaTeX を持つ"
+        );
+        // 直前の段落 + そこで止まった構造境界（節見出し）が読み順で付く。
+        assert_eq!(v["before"][0]["kind"], "section", "境界を含めて打ち切る");
+        assert_eq!(v["before"][1]["kind"], "paragraph");
+        assert_eq!(v["section_path"][0]["kind"], "section");
+        // 記号 $E$ は同じ段落で定義されており、読み順で焦点より前にある。
+        let premises = v["premises"].as_array().expect("premises");
+        assert!(
+            premises.iter().any(|p| p["symbol"]["surface_form"] == "E"),
+            "{premises:?}"
+        );
+        // TeX 版に座標は無いことを注記する。
+        let codes: Vec<&str> = v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["code"].as_str().unwrap())
+            .collect();
+        assert!(codes.contains(&"no_regions_in_this_source"), "{codes:?}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn node_context_rejects_an_unknown_node_id(pool: SqlitePool) {
+        let err = cmd_node_context(
+            &pool,
+            &NodeContextArgs {
+                node_id: 987654,
+                before: 2,
+                continuation: 8,
+                max_related: 12,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("no LCIR node"), "{err}");
     }
 
     /// PDF 版（pdfium 由来の実データ形）を直接 INSERT で用意し、`--source pdf` の成功経路を
