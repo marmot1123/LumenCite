@@ -735,7 +735,7 @@ async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOut
         });
     };
 
-    let text = match a.format.as_str() {
+    let report = match a.format.as_str() {
         "md" => {
             let detail = db::entries::get_entry(pool, entry_id)
                 .await
@@ -753,7 +753,7 @@ async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOut
         _ => crate::export::lcir_json_pretty(&doc)?,
     };
 
-    match &a.output {
+    let mut out = match &a.output {
         Some(path) => {
             // 同一ディレクトリの一時ファイル経由で原子的に置く（書込失敗時に
             // 出力先へ切り詰めたゴミを残さない）。
@@ -763,16 +763,33 @@ async fn cmd_export_lcir(pool: &SqlitePool, a: &ExportLcirArgs) -> Result<CmdOut
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "export-lcir".to_string())
             ));
-            std::fs::write(&tmp, &text)
+            std::fs::write(&tmp, &report.text)
                 .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
             std::fs::rename(&tmp, path).map_err(|e| {
                 let _ = std::fs::remove_file(&tmp);
                 format!("failed to write {}: {e}", path.display())
             })?;
-            Ok(CmdOutput::new(format!("wrote {}", path.display())))
+            CmdOutput::new(format!("wrote {}", path.display()))
         }
-        None => Ok(CmdOutput::new(text)),
+        None => CmdOutput::new(report.text),
+    };
+    // LCIR 固有情報の欠落（debt-8）は **stderr**（`CmdOutput.warnings`）へ。stdout は
+    // エクスポート本文そのものなので、`--format json` のパイプ利用を壊さない。
+    // 警告はエラーではないので終了コードは 0 のまま。
+    for w in &report.warnings {
+        let detail = w
+            .detail
+            .as_deref()
+            .map(|d| format!(": {d}"))
+            .unwrap_or_default();
+        out.warnings.push(format!(
+            "lcir export [{}] {} ({}){detail}",
+            w.severity.as_str(),
+            w.code.as_str(),
+            w.count
+        ));
     }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1200,6 +1217,19 @@ mod tests {
         assert!(out.stdout.starts_with("wrote "), "{}", out.stdout);
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("## Abstract"), "{written}");
+        // debt-8: `-o` でファイルに書いても欠落警告は返る（stdout は保存先の通知に変わる）。
+        // 警告はエラーではないので export 自体は成功している。
+        assert!(
+            out.warnings.iter().any(|w| w.contains("symbols_dropped")),
+            "TeX 版の記号定義は Markdown では落ちる: {:?}",
+            out.warnings
+        );
+        // 狼少年にしない: この fixture は参照グラフを持たないので relations の警告は出ない。
+        assert!(
+            !out.warnings.iter().any(|w| w.contains("relations_dropped")),
+            "存在しないデータの損失は報告しない: {:?}",
+            out.warnings
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1345,12 +1375,42 @@ mod tests {
             1,
             "caption を二重に出さない: {md}"
         );
+        // debt-8: 欠落警告は stderr（CmdOutput.warnings）へ。stdout は本文のまま。
+        assert!(
+            out.warnings.iter().any(|w| w.contains("source_fragments_dropped")),
+            "PDF 座標の欠落を報告する: {:?}",
+            out.warnings
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("assets_not_embedded")),
+            "アセット実体の非同梱を報告する: {:?}",
+            out.warnings
+        );
+        assert!(
+            !out.stdout.contains("assets_not_embedded"),
+            "警告は stdout に混ぜない: {}",
+            out.stdout
+        );
+
         // 既定（source 未指定）は tex 優先のまま。
         let out = cmd_export_lcir(&pool, &export_lcir_args(&entry_id.to_string(), "md", None))
             .await
             .unwrap();
         assert!(out.stdout.contains("lcir_source: \"lumencite-tex"), "{}", out.stdout);
     }
+
+    /// debt-8: `--format json` の stdout は警告があっても生 JSON のままで、パイプ利用を壊さない。
+    /// LCIR JSON は無損失なのでアセットが無い文書では警告 0 件（狼少年にしない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn export_lcir_json_stdout_stays_parseable_and_quiet(pool: SqlitePool) {
+        let entry_id = build_tex_lcir_fixture(&pool, "warnjson").await;
+        let out = cmd_export_lcir(&pool, &export_lcir_args(&entry_id.to_string(), "json", None))
+            .await
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&out.stdout).expect("stdout は生 JSON のまま");
+        assert!(out.warnings.is_empty(), "LCIR JSON は無損失: {:?}", out.warnings);
+    }
+
 
     #[sqlx::test(migrations = "./migrations")]
     async fn export_lcir_errors_without_lcir_and_lists_available_sources(pool: SqlitePool) {

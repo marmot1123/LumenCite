@@ -613,3 +613,29 @@ export const EXTRA_FIELD_LABEL_KEYS: Record<string, string> = {
   meetingName:      "extraField.meetingName",
   presentationType: "extraField.presentationType",
 };
+
+/// LCIR エクスポートの欠落警告（Phase 9a・debt-8）。Rust 側 `export::ExportWarningCode` と 1:1。
+/// **エラーではない** — 書き出しは成功しており、「この形式では運べなかった LCIR 固有情報」を伝える。
+/// コードは i18n キー `detailPanel.lcirExportWarn.<code>` に対応する（追加時は ja/en 両方に足すこと）。
+export type LcirExportWarningCode =
+  | "relations_dropped"
+  | "symbols_dropped"
+  | "inferred_provenance_dropped"
+  | "source_fragments_dropped"
+  | "assets_not_embedded"
+  | "table_rowspan_flattened";
+
+export interface LcirExportWarning {
+  code: LcirExportWarningCode;
+  severity: "warn" | "info";
+  /** 落ちた対象の実数（辺数・記号数・ノード数…）。 */
+  count: number;
+  /** 内訳の短い補足（種別ごとの件数など・未翻訳）。 */
+  detail?: string;
+}
+
+export interface LcirExportResult {
+  /** 保存先。保存ダイアログをキャンセルすると null。 */
+  path: string | null;
+  warnings: LcirExportWarning[];
+}

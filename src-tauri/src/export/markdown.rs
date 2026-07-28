@@ -41,8 +41,21 @@ struct RenderState {
     abstract_heading_done: bool,
 }
 
-/// `LcirDocument` を Markdown 文字列に描画する。
-pub fn render_markdown(doc: &LcirDocument, header: Option<&MarkdownHeader>) -> String {
+/// `LcirDocument` を Markdown に描画し、この形式で運べなかった LCIR 固有情報の警告
+/// （debt-8）を添えて返す。**警告の収集はレンダラの分岐に一切干渉しない**（形式の表現力
+/// `warning::MARKDOWN` から機械的に導く別パス）ので、`text` はこの変更の前後で 1 バイトも
+/// 変わらない。
+pub fn render_markdown(doc: &LcirDocument, header: Option<&MarkdownHeader>) -> super::ExportReport {
+    let mut sink = super::warning::WarningSink::new();
+    super::warning::collect_document_warnings(doc, &super::warning::MARKDOWN, &mut sink);
+    super::ExportReport {
+        text: render_text(doc, header),
+        warnings: sink.finish(),
+    }
+}
+
+/// Markdown 本文の描画（警告収集を含まない純粋な変換）。
+fn render_text(doc: &LcirDocument, header: Option<&MarkdownHeader>) -> String {
     let mut out = String::new();
     if let Some(h) = header {
         push_frontmatter(&mut out, h, doc);
@@ -693,7 +706,7 @@ mod tests {
             bib,
             be,
         ]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
 
         assert!(md.starts_with("# Tex Paper\n"), "{md}");
         assert!(md.contains("\n## 1 Introduction\n"), "節番号は二重付与しない: {md}");
@@ -733,7 +746,7 @@ mod tests {
         })
         .into();
         let d = doc(vec![node(1, None, 0, "document", None), cap, tab]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
 
         assert!(md.contains("*Masses.*"), "{md}");
         assert!(md.contains("| Name | Value |  |"), "短行はパディング: {md}");
@@ -755,7 +768,7 @@ mod tests {
         })
         .into();
         let d = doc(vec![node(1, None, 0, "document", None), tab]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("| a | b |"), "{md}");
         assert!(md.contains("| --- | --- |"), "未検証 spec は素のデリミタ: {md}");
     }
@@ -764,7 +777,7 @@ mod tests {
     fn table_without_payload_degrades_to_paragraph() {
         let tab = node(2, Some(1), 0, "table", Some("a | b\nc | d"));
         let d = doc(vec![node(1, None, 0, "document", None), tab]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("a | b\nc | d"), "plain_text 段落へ degrade: {md}");
         assert!(!md.contains("| --- |"), "{md}");
     }
@@ -785,7 +798,7 @@ mod tests {
         })
         .into();
         let d = doc(vec![node(1, None, 0, "document", None), tab]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("$$P(A\\vert B)$$"), "$$ 数式内は \\vert: {md}");
         assert!(md.contains("\\[P(A\\vert B)\\]"), "\\[ 数式内は \\vert: {md}");
     }
@@ -819,7 +832,7 @@ mod tests {
             origin: None,
         });
         let d = doc(vec![node(1, None, 0, "document", None), bracket, dollars]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("$$\na^2 + b^2 = c^2\n$$"), "\\[..\\] は剥がして包む: {md}");
         assert!(md.contains("$$ x = y $$"), "$$..$$ はそのまま: {md}");
         assert!(!md.contains("$$$"), "二重区切りを作らない: {md}");
@@ -854,7 +867,7 @@ mod tests {
         });
         d.nodes = vec![node(1, None, 0, "document", None), page, block, line, math];
 
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(!md.contains("FULL PAGE TEXT DUPLICATE"), "page 全文は出さない: {md}");
         assert_eq!(md.matches("A paragraph.").count(), 1, "line と重複させない: {md}");
         assert!(!md.contains("$$"), "surface-only に $$ を付けない: {md}");
@@ -871,7 +884,7 @@ mod tests {
         let code = node(6, Some(1), 2, "code_block", Some("let x = 1;"));
         let cap = node(7, Some(1), 3, "figure_caption", Some("Figure 1: caption"));
         let d = doc(vec![node(1, None, 0, "document", None), future, list, li1, li2, code, cap]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("Grouped equations (Phase 7)."), "未知型は段落に degrade: {md}");
         assert!(md.contains("- first\n- second"), "{md}");
         assert!(md.contains("```\nlet x = 1;\n```"), "{md}");
@@ -892,7 +905,7 @@ mod tests {
             arxiv_id: Some("2607.14797".to_string()),
             citation_key: Some("alice2026".to_string()),
         };
-        let md = render_markdown(&d, Some(&header));
+        let md = render_markdown(&d, Some(&header)).text;
         assert!(md.starts_with("---\n"), "{md}");
         assert!(
             md.contains(r#"title: "On \"quoted\" $\\tau$-periodic walks""#),
@@ -909,7 +922,7 @@ mod tests {
     #[test]
     fn empty_document_renders_empty_string() {
         let d = doc(vec![node(1, None, 0, "document", None)]);
-        assert_eq!(render_markdown(&d, None), "");
+        assert_eq!(render_markdown(&d, None).text, "");
     }
 
     #[test]
@@ -917,7 +930,7 @@ mod tests {
         // 実データ形: TeX 抽出器はフラット木で、"• item" 行を list 自身の plain_text に持つ。
         let list = node(2, Some(1), 0, "list", Some("• first point\n• second point"));
         let d = doc(vec![node(1, None, 0, "document", None), list]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("- first point\n- second point"), "{md}");
         assert!(!md.contains('•'), "bullet は Markdown 記法に変換: {md}");
     }
@@ -935,7 +948,7 @@ mod tests {
         thm.payload = serde_json::json!({"theorem_number": "2.3", "note": "Zorn"}).into();
         let proof = node(3, Some(1), 1, "proof", Some("Proof. Consider the union."));
         let d = doc(vec![node(1, None, 0, "document", None), thm, proof]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert_eq!(md.matches("Theorem 2.3").count(), 1, "見出しを重ねない: {md}");
         assert!(md.contains("> Theorem 2.3 (Zorn). Every poset"), "{md}");
         assert_eq!(md.matches("Proof.").count(), 1, "{md}");
@@ -952,7 +965,7 @@ mod tests {
             node(3, Some(1), 1, "abstract", Some("First abstract block.")),
             node(4, Some(1), 2, "abstract", Some("Second abstract block.")),
         ]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert_eq!(md.matches("## Abstract").count(), 1, "{md}");
         assert!(md.contains("First abstract block."), "{md}");
         assert!(md.contains("Second abstract block."), "{md}");
@@ -961,7 +974,7 @@ mod tests {
             node(1, None, 0, "document", None),
             node(2, Some(1), 0, "abstract", Some("Tex abstract.")),
         ]);
-        let md2 = render_markdown(&d2, None);
+        let md2 = render_markdown(&d2, None).text;
         assert_eq!(md2.matches("## Abstract").count(), 1, "{md2}");
     }
 
@@ -979,7 +992,7 @@ mod tests {
             arxiv_id: None,
             citation_key: None,
         };
-        let md = render_markdown(&d, Some(&header));
+        let md = render_markdown(&d, Some(&header)).text;
         // フロントマター内は「1 キー = 1 行」を維持する（生の改行・制御文字を残さない）。
         let fm: Vec<&str> = md.splitn(3, "---").collect();
         let inner = fm[1];
@@ -1047,7 +1060,7 @@ mod tests {
     #[test]
     fn figure_renders_marker_with_number_and_page() {
         let d = doc(vec![node(1, None, 0, "document", None), figure_node(2, Some("3"))]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("**[Figure 3]** (p. 5)"), "{md}");
     }
 
@@ -1057,7 +1070,7 @@ mod tests {
         let mut fig = figure_node(2, Some("3"));
         fig.alt_text = Some(alt("A wireframe surface plot.", "llm_inference", Some("claude-sonnet-5")));
         let d = doc(vec![node(1, None, 0, "document", None), fig]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(!md.contains("!["), "画像リンクを張らない: {md}");
         assert!(!md.contains("]("), "リンク記法を出さない: {md}");
         assert!(!md.contains(".lcir/"), "内部パスを漏らさない: {md}");
@@ -1067,7 +1080,7 @@ mod tests {
     fn figure_without_paired_number_does_not_invent_one() {
         // caption とペアリングできなかった図。内部通番 figure_index=7 を紙面番号に昇格させない。
         let d = doc(vec![node(1, None, 0, "document", None), figure_node(2, None)]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("**[Figure]** (p. 5)"), "{md}");
         assert!(!md.contains("Figure 7"), "figure_index を番号として出さない: {md}");
     }
@@ -1079,7 +1092,7 @@ mod tests {
         fig.assets.clear();
         fig.source_fragments.clear();
         let d = doc(vec![node(1, None, 0, "document", None), fig]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("**[Figure 3]**"), "{md}");
         assert!(!md.contains("(p."), "fragment が無ければページは出さない: {md}");
     }
@@ -1093,7 +1106,7 @@ mod tests {
             Some("claude-sonnet-5"),
         ));
         let d = doc(vec![node(1, None, 0, "document", None), fig]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(
             md.contains("> **AI-generated description** (model: claude-sonnet-5). A 3D wireframe"),
             "生成物であることと生成器を明示する: {md}"
@@ -1108,7 +1121,7 @@ mod tests {
         a.confidence = None;
         fig.alt_text = Some(a);
         let d = doc(vec![node(1, None, 0, "document", None), fig]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("> **Figure description (user-edited)**. Hand written"), "{md}");
         assert!(!md.contains("AI-generated"), "手編集を生成物と偽らない: {md}");
     }
@@ -1118,7 +1131,7 @@ mod tests {
         let mut fig = figure_node(2, Some("3"));
         fig.alt_text = Some(alt("Publisher supplied.", "publisher_source", None));
         let d = doc(vec![node(1, None, 0, "document", None), fig]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(
             md.contains("> **Figure description** (origin: publisher_source). Publisher supplied."),
             "未知 origin は AI 生成とも手編集とも偽らない: {md}"
@@ -1130,7 +1143,7 @@ mod tests {
         let mut fig = figure_node(2, Some("3"));
         fig.alt_text = Some(alt("   \n  ", "llm_inference", Some("m")));
         let d = doc(vec![node(1, None, 0, "document", None), fig]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("**[Figure 3]**"), "{md}");
         assert!(!md.contains("AI-generated"), "空の alt text で見出しだけ出さない: {md}");
     }
@@ -1144,7 +1157,7 @@ mod tests {
             node(2, Some(1), 0, "figure_caption", Some("Figure 3: The overall pipeline.")),
             fig,
         ]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert_eq!(
             md.matches("The overall pipeline.").count(),
             1,
@@ -1160,8 +1173,38 @@ mod tests {
         fig.ordinal = 0;
         let child = node(3, Some(2), 0, "paragraph", Some("Sub-figure note."));
         let d = doc(vec![node(1, None, 0, "document", None), fig, child]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(md.contains("Sub-figure note."), "{md}");
+    }
+
+    /// debt-8: 警告チャネルは本文に一切干渉しない（収集は別パス）。
+    #[test]
+    fn markdown_text_is_unchanged_by_the_warning_channel() {
+        let mut n = node(2, Some(1), 0, "paragraph", Some("Body."));
+        n.origin = Some("layout_model".to_string());
+        n.source_fragments = vec![LcirFragment {
+            page: 1,
+            bbox: BBox { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            fragment_type: None,
+        }];
+        let d = doc(vec![node(1, None, 0, "document", None), n]);
+        let report = render_markdown(&d, None);
+        assert_eq!(report.text, "Body.\n", "警告が出ても本文は変わらない");
+        assert!(!report.warnings.is_empty(), "落ちるものは報告される");
+    }
+
+    /// debt-8 × debt-6 の回帰: figure を描画するようになった後は、alt text の欠落を
+    /// 警告しない（Markdown は alt text を運べる）。アセット**実体**の非同梱だけが残る。
+    #[test]
+    fn markdown_does_not_warn_about_alt_text_after_figure_rendering() {
+        let mut fig = figure_node(2, Some("3"));
+        fig.alt_text = Some(alt("A plot.", "llm_inference", Some("m")));
+        let d = doc(vec![node(1, None, 0, "document", None), fig]);
+        let report = render_markdown(&d, None);
+        let codes: Vec<&str> = report.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert!(!codes.contains(&"alt_text_dropped"), "{codes:?}");
+        assert!(codes.contains(&"assets_not_embedded"), "{codes:?}");
+        assert!(report.text.contains("A plot."), "{}", report.text);
     }
 
     #[test]
@@ -1172,7 +1215,7 @@ mod tests {
             node(2, Some(1), 0, "figure_caption", Some("Figure 1: caption")),
             node(3, Some(1), 1, "paragraph", Some("Body.")),
         ]);
-        let md = render_markdown(&d, None);
+        let md = render_markdown(&d, None).text;
         assert!(!md.contains("[Figure"), "{md}");
         assert_eq!(md, "*Figure 1: caption*\n\nBody.\n");
     }

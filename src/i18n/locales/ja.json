@@ -544,6 +544,15 @@
     "lcirExportBusy": "書き出し中…",
     "lcirExportDone": "書き出しました: {{path}}",
     "lcirExportFailed": "LCIR 書き出しに失敗しました: {{error}}",
+    "lcirExportWarnings": "この形式では書き出せなかった LCIR 固有情報:",
+    "lcirExportWarn": {
+      "relations_dropped": "参照グラフ {{count}} 本（引用・数式/定理/図表への参照・証明の対応）",
+      "symbols_dropped": "記号定義 {{count}} 件",
+      "inferred_provenance_dropped": "AI 推定由来であることの表示 {{count}} ノード分",
+      "source_fragments_dropped": "PDF 上の領域座標 {{count}} 件",
+      "assets_not_embedded": "図の画像 {{count}} 件（本文には参照のみ・実体は同梱しません）",
+      "table_rowspan_flattened": "表の縦結合セル {{count}} 個（結合を解いて出力します）"
+    },
     "tagsLabel2": "タグ",
     "addTag": "追加",
     "tagsPlaceholder2": "タグ名…",

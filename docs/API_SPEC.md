@@ -492,10 +492,32 @@ type FulltextResult = {
 | `get_lcir_vision_alt_text_enabled` / `set_lcir_vision_alt_text_enabled` | `—` / `enabled: bool` | `bool` / `()` — **Phase 8c**: settings `lcir.vision_alt_text.enabled`（既定 off・`lcir.enabled` とは独立の同意面） |
 | `count_figures_missing_alt_text` | `entry_id?: i64, attachment_id?: i64` | `i64` — **Phase 8c**: 代替テキストがまだ無い図の件数（読み取り専用・フラグ非依存）。**課金の前に規模を見せる**ため設定画面と詳細パネルが引く。絞り込み・しきい値は生成バッチと同一述語 |
 | `generate_vision_alt_texts` | `entry_id?: i64, attachment_id?: i64` | `{enabled, total, generated, skipped, failed, aborted, abort_reason}` — **Phase 8c**: alt text の無い `figure` ノードの crop PNG を LLM Vision に説明させて `node_alt_texts` に保存する後追いバッチ。1 図ずつ best-effort（1 図の失敗で全体を捨てない）・リクエスト間 1 秒スロットル・多重起動ガード + `vision-alt-text-progress {done,total}` 進捗イベント。`lcir.enabled` / `lcir.vision_alt_text.enabled` のどちらかが OFF なら `enabled: false` で全 0（**課金する操作なので暗黙には走らせない**）。`skipped` = crop ファイル欠損・空応答・ループ中に版が古くなった図（Vision を呼ぶ前に最新 completed 版か再確認する）。対象は**ゴミ箱のエントリを除外**し、**短辺 200px 未満の crop（ロゴ・装飾等の小片）も除外**する（`DEFAULT_MIN_CROP_PX`。実蔵書では 1198 crop のうち 310 件が該当）。`entry_id`/`attachment_id` で範囲を絞れる（**まず 1 本で品質と費用を確かめてから広げる**ため。詳細パネルのボタンはエントリ単位で呼ぶ）。同一ラン内で crop 指紋が一致する図は API を呼ばず複製する。**打ち切り**は `aborted: true` + `abort_reason`: `"failures"`（1 件も生成できないまま連続 3 件失敗 = キー不正/レート制限/画像非対応モデル）/ `"consent_withdrawn"`（実行中に同意フラグが外された = 実質のキャンセル・毎図の先頭で再評価する）。未処理の図は対象のまま残り次回に拾える |
-| `export_lcir_json` | `entry_id: i64, source?: "tex" \| "pdf"` | `Result<Option<String>>` — **Phase 9a**: 保存ダイアログで LCIR JSON（`LcirDocument` 派生ビュー・validation 通過必須）を書き出す。キャンセルで `None`。LCIR 未構築はエラー（`available_sources` 相当の案内文） |
-| `export_lcir_markdown` | `entry_id: i64, source?: "tex" \| "pdf"` | `Result<Option<String>>` — **Phase 9a**: 保存ダイアログで構造付き Markdown を書き出す。キャンセルで `None` |
+| `export_lcir_json` | `entry_id: i64, source?: "tex" \| "pdf"` | `Result<{path: String\|null, warnings: ExportWarning[]}>` — **Phase 9a**: 保存ダイアログで LCIR JSON（`LcirDocument` 派生ビュー・validation 通過必須）を書き出す。キャンセルで `path: null`（**警告は返す**）。LCIR 未構築はエラー（`available_sources` 相当の案内文）。`warnings` は下記「エクスポート欠落警告」 |
+| `export_lcir_markdown` | `entry_id: i64, source?: "tex" \| "pdf"` | `Result<{path: String\|null, warnings: ExportWarning[]}>` — **Phase 9a**: 保存ダイアログで構造付き Markdown を書き出す。キャンセルで `path: null`（**警告は返す**） |
 
 **LCIR エクスポート（Phase 9a・v0.10.0 予定）**: エントリ→版解決は MCP と同じ共有ロジック（`ingestion::load_entry_lcir`・添付ごとの最新 completed 版を `extractor_priority`（tex > pdfium）で並べ、`source` 指定時はその抽出器に限定）。Markdown は `export::markdown::render_markdown`（**決定的純関数**・pdfium 非依存で CI テスト可能）が `LcirDocument` を描画する: YAML フロントマター（title/authors/year/doi/arxiv/citation_key + `lcir_source` = 抽出器名・版で由来を明示）→ 節見出し（`section_number` 付き・`##`〜）→ 段落（インライン数式 `$..$` は生 LaTeX のまま温存）→ display 数式（`latex` があれば `$$..$$`・**無ければ surface-only の Unicode 線形をそのまま段落に出し `$$` を付けない** — 生 LaTeX でないものを数式と偽らない）→ 定理/補題/証明（blockquote・`theorem_number`/`note` 付き）→ 図表 caption（イタリック）→ 参考文献（`cite_key` 付きリスト）。未知の `node_kind` は plain_text の段落に degrade（Phase 7/8 のノード型追加でレンダラが壊れない）。`document`/`page`/`line` ノードと **`page` の全文 `plain_text` は描画しない**（ブロックと重複するため）。
+
+**エクスポート欠落警告（Phase 9 完了条件・debt-8）**: 「LCIR 固有情報が失われる場合に警告を出せる」の実装。
+`export::warning` に置き、Phase 9b（HTML/JATS/TEI）も同じチャネルを共有する。`render_markdown` /
+`lcir_json_pretty` は `ExportReport { text, warnings }` を返す。**警告はエラーではない**（書き出しは成功している）。
+`document_ir::validation`（不正な LCIR を弾く・Err）とは別物。形式ごとの表現力を `FormatCapabilities` で宣言し、
+警告はそこから機械的に導く。**その文書に実際に存在するデータのうち出力に現れないものだけ**を報告する
+（relations が 0 本なら relations の警告は出ない）。どの形式でも常に落ちる縮約（ノード id・`content_key`・
+schema URI 等）は警告にしない — 狼少年にしないため。
+
+| code | severity | 発火条件 | count |
+|------|----------|----------|-------|
+| `relations_dropped` | warn | 形式が関係を運べず `relations` がある | 辺数（`detail` に type 別内訳） |
+| `symbols_dropped` | warn | 形式が記号定義を運べず `symbols` がある | 記号数 |
+| `inferred_provenance_dropped` | warn | 形式が provenance を運べず推定 origin のノードがある | ノード数（`detail` に origin 別内訳） |
+| `source_fragments_dropped` | info | 形式が座標を運べず fragment がある | fragment 数 |
+| `assets_not_embedded` | info | 形式がアセット実体を同梱できず asset がある | asset 数 |
+| `table_rowspan_flattened` | info | 形式が結合セルを運べず `rowspan > 1` のセルがある | セル数 |
+
+推定 origin は `layout_model` / `llm_inference` / `math_recognition` / `ocr`（`pdf_text_layer` / `tex_source` は
+原文由来なので数えない）。並びは `(severity, code)` で決定的。**Markdown** は全項目が落ちうる形式、
+**LCIR JSON** は無損失なので `assets_not_embedded` しか出ない。UI は保存後に一覧表示（i18n キーは
+`detailPanel.lcirExportWarn.<code>`）、CLI は stderr に 1 行ずつ。
 
 ```ts
 type LcirBuildResult = {
@@ -866,7 +888,7 @@ DB を `PRAGMA query_only = ON` の読取専用プールで直接開く（読取
 | `tags` | — | `Tag[]` | `db::tags::get_tags` |
 | `collections` | — | `Collection[]` | `db::collections::get_collections` |
 | `fulltext <query…>` | `--collection <id>` `--tag <id>` | `FulltextHit[]` | `db::fulltext::search_fulltext` |
-| `export-lcir <id\|citation_key>` | `--format json\|md`（既定 `json`） `--source tex\|pdf` `-o <path>` | LCIR JSON / Markdown（stdout・`-o` でファイル書き出し。**v0.10.0 / Phase 9a**） | `ingestion::load_entry_lcir` / `export::markdown::render_markdown` |
+| `export-lcir <id\|citation_key>` | `--format json\|md`（既定 `json`） `--source tex\|pdf` `-o <path>` | LCIR JSON / Markdown（stdout・`-o` でファイル書き出し。**v0.10.0 / Phase 9a**）。**LCIR 固有情報の欠落警告は stderr**（stdout は本文のままなのでパイプ利用を壊さない）・**終了コードは 0**（警告はエラーではない） | `ingestion::load_entry_lcir` / `export::markdown::render_markdown` |
 
 ### 書込コマンド（ハイブリッド C）
 
