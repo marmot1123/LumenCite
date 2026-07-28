@@ -310,6 +310,8 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setTagInput("");
     setAttachError(null);
     setIndexNote(null);
+    // 直前のエントリの警告を残すと、別の文献の欠落として読まれてしまう。
+    setLcirExportWarnings([]);
   }, [entry?.id]);
 
   // LCIR フラグ（Phase 9a: エクスポートボタンの表示可否）。設定モーダルでの切替を
@@ -592,9 +594,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         format === "json" ? "export_lcir_json" : "export_lcir_markdown",
         { entryId: startedFor },
       );
-      if (stillHere()) {
-        if (res.path) setIndexNote(t("detailPanel.lcirExportDone", { path: res.path }));
-        // 警告はキャンセル時も返る（次に何が落ちるかを先に知らせる）。
+      if (stillHere() && res.path) {
+        setIndexNote(t("detailPanel.lcirExportDone", { path: res.path }));
+        // 警告は保存が成立したときだけ出す。保存ダイアログをキャンセルした場合は
+        // 「書き出せなかったもの」の一覧だけが宙に浮いて誤解を招く（API は常に返す）。
         setLcirExportWarnings(res.warnings);
       }
     } catch (e: any) {
@@ -1010,7 +1013,10 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                     <div>{t("detailPanel.lcirExportWarnings")}</div>
                     <ul style={{ margin: "2px 0 0", paddingLeft: 16 }}>
                       {lcirExportWarnings.map(w => (
-                        <li key={w.code}>
+                        <li
+                          key={w.code}
+                          style={w.severity === "info" ? { color: "var(--text-faint)" } : undefined}
+                        >
                           {t(`detailPanel.lcirExportWarn.${w.code}` as const, { count: w.count })}
                           {w.detail ? ` (${w.detail})` : ""}
                         </li>

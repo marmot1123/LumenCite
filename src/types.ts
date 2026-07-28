@@ -623,7 +623,7 @@ export type LcirExportWarningCode =
   | "inferred_provenance_dropped"
   | "source_fragments_dropped"
   | "assets_not_embedded"
-  | "table_rowspan_flattened";
+  | "table_cell_spans_flattened";
 
 export interface LcirExportWarning {
   code: LcirExportWarningCode;

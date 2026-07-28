@@ -876,8 +876,9 @@ mod tests {
 
     #[test]
     fn unknown_kinds_degrade_to_paragraph_and_lists_render() {
-        // figure は専用分岐を持つので degrade の検証には使えない（Phase 8d 以降の未生成型を使う）。
-        let future = node(2, Some(1), 0, "equation_group", Some("Grouped equations (Phase 7)."));
+        // 実在の NodeKind を使うと、将来そこに専用分岐ができた瞬間に degrade の検証が消える
+        // （figure がまさにそうなった）。レンダラが決して分岐を持たない合成 kind を使う。
+        let future = node(2, Some(1), 0, "not_a_real_node_kind_v99", Some("Body of a future kind."));
         let list = node(3, Some(1), 1, "list", None);
         let li1 = node(4, Some(3), 0, "list_item", Some("first"));
         let li2 = node(5, Some(3), 1, "list_item", Some("second"));
@@ -885,7 +886,7 @@ mod tests {
         let cap = node(7, Some(1), 3, "figure_caption", Some("Figure 1: caption"));
         let d = doc(vec![node(1, None, 0, "document", None), future, list, li1, li2, code, cap]);
         let md = render_markdown(&d, None).text;
-        assert!(md.contains("Grouped equations (Phase 7)."), "未知型は段落に degrade: {md}");
+        assert!(md.contains("Body of a future kind."), "未知型は段落に degrade: {md}");
         assert!(md.contains("- first\n- second"), "{md}");
         assert!(md.contains("```\nlet x = 1;\n```"), "{md}");
         assert!(md.contains("*Figure 1: caption*"), "{md}");
@@ -1202,9 +1203,20 @@ mod tests {
         let d = doc(vec![node(1, None, 0, "document", None), fig]);
         let report = render_markdown(&d, None);
         let codes: Vec<&str> = report.warnings.iter().map(|w| w.code.as_str()).collect();
-        assert!(!codes.contains(&"alt_text_dropped"), "{codes:?}");
-        assert!(codes.contains(&"assets_not_embedded"), "{codes:?}");
+        // alt text は本文に出るので損失ではない（存在しないコードの非包含を書いても恒真なので、
+        // 「本文に出ていること」＋「残る損失はアセット実体だけ」の 2 点で固定する）。
         assert!(report.text.contains("A plot."), "{}", report.text);
+        assert!(
+            report.text.contains("**AI-generated description**"),
+            "由来ラベルつきで出る: {}",
+            report.text
+        );
+        // 残る損失は figure が持つ「座標」と「画像実体」だけ（alt text 由来のコードは無い）。
+        assert_eq!(
+            codes,
+            vec!["source_fragments_dropped", "assets_not_embedded"],
+            "{codes:?}"
+        );
     }
 
     #[test]

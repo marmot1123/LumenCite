@@ -21,7 +21,7 @@
 
 use serde::Serialize;
 
-use crate::document_ir::LcirDocument;
+use crate::document_ir::{LcirDocument, Origin};
 
 /// 警告の重さ。`warn` = 意味のある情報が落ちる / `info` = 落ちるが派生ビューの性質上想定内。
 /// 3 段目（部分変換）が要るのは 9b-2（JATS）なので、必要になってから足す。
@@ -56,8 +56,8 @@ pub enum ExportWarningCode {
     SourceFragmentsDropped,
     /// アセット（図の crop PNG）の実体を同梱していない（参照だけ／それも出さない）。
     AssetsNotEmbedded,
-    /// 表の縦結合セル（`rowspan`）が平坦化される。
-    TableRowspanFlattened,
+    /// 表の結合セル（`colspan`/`rowspan`）が平坦化される。
+    TableCellSpansFlattened,
 }
 
 impl ExportWarningCode {
@@ -68,7 +68,7 @@ impl ExportWarningCode {
             ExportWarningCode::InferredProvenanceDropped => "inferred_provenance_dropped",
             ExportWarningCode::SourceFragmentsDropped => "source_fragments_dropped",
             ExportWarningCode::AssetsNotEmbedded => "assets_not_embedded",
-            ExportWarningCode::TableRowspanFlattened => "table_rowspan_flattened",
+            ExportWarningCode::TableCellSpansFlattened => "table_cell_spans_flattened",
         }
     }
 
@@ -79,7 +79,7 @@ impl ExportWarningCode {
             | ExportWarningCode::InferredProvenanceDropped => ExportSeverity::Warn,
             ExportWarningCode::SourceFragmentsDropped
             | ExportWarningCode::AssetsNotEmbedded
-            | ExportWarningCode::TableRowspanFlattened => ExportSeverity::Info,
+            | ExportWarningCode::TableCellSpansFlattened => ExportSeverity::Info,
         }
     }
 
@@ -91,7 +91,7 @@ impl ExportWarningCode {
             ExportWarningCode::InferredProvenanceDropped,
             ExportWarningCode::SourceFragmentsDropped,
             ExportWarningCode::AssetsNotEmbedded,
-            ExportWarningCode::TableRowspanFlattened,
+            ExportWarningCode::TableCellSpansFlattened,
         ]
     }
 }
@@ -121,7 +121,7 @@ pub struct FormatCapabilities {
     pub coordinates: bool,
     /// アセットの実体を同梱できるか（参照だけでは false）。
     pub embedded_assets: bool,
-    /// 表の結合セル（rowspan）を表現できるか。
+    /// 表の結合セル（colspan/rowspan）を表現できるか。
     pub cell_spans: bool,
 }
 
@@ -148,7 +148,18 @@ pub const LCIR_JSON: FormatCapabilities = FormatCapabilities {
 };
 
 /// 「推定」を表す origin（roadmap §16・これらが落ちると AI 推定と原文由来の区別がつかなくなる）。
-const INFERRED_ORIGINS: &[&str] = &["layout_model", "llm_inference", "math_recognition", "ocr"];
+/// `publisher_source` / `tex_source` / `pdf_text_layer` は原文由来、`user_edited` は人間の判断なので
+/// 数えない。文字列リテラルではなく `Origin` から引いて綴りの二重管理を作らない。
+const INFERRED_ORIGINS: &[Origin] = &[
+    Origin::LayoutModel,
+    Origin::LlmInference,
+    Origin::MathRecognition,
+    Origin::Ocr,
+];
+
+fn is_inferred_origin(origin: &str) -> bool {
+    INFERRED_ORIGINS.iter().any(|o| o.as_str() == origin)
+}
 
 /// 警告の収集先。`count` が 0 のコードは最終的に落とす（存在しない損失を報告しない）。
 #[derive(Debug, Default)]
@@ -204,21 +215,21 @@ pub fn collect_document_warnings(
         sink.push(ExportWarningCode::SymbolsDropped, doc.symbols.len() as i64, None);
     }
 
-    // ノード走査（provenance / 座標 / アセット / rowspan を 1 周で数える）。
+    // ノード走査（provenance / 座標 / アセット / 結合セルを 1 周で数える）。
     let mut inferred: std::collections::BTreeMap<&str, i64> = Default::default();
     let mut fragments = 0i64;
     let mut assets = 0i64;
-    let mut rowspan_cells = 0i64;
+    let mut merged_cells = 0i64;
     for n in &doc.nodes {
         if let Some(o) = n.origin.as_deref() {
-            if INFERRED_ORIGINS.contains(&o) {
+            if is_inferred_origin(o) {
                 *inferred.entry(o).or_insert(0) += 1;
             }
         }
         fragments += n.source_fragments.len() as i64;
         assets += n.assets.len() as i64;
         if n.kind == "table" {
-            rowspan_cells += count_rowspan_cells(n);
+            merged_cells += count_merged_cells(n);
         }
     }
 
@@ -237,19 +248,22 @@ pub fn collect_document_warnings(
         sink.push(ExportWarningCode::AssetsNotEmbedded, assets, None);
     }
     if !caps.cell_spans {
-        sink.push(ExportWarningCode::TableRowspanFlattened, rowspan_cells, None);
+        sink.push(ExportWarningCode::TableCellSpansFlattened, merged_cells, None);
     }
 }
 
-/// table ノードの payload から `rowspan > 1` のセル数を数える（形が違う payload は 0）。
-fn count_rowspan_cells(n: &crate::document_ir::LcirNode) -> i64 {
+/// table ノードの payload から**結合セル**（`colspan > 1` または `rowspan > 1`）の数を数える
+/// （形が違う payload は 0）。GFM に結合セルは無く、`push_table` は colspan を空セルで埋め
+/// rowspan は無視するので、どちらも「結合が解かれる」損失として同じコードで報告する。
+fn count_merged_cells(n: &crate::document_ir::LcirNode) -> i64 {
     let Some(rows) = n.payload.as_ref().and_then(|p| p.get("rows")?.as_array()) else {
         return 0;
     };
+    let span = |c: &serde_json::Value, key: &str| c.get(key).and_then(|v| v.as_i64()).unwrap_or(1);
     rows.iter()
         .filter_map(|r| r.get("cells")?.as_array())
         .flatten()
-        .filter(|c| c.get("rowspan").and_then(|v| v.as_i64()).unwrap_or(1) > 1)
+        .filter(|c| span(c, "colspan") > 1 || span(c, "rowspan") > 1)
         .count() as i64
 }
 
@@ -456,11 +470,13 @@ mod tests {
     }
 
     #[test]
-    fn table_with_rowspan_is_reported_as_flattened() {
+    fn table_merged_cells_are_reported_as_flattened() {
+        // GFM に結合セルは無く、`push_table` は colspan を空セルで埋め rowspan は無視する。
+        // どちらも「結合が解かれる」損失なので同じコードで数える。
         let mut t = node(2, "table", None);
         t.payload = Some(serde_json::json!({
             "rows": [
-                {"cells": [{"text": "a", "rowspan": 2}, {"text": "b"}]},
+                {"cells": [{"text": "a", "rowspan": 2}, {"text": "b", "colspan": 3}]},
                 {"cells": [{"text": "c"}]}
             ]
         }));
@@ -468,18 +484,50 @@ mod tests {
         let ws = collect(&d, &MARKDOWN);
         let w = ws
             .iter()
-            .find(|w| w.code == ExportWarningCode::TableRowspanFlattened)
-            .expect("{ws:?}");
-        assert_eq!(w.count, 1);
+            .find(|w| w.code == ExportWarningCode::TableCellSpansFlattened)
+            .unwrap_or_else(|| panic!("{ws:?}"));
+        assert_eq!(w.count, 2, "rowspan セルと colspan セルの両方を数える");
         assert_eq!(w.severity, ExportSeverity::Info);
     }
 
     #[test]
-    fn table_without_rowspan_does_not_warn() {
+    fn table_without_merged_cells_does_not_warn() {
         let mut t = node(2, "table", None);
-        t.payload = Some(serde_json::json!({"rows": [{"cells": [{"text": "a"}]}]}));
+        t.payload = Some(serde_json::json!({
+            "rows": [{"cells": [{"text": "a", "colspan": 1, "rowspan": 1}]}]
+        }));
         let d = doc(vec![node(1, "document", None), t]);
-        assert!(!codes(&collect(&d, &MARKDOWN)).contains(&"table_rowspan_flattened"));
+        assert!(!codes(&collect(&d, &MARKDOWN)).contains(&"table_cell_spans_flattened"));
+    }
+
+    /// `as_str()`（CLI・docs）と serde 表現（フロントの i18n キー）がズレると、
+    /// UI が翻訳を引けず生のコード名が出る。両者を機械的に固定する。
+    #[test]
+    fn serde_representation_matches_as_str() {
+        for c in ExportWarningCode::all() {
+            let json = serde_json::to_string(c).unwrap();
+            assert_eq!(json, format!("\"{}\"", c.as_str()), "{c:?}");
+        }
+        for s in [ExportSeverity::Warn, ExportSeverity::Info] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, format!("\"{}\"", s.as_str()), "{s:?}");
+        }
+    }
+
+    /// `INFERRED_ORIGINS` は `Origin` から引くので、原文由来 / 人間由来を推定と数えない。
+    #[test]
+    fn only_inferred_origins_are_counted() {
+        for o in [Origin::LayoutModel, Origin::LlmInference, Origin::MathRecognition, Origin::Ocr] {
+            assert!(is_inferred_origin(o.as_str()), "{o:?}");
+        }
+        for o in [
+            Origin::TexSource,
+            Origin::PdfTextLayer,
+            Origin::PublisherSource,
+            Origin::UserEdited,
+        ] {
+            assert!(!is_inferred_origin(o.as_str()), "{o:?}");
+        }
     }
 
     #[test]

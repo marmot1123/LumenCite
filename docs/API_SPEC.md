@@ -512,7 +512,7 @@ schema URI 等）は警告にしない — 狼少年にしないため。
 | `inferred_provenance_dropped` | warn | 形式が provenance を運べず推定 origin のノードがある | ノード数（`detail` に origin 別内訳） |
 | `source_fragments_dropped` | info | 形式が座標を運べず fragment がある | fragment 数 |
 | `assets_not_embedded` | info | 形式がアセット実体を同梱できず asset がある | asset 数 |
-| `table_rowspan_flattened` | info | 形式が結合セルを運べず `rowspan > 1` のセルがある | セル数 |
+| `table_cell_spans_flattened` | info | 形式が結合セルを運べず `colspan`/`rowspan > 1` のセルがある | セル数 |
 
 推定 origin は `layout_model` / `llm_inference` / `math_recognition` / `ocr`（`pdf_text_layer` / `tex_source` は
 原文由来なので数えない）。並びは `(severity, code)` で決定的。**Markdown** は全項目が落ちうる形式、
