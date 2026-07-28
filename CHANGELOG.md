@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **LCIR — reading context around one block (Phase 10a, experimental)** — a new read tool, `get_node_context`, assembles everything needed to read and cite a single block in one call: the statement, the blocks that continue it, the proof that proves it, the definitions it rests on, the equations/figures/works it references, and the PDF region of every piece. This matters most for PDF-derived documents, where a theorem node holds only its first layout block and the rest of the statement continues into sibling blocks — often onto the next page. Every element carries its `origin` and `confidence`, so source text and inference stay distinguishable when quoted, and a `notes` list states what the bundle could not reach. Available over MCP as `get_node_context` and from the CLI as `lumencite node-context <node_id>`. No migration; nothing new is stored.
+- **`get_document_blocks` and `search_document_nodes` now return each block's `node_id`** — the stable handle you pass to `get_node_context` and `get_node_relations`. (`get_document_blocks`' existing `index` only numbers blocks within one response and was never a block id.)
 
 ## [0.10.0] - 2026-07-28
 

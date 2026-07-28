@@ -1335,14 +1335,14 @@ mod tests {
             premises.iter().any(|p| p["symbol"]["surface_form"] == "E"),
             "{premises:?}"
         );
-        // TeX 版に座標は無いことを注記する。
-        let codes: Vec<&str> = v["notes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n["code"].as_str().unwrap())
-            .collect();
-        assert!(codes.contains(&"no_regions_in_this_source"), "{codes:?}");
+        // TeX 版に座標は無い（表現から自明なので notes には出さない — `source` で分かる）。
+        assert!(v["focus"]["page"].is_null() && v["focus"]["bbox"].is_null());
+        assert!(v["notes"].is_null(), "何も欠けていないので注記は出ない: {}", v["notes"]);
+        // 続きをどこで止めたかは必ず返す（空であることの意味が読めるように）。
+        assert_eq!(
+            v["continuation_stopped_at"]["reason"], "end_of_document",
+            "この fixture では数式が最後のブロック"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

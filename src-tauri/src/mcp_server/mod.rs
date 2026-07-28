@@ -223,7 +223,8 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             indices are only valid within one source. Long documents are paginated: pass \
             block_start (from a previous next_block) or raise max_chars. Returns {has_lcir, \
             source, available_sources, total_blocks, returned, block_start, truncated, next_block, \
-            blocks:[{index, kind, page, section_number?, equation_label?, latex?, text}]}.",
+            blocks:[{index, node_id, kind, page, section_number?, equation_label?, latex?, text}]}. \
+            Pass a block's node_id to get_node_context to read it with its surrounding context.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -405,7 +406,7 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             call. Node ids come from search_document_nodes, get_document_blocks, get_figures or \
             get_node_relations; the node itself selects the representation, so there is no \
             `source` argument. Why this exists: on the pdf representation a theorem node holds \
-            only its FIRST layout block (median ~168 chars) and the rest of the statement lands \
+            only its FIRST layout block (~168 chars on average) and the rest of the statement lands \
             in sibling blocks that often continue onto the next page, so reading `focus` alone \
             loses the statement — read `focus` then `continuation` (blocks in reading order up to \
             the next structural boundary; on the tex representation the environment body is \
@@ -421,12 +422,21 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             remark or example — check node.kind. Figure/table references resolve the caption_of \
             hop for you: `figure` is the region (bbox, crop asset, alt text) and is often absent, \
             `caption` is the authors' wording. Read `notes` — it lists what this bundle could not \
-            reach. Returns {node_id, entry_id, citation_key?, attachment_id, version_id, source, \
-            available_sources, focus, section_path, before, continuation, proofs, proves, \
-            premises, equations, figures, citations, references, notes}. Nodes are \
-            {node_id, kind, text?, page?, bbox?, origin?, confidence?, identifiers?, math?, \
-            alt_text?, assets?} with bbox [x, y, width, height] in PDF points (bottom-left \
-            origin); the tex representation has no coordinates at all.",
+            reach — and `continuation_stopped_at`, which says whether the continuation ended at \
+            the next logical unit ({reason:\"boundary\", node_id, kind}) or at a size limit. A \
+            boundary of kind figure_caption/table_caption means a float interrupted the text, not \
+            that the statement ended. Returns {found:true, node_id, entry_id, citation_key, \
+            attachment_id, version_id, source, extractor_version, available_sources, focus, \
+            continuation_stopped_at} plus these keys, EACH OMITTED WHEN EMPTY: section_path, \
+            before, continuation, proofs, proves, premises, equations, figures, citations, \
+            references, notes. An unknown node_id returns {node_id, found:false, message} \
+            instead. Nodes are {node_id, kind, text?, page?, bbox?, origin?, confidence?, \
+            identifiers?, math?, alt_text?, assets?} with bbox [x, y, width, height] in PDF \
+            points (bottom-left origin); the tex representation has no coordinates at all, so \
+            page and bbox are absent on every node there. proofs/proves/equations/citations/\
+            references entries are {relation_type, direction, from_node_id, confidence?, origin?, \
+            metadata?, node}; figures entries are {relation_type, from_node_id, resolved_via?, \
+            node, figure?, caption?}; premises entries are {via, node, symbol?, relation?}.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1124,6 +1134,9 @@ async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<Str
         let n_rows = payload_i64("n_rows");
         out.push(json!({
             "index": i,
+            // ブロック粒度の安定ハンドル。get_node_context / get_node_relations は
+            // この id を取る（`index` はこの応答の中でしか意味を持たない）。
+            "node_id": n.id,
             "kind": n.kind,
             "page": node_page(n),
             "section_number": section_number,
@@ -1173,6 +1186,8 @@ async fn exec_search_document_nodes(pool: &SqlitePool, args: &Value) -> Result<S
                 "entry_id": h.entry.id,
                 "title": h.entry.title,
                 "year": h.entry.year,
+                // ヒットしたブロックの id。get_node_context / get_node_relations に渡せる。
+                "node_id": h.node_id,
                 "node_kind": h.node_kind,
                 "page": h.page,
                 "snippet": h.snippet,
@@ -4270,6 +4285,7 @@ mod tests {
                     .as_array()
                     .map(|a| a.iter().filter_map(|n| n["page"].as_i64()).collect())
                     .unwrap_or_default();
+                eprintln!("  continuation_stopped_at: {}", ctx["continuation_stopped_at"]);
                 eprintln!(
                     "  continuation: {} blocks, pages={:?}{}",
                     ctx["continuation"].as_array().map(|a| a.len()).unwrap_or(0),
@@ -4998,14 +5014,7 @@ mod tests {
         let tex =
             tool_json(&call_tool(&pool, "get_node_context", json!({ "node_id": tex_thm })).await);
         assert_eq!(tex["source"], "tex");
-        assert!(tex["focus"]["bbox"].is_null());
-        let codes: Vec<&str> = tex["notes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n["code"].as_str().unwrap())
-            .collect();
-        assert!(codes.contains(&"no_regions_in_this_source"), "{codes:?}");
+        assert!(tex["focus"]["bbox"].is_null(), "TeX 版に座標は無い");
         assert_eq!(tex["available_sources"].as_array().unwrap().len(), 2);
     }
 

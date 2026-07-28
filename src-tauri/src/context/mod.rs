@@ -213,13 +213,16 @@ pub struct PremiseSymbol {
 /// ①このバンドルで実際に起きたことだけ報告する ②どの文書でも必ず真になる一般論
 /// （「複数形の参照には辺が無い」等）は載せない — それはツール説明の仕事 ③1 つの事実を
 /// 1 コードで報告する。
+///
+/// 規約②で**落としたもの**（過去に入れていたが外した）: 「TeX 版に座標が無い」
+/// 「PDF 版に記号が無い」。どちらも `source` から機械的に決まる表現ごとの恒真命題で、
+/// PDF 版バンドルの 100% / TeX 版バンドルの 100% に必ず付く ＝ 注記として情報量が無い。
+/// 事実自体はツール説明に書いてある。`notes` は「**今回**届かなかったもの」に保つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextNoteCode {
     /// 焦点が本文ブロックではない（`document`/`page`/`line`）ので前後の文脈を組めない。
     FocusIsNotAContentBlock,
-    /// TeX 由来の版なので `source_fragments` が無く、ページ・bbox を返せない。
-    NoRegionsInThisSource,
     /// `continuation` を上限（件数または文字数）で打ち切った。続きは残っている。
     ContinuationTruncated,
     /// 図表参照のうち実体（`figure`/`table` ノード）へ到達できなかったものがある。
@@ -228,22 +231,21 @@ pub enum ContextNoteCode {
     /// `proves` の相手が定理・補題・命題・系ではない（`remark`/`example`/`definition`）。
     /// 隣接フォールバックの副作用で起きる。
     ProvesTargetIsNotATheorem,
-    /// この版（PDF）には記号が 1 件も無い（Phase 6b は TeX のみ）。記号経由の前提定義は出ない。
-    SymbolsAreTexOnly,
-    /// 件数上限でリストを切った。
+    /// 件数上限で関係リストを切った。
     RelatedTruncated,
+    /// 件数上限で `premises` を切った。
+    PremisesTruncated,
 }
 
 impl ContextNoteCode {
     pub fn as_str(self) -> &'static str {
         match self {
             ContextNoteCode::FocusIsNotAContentBlock => "focus_is_not_a_content_block",
-            ContextNoteCode::NoRegionsInThisSource => "no_regions_in_this_source",
             ContextNoteCode::ContinuationTruncated => "continuation_truncated",
             ContextNoteCode::FloatEntityUnreachable => "float_entity_unreachable",
             ContextNoteCode::ProvesTargetIsNotATheorem => "proves_target_is_not_a_theorem",
-            ContextNoteCode::SymbolsAreTexOnly => "symbols_are_tex_only",
             ContextNoteCode::RelatedTruncated => "related_truncated",
+            ContextNoteCode::PremisesTruncated => "premises_truncated",
         }
     }
 
@@ -254,10 +256,6 @@ impl ContextNoteCode {
                 "the focus node is a skeleton node (document/page/line), so no surrounding blocks \
                  were assembled; pass a content block id from search_document_nodes or \
                  get_document_blocks"
-            }
-            ContextNoteCode::NoRegionsInThisSource => {
-                "this bundle comes from the tex representation, which has no PDF coordinates; \
-                 page and bbox are absent for every node"
             }
             ContextNoteCode::ContinuationTruncated => {
                 "the continuation was cut at a size limit before reaching the next structural \
@@ -274,15 +272,42 @@ impl ContextNoteCode {
                  theorem/lemma/proposition/corollary; on the pdf representation most proves edges \
                  come from reading-order adjacency, so treat it as a hint"
             }
-            ContextNoteCode::SymbolsAreTexOnly => {
-                "this bundle comes from the pdf representation, which carries no symbol \
-                 definitions (Phase 6b is tex-only); premises via symbols are absent by \
-                 construction"
-            }
             ContextNoteCode::RelatedTruncated => {
                 "at least one relation list was cut at max_related"
             }
+            ContextNoteCode::PremisesTruncated => {
+                "premises were cut at max_premises; more definitions back this block"
+            }
         }
+    }
+}
+
+/// `continuation` がどこで止まったか。**空/短いことの意味**を呼び出し側が読めるようにする。
+///
+/// - `boundary` — 次の論理単位が始まった（`node_id`/`kind` がその境界）。`kind` が
+///   `figure_caption`/`table_caption` なら、フロートに割り込まれただけで主張はまだ続く
+///   可能性がある（その caption の node_id で呼び直せる）。
+/// - `max_continuation` / `max_continuation_chars` — 上限で切った。続きは残っている。
+/// - `end_of_document` — 文書の終わり。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContinuationStop {
+    pub reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl ContinuationStop {
+    fn limit(reason: &'static str) -> Self {
+        Self {
+            reason,
+            node_id: None,
+            kind: None,
+        }
+    }
+    fn truncated(&self) -> bool {
+        matches!(self.reason, "max_continuation" | "max_continuation_chars")
     }
 }
 
@@ -309,6 +334,9 @@ pub struct NodeContext {
     /// 焦点に続くブロック（読み順・次の構造境界の手前まで・ページをまたぐ）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub continuation: Vec<ContextNode>,
+    /// `continuation` を**なぜそこで止めたか**。焦点が本文ブロックでなければ省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_stopped_at: Option<ContinuationStop>,
     /// この定理を証明する `proof`（`proves` の入辺）。1 定理に複数付きうる。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub proofs: Vec<Related>,
@@ -344,10 +372,24 @@ fn is_content_block(kind: &str) -> bool {
 }
 
 /// 読み順スパンを打ち切る「構造の切れ目」。ここに当たったら別の論理単位が始まっている。
-/// 実測（棚卸し）で使った集合と同じ。
-fn is_structural_boundary(kind: &str) -> bool {
+///
+/// **`heading` はレベル宣言のあるものだけ**を境界にする。実ライブラリの PDF 版 `heading`
+/// 2,810 件のうち 2,640 件（94%）は `heading_level` を持たない confidence 0.55 の推定で、
+/// 中身は数式から切り出された断片（`"AiAj ="` / `"fλ = n!"` / `"π P = π,"`）や柱
+/// （`"204 SOME IMPORTANT DISTRIBUTIONS AND PROCESSES"`）である。これを境界に数えると
+/// **定理の主張そのものの直前で continuation が止まる**（実測: 定理系スパン 2,526 件のうち
+/// 240 件がレベル無し heading で停止し、うち 43 件は continuation 0 ブロック。例: 焦点
+/// "Lemma 3.4 (Linearization formula)…" が `"AiAj ="` ＝その線形化公式で止まる）。
+/// 見出しかどうか確信が持てないブロックで本文を捨てるより、節をまたいで数ブロック
+/// 余分に載る方がまし — 載った側はテキストが見えるので読み手が判断できるが、
+/// 捨てた側は見えない（§16「誤検出より欠損」は**構造の主張**に掛かる原則であって、
+/// 「推定した境界で本文を落とす」ことの正当化にはならない）。
+fn is_structural_boundary(n: &LcirNode) -> bool {
+    if n.kind == "heading" {
+        return heading_level_of(n).is_some();
+    }
     matches!(
-        kind,
+        n.kind.as_str(),
         "definition"
             | "theorem"
             | "lemma"
@@ -358,7 +400,6 @@ fn is_structural_boundary(kind: &str) -> bool {
             | "proof"
             | "section"
             | "subsection"
-            | "heading"
             | "abstract"
             | "front_matter"
             | "bibliography"
@@ -412,15 +453,6 @@ pub fn build_node_context(
     let focus = *by_id.get(&focus_node_id)?;
 
     let mut notes: NoteSet = NoteSet::default();
-    // 座標を持つのは PDF 由来の版だけ（TeX 版は `source_fragments` が 1 行も無い）。
-    let has_regions = doc.nodes.iter().any(|n| !n.source_fragments.is_empty());
-    if !has_regions {
-        notes.add(ContextNoteCode::NoRegionsInThisSource);
-    } else if doc.symbols.is_empty() {
-        // PDF 版に記号が無いのは構造的（Phase 6b は TeX のみ）。TeX 版で 0 件なのは
-        // 「その論文に定義文が無かった」だけなので注記しない。
-        notes.add(ContextNoteCode::SymbolsAreTexOnly);
-    }
 
     // 読み順（木の pre-order）。PDF の `document > page > block` も TeX の `document > block`
     // も同じ規則で 1 本の列になる ＝ ページ境界が列の上で消える。
@@ -440,10 +472,11 @@ pub fn build_node_context(
     let before = focus_pos
         .map(|p| collect_before(&seq, &by_id, p, opts.max_before))
         .unwrap_or_default();
-    let (continuation, cont_cut) = focus_pos
-        .map(|p| collect_continuation(&seq, &by_id, p, opts))
-        .unwrap_or((Vec::new(), false));
-    if cont_cut {
+    let stop = focus_pos.map(|p| collect_continuation(&seq, &by_id, p, opts));
+    let continuation: Vec<ContextNode> =
+        stop.as_ref().map(|(c, _)| c.clone()).unwrap_or_default();
+    let continuation_stopped_at = stop.map(|(_, s)| s);
+    if continuation_stopped_at.as_ref().is_some_and(|s| s.truncated()) {
         notes.add(ContextNoteCode::ContinuationTruncated);
     }
     let section_path = focus_pos
@@ -474,11 +507,32 @@ pub fn build_node_context(
     let mut references: Vec<Related> = Vec::new();
 
     for r in &doc.relations {
-        // 入辺で拾うのは「この定理を証明する proof」だけ。それ以外の被参照は
-        // get_node_relations(node_id=…) の担当（バンドルを無制限に太らせない）。
+        // 入辺で拾うのは 2 種類だけ（それ以外の被参照は get_node_relations(node_id=…) の
+        // 担当 — バンドルを無制限に太らせない）。
+        //
+        // ① この定理を証明する proof。
         if r.relation_type == "proves" && r.to_node_id == focus_node_id {
             if let Some(n) = by_id.get(&r.from_node_id) {
                 proofs.push(related(r, "incoming", r.to_node_id, n, RELATED_TEXT_CAP));
+            }
+            continue;
+        }
+        // ② 焦点（または続き）が図表**実体**のときの caption。`caption_of` は
+        //    from=caption → to=figure の一方向でしか保存されないので、実体を焦点に
+        //    すると出辺が 1 本も無く、原文キャプション（引用時に最も要る文）へ到達
+        //    できなくなる。`get_figures` は figure ノードの id を返すので、ツール説明
+        //    どおりに使うとこの経路に入る。
+        if r.relation_type == "caption_of" && origin_set.contains(&r.to_node_id) {
+            if let (Some(entity), Some(_caption)) =
+                (by_id.get(&r.to_node_id), by_id.get(&r.from_node_id))
+            {
+                figures.push(float_ref(
+                    r,
+                    entity,
+                    &by_id,
+                    &caption_to_entity,
+                    &entity_to_caption,
+                ));
             }
             continue;
         }
@@ -514,6 +568,15 @@ pub fn build_node_context(
         }
     }
 
+    // 前提定義の「明示参照」経路は**打ち切り前**の references から作る。`max_related` は
+    // 参照一覧の見やすさのための上限であって、最も確かな前提定義がそれで落ちるのは筋が悪い。
+    let mut reference_premise_targets: Vec<Related> = references
+        .iter()
+        .filter(|r| r.node.kind == "definition")
+        .cloned()
+        .collect();
+    reference_premise_targets.sort_by_key(|r| (r.from_node_id, r.node.node_id));
+
     let mut cut = false;
     cut |= cap_related(&mut proofs, opts.max_related);
     cut |= cap_related(&mut proves, opts.max_related);
@@ -521,6 +584,7 @@ pub fn build_node_context(
     cut |= cap_related(&mut citations, opts.max_related);
     cut |= cap_related(&mut references, opts.max_related);
     figures.sort_by_key(|a| (a.from_node_id, a.node.node_id));
+    figures.dedup_by_key(|a| (a.from_node_id, a.node.node_id));
     if figures.len() > opts.max_related {
         figures.truncate(opts.max_related);
         cut = true;
@@ -529,16 +593,19 @@ pub fn build_node_context(
         notes.add(ContextNoteCode::RelatedTruncated);
     }
 
-    let premises = collect_premises(
+    let (premises, premises_cut) = collect_premises(
         doc,
         &by_id,
         &pos,
         focus_pos,
         &origin_ids,
         &equations,
-        &references,
+        &reference_premise_targets,
         opts,
     );
+    if premises_cut {
+        notes.add(ContextNoteCode::PremisesTruncated);
+    }
 
     Some(NodeContext {
         node_id: focus_node_id,
@@ -547,6 +614,7 @@ pub fn build_node_context(
         section_path,
         before,
         continuation,
+        continuation_stopped_at,
         proofs,
         proves,
         premises,
@@ -604,6 +672,11 @@ fn reading_order(nodes: &[LcirNode]) -> Vec<i64> {
     out
 }
 
+/// 焦点の直前のブロック（向き付け用）。本文を持たないノードは**飛ばす** — 8a の `figure`
+/// ノードはページ内の全ブロックより後ろの ordinal で入る（`ingestion/mod.rs` の
+/// `ordinal: blocks.len() + ri`）ので、ページ先頭のブロックを焦点にすると `before` が
+/// 本文ゼロの figure だけで埋まり、向き付けの役に立たない。図そのものは辺（`figures`）で
+/// 到達できる。
 fn collect_before(
     seq: &[i64],
     by_id: &HashMap<i64, &LcirNode>,
@@ -615,7 +688,10 @@ fn collect_before(
     while i > 0 && out.len() < max {
         i -= 1;
         let Some(n) = by_id.get(&seq[i]) else { continue };
-        let boundary = is_structural_boundary(&n.kind);
+        if n.plain_text.as_ref().is_none_or(|t| t.trim().is_empty()) {
+            continue;
+        }
+        let boundary = is_structural_boundary(n);
         out.push(context_node(n, BEFORE_TEXT_CAP));
         if boundary {
             // 直前の見出し/定理まで載せたら、そこから先は別の論理単位。
@@ -626,14 +702,17 @@ fn collect_before(
     out
 }
 
-/// 焦点に続くブロックを次の構造境界の**手前**まで。境界に当たる前に上限で止めたら
-/// `true`（打ち切った）を返す。
+/// 焦点に続くブロックを次の構造境界の**手前**まで。**なぜそこで止めたか**も返す —
+/// 「主張が終わった」と「フロートのキャプションに割り込まれた」と「上限で切った」を
+/// 呼び出し側が区別できないと、`continuation` が空/短いことの意味が読めない
+/// （実測: 定理系 2,345 件のうち 63 件は次の境界が figure/table の caption で、
+/// フロートはページ先頭・末尾に置かれるので、まさにページ跨ぎの連結中に起きる）。
 fn collect_continuation(
     seq: &[i64],
     by_id: &HashMap<i64, &LcirNode>,
     focus_pos: usize,
     opts: &ContextOptions,
-) -> (Vec<ContextNode>, bool) {
+) -> (Vec<ContextNode>, ContinuationStop) {
     let mut out = Vec::new();
     let mut spent = 0usize;
     let mut i = focus_pos + 1;
@@ -642,31 +721,53 @@ fn collect_continuation(
             i += 1;
             continue;
         };
-        if is_structural_boundary(&n.kind) {
-            return (out, false);
+        if is_structural_boundary(n) {
+            return (
+                out,
+                ContinuationStop {
+                    reason: "boundary",
+                    node_id: Some(n.id),
+                    kind: Some(n.kind.clone()),
+                },
+            );
         }
         if out.len() >= opts.max_continuation {
-            return (out, true);
+            return (out, ContinuationStop::limit("max_continuation"));
         }
         let remaining = opts.max_continuation_chars.saturating_sub(spent);
         if remaining == 0 {
-            return (out, true);
+            return (out, ContinuationStop::limit("max_continuation_chars"));
         }
         let node = context_node(n, remaining);
-        spent += node.text.as_ref().map_or(0, |t| t.chars().count());
+        // 予算には LaTeX 原文・alt text も数える。TeX 版の display 数式は plain_text とは
+        // 別に `math.latex` を持つので、本文長だけで測ると応答が入力依存で膨らむ。
+        spent += node_weight(&node);
         let cut = node.text_truncated;
         out.push(node);
         if cut {
-            return (out, true);
+            return (out, ContinuationStop::limit("max_continuation_chars"));
         }
         i += 1;
     }
-    (out, false)
+    (out, ContinuationStop::limit("end_of_document"))
+}
+
+/// 応答サイズに効く文字数（本文 + 原文 LaTeX + 代替テキスト）。
+fn node_weight(n: &ContextNode) -> usize {
+    let text = n.text.as_ref().map_or(0, |t| t.chars().count());
+    let math = n.math.as_ref().map_or(0, |m| {
+        m.latex.as_ref().map_or(0, |l| l.chars().count())
+            + m.normalized_text.as_ref().map_or(0, |t| t.chars().count())
+    });
+    let alt = n.alt_text.as_ref().map_or(0, |a| a.text.chars().count());
+    text + math + alt
 }
 
 /// 焦点を囲む節。木が平坦（PDF は page 直下・TeX は document 直下）で `section` は兄弟なので、
 /// 読み順を後ろ向きに走査して**見出しレベルが厳密に小さくなるもの**だけを拾う。
-/// `ingestion::symbols` の `current_section`（`scope_node_id` の決め方）と同じ規約。
+/// `ingestion::symbols` の `current_section`（`symbols.scope_node_id` の決め方）と**似ているが
+/// 同じではない**: あちらは `section`/`subsection` を読み順で「最後に見たもの」1 件に上書きし
+/// レベルを見ない。こちらはレベル宣言のあるものだけを対象に、階層として最大 4 件積む。
 fn collect_section_path(
     seq: &[i64],
     by_id: &HashMap<i64, &LcirNode>,
@@ -700,22 +801,27 @@ fn collect_premises(
     focus_pos: Option<usize>,
     origin_ids: &[i64],
     equations: &[Related],
-    references: &[Related],
+    reference_targets: &[Related],
     opts: &ContextOptions,
-) -> Vec<Premise> {
+) -> (Vec<Premise>, bool) {
     let mut out: Vec<Premise> = Vec::new();
 
     // 経路 1: 明示参照（辺の指し先が definition ノード）。最も確かだが実データでは希少。
-    for r in references {
-        if r.node.kind == "definition" {
-            if let Some(n) = by_id.get(&r.node.node_id) {
-                out.push(Premise {
-                    via: "reference",
-                    node: context_node(n, PREMISE_TEXT_CAP),
-                    symbol: None,
-                    relation: Some(r.clone()),
-                });
-            }
+    // **定義ノード単位で 1 件に畳む** — 焦点と続きブロックの両方が同じ "Definition 3.1" に
+    // 言及すると `push_edge` の重複排除（from を含む三つ組）を素通りして 2 本残るので、
+    // そのまま流すと同じ定義が 2 度並び `max_premises` の枠も 2 消費する。
+    let mut seen_reference: HashSet<i64> = HashSet::new();
+    for r in reference_targets {
+        if r.node.kind != "definition" || !seen_reference.insert(r.node.node_id) {
+            continue;
+        }
+        if let Some(n) = by_id.get(&r.node.node_id) {
+            out.push(Premise {
+                via: "reference",
+                node: context_node(n, PREMISE_TEXT_CAP),
+                symbol: None,
+                relation: Some(r.clone()),
+            });
         }
     }
 
@@ -801,8 +907,9 @@ fn collect_premises(
         out.extend(symbol_premises);
     }
 
+    let cut = out.len() > opts.max_premises;
     out.truncate(opts.max_premises);
-    out
+    (out, cut)
 }
 
 // ── 変換ヘルパ ──────────────────────────────────────────────────────────────
@@ -818,11 +925,14 @@ fn context_node(n: &LcirNode, text_cap: usize) -> ContextNode {
     let frag = n.source_fragments.first();
     let mut identifiers = serde_json::Map::new();
     if let Some(p) = n.payload.as_ref() {
+        // `cite_key` は「読んで引用する」ツールの中核（TeX の bibliography_entry が持つ）。
+        // `figure_index` は内部通番なので出さない。
         for key in [
             "theorem_number",
             "section_number",
             "note",
             "labels",
+            "cite_key",
             "figure_number",
             "caption_number",
             "caption_label",
@@ -1154,6 +1264,68 @@ mod tests {
         assert_eq!(ids(&c.section_path), vec![2], "レベル宣言のある section だけ");
     }
 
+    /// **回帰（レビュー high）**: レベル宣言の無い `heading` は境界にしない。実データの
+    /// PDF `heading` の 94% は数式断片（"AiAj =" 等）で、境界に数えると定理の主張が
+    /// その式の直前で切れる（しかも「境界で止めた」ので黙って切れる）。
+    #[test]
+    fn a_heading_without_a_declared_level_does_not_cut_the_statement() {
+        let mut d = pdf_two_pages();
+        // 定理の続きの式が `heading` に誤分類されたケース（レベル宣言なし）。
+        d.nodes[4] = with_region(node(11, "heading", 1, Some(2), Some("AiAj =")), 1);
+        let c = build_node_context(&d, 10, &ContextOptions::default()).unwrap();
+        assert_eq!(ids(&c.continuation), vec![11, 12, 20], "式で切らずに続きを連結する");
+
+        // レベル宣言のある heading は本物の見出しなので境界のまま。
+        d.nodes[4] = with_region(
+            with_payload(
+                node(11, "heading", 1, Some(2), Some("2.1 Setup")),
+                serde_json::json!({"heading_level": 2}),
+            ),
+            1,
+        );
+        let c2 = build_node_context(&d, 10, &ContextOptions::default()).unwrap();
+        assert!(c2.continuation.is_empty());
+        assert_eq!(c2.continuation_stopped_at.as_ref().unwrap().kind.as_deref(), Some("heading"));
+    }
+
+    /// **回帰（レビュー medium）**: 止めた理由を必ず返す。フロートの caption に
+    /// 割り込まれただけなのか主張が終わったのかを、呼び出し側が区別できるようにする。
+    #[test]
+    fn continuation_reports_where_and_why_it_stopped() {
+        let mut d = pdf_two_pages();
+        d.nodes[4] = with_region(
+            node(11, "figure_caption", 1, Some(2), Some("FIG. 1. A contour.")),
+            1,
+        );
+        let c = build_node_context(&d, 10, &ContextOptions::default()).unwrap();
+        let stop = c.continuation_stopped_at.as_ref().unwrap();
+        assert_eq!(stop.reason, "boundary");
+        assert_eq!(stop.node_id, Some(11));
+        assert_eq!(stop.kind.as_deref(), Some("figure_caption"));
+        assert!(c.continuation.is_empty());
+        // 境界は「打ち切り」ではないので truncated 注記は出さない（理由は別フィールドで返る）。
+        assert!(!has_note(&c, ContextNoteCode::ContinuationTruncated));
+
+        let last = build_node_context(&d, 20, &ContextOptions::default()).unwrap();
+        assert_eq!(
+            last.continuation_stopped_at.as_ref().unwrap().reason,
+            "boundary",
+            "20 の次は section(21)"
+        );
+    }
+
+    /// **回帰（レビュー medium）**: 本文を持たないノード（8a の figure はページ末尾の
+    /// ordinal で入る）で `before` が埋まると向き付けの役に立たない。
+    #[test]
+    fn before_skips_nodes_without_text() {
+        let mut d = pdf_two_pages();
+        // ページ 1 の末尾に図領域が 2 件（実データと同じくブロックより後ろの ordinal）。
+        d.nodes.push(with_region(node(80, "figure", 10, Some(2), None), 1));
+        d.nodes.push(with_region(node(81, "figure", 11, Some(2), None), 1));
+        let c = build_node_context(&d, 20, &ContextOptions::default()).unwrap();
+        assert_eq!(ids(&c.before), vec![11, 12], "figure ではなく地の文が入る");
+    }
+
     #[test]
     fn missing_focus_node_returns_none() {
         assert!(build_node_context(&pdf_two_pages(), 999, &ContextOptions::default()).is_none());
@@ -1340,6 +1512,33 @@ mod tests {
         assert_eq!(c.figures[0].caption.as_ref().unwrap().node_id, 60);
     }
 
+    /// **回帰（レビュー medium）**: `get_figures` が返す figure ノード id をそのまま渡す
+    /// 経路（ツール説明が案内している）。`caption_of` は from=caption → to=figure の
+    /// 一方向なので、出辺だけ見ていると原文キャプションに到達できない。
+    #[test]
+    fn a_figure_entity_as_focus_still_reaches_its_caption() {
+        let mut d = pdf_two_pages();
+        d.nodes.push(with_region(
+            with_payload(
+                node(60, "figure_caption", 10, Some(3), Some("Figure 3: architecture")),
+                serde_json::json!({"caption_label": "Figure", "caption_number": "3"}),
+            ),
+            2,
+        ));
+        d.nodes.push(figure_node(61));
+        d.relations = vec![rel(60, "caption_of", 61)];
+
+        let c = build_node_context(&d, 61, &ContextOptions::default()).unwrap();
+        assert_eq!(c.focus.kind, "figure");
+        assert_eq!(c.figures.len(), 1, "{:?}", c.figures);
+        assert_eq!(c.figures[0].caption.as_ref().unwrap().node_id, 60);
+        assert_eq!(
+            c.figures[0].caption.as_ref().unwrap().text.as_deref(),
+            Some("Figure 3: architecture")
+        );
+        assert_eq!(c.figures[0].figure.as_ref().unwrap().node_id, 61);
+    }
+
     // ── 前提定義 ────────────────────────────────────────────────────────────
 
     fn tex_doc_with_symbols(symbols: Vec<LcirSymbol>) -> LcirDocument {
@@ -1431,22 +1630,131 @@ mod tests {
         assert_eq!(c.references.len(), 1, "参照リストにも残る（重複ではなく別の見方）");
     }
 
+    /// **回帰（レビュー low）**: 焦点と続きブロックの両方が同じ "Definition 3.1" に
+    /// 言及すると `push_edge` の重複排除（from を含む三つ組）を素通りして辺が 2 本残る。
+    /// 定義ノード単位で 1 件に畳む。
+    #[test]
+    fn the_same_definition_is_not_listed_twice_as_a_premise() {
+        let mut d = pdf_two_pages();
+        d.nodes.push(with_region(
+            node(70, "definition", 7, Some(3), Some("Definition 1. A graph is ...")),
+            2,
+        ));
+        // 焦点（10）と続き（12）の両方から同じ定義へ。
+        d.relations = vec![
+            rel(10, "refers_to_theorem", 70),
+            rel(12, "refers_to_theorem", 70),
+        ];
+        let c = build_node_context(&d, 10, &ContextOptions::default()).unwrap();
+        assert_eq!(c.premises.len(), 1, "{:?}", c.premises);
+        assert_eq!(c.references.len(), 2, "参照一覧の方は 2 本のまま（辺は 2 本ある）");
+    }
+
+    /// **回帰（レビュー low）**: 最も確かな明示参照の前提定義が、無関係な
+    /// `max_related` の打ち切りで消えてはいけない。
+    #[test]
+    fn reference_premises_survive_the_related_cap() {
+        let mut d = pdf_two_pages();
+        for i in 0..4 {
+            d.nodes.push(node(100 + i, "bibliography_entry", 20 + i, Some(3), Some("[x]")));
+            d.relations.push(rel(10, "refers_to_theorem", 100 + i));
+        }
+        d.nodes.push(with_region(
+            node(70, "definition", 30, Some(3), Some("Definition 1.")),
+            2,
+        ));
+        d.relations.push(rel(10, "refers_to_theorem", 70));
+        let opts = ContextOptions {
+            max_related: 2,
+            ..Default::default()
+        };
+        let c = build_node_context(&d, 10, &opts).unwrap();
+        assert_eq!(c.references.len(), 2, "参照一覧は上限どおり");
+        assert_eq!(c.premises.len(), 1, "定義は打ち切りに巻き込まれない: {:?}", c.premises);
+        assert_eq!(c.premises[0].node.node_id, 70);
+    }
+
+    /// **回帰（レビュー medium）**: premises の打ち切りも注記する（他の 6 リストと対称）。
+    #[test]
+    fn truncating_premises_is_reported() {
+        let d = tex_doc_with_symbols(vec![
+            symbol(1, "U", 2, Some("the evolution operator")),
+            symbol(2, "W", 2, Some("another")),
+        ]);
+        let mut d = d;
+        d.nodes[3].plain_text = Some("The operators $U$ and $W$ are unitary.".to_string());
+        let opts = ContextOptions {
+            max_premises: 1,
+            ..Default::default()
+        };
+        let c = build_node_context(&d, 4, &opts).unwrap();
+        assert_eq!(c.premises.len(), 1);
+        assert!(has_note(&c, ContextNoteCode::PremisesTruncated));
+    }
+
+    /// **回帰（レビュー medium）**: 予算は本文だけでなく原文 LaTeX も数える。
+    /// TeX の display 数式は plain_text とは別に `math.latex` を持つので、本文長だけで
+    /// 測ると応答が入力依存で膨らむ。
+    #[test]
+    fn the_continuation_budget_counts_latex_too() {
+        let mut d = pdf_two_pages();
+        d.nodes[4].plain_text = Some("x".to_string());
+        d.nodes[4].math = Some(LcirMath {
+            display_mode: "display".to_string(),
+            equation_label: None,
+            latex: Some("y".repeat(500)),
+            presentation_mathml: None,
+            content_mathml: None,
+            openmath: None,
+            normalized_text: None,
+            semantic_status: "source_provided".to_string(),
+            confidence: None,
+            origin: Some("tex_source".to_string()),
+        });
+        let opts = ContextOptions {
+            max_continuation_chars: 100,
+            ..Default::default()
+        };
+        let c = build_node_context(&d, 10, &opts).unwrap();
+        assert_eq!(ids(&c.continuation), vec![11], "LaTeX 500 字で予算を使い切る");
+        assert!(has_note(&c, ContextNoteCode::ContinuationTruncated));
+    }
+
+    /// **回帰（レビュー low）**: cite key は「読んで引用する」ツールの中核。
+    #[test]
+    fn identifiers_carry_the_cite_key() {
+        let d = doc(
+            vec![
+                node(1, "document", 0, None, None),
+                with_payload(
+                    node(2, "bibliography_entry", 0, Some(1), Some("[1] Smith 2020")),
+                    serde_json::json!({"cite_key": "smith2020"}),
+                ),
+            ],
+            Vec::new(),
+        );
+        let c = build_node_context(&d, 2, &ContextOptions::default()).unwrap();
+        assert_eq!(c.focus.identifiers["cite_key"], "smith2020");
+    }
+
     // ── provenance と注記 ───────────────────────────────────────────────────
 
     #[test]
-    fn tex_bundle_has_no_regions_and_says_so() {
+    fn tex_bundle_has_no_regions() {
         let d = tex_doc_with_symbols(Vec::new());
         let c = build_node_context(&d, 4, &ContextOptions::default()).unwrap();
         assert!(c.focus.page.is_none() && c.focus.bbox.is_none());
-        assert!(has_note(&c, ContextNoteCode::NoRegionsInThisSource));
-        assert!(!has_note(&c, ContextNoteCode::SymbolsAreTexOnly));
     }
 
+    /// 規約②: 表現ごとに必ず真になる事実（TeX に座標が無い / PDF に記号が無い）は
+    /// notes に載せない。`notes` は「**今回**届かなかったもの」に保つ。
     #[test]
-    fn pdf_bundle_says_symbols_are_tex_only() {
-        let c = build_node_context(&pdf_two_pages(), 10, &ContextOptions::default()).unwrap();
-        assert!(has_note(&c, ContextNoteCode::SymbolsAreTexOnly));
-        assert!(!has_note(&c, ContextNoteCode::NoRegionsInThisSource));
+    fn notes_are_empty_when_nothing_actually_went_wrong() {
+        let pdf = build_node_context(&pdf_two_pages(), 10, &ContextOptions::default()).unwrap();
+        assert!(pdf.notes.is_empty(), "{:?}", pdf.notes);
+        let tex = tex_doc_with_symbols(Vec::new());
+        let tex = build_node_context(&tex, 4, &ContextOptions::default()).unwrap();
+        assert!(tex.notes.is_empty(), "{:?}", tex.notes);
     }
 
     /// 完了条件「AI 推定部分を回答中で識別できる」— origin/confidence をノードごとに透過する。
