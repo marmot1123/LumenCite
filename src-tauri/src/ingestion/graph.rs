@@ -7,13 +7,15 @@
 //!   まま残る `\ref`/`\eqref`/`\cite` を、`\label` 名（payload の labels）/ `\bibitem` の cite key
 //!   と照合する。
 //! - **PDF**（`RefStrategy::Pdf`・origin=layout_model・中信頼 0.6）: `plain_text` 中の "Theorem 2.3"
-//!   / "Eq. (2.1)" を定理番号 / 数式番号と照合する（PDF は `\label` を復元できないため番号一致）。
+//!   / "Eq. (2.1)" / "Figure 3" / "Table 2" を定理番号 / 数式番号 / 図表番号と照合する
+//!   （PDF は `\label` を復元できないため番号一致）。
 //! - **proof → theorem**（`proves`）: PDF は "Proof of Theorem 2.3" の番号一致、無ければ読み順で
 //!   直前の定理系ノード。TeX は `\ref` 先が定理系ならそれ、無ければ読み順の直前。
 //!
 //! **誤検出より欠損**（roadmap §16）: 解決できない参照（ターゲット不在・曖昧）は辺を張らない。
 //! 自己参照（定理見出し "Theorem 2.3." がその定理自身を指す等）も張らない。
 
+use super::structure;
 use crate::document_ir::{NodeKind, Origin, RelationType};
 use std::collections::{HashMap, HashSet};
 
@@ -23,8 +25,8 @@ use std::collections::{HashMap, HashSet};
 pub struct GraphNode {
     pub id: i64,
     pub kind: NodeKind,
-    /// 読み順の単調増加インデックス（PDF は (page, block) を平坦化した通し番号 / TeX は block 順）。
-    /// proof → 直前の定理の解決に使う。
+    /// 読み順の単調増加インデックス（PDF は (page, block/figure) を平坦化した通し番号 /
+    /// TeX は block 順）。proof → 直前の定理の解決に使う。
     pub reading_index: i64,
     pub plain_text: String,
     /// `\label{..}` の対象名（TeX のみ・payload.labels）。参照解決のターゲット。
@@ -35,6 +37,16 @@ pub struct GraphNode {
     pub theorem_number: Option<String>,
     /// `\bibitem{key}` の cite key（bibliography_entry・TeX のみ）。`\cite` のターゲット。
     pub cite_key: Option<String>,
+    /// caption のラベル語 "Figure" / "Fig" / "Table" / "Algorithm" / "Listing"（caption ノードのみ・
+    /// PDF のみ・`structure::StructuredBlock::caption_label` そのまま）。図表番号参照のターゲット
+    /// 索引に載せる caption を絞る鍵（Algorithm / Listing は figure_caption だが図番号ではない）。
+    /// TeX 経路は caption のラベル語を持たないので常に None。
+    pub caption_label: Option<String>,
+    /// 図表番号 "3" / "A.1"（PDF のみ）。caption ノードは自身の caption 番号、`figure` ノードは
+    /// caption から引き継いだ図番号（`payload.figure_number`）。PDF の "Figure 3" / "Table 2"
+    /// 参照のターゲット。**図と表は `kind` で区別できるので 1 フィールドで兼ねる**
+    /// （`equation_label` / `theorem_number` と同じく「そのノード自身の番号」の位置づけ）。
+    pub caption_number: Option<String>,
 }
 
 /// 解決した参照辺（`node_relations` に 1 行になる）。
@@ -97,6 +109,13 @@ const PDF_THM_KEYWORDS: &[&str] = &[
 ];
 // 数式参照は "Equation" を "Eq" より先に（前方一致の取りこぼしを防ぐ）。
 const PDF_EQ_KEYWORDS: &[&str] = &["Equation", "Eqs", "Eq"];
+// 図表参照（Phase 8d-7）。`structure::detect_caption` が caption として認識できるラベル語だけを
+// 載せる — 認識できない語（"Tab." / "Scheme" / "Chart"）を参照側だけ拾っても照合先が永久に存在せず、
+// 走査コストと誤検出リスクだけが増えるため。"Figure" を "Fig" より先に置くのは上と同じ規約。
+// **複数形（"Figures 3 and 4"）は載せない** — `take_ref_number` は先頭 1 個しか読まないので、
+// 拾うと「部分的な参照集合」を完全なものとして下流に見せることになる（§16「誤検出より欠損」）。
+const PDF_FIG_KEYWORDS: &[&str] = &["Figure", "Fig"];
+const PDF_TAB_KEYWORDS: &[&str] = &["Table"];
 
 const TEX_CONF: f64 = 0.9;
 const PDF_REF_CONF: f64 = 0.6;
@@ -111,7 +130,10 @@ pub fn resolve_relations(nodes: &[GraphNode], strategy: RefStrategy) -> Vec<Rela
     let mut theorem_num_to_node: HashMap<(&str, &str), i64> = HashMap::new();
     let mut equation_num_to_node: HashMap<String, i64> = HashMap::new();
     let mut cite_to_node: HashMap<&str, i64> = HashMap::new();
+    // Phase 8d-7: 図表番号 → ノード（実体優先・caption fallback・曖昧は落とす）。
+    let mut float_targets = FloatTargets::default();
     for n in nodes {
+        float_targets.insert(n);
         for l in &n.labels {
             label_to_node.entry(l.as_str()).or_insert((n.id, n.kind));
         }
@@ -233,6 +255,32 @@ pub fn resolve_relations(nodes: &[GraphNode], strategy: RefStrategy) -> Vec<Rela
                                     PDF_REF_CONF,
                                     Origin::LayoutModel,
                                     meta_pdf(&pref.raw, &pref.number),
+                                );
+                            }
+                        }
+                        // 図表参照（Phase 8d-7）。実体（figure/table ノード）に解決できれば
+                        // それを、できなければ caption ノードを指す。
+                        RefCategory::Figure | RefCategory::Table => {
+                            // caption 冒頭の "Figure 3:" は自分の図表への自己言及
+                            // （8a の caption_of と重複する冗長辺）なので張らない。
+                            if is_own_float_mention(n, &pref) {
+                                continue;
+                            }
+                            let Some(relation_type) = pref.category.float_relation() else {
+                                continue;
+                            };
+                            if let Some((to, via)) =
+                                float_targets.resolve(pref.category, &pref.number)
+                            {
+                                push_edge(
+                                    &mut edges,
+                                    &mut seen,
+                                    n.id,
+                                    relation_type,
+                                    to,
+                                    PDF_REF_CONF,
+                                    Origin::LayoutModel,
+                                    meta_pdf_float(&pref.raw, &pref.number, via),
                                 );
                             }
                         }
@@ -373,6 +421,92 @@ fn keyword_to_kind(keyword: &str) -> Option<NodeKind> {
     }
 }
 
+/// 図表番号 → ノードの索引（Phase 8d-7・PDF の "Figure 3" / "Table 2" のターゲット）。
+///
+/// **実体（`figure`/`table`）優先・無ければ caption（`figure_caption`/`table_caption`）**の 2 段。
+/// ただし実データ上の主経路は caption 側である: PDF の `figure` ノードは caption と幾何ペアリング
+/// できたときしか番号を持たず（実測で保有率 2 割強）、`table` ノードは PDF 側では 1 件も作られない
+/// （8d-6 未実装）。実体に当たるのは 3 本に 1 本程度で、残りは caption ノードを指す。
+/// どちらに解決したかは `metadata.resolved_via` に残す（bbox が引けるのは実体のときだけ）。
+#[derive(Default)]
+struct FloatTargets<'a> {
+    figure: HashMap<&'a str, Option<i64>>,
+    figure_caption: HashMap<&'a str, Option<i64>>,
+    table: HashMap<&'a str, Option<i64>>,
+    table_caption: HashMap<&'a str, Option<i64>>,
+}
+
+impl<'a> FloatTargets<'a> {
+    /// ノードを索引に載せる（対象外の種別・番号なしは無視）。
+    fn insert(&mut self, n: &'a GraphNode) {
+        let Some(num) = n.caption_number.as_deref() else {
+            return;
+        };
+        let map = match n.kind {
+            NodeKind::Figure => &mut self.figure,
+            // 8d-6（PDF 表認識）が table ノードを作れば自動で優先ターゲットになる。
+            // TeX の table ノードは番号を持たないので現状は空のまま。
+            NodeKind::Table => &mut self.table,
+            NodeKind::FigureCaption
+                if structure::is_figure_caption_label(n.caption_label.as_deref()) =>
+            {
+                &mut self.figure_caption
+            }
+            NodeKind::TableCaption
+                if structure::is_table_caption_label(n.caption_label.as_deref()) =>
+            {
+                &mut self.table_caption
+            }
+            _ => return,
+        };
+        // 同じ番号が複数のノードに付いていたらその番号は落とす（`None` で墓標を立てる）。
+        // 定理番号は種別との複合キーで衝突がまれだが、図表番号は同一文書内で実際に衝突する
+        // （実測 45 件）。先勝ちにすると「どちらかに当たっただけの辺」が正しい辺と混ざるので、
+        // 曖昧なら張らない（§16）。
+        map.entry(num)
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(n.id));
+    }
+
+    /// 番号を解決する。返り値は (ノード id, 解決経路)。
+    fn resolve(&self, category: RefCategory, number: &str) -> Option<(i64, &'static str)> {
+        let (entity, caption) = match category {
+            RefCategory::Figure => (&self.figure, &self.figure_caption),
+            RefCategory::Table => (&self.table, &self.table_caption),
+            RefCategory::Theorem | RefCategory::Equation => return None,
+        };
+        entity
+            .get(number)
+            .copied()
+            .flatten()
+            .map(|id| (id, "node"))
+            .or_else(|| caption.get(number).copied().flatten().map(|id| (id, "caption")))
+    }
+}
+
+/// 図表番号参照が「その caption 自身の見出し」か（Phase 8d-7）。caption の本文は
+/// "Figure 3: The architecture of …" で始まるので、素朴に張ると 8a が張る `caption_of` 辺と
+/// 重複する冗長辺になる（実体 figure ノードは別 id なので `push_edge` の from==to ガードでは
+/// 防げない）。判定は「同カテゴリの caption」かつ「同番号 **または** 本文の先頭 2 バイト以内」。
+/// 番号を見るだけでは `detect_caption` がラベルは通したが番号を取れなかった caption
+/// （"Fig. (3): …"）を素通しするので、先頭位置を保険に併用する。
+/// caption 内の**他図への**参照（"Figure 5: Compared with Figure 3, …"）は残る。
+fn is_own_float_mention(n: &GraphNode, pref: &PdfRef) -> bool {
+    let own_caption = match pref.category {
+        RefCategory::Figure => {
+            n.kind == NodeKind::FigureCaption
+                && structure::is_figure_caption_label(n.caption_label.as_deref())
+        }
+        RefCategory::Table => {
+            n.kind == NodeKind::TableCaption
+                && structure::is_table_caption_label(n.caption_label.as_deref())
+        }
+        RefCategory::Theorem | RefCategory::Equation => false,
+    };
+    own_caption
+        && (n.caption_number.as_deref() == Some(pref.number.as_str()) || pref.start <= 2)
+}
+
 /// `\ref` 先ノードの種別 → relation_type。
 fn relation_type_for_target(kind: NodeKind) -> RelationType {
     match kind {
@@ -408,6 +542,12 @@ fn meta_cite(macro_name: &str, key: &str) -> Option<String> {
 }
 fn meta_pdf(raw: &str, number: &str) -> Option<String> {
     Some(serde_json::json!({ "ref": raw, "number": number }).to_string())
+}
+/// 図表参照（Phase 8d-7）の metadata。`resolved_via` は "node"（figure/table ノードに解決）/
+/// "caption"（実体ノードが取れず caption に落ちた）で、辺の指し先の粒度を下流に伝える
+/// （bbox が引けるのは "node" のときだけ・実体へは `caption_of` を 1 ホップ辿る）。
+fn meta_pdf_float(raw: &str, number: &str, via: &str) -> Option<String> {
+    Some(serde_json::json!({ "ref": raw, "number": number, "resolved_via": via }).to_string())
 }
 fn meta_proves_number(number: &str) -> Option<String> {
     Some(serde_json::json!({ "by": "number", "number": number }).to_string())
@@ -534,15 +674,33 @@ fn split_keys(arg: &str) -> Vec<String> {
 enum RefCategory {
     Theorem,
     Equation,
+    /// 図参照 "Figure 3" / "Fig. 3"（Phase 8d-7・PDF のみ）。
+    Figure,
+    /// 表参照 "Table 2"（Phase 8d-7・PDF のみ）。
+    Table,
+}
+
+impl RefCategory {
+    /// 図表参照カテゴリ → relation_type。定理 / 数式は自分の分岐で扱うので None。
+    fn float_relation(self) -> Option<RelationType> {
+        match self {
+            RefCategory::Figure => Some(RelationType::RefersToFigure),
+            RefCategory::Table => Some(RelationType::RefersToTable),
+            RefCategory::Theorem | RefCategory::Equation => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct PdfRef {
     category: RefCategory,
-    /// 定理系のときの参照キーワード（"Theorem"/"Definition"/…）。数式は空。
+    /// 定理系・図表のときの参照キーワード（"Theorem"/"Definition"/"Figure"/"Fig"/"Table"）。数式は空。
     keyword: String,
     number: String,
     raw: String,
+    /// `plain_text` 内での参照開始位置（byte offset）。caption 冒頭の自己ラベル
+    /// "Figure 3: …" を番号が取れていないときにも落とすのに使う（`is_own_float_mention`）。
+    start: usize,
 }
 
 fn find_pdf_refs(text: &str) -> Vec<PdfRef> {
@@ -565,6 +723,7 @@ fn find_pdf_refs(text: &str) -> Vec<PdfRef> {
                         keyword: kw.to_string(),
                         number: num,
                         raw: text[i..end].to_string(),
+                        start: i,
                     });
                     i = end;
                     continue;
@@ -593,14 +752,57 @@ fn find_pdf_refs(text: &str) -> Vec<PdfRef> {
                     keyword: String::new(),
                     number: num,
                     raw: text[i..raw_end].to_string(),
+                    start: i,
                 });
                 i = raw_end;
                 continue;
             }
         }
+        // 図表キーワード + 番号（Phase 8d-7）。キーワード集合は定理系・数式系と互いに素なので、
+        // この分岐の位置は結果に影響しない。
+        if let Some((pref, end)) = take_float_ref(text, i) {
+            out.push(pref);
+            i = end;
+            continue;
+        }
         i += 1;
     }
     out
+}
+
+/// 位置 i から図表参照 "Figure 3" / "Fig. 3" / "Table 2" を読み、(参照, 終端 index) を返す。
+/// キーワード直後の任意の '.'（"Fig. 3"）と空白を読み飛ばして番号を取る（数式側の "Eq. (2.1)" と
+/// 同じ形）。定理系のような「空白 1 個以上」は課さない — PDF のテキスト層は空白を落とすことがあり、
+/// 大文字始まりのラベル語直後の数字に曖昧さはないため（"Fig.3" を拾える）。
+fn take_float_ref(text: &str, i: usize) -> Option<(PdfRef, usize)> {
+    let b = text.as_bytes();
+    for (keywords, category) in [
+        (PDF_FIG_KEYWORDS, RefCategory::Figure),
+        (PDF_TAB_KEYWORDS, RefCategory::Table),
+    ] {
+        let Some((kw, after)) = match_keyword(b, i, keywords) else {
+            continue;
+        };
+        let mut k = after;
+        if b.get(k) == Some(&b'.') {
+            k += 1; // "Fig. 3"
+        }
+        k = skip_spaces(b, k);
+        let Some((number, end)) = take_ref_number(text, k) else {
+            continue;
+        };
+        return Some((
+            PdfRef {
+                category,
+                keyword: kw.to_string(),
+                number,
+                raw: text[i..end].to_string(),
+                start: i,
+            },
+            end,
+        ));
+    }
+    None
 }
 
 /// text の位置 i でキーワードのどれかが完全語（後続が非英字）で一致するか。
@@ -691,7 +893,24 @@ mod tests {
             equation_label: None,
             theorem_number: None,
             cite_key: None,
+            caption_label: None,
+            caption_number: None,
         }
+    }
+
+    /// caption ノード（PDF）。ラベル語と番号は `structure::detect_caption` 由来の形で渡す。
+    fn caption(id: i64, kind: NodeKind, ri: i64, label: &str, num: &str, text: &str) -> GraphNode {
+        let mut n = node(id, kind, ri, text);
+        n.caption_label = Some(label.to_string());
+        n.caption_number = Some(num.to_string());
+        n
+    }
+
+    /// 図領域ノード（PDF・Phase 8a）。plain_text は持たず番号だけを持つターゲット専用ノード。
+    fn figure(id: i64, ri: i64, num: Option<&str>) -> GraphNode {
+        let mut n = node(id, NodeKind::Figure, ri, "");
+        n.caption_number = num.map(|s| s.to_string());
+        n
     }
 
     fn find(edges: &[RelationEdge], from: i64, ty: RelationType, to: i64) -> Option<&RelationEdge> {
@@ -941,5 +1160,192 @@ mod tests {
         let meta: serde_json::Value =
             serde_json::from_str(e.metadata_json.as_ref().unwrap()).unwrap();
         assert_eq!(meta["key"], "thm:main");
+    }
+
+    // ── PDF: 図表参照（Phase 8d-7） ──
+
+    fn meta_of(e: &RelationEdge) -> serde_json::Value {
+        serde_json::from_str(e.metadata_json.as_ref().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pdf_figure_ref_resolves_to_figure_node() {
+        let cap = caption(2, NodeKind::FigureCaption, 1, "Figure", "3", "Figure 3: Overview.");
+        let fig = figure(4, 2, Some("3"));
+        let para = node(5, NodeKind::Paragraph, 3, "The pipeline is shown in Figure 3.");
+        let edges = resolve_relations(&[cap, fig, para], RefStrategy::Pdf);
+        // 実体（figure ノード）が番号を持つので caption ではなくそちらに解決する。
+        let e = find(&edges, 5, RelationType::RefersToFigure, 4).expect("ref→figure ノード");
+        assert_eq!(e.origin, Origin::LayoutModel);
+        assert!((e.confidence - 0.6).abs() < 1e-9);
+        assert_eq!(meta_of(e)["resolved_via"], "node");
+        assert!(find(&edges, 5, RelationType::RefersToFigure, 2).is_none());
+    }
+
+    #[test]
+    fn pdf_figure_ref_falls_back_to_caption_when_no_figure_node() {
+        // tikz/pgf 由来の図は 8a が図領域を作れず figure ノードが存在しない（実測で半数）。
+        let cap = caption(2, NodeKind::FigureCaption, 1, "Figure", "3", "Figure 3: Overview.");
+        let para = node(5, NodeKind::Paragraph, 3, "As Figure 3 shows, ...");
+        let edges = resolve_relations(&[cap, para], RefStrategy::Pdf);
+        let e = find(&edges, 5, RelationType::RefersToFigure, 2).expect("ref→caption fallback");
+        assert_eq!(meta_of(e)["resolved_via"], "caption");
+    }
+
+    #[test]
+    fn pdf_figure_node_without_number_does_not_shadow_the_caption() {
+        // caption とペアリングできなかった figure ノードは番号を持たない（索引に載らない）。
+        let cap = caption(2, NodeKind::FigureCaption, 1, "Figure", "3", "Figure 3: Overview.");
+        let fig = figure(4, 2, None);
+        let para = node(5, NodeKind::Paragraph, 3, "See Figure 3 for details.");
+        let edges = resolve_relations(&[cap, fig, para], RefStrategy::Pdf);
+        let e = find(&edges, 5, RelationType::RefersToFigure, 2).expect("caption に解決する");
+        assert_eq!(meta_of(e)["resolved_via"], "caption");
+    }
+
+    #[test]
+    fn pdf_table_ref_resolves_to_table_caption() {
+        // PDF 側に table ノードは存在しない（8d-6 未実装）ので必ず caption 宛になる。
+        let cap = caption(2, NodeKind::TableCaption, 1, "Table", "2", "Table 2: Results.");
+        let para = node(5, NodeKind::Paragraph, 2, "Accuracy is summarized in Table 2.");
+        let edges = resolve_relations(&[cap, para], RefStrategy::Pdf);
+        let e = find(&edges, 5, RelationType::RefersToTable, 2).expect("ref→table_caption");
+        assert_eq!(meta_of(e)["resolved_via"], "caption");
+    }
+
+    #[test]
+    fn pdf_fig_abbreviation_forms_are_matched() {
+        let fig = figure(4, 1, Some("3"));
+        for text in [
+            "See Fig. 3 above.",
+            "See Fig 3 above.",
+            "See Fig.3 above.",
+            "See (Figure 3) above.",
+            "As shown in Figure 3, ...",
+        ] {
+            let para = node(5, NodeKind::Paragraph, 2, text);
+            let edges = resolve_relations(&[fig.clone(), para], RefStrategy::Pdf);
+            assert!(
+                find(&edges, 5, RelationType::RefersToFigure, 4).is_some(),
+                "{text} から図参照が取れること"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_appendix_figure_number_resolves() {
+        let fig = figure(4, 1, Some("A.1"));
+        let para = node(5, NodeKind::Paragraph, 2, "See Figure A.1 in the appendix.");
+        let edges = resolve_relations(&[fig, para], RefStrategy::Pdf);
+        assert!(find(&edges, 5, RelationType::RefersToFigure, 4).is_some());
+    }
+
+    #[test]
+    fn pdf_plural_and_range_figure_refs_are_not_matched() {
+        let fig3 = figure(4, 1, Some("3"));
+        let fig4 = figure(6, 2, Some("4"));
+        // 複数形・範囲は語彙に無いので拾わない（先頭 1 個だけ張ると部分的な参照集合を
+        // 完全なものとして下流に見せることになる）。
+        let para = node(5, NodeKind::Paragraph, 3, "Compare Figures 3 and 4, and Figs. 3-4.");
+        let edges = resolve_relations(&[fig3, fig4, para], RefStrategy::Pdf);
+        assert!(edges.is_empty(), "複数形・範囲参照は張らない: {edges:?}");
+    }
+
+    #[test]
+    fn pdf_all_caps_and_lowercase_float_refs_are_not_matched() {
+        let fig = figure(4, 1, Some("3"));
+        let para = node(5, NodeKind::Paragraph, 2, "See FIG. 3 and fig. 3 and figure 3.");
+        let edges = resolve_relations(&[fig, para], RefStrategy::Pdf);
+        assert!(edges.is_empty(), "大文字始まり以外は拾わない: {edges:?}");
+    }
+
+    #[test]
+    fn pdf_duplicate_figure_numbers_are_ambiguous_and_skipped() {
+        // 同一版に同じ図番号が複数（実測 45 件）。先勝ちにせず索引ごと落とす（§16）。
+        let a = figure(4, 1, Some("3"));
+        let b = figure(6, 2, Some("3"));
+        let para = node(5, NodeKind::Paragraph, 3, "See Figure 3.");
+        let edges = resolve_relations(&[a, b, para], RefStrategy::Pdf);
+        assert!(edges.is_empty(), "曖昧な番号には辺を張らない: {edges:?}");
+    }
+
+    #[test]
+    fn pdf_caption_does_not_refer_to_its_own_figure() {
+        let cap = caption(2, NodeKind::FigureCaption, 1, "Figure", "3", "Figure 3: Overview.");
+        let fig = figure(4, 2, Some("3"));
+        let edges = resolve_relations(&[cap, fig], RefStrategy::Pdf);
+        assert!(edges.is_empty(), "caption の自己ラベルは冗長辺にしない: {edges:?}");
+    }
+
+    #[test]
+    fn pdf_caption_leading_self_label_is_skipped_without_number_match() {
+        // detect_caption はラベルを通したが番号を取れなかった caption（caption_number = None）。
+        // 番号一致ガードは効かないので先頭位置で落とす。
+        let mut cap = node(2, NodeKind::FigureCaption, 1, "Figure 3 Overview of the system.");
+        cap.caption_label = Some("Figure".to_string());
+        let fig = figure(4, 2, Some("3"));
+        let edges = resolve_relations(&[cap, fig], RefStrategy::Pdf);
+        assert!(edges.is_empty(), "先頭の自己ラベルは番号不明でも落とす: {edges:?}");
+    }
+
+    #[test]
+    fn pdf_caption_still_refers_to_other_figures() {
+        let cap = caption(
+            2,
+            NodeKind::FigureCaption,
+            1,
+            "Figure",
+            "5",
+            "Figure 5: Compared with Figure 3, the error is halved.",
+        );
+        let fig3 = figure(4, 2, Some("3"));
+        let fig5 = figure(6, 3, Some("5"));
+        let edges = resolve_relations(&[cap, fig3, fig5], RefStrategy::Pdf);
+        assert!(
+            find(&edges, 2, RelationType::RefersToFigure, 4).is_some(),
+            "他図への参照は残す"
+        );
+        assert!(
+            find(&edges, 2, RelationType::RefersToFigure, 6).is_none(),
+            "自図への参照は落とす"
+        );
+    }
+
+    #[test]
+    fn pdf_algorithm_caption_is_not_a_figure_target_but_can_reference_one() {
+        // "Algorithm 2" は kind=figure_caption だが図番号ではない（8a のペアリングも除外する）。
+        let algo = caption(
+            2,
+            NodeKind::FigureCaption,
+            1,
+            "Algorithm",
+            "2",
+            "Algorithm 2: Training loop. See Figure 2 for the architecture.",
+        );
+        let fig = figure(4, 2, Some("2"));
+        let edges = resolve_relations(&[algo, fig], RefStrategy::Pdf);
+        // Algorithm caption は figure 索引に載らない（載ると番号 2 が曖昧になり辺が消える）。
+        let e = find(&edges, 2, RelationType::RefersToFigure, 4)
+            .expect("Algorithm caption からの図参照は張る");
+        assert_eq!(meta_of(e)["resolved_via"], "node");
+    }
+
+    #[test]
+    fn pdf_float_ref_metadata_carries_raw_and_number() {
+        let fig = figure(4, 1, Some("3"));
+        let para = node(5, NodeKind::Paragraph, 2, "See Fig. 3 for details.");
+        let edges = resolve_relations(&[fig, para], RefStrategy::Pdf);
+        let m = meta_of(find(&edges, 5, RelationType::RefersToFigure, 4).unwrap());
+        assert_eq!(m["ref"], "Fig. 3");
+        assert_eq!(m["number"], "3");
+    }
+
+    #[test]
+    fn tex_strategy_ignores_pdf_style_figure_text() {
+        // TeX 経路は \ref 一致のみ。本文の "Figure 3" は拾わない（挙動は完全に不変）。
+        let fig = figure(4, 1, Some("3"));
+        let para = node(5, NodeKind::Paragraph, 2, "See Figure 3 and Table 2.");
+        let edges = resolve_relations(&[fig, para], RefStrategy::Tex);
+        assert!(edges.is_empty(), "TeX 側は文字列走査しない: {edges:?}");
     }
 }

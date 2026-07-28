@@ -517,10 +517,12 @@ async fn insert_pdf_version_tx(
                 equation_label: sblock.equation_label.clone(),
                 theorem_number: sblock.theorem_number.clone(),
                 cite_key: None,
+                caption_label: sblock.caption_label.clone(),
+                caption_number: sblock.caption_number.clone(),
             });
             reading_index += 1;
             if sblock.kind == NodeKind::FigureCaption
-                && matches!(sblock.caption_label.as_deref(), Some("Figure") | Some("Fig"))
+                && structure::is_figure_caption_label(sblock.caption_label.as_deref())
             {
                 page_captions.push((
                     block_node_id,
@@ -651,6 +653,21 @@ async fn insert_pdf_version_tx(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+                // 参照グラフ用ビュー（Phase 8d-7）。本文の "Figure 3" が指す**実体**の
+                // ターゲットになる。plain_text は無いのでこの行から参照が出ることはない。
+                graph_nodes.push(graph::GraphNode {
+                    id: figure_node_id,
+                    kind: NodeKind::Figure,
+                    reading_index,
+                    plain_text: String::new(),
+                    labels: Vec::new(),
+                    equation_label: None,
+                    theorem_number: None,
+                    cite_key: None,
+                    caption_label: None,
+                    caption_number: figure_number.map(|s| s.to_string()),
+                });
+                reading_index += 1;
                 source_fragments::insert_fragment(
                     &mut *tx,
                     &NewSourceFragment {
@@ -896,6 +913,9 @@ async fn build_tex_version(
             equation_label: block.equation_label.clone(),
             theorem_number: None,
             cite_key: block.cite_key.clone(),
+            // TeX は caption のラベル語も float 番号（コンパイル時に決まる）も持たない。
+            caption_label: None,
+            caption_number: None,
         });
         symbol_nodes.push(symbols::SymbolNode {
             id: node_id,
@@ -2399,6 +2419,119 @@ mod tests {
         assert!(doc.nodes.iter().find(|n| n.kind == "document").unwrap().math.is_none());
     }
 
+    /// Phase 8d-7: PDF 本文の "Figure 3" が図表番号と照合され、`node_relations` に永続化されて
+    /// read 面（`LcirDocument.relations`）まで出ること。純関数側（`graph.rs`）で解決規則は
+    /// 押さえてあるので、ここは **DB 経路の配線**（figure ノードが索引に載る / metadata が
+    /// 往復する / caption の自己言及が辺にならない）を守るのが役目。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn insert_relations_persists_pdf_figure_reference(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let vid = document_versions::insert_version(
+            &pool,
+            &NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck",
+                schema_version: document_ir::schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: document_ir::schema::EXTRACTOR_NAME,
+                extractor_version: document_ir::schema::EXTRACTOR_VERSION,
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let new_node = |kind: NodeKind, ordinal: i64, text: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                document_nodes::insert_node(
+                    &pool,
+                    &NewDocumentNode {
+                        document_version_id: vid,
+                        parent_id: None,
+                        node_kind: kind.as_str(),
+                        ordinal,
+                        plain_text: text,
+                        language: None,
+                        confidence: Some(0.6),
+                        origin: Some("layout_model"),
+                        payload_json: None,
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let cap = new_node(NodeKind::FigureCaption, 0, Some("Figure 3: Overview.")).await;
+        let fig = new_node(NodeKind::Figure, 1, None).await;
+        let para = new_node(NodeKind::Paragraph, 2, Some("The pipeline is shown in Figure 3.")).await;
+
+        let graph_nodes = vec![
+            graph::GraphNode {
+                id: cap,
+                kind: NodeKind::FigureCaption,
+                reading_index: 0,
+                plain_text: "Figure 3: Overview.".to_string(),
+                labels: Vec::new(),
+                equation_label: None,
+                theorem_number: None,
+                cite_key: None,
+                caption_label: Some("Figure".to_string()),
+                caption_number: Some("3".to_string()),
+            },
+            graph::GraphNode {
+                id: fig,
+                kind: NodeKind::Figure,
+                reading_index: 1,
+                plain_text: String::new(),
+                labels: Vec::new(),
+                equation_label: None,
+                theorem_number: None,
+                cite_key: None,
+                caption_label: None,
+                caption_number: Some("3".to_string()),
+            },
+            graph::GraphNode {
+                id: para,
+                kind: NodeKind::Paragraph,
+                reading_index: 2,
+                plain_text: "The pipeline is shown in Figure 3.".to_string(),
+                labels: Vec::new(),
+                equation_label: None,
+                theorem_number: None,
+                cite_key: None,
+                caption_label: None,
+                caption_number: None,
+            },
+        ];
+        let mut tx = pool.begin().await.unwrap();
+        insert_relations_for_version(&mut tx, vid, &graph_nodes, graph::RefStrategy::Pdf)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let doc = load_lcir_document(&pool, att).await.unwrap().unwrap();
+        let figure_refs: Vec<_> = doc
+            .relations
+            .iter()
+            .filter(|r| r.relation_type == "refers_to_figure")
+            .collect();
+        assert_eq!(figure_refs.len(), 1, "本文からの図参照 1 本だけ: {figure_refs:?}");
+        let e = figure_refs[0];
+        assert_eq!(e.from_node_id, para);
+        assert_eq!(e.to_node_id, fig, "番号を持つ figure ノードに解決する");
+        assert_eq!(e.origin.as_deref(), Some("layout_model"));
+        assert_eq!(
+            e.metadata.as_ref().and_then(|m| m.get("resolved_via")),
+            Some(&serde_json::Value::from("node")),
+            "metadata が DB を往復する"
+        );
+    }
+
     /// 手動 pdfium 実機確認: 実 DB コピー + 実 PDF に対して build → load → 冪等 build を走らせる。
     /// native lib（`src-tauri/pdfium/libpdfium.dylib`）が要るため `#[ignore]`。env 未設定なら skip。
     ///
@@ -2589,6 +2722,35 @@ mod tests {
                 r.relation_type, r.from_node_id, r.to_node_id, r.confidence, r.origin, r.metadata,
             );
         }
+        // Phase 8d-7: 図表参照の解決先の内訳（実体 figure/table か caption fallback か）。
+        // 期待は caption 優勢（figure ノードが番号を持つのは caption とペアリングできたときだけ）。
+        // `from` が figure_caption で `to` がその図、という組が出ていたら自己言及の抑止漏れ。
+        let kind_by_id: std::collections::HashMap<i64, &str> = doc
+            .nodes
+            .iter()
+            .map(|n| (n.id, n.kind.as_str()))
+            .collect();
+        let mut via_counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for r in doc.relations.iter().filter(|r| {
+            matches!(
+                r.relation_type.as_str(),
+                "refers_to_figure" | "refers_to_table"
+            )
+        }) {
+            let via = r
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("resolved_via"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let from_kind = kind_by_id.get(&r.from_node_id).copied().unwrap_or("?");
+            let to_kind = kind_by_id.get(&r.to_node_id).copied().unwrap_or("?");
+            *via_counts
+                .entry(format!("{from_kind}→{via}/{to_kind}"))
+                .or_insert(0) += 1;
+        }
+        eprintln!("  [8d-7] float refs by from_kind→resolved_via/to_kind = {via_counts:?}");
         let rel_rows: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM node_relations WHERE document_version_id = ?")
                 .bind(doc.version_id)

@@ -20,9 +20,13 @@ pub enum RelationType {
     Cites,
     /// 本文 → 数式（`\eqref`/`\ref` の数式 label、または PDF "Eq. (2.1)" → 数式番号）。
     RefersToEquation,
-    /// 本文 → 図（TeX `\ref{fig:..}`）。
+    /// 本文 → 図（TeX `\ref{fig:..}`、または PDF "Figure 3"/"Fig. 3" → 図番号）。
+    /// PDF は図領域が検出できていれば `figure` ノード、できなければ `figure_caption` ノードを
+    /// 指す（`metadata.resolved_via` が `"node"`/`"caption"` を区別する）。TeX は figure ノードを
+    /// 作らないので常に caption 宛。
     RefersToFigure,
-    /// 本文 → 表（TeX `\ref{tab:..}`）。
+    /// 本文 → 表（TeX `\ref{tab:..}`、または PDF "Table 2" → 表番号）。
+    /// PDF 側に `table` ノードは無いので（Phase 8d-6 未実装）常に `table_caption` 宛。
     RefersToTable,
     /// 本文 → 定理系ノード（TeX `\ref{thm:..}`、または PDF "Theorem 2.3" → 定理番号）。
     RefersToTheorem,
