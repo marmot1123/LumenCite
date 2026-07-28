@@ -78,7 +78,11 @@ impl Default for ContextOptions {
     fn default() -> Self {
         Self {
             max_before: 2,
-            max_continuation: 8,
+            // 実ライブラリ実測（latest pdfium 版・定理系 1,375 件の「次の構造境界まで」の
+            // ブロック数）: 8 で 78.3% / 12 で 84.7% / **16 で 88.9%** / 24 で 92.3%。
+            // 16 以降は伸びが鈍る。数式の続きは 1 ブロックが数十文字と短いので、実際の
+            // 大きさは `max_continuation_chars` の方で抑える。
+            max_continuation: 16,
             max_continuation_chars: 6000,
             max_related: 12,
             max_premises: 12,
@@ -364,20 +368,22 @@ fn is_structural_boundary(kind: &str) -> bool {
     )
 }
 
-/// 見出し系（`section_path` を組む対象）。
+/// 見出し系（`section_path` を組む対象）の階層レベル。
+///
+/// **`heading_level` を宣言しているノードだけ**を見出しとして扱う。実ライブラリでは
+/// `section`（1,758 件）と `subsection`（1,948 件）は必ず宣言している一方、`heading` は
+/// 2,676 件が宣言なしで、その中身は数式から切り出された断片（`"bound"` / `"K nT nT"` 等）が
+/// 多い。レベルなし `heading` を既定値で拾うと、そういう断片を「この定理を囲む節」として
+/// LLM に見せることになる（誤検出より欠損・§16）。`abstract`/`front_matter` は宣言を
+/// 持たないので対象外 — 前書きは後続ノードを「囲んで」いない。
 fn heading_level_of(n: &LcirNode) -> Option<i64> {
-    let explicit = n
-        .payload
+    if !matches!(n.kind.as_str(), "section" | "subsection" | "heading") {
+        return None;
+    }
+    n.payload
         .as_ref()
         .and_then(|p| p.get("heading_level"))
-        .and_then(|v| v.as_i64());
-    match n.kind.as_str() {
-        "abstract" | "front_matter" => Some(explicit.unwrap_or(1)),
-        "section" => Some(explicit.unwrap_or(1)),
-        "subsection" => Some(explicit.unwrap_or(2)),
-        "heading" => Some(explicit.unwrap_or(3)),
-        _ => None,
-    }
+        .and_then(|v| v.as_i64())
 }
 
 /// 図・表の**実体**ノード（領域・アセット・alt text の持ち主）。
@@ -1124,6 +1130,28 @@ mod tests {
         );
         let c = build_node_context(&d, 4, &ContextOptions::default()).unwrap();
         assert_eq!(ids(&c.section_path), vec![2, 3], "root 側から順");
+    }
+
+    /// `heading_level` を宣言していない `heading` は見出しとして扱わない。実データでは
+    /// 数式から切り出された断片（"bound" 等）が `heading` に落ちており、拾うと
+    /// 「この定理を囲む節」として嘘を見せることになる。
+    #[test]
+    fn section_path_ignores_headings_without_a_declared_level() {
+        let d = doc(
+            vec![
+                node(1, "document", 0, None, None),
+                with_payload(
+                    node(2, "section", 0, Some(1), Some("2 Setup")),
+                    serde_json::json!({"heading_level": 1}),
+                ),
+                node(3, "heading", 1, Some(1), Some("bound")),
+                node(4, "abstract", 2, Some(1), Some("We study ...")),
+                node(5, "paragraph", 3, Some(1), Some("We write ...")),
+            ],
+            Vec::new(),
+        );
+        let c = build_node_context(&d, 5, &ContextOptions::default()).unwrap();
+        assert_eq!(ids(&c.section_path), vec![2], "レベル宣言のある section だけ");
     }
 
     #[test]

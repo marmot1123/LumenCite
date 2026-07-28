@@ -279,7 +279,7 @@ struct NodeContextArgs {
     #[arg(long, default_value_t = 2)]
     before: usize,
     /// Blocks after the focus, up to the next structural boundary.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     continuation: usize,
     /// Max entries per relation list.
     #[arg(long, default_value_t = 12)]

@@ -432,7 +432,7 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             "properties": {
                 "node_id": { "type": "integer", "description": "Block id to center the bundle on (from search_document_nodes / get_document_blocks / get_node_relations / get_figures)." },
                 "max_before": { "type": "integer", "description": "Blocks of lead-in before the focus (default 2)." },
-                "max_continuation": { "type": "integer", "description": "Blocks after the focus, up to the next structural boundary (default 8)." },
+                "max_continuation": { "type": "integer", "description": "Blocks after the focus, up to the next structural boundary (default 16)." },
                 "max_continuation_chars": { "type": "integer", "description": "Character budget over the continuation (default 6000)." },
                 "max_related": { "type": "integer", "description": "Max entries per relation list (default 12)." },
                 "max_premises": { "type": "integer", "description": "Max premise definitions (default 12)." }
@@ -4210,6 +4210,130 @@ mod tests {
                 f["caption"]["text"],
                 f["assets"],
             );
+        }
+
+        // Phase 8d-7: 図表参照の解決先の内訳（実体 / caption）。再構築後の版でのみ非空。
+        let mut float_breakdown: std::collections::BTreeMap<String, i64> = Default::default();
+        for r in rels["relations"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            let ty = r["relation_type"].as_str().unwrap_or("");
+            if ty != "refers_to_figure" && ty != "refers_to_table" {
+                continue;
+            }
+            let via = r["metadata"]["resolved_via"].as_str().unwrap_or("(none)");
+            let to_kind = r["to"]["kind"].as_str().unwrap_or("?");
+            *float_breakdown
+                .entry(format!("{ty} via={via} -> {to_kind}"))
+                .or_default() += 1;
+        }
+        eprintln!("\n=== [8d-7] float refs by resolved_via -> to_kind ===");
+        for (k, v) in &float_breakdown {
+            eprintln!("  {k}: {v}");
+        }
+
+        // Phase 10a: 定理系ノードを 1 つ選んで文脈バンドルを組む（無ければ最長の段落）。
+        let blocks = tool_json(
+            &call_tool(
+                &pool,
+                "get_document_blocks",
+                json!({ "entry_id": entry_id, "kinds": ["theorem", "lemma", "proposition"], "max_chars": 4000 }),
+            )
+            .await,
+        );
+        let focus_node = rels["relations"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["relation_type"] == "proves"))
+            .and_then(|r| r["to"]["node_id"].as_i64())
+            .or_else(|| {
+                blocks["blocks"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|b| b["node_id"].as_i64())
+            });
+        match focus_node {
+            None => eprintln!("\n=== get_node_context: skip（定理系ノードも proves 辺も無い）"),
+            Some(nid) => {
+                let ctx =
+                    tool_json(&call_tool(&pool, "get_node_context", json!({ "node_id": nid })).await);
+                eprintln!(
+                    "\n=== get_node_context node_id={nid} (source={}, focus.kind={}) ===",
+                    ctx["source"], ctx["focus"]["kind"]
+                );
+                eprintln!(
+                    "  focus: page={} bbox={} chars={} identifiers={}",
+                    ctx["focus"]["page"],
+                    ctx["focus"]["bbox"],
+                    ctx["focus"]["text"].as_str().map(|s| s.chars().count()).unwrap_or(0),
+                    ctx["focus"]["identifiers"],
+                );
+                eprintln!("  focus.text: {}", ctx["focus"]["text"]);
+                let pages: Vec<i64> = ctx["continuation"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|n| n["page"].as_i64()).collect())
+                    .unwrap_or_default();
+                eprintln!(
+                    "  continuation: {} blocks, pages={:?}{}",
+                    ctx["continuation"].as_array().map(|a| a.len()).unwrap_or(0),
+                    pages,
+                    if pages.first() != pages.last() {
+                        "  ← ページをまたいで連結"
+                    } else {
+                        ""
+                    }
+                );
+                for n in ctx["continuation"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                    eprintln!(
+                        "    [{}] p.{} {}",
+                        n["kind"],
+                        n["page"],
+                        n["text"].as_str().unwrap_or("").chars().take(90).collect::<String>()
+                    );
+                }
+                eprintln!(
+                    "  section_path={:?}",
+                    ctx["section_path"]
+                        .as_array()
+                        .map(|a| a
+                            .iter()
+                            .map(|n| n["text"].as_str().unwrap_or("").chars().take(40).collect::<String>())
+                            .collect::<Vec<_>>())
+                        .unwrap_or_default()
+                );
+                for key in ["proofs", "proves", "premises", "equations", "figures", "citations", "references"] {
+                    eprintln!(
+                        "  {key}: {}",
+                        ctx[key].as_array().map(|a| a.len()).unwrap_or(0)
+                    );
+                }
+                for p in ctx["premises"].as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().take(8) {
+                    eprintln!(
+                        "    [premise via={}] {} kind={} desc={}",
+                        p["via"],
+                        p["symbol"]["surface_form"],
+                        p["node"]["kind"],
+                        p["symbol"]["description"],
+                    );
+                }
+                for f in ctx["figures"].as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().take(8) {
+                    eprintln!(
+                        "    [float {}] via={} node={} figure={} caption={}",
+                        f["relation_type"],
+                        f["resolved_via"],
+                        f["node"]["kind"],
+                        f["figure"]["node_id"],
+                        f["caption"]["node_id"],
+                    );
+                }
+                eprintln!(
+                    "  notes={:?}",
+                    ctx["notes"]
+                        .as_array()
+                        .map(|a| a.iter().map(|n| n["code"].as_str().unwrap_or("")).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                );
+                assert_eq!(ctx["found"], true);
+                assert_eq!(ctx["node_id"], nid);
+                assert_eq!(ctx["entry_id"], entry_id);
+            }
         }
 
         assert_eq!(structure["has_lcir"], true);
