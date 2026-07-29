@@ -3124,6 +3124,66 @@ mod tests {
                 assert_eq!(ctx["found"], true);
                 assert_eq!(ctx["node_id"], nid);
                 assert_eq!(ctx["entry_id"], entry_id);
+
+                // ── Phase 10b: チャット経路で同じものが引けること + 根拠参照 ──
+                // MCP と同じ定義・同じ実行を共有しているかを実データで確かめる。
+                let chat_ctx = crate::llm::tools::ToolContext {
+                    pool: &pool,
+                    session_id: 0,
+                    scope_mode: "all",
+                    scope_entry_ids: &[],
+                    mcp: None,
+                    app_data_dir: &build_root,
+                };
+                let chat_call = crate::llm::ToolCallSpec {
+                    call_id: "smoke".to_string(),
+                    tool_name: "get_node_context".to_string(),
+                    arguments: json!({ "node_id": nid }),
+                };
+                let chat_text = crate::llm::tools::execute_tool(&chat_ctx, &chat_call)
+                    .await
+                    .expect("chat path must route get_node_context");
+                let chat_ctx_json: Value = serde_json::from_str(&chat_text).unwrap();
+                assert_eq!(
+                    chat_ctx_json, ctx,
+                    "chat and MCP must return byte-identical results for the same node"
+                );
+
+                let refs = crate::llm::tools::document::provenance_refs("get_node_context", &chat_text);
+                eprintln!("[phase 10b] get_node_context refs={:?}", refs);
+
+                // 各 ref-bearing ツールの実出力から根拠が取れるか。
+                for (tool, args) in [
+                    ("search_document_nodes", json!({ "query": "theorem", "max_results": 5 })),
+                    ("get_document_blocks", json!({ "entry_id": entry_id, "source": "pdf", "max_chars": 3000 })),
+                    ("get_figures", json!({ "entry_id": entry_id })),
+                ] {
+                    let call = crate::llm::ToolCallSpec {
+                        call_id: "smoke".to_string(),
+                        tool_name: tool.to_string(),
+                        arguments: args,
+                    };
+                    let out = crate::llm::tools::execute_tool(&chat_ctx, &call).await.unwrap();
+                    let r = crate::llm::tools::document::provenance_refs(tool, &out);
+                    eprintln!(
+                        "[phase 10b] {tool}: refs={} -> {:?}",
+                        r.len(),
+                        r.iter().map(|x| format!("{}:{} p{}", x.node_id, x.kind, x.page)).collect::<Vec<_>>()
+                    );
+                    // 根拠を出すなら必ず page を持つ（飛び先の無いチップを作らない）。
+                    assert!(r.iter().all(|x| x.page >= 1), "{tool}: every ref must carry a page");
+                    assert!(r.len() <= 5, "{tool}: refs are capped");
+                }
+
+                // チャットに出すツール一覧（この DB は LCIR 構築済みなので 8 種が出る）。
+                let readable = crate::ingestion::lcir_readable(&pool).await;
+                let shown: Vec<String> = crate::llm::tools::all_tool_specs(readable)
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+                eprintln!("[phase 10b] lcir_readable={readable} tools={}", shown.len());
+                assert!(readable, "the smoke DB has built LCIR, so the tools must be shown");
+                assert!(shown.contains(&"get_node_context".to_string()));
             }
         }
 
