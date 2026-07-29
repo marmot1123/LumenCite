@@ -70,6 +70,11 @@ pub async fn unindex_attachment(pool: &SqlitePool, attachment_id: i64) -> Result
 /// UI（`search_lcir_nodes`）は従来どおり `None`、LLM ツール経路は必ず有限値を渡すこと —
 /// チャットではツール結果が会話履歴に残り以後のターンで毎回再送されるため、
 /// 1 回の巨大な応答がセッション全体を壊す（Phase 10b）。
+///
+/// `entry_ids` は対象エントリの絞り込み（`None` で全件）。**`limit` を使うなら絞り込みは
+/// 必ずこちらで渡すこと** — 取得後に Rust 側で落とすと、`LIMIT` がライブラリ全体の上位 N を
+/// 先に取ってしまい、対象エントリのブロックが全体の上位に入らなければ 0 件になる
+/// （「選択した論文にその語は無い」という嘘の答えになる）。空スライスは 0 件を返す。
 pub async fn search_nodes(
     pool: &SqlitePool,
     query: &str,
@@ -77,9 +82,14 @@ pub async fn search_nodes(
     tag_id: Option<i64>,
     view: Option<&str>,
     limit: Option<i64>,
+    entry_ids: Option<&[i64]>,
 ) -> Result<Vec<NodeFtsHit>, sqlx::Error> {
     let tokens: Vec<&str> = query.split_whitespace().collect();
     if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 対象が空 ＝ 何にも当たらない（`IN ()` は SQLite の構文エラー）。
+    if entry_ids.is_some_and(|ids| ids.is_empty()) {
         return Ok(Vec::new());
     }
 
@@ -126,6 +136,11 @@ pub async fn search_nodes(
     if tag_id.is_some() {
         sql.push_str(" AND a.entry_id IN (SELECT entry_id FROM entry_tags WHERE tag_id = ?)");
     }
+    if let Some(ids) = entry_ids {
+        sql.push_str(" AND a.entry_id IN (");
+        sql.push_str(&vec!["?"; ids.len()].join(","));
+        sql.push(')');
+    }
     if use_like {
         sql.push_str(" ORDER BY dnf.attachment_id, dnf.page, dnf.node_id");
     } else {
@@ -149,6 +164,10 @@ pub async fn search_nodes(
     }
     if let Some(tid) = tag_id {
         q = q.bind(tid);
+    }
+    // bind 順は WHERE に積んだ順（match/like → collection → tag → entry_ids）と一致させる。
+    for id in entry_ids.unwrap_or(&[]) {
+        q = q.bind(*id);
     }
 
     let rows = q.fetch_all(pool).await?;
@@ -282,7 +301,7 @@ mod tests {
         .await
         .unwrap();
 
-        let hits = search_nodes(&pool, "transformer", None, None, None, None)
+        let hits = search_nodes(&pool, "transformer", None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -323,12 +342,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(search_nodes(&pool, "obsolete", None, None, None, None)
+        assert!(search_nodes(&pool, "obsolete", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());
         assert_eq!(
-            search_nodes(&pool, "replacement", None, None, None, None)
+            search_nodes(&pool, "replacement", None, None, None, None, None)
                 .await
                 .unwrap()
                 .len(),
@@ -352,7 +371,7 @@ mod tests {
         .await
         .unwrap();
         unindex_attachment(&pool, att).await.unwrap();
-        assert!(search_nodes(&pool, "needle", None, None, None, None)
+        assert!(search_nodes(&pool, "needle", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());
@@ -383,7 +402,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            search_nodes(&pool, "深層学習", None, None, None, None)
+            search_nodes(&pool, "深層学習", None, None, None, None, None)
                 .await
                 .unwrap()
                 .len(),
@@ -391,14 +410,14 @@ mod tests {
         );
         // 短いトークン（<3 文字）→ LIKE。
         assert_eq!(
-            search_nodes(&pool, "AI", None, None, None, None).await.unwrap().len(),
+            search_nodes(&pool, "AI", None, None, None, None, None).await.unwrap().len(),
             1
         );
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn empty_query_returns_empty(pool: SqlitePool) {
-        assert!(search_nodes(&pool, "   ", None, None, None, None)
+        assert!(search_nodes(&pool, "   ", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());

@@ -165,8 +165,9 @@ pub fn specs() -> Vec<ToolSpec> {
                 text layer with layout_model structure — call get_node_context on a node_id when you \
                 need per-node origin and confidence. On an empty result the response adds \
                 `index_built`: when it is false nothing has been indexed yet, so use fulltext_search \
-                instead of concluding the library has no match. `scope_filtered: true` means hits \
-                were dropped because they fell outside the caller's current selection.".to_string(),
+                instead of concluding the library has no match. `scope_filtered: true` means the search was \
+                restricted to the entries the caller has selected, so an empty result says nothing \
+                about the rest of the library.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -843,6 +844,13 @@ async fn exec_search_document_nodes(ctx: &ToolContext<'_>, args: &Value) -> Resu
         .unwrap_or(DEFAULT_MAX_SEARCH_RESULTS)
         .clamp(1, MAX_SEARCH_RESULTS);
 
+    // スコープ（CR-024）は **SQL に押し込む**。取得後に Rust 側で落とすと、`LIMIT` が
+    // ライブラリ全体の上位 N を先に取ってしまい、選択したエントリのブロックが全体の
+    // 上位に入らなければ 0 件になる ＝「選択した論文にその語は無い」という嘘の答えになる
+    // （`fulltext_search` が上限なしで後段フィルタなのは、上限が無いから成立している）。
+    let scoped = ctx.scope_mode == "entries";
+    let scope_ids = scoped.then_some(ctx.scope_entry_ids);
+
     // 1 件多く引いて「まだある」を検出する（COUNT の 2 回引きを避ける）。
     let mut hits = crate::db::document_nodes_fts::search_nodes(
         pool,
@@ -851,18 +859,11 @@ async fn exec_search_document_nodes(ctx: &ToolContext<'_>, args: &Value) -> Resu
         tag_id,
         None,
         Some(max_results + 1),
+        scope_ids,
     )
     .await?;
     let truncated = hits.len() as i64 > max_results;
     hits.truncate(max_results as usize);
-
-    // スコープ（CR-024）。SQL ではなく取得後に落とすので、絞られたことを応答に明示する
-    // ——「ライブラリに無い」と「選択範囲に無い」は LLM にとって全く違う事実。
-    let before = hits.len();
-    if ctx.scope_mode == "entries" {
-        hits.retain(|h| ctx.scope_entry_ids.contains(&h.entry.id));
-    }
-    let scope_filtered = hits.len() < before;
 
     let results: Vec<Value> = hits
         .iter()
@@ -884,10 +885,12 @@ async fn exec_search_document_nodes(ctx: &ToolContext<'_>, args: &Value) -> Resu
     let mut obj = serde_json::Map::new();
     obj.insert("count".to_string(), json!(results.len()));
     obj.insert("truncated".to_string(), json!(truncated));
-    if scope_filtered {
+    if scoped {
+        // 「ライブラリに無い」と「選択範囲に無い」は LLM にとって全く違う事実なので、
+        // **絞ったこと自体**を必ず伝える（何件落ちたかではなく、探した範囲の話）。
         obj.insert("scope_filtered".to_string(), json!(true));
     }
-    if results.is_empty() && !scope_filtered {
+    if results.is_empty() && !scoped {
         // 0 件が「一致しない」なのか「索引が無い」なのかを区別できるようにする。
         // node-FTS は PDF 由来 LCIR だけを載せるので、未構築のライブラリでは常に 0 件になる。
         obj.insert(
@@ -1873,6 +1876,54 @@ mod tests {
         let v2: Value = serde_json::from_str(&scoped).unwrap();
         assert_eq!(v2["count"], 1);
         assert_eq!(v2["scope_filtered"], true);
+    }
+
+    /// **上限とスコープの相互作用**（レビューで確定した回帰）。上限を SQL の LIMIT に落とす以上、
+    /// スコープも SQL に押し込まないと「ライブラリ全体の上位 N」を先に取ってしまい、
+    /// 選択したエントリのブロックがそこに入らなければ 0 件になる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scoped_search_is_not_starved_by_the_result_limit(pool: SqlitePool) {
+        // 先に「他人の論文」を沢山作り、最後に自分の 1 本を作る。
+        // node id / attachment id は昇順なので、LIKE フォールバックの並び順
+        // （attachment_id, page, node_id）では自分のヒットが最後尾に来る。
+        for i in 0..6 {
+            entry_with_lcir(&pool, &format!("Theirs {i}"), "収束定理の話").await;
+        }
+        let (mine, my_node) = entry_with_lcir(&pool, "Mine", "収束定理の話").await;
+
+        // 2 文字の CJK トークン → LIKE 経路（bm25 ではなく attachment_id 順）。
+        let ids = vec![mine];
+        let s = try_execute(
+            &ctx_scoped(&pool, &ids),
+            &call("search_document_nodes", json!({ "query": "収束", "max_results": 3 })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(
+            v["count"], 1,
+            "scoped search must find the selected entry even when it ranks below the global limit: {s}"
+        );
+        assert_eq!(v["results"][0]["node_id"], my_node);
+        assert_eq!(v["scope_filtered"], true);
+    }
+
+    /// 空のスコープ（対象 0 件）でも SQL エラーにならず 0 件を返す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn empty_scope_returns_no_hits(pool: SqlitePool) {
+        entry_with_lcir(&pool, "Paper", "convergence theorem").await;
+        let empty: Vec<i64> = Vec::new();
+        let s = try_execute(
+            &ctx_scoped(&pool, &empty),
+            &call("search_document_nodes", json!({ "query": "convergence" })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["scope_filtered"], true);
     }
 
     // ── 応答の大きさ ────────────────────────────────────────────────────────

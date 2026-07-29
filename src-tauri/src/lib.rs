@@ -1169,6 +1169,7 @@ async fn search_lcir_nodes(
         tag_id,
         view.as_deref(),
         None,
+        None,
     )
     .await
     .map_err(|e| e.to_string())

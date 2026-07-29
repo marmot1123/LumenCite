@@ -415,6 +415,10 @@ function PdfPage({ doc, page, scale, focusRect, registerRef }: {
  * 根拠領域の一時強調（Phase 10b）。**永続ハイライトとは別物**なので枠線で描き、
  * 塗りは薄くする。座標変換は `PdfPane` の highlights overlay と同一
  * （LCIR の bbox は既存ハイライトと同じ PDF user space・左下原点・pt）。
+ *
+ * **ページ外を覆うスクリムは使わない** — このオーバーレイはページ要素の子なので、
+ * 巨大な `box-shadow` で外周を暗くすると DOM 順で後ろに来るページの上には乗らず、
+ * 「焦点より前のページだけが暗い」という壊れた見え方になる。枠線と塗りで足りる。
  */
 function FocusOverlay({ viewport, rect }: {
   viewport: PageViewport;
@@ -435,7 +439,6 @@ function FocusOverlay({ viewport, rect }: {
         background: "oklch(0.85 0.15 85 / 0.22)",
         borderRadius: 2,
         pointerEvents: "none",
-        boxShadow: "0 0 0 9999px oklch(0 0 0 / 0.06)",
       }}
     />
   );

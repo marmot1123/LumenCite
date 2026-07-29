@@ -2029,7 +2029,7 @@ mod tests {
         let n = regenerate_node_fts_from_lcir(&pool, att).await.unwrap();
         assert_eq!(n, 1, "block(paragraph) だけ索引・page/line/document は除外");
 
-        let hits = document_nodes_fts::search_nodes(&pool, "transformer", None, None, None, None)
+        let hits = document_nodes_fts::search_nodes(&pool, "transformer", None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -2059,7 +2059,7 @@ mod tests {
 
         let n = regenerate_node_fts_from_lcir(&pool, att).await.unwrap();
         assert_eq!(n, 0);
-        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None, None)
+        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());
@@ -2301,11 +2301,11 @@ mod tests {
 
         let n = regenerate_node_fts_from_lcir(&pool, att).await.unwrap();
         assert_eq!(n, 0, "TeX 版は索引しない");
-        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None, None)
+        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());
-        assert!(document_nodes_fts::search_nodes(&pool, "tex paragraph", None, None, None, None)
+        assert!(document_nodes_fts::search_nodes(&pool, "tex paragraph", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());
