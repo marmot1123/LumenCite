@@ -200,7 +200,7 @@ type ChatStreamEvent =
   | { kind: "session_started"; session_id: number }
   | { kind: "delta"; text: string }                       // 本文が伸びる
   | { kind: "tool_call_proposed"; call_id; tool_name; args_preview: string; needs_approval: boolean }  // カード出現
-  | { kind: "tool_call_executed"; call_id; result_summary: string }  // カード→実行済み
+  | { kind: "tool_call_executed"; call_id; result_summary: string; refs: ToolResultRef[] }  // カード→実行済み（refs = 結果が指す PDF 上の根拠・Phase 10b）
   | { kind: "message_persisted"; message_id; role }
   | { kind: "done" }
   | { kind: "error"; message: string };                   // エラー表示

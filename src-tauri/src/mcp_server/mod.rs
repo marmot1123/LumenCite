@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::llm::tools::{mutate, search, ToolContext, ToolError};
+use crate::llm::tools::{document, mutate, search, ToolContext, ToolError};
 use crate::llm::ToolCallSpec;
 
 /// MCP プロトコルバージョン（クライアント側 `mcp` と揃える）。
@@ -163,293 +163,17 @@ fn tool_specs(write_on: bool) -> Vec<Value> {
             "required": ["citation_keys"]
         }
     }));
-    tools.push(json!({
-        "name": "get_fulltext",
-        "description": "Return the extracted full text of a library entry's indexed PDF, by \
-            entry_id or citation_key. Use this to actually read and summarise a specific paper — \
-            `get_entry` only returns metadata (abstract / notes), which are often empty. Returns \
-            {entry_id, indexed, total_pages, truncated, next_page, text}. If the entry has no \
-            attached/indexed PDF, `indexed` is false and there is no text — say so plainly and do \
-            NOT answer from general knowledge. Long papers are paginated: pass `page_start` (from a \
-            previous `next_page`) to keep reading, or raise `max_chars`.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entry_id": { "type": "integer", "description": "Entry id." },
-                "citation_key": { "type": "string", "description": "Citation key (as in \\cite{}); alternative to entry_id." },
-                "max_chars": { "type": "integer", "description": "Max characters to return this call (default 24000)." },
-                "page_start": { "type": "integer", "description": "1-based PDF page to start from, for continuing a long paper (default 1)." }
-            }
-        }
-    }));
 
-    // LCIR（機械可読中間形式）の read ツール（Phase 3.5）。実験フラグ lcir.enabled で
-    // 構築された論文だけが対象。未構築なら has_lcir=false を返す（get_fulltext に退避可能）。
-    tools.push(json!({
-        "name": "get_document_structure",
-        "description": "Return the logical structure (LCIR) of a paper — its section outline, \
-            block-type counts, and abstract — by entry_id or citation_key. Unlike get_fulltext \
-            (flat page text), this exposes headings/sections with their numbers and reports how \
-            many paragraphs, display equations, captions and bibliography entries were found. Two \
-            representations can coexist per paper: \"tex\" (parsed from the arXiv TeX source — \
-            exact structure, exact LaTeX math, but no page numbers) and \"pdf\" (heuristically \
-            recovered from the PDF text layer — approximate, with pages and bounding boxes). By \
-            default the best available is used (tex over pdf); pass `source` to switch explicitly. \
-            Returns {has_lcir, source, available_sources, page_count (null for tex), block_count, \
-            outline:[{kind, section_number, level, text, page}], counts, abstract}. If has_lcir is \
-            false nothing is built (build it in the app) — fall back to get_fulltext. Then use \
-            get_document_blocks to read the structured text or equations, and \
-            search_document_nodes to locate content.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entry_id": { "type": "integer", "description": "Entry id." },
-                "citation_key": { "type": "string", "description": "Citation key (as in \\cite{}); alternative to entry_id." },
-                "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation: \"tex\" (arXiv TeX source; exact LaTeX) or \"pdf\" (PDF text layer; pages/bbox). Omit for the best available (tex preferred)." }
-            }
-        }
-    }));
-    tools.push(json!({
-        "name": "get_document_blocks",
-        "description": "Read a paper's content as structure-tagged blocks (LCIR) in reading order — \
-            paragraphs, headings, captions and display equations — by entry_id or citation_key. \
-            Better than get_fulltext for structured reading. Filter with `kinds` (e.g. \
-            [\"display_math\"] to list just the equations, or [\"section\",\"paragraph\"] to read \
-            prose). Math depends on the representation: blocks served from the arXiv TeX source \
-            (source \"tex\", preferred when built) carry the EXACT LaTeX in `latex`; blocks from \
-            the PDF (source \"pdf\") are surface-only Unicode text — approximate, no LaTeX. Pass \
-            `source` to switch explicitly; `page` implies the pdf representation (tex has no \
-            pages), so with `page` and no `source` the pdf version is used automatically. Block \
-            indices are only valid within one source. Long documents are paginated: pass \
-            block_start (from a previous next_block) or raise max_chars. Returns {has_lcir, \
-            source, available_sources, total_blocks, returned, block_start, truncated, next_block, \
-            blocks:[{index, node_id, kind, page, section_number?, equation_label?, latex?, text}]}. \
-            Pass a block's node_id to get_node_context to read it with its surrounding context.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entry_id": { "type": "integer", "description": "Entry id." },
-                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
-                "kinds": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Restrict to these block kinds (e.g. [\"display_math\"], [\"section\",\"paragraph\"]). Omit for all content blocks."
-                },
-                "page": { "type": "integer", "description": "Restrict to a single 1-based PDF page (pdf representation only; forces source \"pdf\" when source is omitted)." },
-                "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation: \"tex\" (exact LaTeX math, no pages) or \"pdf\" (pages/bbox, surface-only math). Omit for the best available (tex preferred)." },
-                "block_start": { "type": "integer", "description": "0-based index into the (filtered) block list to start from, for continuing a long read (default 0)." },
-                "max_chars": { "type": "integer", "description": "Max characters of block text to return this call (default 24000)." }
-            }
-        }
-    }));
-    tools.push(json!({
-        "name": "search_document_nodes",
-        "description": "Search the library at BLOCK granularity (paragraph / heading / caption / \
-            display equation) using the LCIR node index — finer than fulltext_search, which is page \
-            granularity. Each hit reports the entry, node_kind, page, a snippet, and the PDF \
-            bounding box (bbox = [x, y, width, height] in PDF points, bottom-left origin) so the \
-            exact block can be located/highlighted. Use this to pinpoint where a concept, term or \
-            equation appears across papers. Only covers papers whose PDF-derived LCIR has been \
-            built (TeX-derived text is not in this index; read it via get_document_blocks). Hit \
-            pages refer to the pdf representation — follow up with get_document_blocks(page=...) \
-            which uses the pdf source automatically. Returns {count, results:[{entry_id, title, \
-            year, node_kind, page, snippet, bbox}]}. Short or CJK queries fall back to substring \
-            matching.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Search query (space-separated terms are ANDed)." },
-                "collection_id": { "type": "integer", "description": "Restrict to a collection id." },
-                "tag_id": { "type": "integer", "description": "Restrict to a tag id." }
-            },
-            "required": ["query"]
-        }
-    }));
-    tools.push(json!({
-        "name": "get_node_relations",
-        "description": "Return the cross-reference graph (LCIR) of a paper — typed directed edges \
-            between its blocks — by entry_id or citation_key. Edges are resolved from the source: \
-            \"tex\" (from \\ref/\\eqref/\\cite matched against \\label and \\bibitem keys — high \
-            confidence, origin tex_source) or \"pdf\" (from \"Theorem 2.3\"/\"Eq. (2.1)\"/\"Figure \
-            3\"/\"Fig. 3\"/\"Table 2\" strings matched against theorem/equation/figure/table \
-            numbers — approximate, origin layout_model). tex is \
-            preferred when built; pass `source` to switch. Relation types: cites, \
-            refers_to_equation, refers_to_theorem, refers_to_figure, refers_to_table, \
-            refers_to_section, refers_to, proves (proof → the theorem it proves), and caption_of \
-            (a figure caption → its detected figure region, pdf only). Use it to \
-            answer \"what does this proof prove\", \"what cites/uses equation (2.1)\", \"which \
-            results does this section reference\". Figure/table edges point at the figure region \
-            only when one was detected; otherwise they point at the caption block — \
-            metadata.resolved_via is \"node\" or \"caption\", and caption_of gets you from the \
-            caption to the region in one hop. Plural and range mentions (\"Figures 3 and 4\", \
-            \"Figs. 1-3\") are deliberately left unresolved, so an absent edge does not mean the \
-            text has no reference. Filter with `relation_type` and/or `node_id` \
-            (edges touching that block, either direction). Returns {has_lcir, source, \
-            available_sources, count, counts_by_type, relations:[{relation_type, confidence, \
-            origin, from:{node_id,kind,page,snippet}, to:{node_id,kind,page,snippet, \
-            theorem_number?, equation_label?, section_number?, labels?, figure_number?, \
-            caption_number?}, metadata}]}. If has_lcir \
-            is false nothing is built (build it in the app).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entry_id": { "type": "integer", "description": "Entry id." },
-                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
-                "relation_type": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Restrict to these relation types (e.g. [\"proves\"], [\"cites\"], [\"refers_to_equation\",\"refers_to_theorem\"]). Omit for all."
-                },
-                "node_id": { "type": "integer", "description": "Only edges touching this node id (as from or to). Node ids come from get_document_blocks / search_document_nodes." },
-                "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation: \"tex\" (\\ref/\\cite resolution) or \"pdf\" (number-string resolution). Omit for the best available (tex preferred)." },
-                "max_relations": { "type": "integer", "description": "Max edges to return (default 300)." }
-            }
-        }
-    }));
-    tools.push(json!({
-        "name": "get_symbol_definitions",
-        "description": "Return the notation/symbol definitions (LCIR) a paper introduces — by \
-            entry_id or citation_key. Recognized heuristically from definition sentences in the \
-            arXiv TeX source (\"let $U$ be ...\", \"define $H$ as ...\", \"denote by \
-            $\\mathcal{H}$ ...\", \"$U := ...$\"), so this is **TeX-only** (PDF inline math cannot be \
-            isolated reliably); returns empty for PDF-only entries. Each symbol carries its \
-            surface_form (raw LaTeX like \"U\" or \"\\mathcal{H}\"), normalized_form, a \
-            description extracted from the sentence, a best-effort symbol_type, the node where it \
-            is defined (defined_at, for \"jump to definition\"), the enclosing section (scope), and \
-            its occurrences in display equations. The surface/description text is verbatim from the \
-            source but the definition ASSOCIATION is heuristic — hence a moderate confidence. \
-            Use it to answer \"what is $U$ in this paper\", \"list the notation\", \"where is \
-            $\\mathcal{H}$ defined\", \"which equations use $\\gamma$\". Filter with `symbol` \
-            (exact surface) or `query` (substring over surface/normalized/description). Returns \
-            {has_lcir, source, count, symbols:[{surface_form, normalized_form, description, \
-            symbol_type, confidence, defined_at:{node_id,kind,snippet}, scope, occurrence_count, \
-            occurrences:[{node_id, equation_label}]}]}.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entry_id": { "type": "integer", "description": "Entry id." },
-                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
-                "symbol": { "type": "string", "description": "Exact surface_form to fetch (e.g. \"U\" or \"\\\\mathcal{H}\")." },
-                "query": { "type": "string", "description": "Case-insensitive substring over surface_form / normalized_form / description." },
-                "source": { "type": "string", "enum": ["tex", "pdf"], "description": "Force a representation. Symbols exist only for \"tex\"; omit for the best available (tex preferred)." },
-                "max_symbols": { "type": "integer", "description": "Max symbols to return (default 200)." }
-            }
-        }
-    }));
-    tools.push(json!({
-        "name": "get_figures",
-        "description": "Return the detected figures (LCIR) of a paper — by entry_id or \
-            citation_key. **PDF-only**: figure regions are detected from embedded raster images on \
-            each page (origin layout_model, moderate confidence), so vector figures (TikZ/pgf, \
-            common in math papers) legitimately yield zero figures — an empty list does NOT mean \
-            the paper has no figures. Each figure carries its page and bbox ([x, y, width, height] \
-            in PDF points, bottom-left origin), the figure number when a nearby \"Figure N\" \
-            caption was paired (caption_of edge), the caption text, and its stored assets \
-            (page-crop PNGs). Asset relative_path is a path under the app data directory as \
-            METADATA — the file's existence is not guaranteed and no image bytes are returned. \
-            Use it to answer \"what figures does this paper have\", \"what does Figure 2 show\" \
-            (caption text), \"where is Figure 2 on the page\" (page + bbox). A figure may also carry \
-            alt_text — a description of the image itself that is NOT from the paper. **Read its \
-            `origin` to decide how much to trust it**: `llm_inference` = generated by a vision \
-            model (a hint only, never the authors' wording — prefer the caption when they \
-            disagree); `user_edited` = written by the library owner (authoritative for what the \
-            image shows). It is absent unless the user ran the opt-in generation batch in the app. \
-            Returns {has_lcir, \
-            source, available_sources, count, figures:[{node_id, page, bbox, figure_number?, \
-            caption:{node_id, text}?, alt_text:{text, origin, confidence, model}?, \
-            assets:[{role, relative_path, mime_type, width, height, \
-            size_bytes}]}]}. If has_lcir is false no PDF version is built (build it in the app).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entry_id": { "type": "integer", "description": "Entry id." },
-                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
-                "max_figures": { "type": "integer", "description": "Max figures to return (default 100)." }
-            }
-        }
-    }));
-
-    tools.push(json!({
-        "name": "get_tables",
-        "description": "Return the structured tables (LCIR) of a paper — by entry_id or \
-            citation_key. **TeX-only**: cells are parsed from tabular/tabular*/tabularx \
-            environments in the arXiv TeX source (origin tex_source), so PDF-only entries return \
-            has_lcir:false and papers whose tables use longtable/tabu or nested layouts \
-            legitimately yield zero or fewer tables — an empty list does NOT mean the paper has \
-            no tables. Each table carries its caption (via the caption_of edge), the verbatim \
-            LaTeX column_spec, n_rows/n_columns, per-column alignments (letters l/c/r/p/m/b/X, \
-            present only when the column spec was fully parsed), and rows as \
-            {cells:[{text, colspan?, rowspan?}], rule_above?} where cell text keeps LaTeX \
-            verbatim (inline math as $..$). rule_above records a full-width rule above the row \
-            (a fact from the source; header detection is NOT performed). Use it to answer \
-            \"what tables does this paper have\", \"read Table 2's cells\", \"which column \
-            holds the masses\". Returns {has_lcir, source, available_sources, count, truncated, \
-            tables:[{node_id, caption:{node_id, text}?, column_spec, n_columns, n_rows, \
-            alignments?, rows}]}.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "entry_id": { "type": "integer", "description": "Entry id." },
-                "citation_key": { "type": "string", "description": "Citation key; alternative to entry_id." },
-                "max_tables": { "type": "integer", "description": "Max tables to return (default 20)." },
-                "max_chars": { "type": "integer", "description": "Approximate budget over cell text (default 24000); further tables are truncated." }
-            }
-        }
-    }));
-
-    tools.push(json!({
-        "name": "get_node_context",
-        "description": "Assemble everything needed to READ AND CITE one block (LCIR) — by \
-            node_id. Give it a theorem's node id and you get the statement (reassembled across \
-            block and page breaks), the proof that proves it, the definitions it rests on, the \
-            equations/figures/works it references, and the PDF region of every piece — in one \
-            call. Node ids come from search_document_nodes, get_document_blocks, get_figures or \
-            get_node_relations; the node itself selects the representation, so there is no \
-            `source` argument. Why this exists: on the pdf representation a theorem node holds \
-            only its FIRST layout block (~168 chars on average) and the rest of the statement lands \
-            in sibling blocks that often continue onto the next page, so reading `focus` alone \
-            loses the statement — read `focus` then `continuation` (blocks in reading order up to \
-            the next structural boundary; on the tex representation the environment body is \
-            already whole, so continuation is the text that FOLLOWS it). `premises` carries the \
-            definitions the block depends on and each one states how it was derived in `via`: \
-            \"reference\" = an explicit \\ref/\"Definition 3.1\" edge (rare but exact), \
-            \"occurrence\" = a symbol recorded in a display equation, \"symbol\" = a symbol whose \
-            surface form appears verbatim in the text and is defined earlier (tex only; both \
-            symbol paths are heuristic associations — check confidence). Every node carries \
-            origin and confidence, so you can tell source text (tex_source, pdf_text_layer) from \
-            inference (layout_model, llm_inference) when you quote it. `proves` edges on the pdf \
-            representation come mostly from reading-order adjacency, so they can point at a \
-            remark or example — check node.kind. Figure/table references resolve the caption_of \
-            hop for you: `figure` is the region (bbox, crop asset, alt text) and is often absent, \
-            `caption` is the authors' wording. Read `notes` — it lists what this bundle could not \
-            reach — and `continuation_stopped_at`, which says whether the continuation ended at \
-            the next logical unit ({reason:\"boundary\", node_id, kind}) or at a size limit. A \
-            boundary of kind figure_caption/table_caption means a float interrupted the text, not \
-            that the statement ended. Returns {found:true, node_id, entry_id, citation_key, \
-            attachment_id, version_id, source, extractor_version, available_sources, focus, \
-            continuation_stopped_at} plus these keys, EACH OMITTED WHEN EMPTY: section_path, \
-            before, continuation, proofs, proves, premises, equations, figures, citations, \
-            references, notes. An unknown node_id returns {node_id, found:false, message} \
-            instead. Nodes are {node_id, kind, text?, page?, bbox?, origin?, confidence?, \
-            identifiers?, math?, alt_text?, assets?} with bbox [x, y, width, height] in PDF \
-            points (bottom-left origin); the tex representation has no coordinates at all, so \
-            page and bbox are absent on every node there. proofs/proves/equations/citations/\
-            references entries are {relation_type, direction, from_node_id, confidence?, origin?, \
-            metadata?, node}; figures entries are {relation_type, from_node_id, resolved_via?, \
-            node, figure?, caption?}; premises entries are {via, node, symbol?, relation?}.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "node_id": { "type": "integer", "description": "Block id to center the bundle on (from search_document_nodes / get_document_blocks / get_node_relations / get_figures)." },
-                "max_before": { "type": "integer", "description": "Blocks of lead-in before the focus (default 2)." },
-                "max_continuation": { "type": "integer", "description": "Blocks after the focus, up to the next structural boundary (default 16)." },
-                "max_continuation_chars": { "type": "integer", "description": "Character budget over the continuation (default 6000)." },
-                "max_related": { "type": "integer", "description": "Max entries per relation list (default 12)." },
-                "max_premises": { "type": "integer", "description": "Max premise definitions (default 12)." }
-            },
-            "required": ["node_id"]
-        }
-    }));
+    // 文献本文の read ツール（`get_fulltext` + LCIR 8 種）。定義の正本は
+    // `llm::tools::document`（Phase 10b でチャットと共有するため移設した）。
+    // ここに積む位置は移設前と同じ ＝ `tools/list` の並び順は変わらない。
+    for s in document::specs() {
+        tools.push(json!({
+            "name": s.name,
+            "description": s.description,
+            "inputSchema": s.parameters,
+        }));
+    }
 
     // write 系（Phase 2・ゲート有効時のみ）。`mutate` の定義を流用し、許可リスト
     // （`WRITE_TOOLS`）に絞る。delete_entry はリストに無いので公開されない。
@@ -605,6 +329,19 @@ async fn exec_tool(
             .unwrap_or_else(|| Err(ToolError::UnknownTool(name.to_string())));
     }
 
+    // 文献本文の read 系（`llm::tools::document` が正本）。`mcp_ctx` は scope_mode="all" 固定
+    // なので、document 側のスコープ検査はこの経路では no-op になる。
+    if document::DOCUMENT_TOOLS.contains(&name) {
+        let call = ToolCallSpec {
+            call_id: "mcp-server".to_string(),
+            tool_name: name.to_string(),
+            arguments: args,
+        };
+        return document::try_execute(&mcp_ctx(pool, app_data_dir), &call)
+            .await
+            .unwrap_or_else(|| Err(ToolError::UnknownTool(name.to_string())));
+    }
+
     // write 系（ゲートは呼び出し側で確認済みだが、二重に write_on を確認する）。
     if write_on && WRITE_TOOLS.contains(&name) {
         let call = ToolCallSpec {
@@ -622,15 +359,6 @@ async fn exec_tool(
         "resolve_citation_key" => exec_resolve_citation_key(pool, &args).await,
         "export_bibtex" => exec_export_bibtex(pool, &args).await,
         "find_entries_by_citation_keys" => exec_find_entries_by_citation_keys(pool, &args).await,
-        "get_fulltext" => exec_get_fulltext(pool, &args).await,
-        "get_document_structure" => exec_get_document_structure(pool, &args).await,
-        "get_document_blocks" => exec_get_document_blocks(pool, &args).await,
-        "search_document_nodes" => exec_search_document_nodes(pool, &args).await,
-        "get_node_relations" => exec_get_node_relations(pool, &args).await,
-        "get_symbol_definitions" => exec_get_symbol_definitions(pool, &args).await,
-        "get_figures" => exec_get_figures(pool, &args).await,
-        "get_tables" => exec_get_tables(pool, &args).await,
-        "get_node_context" => exec_get_node_context(pool, &args).await,
         // それ以外（delete_entry / ocr_* / 無効化中の write 等）は非公開。
         _ => Err(ToolError::UnknownTool(name.to_string())),
     }
@@ -744,970 +472,6 @@ async fn exec_find_entries_by_citation_keys(
         .unwrap_or_default())
 }
 
-async fn exec_get_fulltext(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    // entry_id 優先。無ければ citation_key から逆引き。
-    let entry_id = match args.get("entry_id").and_then(|v| v.as_i64()) {
-        Some(id) => id,
-        None => match args.get("citation_key").and_then(|v| v.as_str()) {
-            Some(key) => match crate::bibtex::find_entry_id_by_citation_key(pool, key).await {
-                Ok(Some(id)) => id,
-                Ok(None) => {
-                    return Ok(serde_json::to_string(&json!({
-                        "indexed": false,
-                        "message": format!("no entry found for citation key '{key}'")
-                    }))
-                    .unwrap_or_default())
-                }
-                Err(e) => return Err(ToolError::Execution(e)),
-            },
-            None => {
-                return Err(ToolError::InvalidArguments(
-                    "provide entry_id (integer) or citation_key (string)".to_string(),
-                ))
-            }
-        },
-    };
-
-    let pages = crate::db::fulltext::get_entry_fulltext(pool, entry_id).await?;
-    if pages.is_empty() {
-        return Ok(serde_json::to_string(&json!({
-            "entry_id": entry_id,
-            "indexed": false,
-            "message": "this entry has no indexed full text (no attached/indexed PDF)"
-        }))
-        .unwrap_or_default());
-    }
-
-    let total_pages = pages.len() as i64;
-    let page_start = args.get("page_start").and_then(|v| v.as_i64()).unwrap_or(1).max(1);
-    let max_chars = args
-        .get("max_chars")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(24_000)
-        .clamp(1_000, 200_000) as usize;
-
-    // page_start 以降のページを、累計が max_chars に達するまでページ単位で連結する
-    // （ページ途中では切らない）。入りきらなかった最初のページを next_page に載せて
-    // 続き読みできるようにする。
-    let mut text = String::new();
-    let mut truncated = false;
-    let mut next_page: Option<i64> = None;
-    for (page, content) in pages.iter().filter(|(p, _)| *p >= page_start) {
-        if text.chars().count() >= max_chars {
-            next_page = Some(*page);
-            truncated = true;
-            break;
-        }
-        text.push_str(&format!("[page {page}]\n{content}\n\n"));
-    }
-
-    Ok(serde_json::to_string(&json!({
-        "entry_id": entry_id,
-        "indexed": true,
-        "total_pages": total_pages,
-        "returned_from_page": page_start,
-        "truncated": truncated,
-        "next_page": next_page,
-        "text": text.trim_end(),
-    }))
-    .unwrap_or_default())
-}
-
-// ─── LCIR（機械可読中間形式）read ツール（Phase 3.5） ────────────────────────
-
-/// entry_id 優先・無ければ citation_key から逆引き（get_fulltext と同じ規約）。
-async fn resolve_entry_id(pool: &SqlitePool, args: &Value) -> Result<i64, ToolError> {
-    if let Some(id) = args.get("entry_id").and_then(|v| v.as_i64()) {
-        return Ok(id);
-    }
-    if let Some(key) = args.get("citation_key").and_then(|v| v.as_str()) {
-        return match crate::bibtex::find_entry_id_by_citation_key(pool, key).await {
-            Ok(Some(id)) => Ok(id),
-            Ok(None) => Err(ToolError::InvalidArguments(format!(
-                "no entry found for citation key '{key}'"
-            ))),
-            Err(e) => Err(ToolError::Execution(e)),
-        };
-    }
-    Err(ToolError::InvalidArguments(
-        "provide entry_id (integer) or citation_key (string)".to_string(),
-    ))
-}
-
-/// MCP の `source` 引数（"tex"/"pdf"）→ extractor_name。
-fn source_to_extractor(source: &str) -> Result<&'static str, ToolError> {
-    crate::ingestion::source_to_extractor(source).map_err(ToolError::InvalidArguments)
-}
-
-/// extractor_name → MCP 応答の短い source 名。
-fn short_source_name(extractor_name: &str) -> &str {
-    crate::ingestion::short_source_name(extractor_name)
-}
-
-/// 併存する表現の列挙（`available_sources` 応答）。
-fn sources_json(versions: &[crate::models::DocumentVersion]) -> Value {
-    Value::Array(
-        versions
-            .iter()
-            .map(|v| {
-                json!({
-                    "source": short_source_name(&v.extractor_name),
-                    "attachment_id": v.attachment_id,
-                    "extractor_name": v.extractor_name,
-                    "extractor_version": v.extractor_version,
-                })
-            })
-            .collect(),
-    )
-}
-
-/// エントリの LCIR を読む。`source` 指定時はその抽出器の版に限定し、未指定なら
-/// 優先度順（tex > pdfium）で最初に読めた版を返す。読めた/読めないに関わらず
-/// 併存する版の一覧（`available_sources` 用）を返す — 無かったときの案内文を
-/// 「実在する表現」に基づいて組み立てるため。
-#[allow(clippy::type_complexity)]
-async fn load_entry_lcir(
-    pool: &SqlitePool,
-    entry_id: i64,
-    source: Option<&str>,
-) -> Result<
-    (
-        Option<(i64, crate::document_ir::LcirDocument)>,
-        Vec<crate::models::DocumentVersion>,
-    ),
-    ToolError,
-> {
-    let wanted: Option<&str> = match source {
-        Some(s) => Some(source_to_extractor(s)?),
-        None => None,
-    };
-    crate::ingestion::load_entry_lcir(pool, entry_id, wanted)
-        .await
-        .map_err(ToolError::Execution)
-}
-
-/// 本文つき論理ブロック（骨格の document/page/line は除く）。
-fn is_content_block(kind: &str) -> bool {
-    !matches!(kind, "document" | "page" | "line")
-}
-
-/// ノードの代表ページ（最初の source_fragment）。
-fn node_page(n: &crate::document_ir::LcirNode) -> Option<i64> {
-    n.source_fragments.first().map(|f| f.page)
-}
-
-fn no_lcir_response(entry_id: i64, source: Option<&str>) -> String {
-    let message = match source {
-        Some(s) => format!(
-            "no built LCIR from source '{s}' for this entry. Omit `source` to use any available \
-             representation, or download/build it in the app (arXiv entries can fetch the TeX \
-             source from the detail panel)."
-        ),
-        None => "no built LCIR for this entry (enable and build LCIR in the app; arXiv entries \
-            can also fetch the TeX source). Fall back to get_fulltext for flat page text."
-            .to_string(),
-    };
-    serde_json::to_string(&json!({
-        "entry_id": entry_id,
-        "has_lcir": false,
-        "message": message,
-    }))
-    .unwrap_or_default()
-}
-
-async fn exec_get_document_structure(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    let entry_id = resolve_entry_id(pool, args).await?;
-    let source_arg = args.get("source").and_then(|v| v.as_str());
-    let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
-    let Some((attachment_id, doc)) = loaded else {
-        return Ok(no_lcir_response(entry_id, source_arg));
-    };
-    let is_tex = doc.source.extractor_name == crate::document_ir::schema::TEX_EXTRACTOR_NAME;
-
-    let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    let mut outline: Vec<Value> = Vec::new();
-    let mut abstract_parts: Vec<String> = Vec::new();
-    let mut page_count = 0i64;
-    let mut block_count = 0i64;
-    for n in &doc.nodes {
-        if n.kind == "page" {
-            page_count += 1;
-        }
-        if !is_content_block(&n.kind) {
-            continue;
-        }
-        block_count += 1;
-        *counts.entry(n.kind.clone()).or_insert(0) += 1;
-        match n.kind.as_str() {
-            "section" | "subsection" | "heading" => {
-                let sec = n
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("section_number"))
-                    .and_then(|v| v.as_str());
-                let level = n
-                    .payload
-                    .as_ref()
-                    .and_then(|p| p.get("heading_level"))
-                    .and_then(|v| v.as_i64());
-                outline.push(json!({
-                    "kind": n.kind,
-                    "section_number": sec,
-                    "level": level,
-                    "text": n.plain_text,
-                    "page": node_page(n),
-                }));
-            }
-            "abstract" => {
-                if let Some(t) = &n.plain_text {
-                    abstract_parts.push(t.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    let abstract_text = if abstract_parts.is_empty() {
-        None
-    } else {
-        Some(abstract_parts.join(" "))
-    };
-
-    // note と page_count は source 依存: TeX 版はページを持たない（page_count: null）。
-    let note = if is_tex {
-        "Parsed from the arXiv TeX source (origin=tex_source). Display equations carry exact \
-         LaTeX; this representation has no page numbers or bounding boxes (use source=\"pdf\" \
-         for page-anchored reading). Use get_document_blocks to read prose or equations."
-    } else {
-        "Structure is heuristically recovered from the PDF text layer (origin=layout_model, \
-         per-node confidence). Equations are surface-only (no LaTeX). Use get_document_blocks to \
-         read prose or equations, search_document_nodes to locate content."
-    };
-    Ok(serde_json::to_string(&json!({
-        "entry_id": entry_id,
-        "attachment_id": attachment_id,
-        "has_lcir": true,
-        "source": short_source_name(&doc.source.extractor_name),
-        "extractor_name": doc.source.extractor_name,
-        "extractor_version": doc.source.extractor_version,
-        "available_sources": sources_json(&versions),
-        "page_count": if is_tex { Value::Null } else { json!(page_count) },
-        "block_count": block_count,
-        "outline": outline,
-        "counts": counts,
-        "abstract": abstract_text,
-        "note": note,
-    }))
-    .unwrap_or_default())
-}
-
-async fn exec_get_document_blocks(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    let entry_id = resolve_entry_id(pool, args).await?;
-    let source_arg = args.get("source").and_then(|v| v.as_str());
-    let page_filter = args.get("page").and_then(|v| v.as_i64());
-
-    // `page` は PDF 空間の概念（search_document_nodes のヒットも PDF 由来）なので、
-    // source 未指定で page が来たら PDF 版へ自動フォールバックする。
-    let effective_source = match (page_filter.is_some(), source_arg) {
-        (true, None) => Some("pdf"),
-        (_, s) => s,
-    };
-    let (loaded, versions) = load_entry_lcir(pool, entry_id, effective_source).await?;
-    let has_tex = versions
-        .iter()
-        .any(|v| v.extractor_name == crate::document_ir::schema::TEX_EXTRACTOR_NAME);
-    let has_pdf = versions
-        .iter()
-        .any(|v| v.extractor_name == crate::document_ir::schema::EXTRACTOR_NAME);
-    let Some((attachment_id, doc)) = loaded else {
-        // page 指定の自動 PDF フォールバックで PDF 版が無かった場合の案内は、
-        // 実在する表現に基づいて出す（無い TeX 版を勧めない）。
-        if page_filter.is_some() && source_arg.is_none() && has_tex {
-            return Ok(serde_json::to_string(&json!({
-                "entry_id": entry_id,
-                "has_lcir": false,
-                "available_sources": sources_json(&versions),
-                "message": "page filtering needs a PDF-derived LCIR and none is built for this \
-                    entry; omit `page` to read the TeX representation, or build the PDF LCIR in \
-                    the app.",
-            }))
-            .unwrap_or_default());
-        }
-        return Ok(no_lcir_response(entry_id, source_arg));
-    };
-    let is_tex = doc.source.extractor_name == crate::document_ir::schema::TEX_EXTRACTOR_NAME;
-    if is_tex && page_filter.is_some() {
-        // 明示 source="tex" + page: 黙って 0 件を返すとエージェントが「中身が無い」と誤解する。
-        let hint = if has_pdf {
-            "the tex representation has no page mapping; omit `page` or use source=\"pdf\"."
-        } else {
-            "the tex representation has no page mapping and no PDF-derived LCIR is built; \
-             omit `page` to read it."
-        };
-        return Ok(serde_json::to_string(&json!({
-            "entry_id": entry_id,
-            "attachment_id": attachment_id,
-            "has_lcir": true,
-            "source": "tex",
-            "available_sources": sources_json(&versions),
-            "total_blocks": 0,
-            "returned": 0,
-            "blocks": [],
-            "message": hint,
-        }))
-        .unwrap_or_default());
-    }
-
-    // kinds フィルタ。
-    let kind_filter: Option<Vec<String>> = args.get("kinds").and_then(|v| v.as_array()).map(|a| {
-        a.iter()
-            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-            .collect()
-    });
-
-    // 読み順の本文ブロック（load_lcir_document のノード順 = ページ→ordinal）。
-    let blocks: Vec<&crate::document_ir::LcirNode> = doc
-        .nodes
-        .iter()
-        .filter(|n| is_content_block(&n.kind))
-        .filter(|n| {
-            kind_filter
-                .as_ref()
-                .map(|ks| ks.iter().any(|k| k == &n.kind))
-                .unwrap_or(true)
-        })
-        .filter(|n| page_filter.is_none_or(|p| node_page(n) == Some(p)))
-        .collect();
-
-    let total_blocks = blocks.len() as i64;
-    let block_start = args.get("block_start").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-    let max_chars = args
-        .get("max_chars")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(24_000)
-        .clamp(1_000, 200_000) as usize;
-
-    let mut out: Vec<Value> = Vec::new();
-    let mut chars = 0usize;
-    let mut truncated = false;
-    let mut next_block: Option<i64> = None;
-    for (i, n) in blocks.iter().enumerate().skip(block_start as usize) {
-        let text = n.plain_text.clone().unwrap_or_default();
-        // 1 ブロックでも返した上で上限超過なら、そこで切って続きを next_block に載せる。
-        if chars + text.chars().count() > max_chars && !out.is_empty() {
-            next_block = Some(i as i64);
-            truncated = true;
-            break;
-        }
-        chars += text.chars().count();
-        let equation_label = n.math.as_ref().and_then(|m| m.equation_label.clone());
-        // TeX 由来の数式は原文 LaTeX を持つ（Phase 4・semantic_status='source_provided'）。
-        let latex = n.math.as_ref().and_then(|m| m.latex.clone());
-        let payload_str = |key: &str| {
-            n.payload
-                .as_ref()
-                .and_then(|p| p.get(key))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        };
-        let payload_i64 = |key: &str| {
-            n.payload
-                .as_ref()
-                .and_then(|p| p.get(key))
-                .and_then(|v| v.as_i64())
-        };
-        let section_number = payload_str("section_number");
-        // 定理系ノード（Phase 5）: 番号・付記名を surface して "定理 2.3 の証明" 取得に使えるようにする。
-        let theorem_number = payload_str("theorem_number");
-        let note = payload_str("note");
-        // figure ノード（Phase 8a）は plain_text を持たない: 空 text の意味が分かるよう
-        // 図番号とアセット数を付ける（画像本体は get_figures で）。
-        let figure_number = payload_str("figure_number");
-        let asset_count = if n.assets.is_empty() {
-            None
-        } else {
-            Some(n.assets.len())
-        };
-        // table ノード（Phase 8b）: text はセルを " | " 結合した可読形。寸法だけ付けて
-        // セル構造（rows/alignments）は get_tables に誘導する。
-        let column_spec = payload_str("column_spec");
-        let n_columns = payload_i64("n_columns");
-        let n_rows = payload_i64("n_rows");
-        out.push(json!({
-            "index": i,
-            // ブロック粒度の安定ハンドル。get_node_context / get_node_relations は
-            // この id を取る（`index` はこの応答の中でしか意味を持たない）。
-            "node_id": n.id,
-            "kind": n.kind,
-            "page": node_page(n),
-            "section_number": section_number,
-            "theorem_number": theorem_number,
-            "note": note,
-            "figure_number": figure_number,
-            "asset_count": asset_count,
-            "column_spec": column_spec,
-            "n_columns": n_columns,
-            "n_rows": n_rows,
-            "equation_label": equation_label,
-            "latex": latex,
-            "text": text,
-        }));
-    }
-
-    Ok(serde_json::to_string(&json!({
-        "entry_id": entry_id,
-        "attachment_id": attachment_id,
-        "has_lcir": true,
-        "source": short_source_name(&doc.source.extractor_name),
-        "available_sources": sources_json(&versions),
-        "total_blocks": total_blocks,
-        "block_start": block_start,
-        "returned": out.len(),
-        "truncated": truncated,
-        "next_block": next_block,
-        "blocks": out,
-    }))
-    .unwrap_or_default())
-}
-
-async fn exec_search_document_nodes(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ToolError::InvalidArguments("missing required argument: query".to_string()))?;
-    let collection_id = args.get("collection_id").and_then(|v| v.as_i64());
-    let tag_id = args.get("tag_id").and_then(|v| v.as_i64());
-
-    let hits = crate::db::document_nodes_fts::search_nodes(pool, query, collection_id, tag_id, None)
-        .await?;
-    let results: Vec<Value> = hits
-        .iter()
-        .map(|h| {
-            json!({
-                "entry_id": h.entry.id,
-                "title": h.entry.title,
-                "year": h.entry.year,
-                // ヒットしたブロックの id。get_node_context / get_node_relations に渡せる。
-                "node_id": h.node_id,
-                "node_kind": h.node_kind,
-                "page": h.page,
-                "snippet": h.snippet,
-                "bbox": h.bbox.as_ref().map(|b| json!([b.x, b.y, b.width, b.height])),
-            })
-        })
-        .collect();
-
-    Ok(serde_json::to_string(&json!({ "count": results.len(), "results": results }))
-        .unwrap_or_default())
-}
-
-/// 短いスニペット（char 単位で安全に切る）。
-fn relation_snippet(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut s: String = text.chars().take(max).collect();
-    s.push('…');
-    s
-}
-
-/// 関係辺の端点ノードを応答用 JSON にする（kind/page/snippet + 番号・label 等の識別子）。
-fn relation_node_json(n: &crate::document_ir::LcirNode) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("node_id".to_string(), json!(n.id));
-    obj.insert("kind".to_string(), json!(n.kind));
-    obj.insert("page".to_string(), json!(node_page(n)));
-    if let Some(t) = &n.plain_text {
-        obj.insert("snippet".to_string(), json!(relation_snippet(t, 160)));
-    }
-    if let Some(p) = &n.payload {
-        // Phase 8d-7: 図表参照の端点がどの図表かを示す（figure ノードは figure_number、
-        // caption ノードは caption_number を payload に持つ）。
-        for key in [
-            "theorem_number",
-            "section_number",
-            "labels",
-            "figure_number",
-            "caption_number",
-        ] {
-            if let Some(v) = p.get(key) {
-                obj.insert(key.to_string(), v.clone());
-            }
-        }
-    }
-    if let Some(el) = n.math.as_ref().and_then(|m| m.equation_label.as_ref()) {
-        obj.insert("equation_label".to_string(), json!(el));
-    }
-    Value::Object(obj)
-}
-
-async fn exec_get_node_relations(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    let entry_id = resolve_entry_id(pool, args).await?;
-    let source_arg = args.get("source").and_then(|v| v.as_str());
-    let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
-    let Some((_attachment_id, doc)) = loaded else {
-        return Ok(no_lcir_response(entry_id, source_arg));
-    };
-
-    // 型フィルタ（省略時は全種別）と node_id フィルタ（端点のどちらかが一致）。
-    let type_filter: Option<Vec<String>> = args.get("relation_type").and_then(|v| v.as_array()).map(
-        |arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        },
-    );
-    let node_filter = args.get("node_id").and_then(|v| v.as_i64());
-    let max_relations = args
-        .get("max_relations")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(300)
-        .max(1) as usize;
-
-    let node_by_id: std::collections::HashMap<i64, &crate::document_ir::LcirNode> =
-        doc.nodes.iter().map(|n| (n.id, n)).collect();
-
-    let mut counts_by_type: std::collections::BTreeMap<String, i64> =
-        std::collections::BTreeMap::new();
-    let mut relations: Vec<Value> = Vec::new();
-    let mut truncated = false;
-    for r in &doc.relations {
-        if let Some(types) = &type_filter {
-            if !types.iter().any(|t| t == &r.relation_type) {
-                continue;
-            }
-        }
-        if let Some(nid) = node_filter {
-            if r.from_node_id != nid && r.to_node_id != nid {
-                continue;
-            }
-        }
-        *counts_by_type.entry(r.relation_type.clone()).or_insert(0) += 1;
-        if relations.len() >= max_relations {
-            truncated = true;
-            continue;
-        }
-        let from = node_by_id.get(&r.from_node_id).map(|n| relation_node_json(n));
-        let to = node_by_id.get(&r.to_node_id).map(|n| relation_node_json(n));
-        relations.push(json!({
-            "relation_type": r.relation_type,
-            "confidence": r.confidence,
-            "origin": r.origin,
-            "from": from,
-            "to": to,
-            "metadata": r.metadata,
-        }));
-    }
-
-    Ok(serde_json::to_string(&json!({
-        "entry_id": entry_id,
-        "has_lcir": true,
-        "source": short_source_name(&doc.source.extractor_name),
-        "available_sources": sources_json(&versions),
-        "count": relations.len(),
-        "truncated": truncated,
-        "counts_by_type": counts_by_type,
-        "relations": relations,
-    }))
-    .unwrap_or_default())
-}
-
-async fn exec_get_symbol_definitions(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    let entry_id = resolve_entry_id(pool, args).await?;
-    let source_arg = args.get("source").and_then(|v| v.as_str());
-    let (loaded, versions) = load_entry_lcir(pool, entry_id, source_arg).await?;
-    let Some((_attachment_id, doc)) = loaded else {
-        return Ok(no_lcir_response(entry_id, source_arg));
-    };
-
-    let exact = args.get("symbol").and_then(|v| v.as_str());
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_lowercase());
-    let max_symbols = args
-        .get("max_symbols")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(200)
-        .max(1) as usize;
-
-    let node_by_id: std::collections::HashMap<i64, &crate::document_ir::LcirNode> =
-        doc.nodes.iter().map(|n| (n.id, n)).collect();
-
-    let mut symbols_out: Vec<Value> = Vec::new();
-    let mut truncated = false;
-    for s in &doc.symbols {
-        if let Some(ex) = exact {
-            if s.surface_form != ex {
-                continue;
-            }
-        }
-        if let Some(q) = &query {
-            let hay = format!(
-                "{} {} {}",
-                s.surface_form,
-                s.normalized_form.as_deref().unwrap_or(""),
-                s.description.as_deref().unwrap_or("")
-            )
-            .to_lowercase();
-            if !hay.contains(q) {
-                continue;
-            }
-        }
-        if symbols_out.len() >= max_symbols {
-            truncated = true;
-            break;
-        }
-        let defined_at = s.defined_at_node_id.and_then(|id| node_by_id.get(&id)).map(|n| {
-            json!({
-                "node_id": n.id,
-                "kind": n.kind,
-                "snippet": n.plain_text.as_deref().map(|t| relation_snippet(t, 200)),
-            })
-        });
-        let scope = s.scope_node_id.and_then(|id| node_by_id.get(&id)).map(|n| {
-            json!({
-                "node_id": n.id,
-                "section_number": n.payload.as_ref().and_then(|p| p.get("section_number")),
-                "text": n.plain_text,
-            })
-        });
-        let occurrences: Vec<Value> = s
-            .occurrences
-            .iter()
-            .take(25)
-            .map(|o| {
-                let equation_label = node_by_id
-                    .get(&o.node_id)
-                    .and_then(|n| n.math.as_ref())
-                    .and_then(|m| m.equation_label.clone());
-                json!({ "node_id": o.node_id, "equation_label": equation_label })
-            })
-            .collect();
-        symbols_out.push(json!({
-            "id": s.id,
-            "surface_form": s.surface_form,
-            "normalized_form": s.normalized_form,
-            "description": s.description,
-            "symbol_type": s.symbol_type,
-            "confidence": s.confidence,
-            "origin": s.origin,
-            "defined_at": defined_at,
-            "scope": scope,
-            "occurrence_count": s.occurrences.len(),
-            "occurrences": occurrences,
-        }));
-    }
-
-    Ok(serde_json::to_string(&json!({
-        "entry_id": entry_id,
-        "has_lcir": true,
-        "source": short_source_name(&doc.source.extractor_name),
-        "available_sources": sources_json(&versions),
-        "count": symbols_out.len(),
-        "truncated": truncated,
-        "symbols": symbols_out,
-    }))
-    .unwrap_or_default())
-}
-
-/// 図一覧（Phase 8a）。図領域は PDF 版のみに存在するため常に pdf 版を読む
-/// （`get_document_blocks` の page フィルタが pdf を強制するのと同じ分担）。
-/// アセットの `relative_path` はメタデータ参照でファイルの存在は保証しない（欠損許容・
-/// base64 は返さない）。ベクター図（tikz）はアセット 0 件が正当。
-async fn exec_get_figures(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    let entry_id = resolve_entry_id(pool, args).await?;
-    let (loaded, versions) = load_entry_lcir(pool, entry_id, Some("pdf")).await?;
-    let Some((attachment_id, doc)) = loaded else {
-        return Ok(no_lcir_response(entry_id, Some("pdf")));
-    };
-    let max_figures = args
-        .get("max_figures")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(100)
-        .max(1) as usize;
-
-    // caption_of 辺（from = caption / to = figure）から caption を解決する。
-    let mut caption_by_figure: std::collections::HashMap<i64, i64> =
-        std::collections::HashMap::new();
-    for r in &doc.relations {
-        if r.relation_type == "caption_of" {
-            caption_by_figure.insert(r.to_node_id, r.from_node_id);
-        }
-    }
-    let node_by_id: std::collections::HashMap<i64, &crate::document_ir::LcirNode> =
-        doc.nodes.iter().map(|n| (n.id, n)).collect();
-
-    let mut figures: Vec<Value> = Vec::new();
-    let mut total = 0usize;
-    let mut truncated = false;
-    for n in &doc.nodes {
-        if n.kind != "figure" {
-            continue;
-        }
-        total += 1;
-        if figures.len() >= max_figures {
-            truncated = true;
-            continue;
-        }
-        let bbox = n
-            .source_fragments
-            .first()
-            .map(|f| json!([f.bbox.x, f.bbox.y, f.bbox.width, f.bbox.height]));
-        let figure_number = n
-            .payload
-            .as_ref()
-            .and_then(|p| p.get("figure_number"))
-            .cloned();
-        let caption = caption_by_figure
-            .get(&n.id)
-            .and_then(|cid| node_by_id.get(cid))
-            .map(|c| {
-                json!({
-                    "node_id": c.id,
-                    "text": c.plain_text,
-                })
-            });
-        let assets: Vec<Value> = n
-            .assets
-            .iter()
-            .map(|a| {
-                json!({
-                    "role": a.role,
-                    "relative_path": a.relative_path,
-                    "mime_type": a.mime_type,
-                    "width": a.width,
-                    "height": a.height,
-                    "size_bytes": a.size_bytes,
-                })
-            })
-            .collect();
-        // Phase 8c: 代替テキストは**生成物**なので origin/model を必ず添えて返す（原文 caption と
-        // 混同させない）。バッチ未実行なら欠落する。
-        let alt_text = n.alt_text.as_ref().map(|a| {
-            json!({
-                "text": a.text,
-                "origin": a.origin,
-                "confidence": a.confidence,
-                "model": a.model,
-            })
-        });
-        figures.push(json!({
-            "node_id": n.id,
-            "page": node_page(n),
-            "bbox": bbox,
-            "figure_number": figure_number,
-            "caption": caption,
-            "alt_text": alt_text,
-            "assets": assets,
-        }));
-    }
-
-    Ok(serde_json::to_string(&json!({
-        "entry_id": entry_id,
-        "attachment_id": attachment_id,
-        "has_lcir": true,
-        "source": short_source_name(&doc.source.extractor_name),
-        "available_sources": sources_json(&versions),
-        "count": total,
-        "truncated": truncated,
-        "figures": figures,
-        "note": "figure regions come from embedded raster images (origin layout_model); vector \
-            figures (TikZ/pgf) legitimately yield zero. asset relative_path is metadata only — \
-            file existence is not guaranteed and no image bytes are returned. alt_text, when \
-            present, is never the authors' wording: check its origin — llm_inference is a vision \
-            model's guess (the caption is the source of truth), user_edited is the library \
-            owner's own description.",
-    }))
-    .unwrap_or_default())
-}
-
-/// Phase 8b: 構造化テーブル（TeX 版のみ — tabular は TeX ソースからしかセル構造化できない）。
-/// caption は caption_of 辺（from=caption / to=table）から解決する。rows は payload の
-/// セル構造をそのまま返すが、原文スニペット `latex_source` は返さない（rows が構造を持ち、
-/// 二重送出でレスポンスが肥大するため）。`max_chars` はセル文字量の概算予算（最低 1 表は返す）。
-async fn exec_get_tables(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    let entry_id = resolve_entry_id(pool, args).await?;
-    let (loaded, versions) = load_entry_lcir(pool, entry_id, Some("tex")).await?;
-    let Some((attachment_id, doc)) = loaded else {
-        return Ok(serde_json::to_string(&json!({
-            "entry_id": entry_id,
-            "has_lcir": false,
-            "source": "tex",
-            "message": "no TeX-derived LCIR for this entry. Tables are cell-structured from the \
-                arXiv TeX source only; fetch the TeX source and build LCIR in the app first \
-                (PDF-only entries have no structured tables).",
-        }))
-        .unwrap_or_default());
-    };
-    let max_tables = args
-        .get("max_tables")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(20)
-        .max(1) as usize;
-    let max_chars = args
-        .get("max_chars")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(24_000)
-        .clamp(1_000, 200_000) as usize;
-
-    let mut caption_by_table: std::collections::HashMap<i64, i64> =
-        std::collections::HashMap::new();
-    for r in &doc.relations {
-        if r.relation_type == "caption_of" {
-            caption_by_table.insert(r.to_node_id, r.from_node_id);
-        }
-    }
-    let node_by_id: std::collections::HashMap<i64, &crate::document_ir::LcirNode> =
-        doc.nodes.iter().map(|n| (n.id, n)).collect();
-
-    let mut tables: Vec<Value> = Vec::new();
-    let mut total = 0usize;
-    let mut chars = 0usize;
-    let mut truncated = false;
-    for n in &doc.nodes {
-        if n.kind != "table" {
-            continue;
-        }
-        total += 1;
-        // セル文字量の概算 = plain_text（セルを " | " 結合したもの）の長さ。予算・件数超過後は
-        // 以降を**すべて**打ち切る（途中の大きい表だけ飛ばすと歯抜けの一覧になり、truncated の
-        // 意味が「先頭から N 個」でなくなるため）。
-        let approx = n.plain_text.as_deref().map_or(0, |t| t.chars().count());
-        if truncated
-            || tables.len() >= max_tables
-            || (!tables.is_empty() && chars + approx > max_chars)
-        {
-            truncated = true;
-            continue;
-        }
-        chars += approx;
-        let payload = n.payload.as_ref();
-        let caption = caption_by_table
-            .get(&n.id)
-            .and_then(|cid| node_by_id.get(cid))
-            .map(|c| {
-                json!({
-                    "node_id": c.id,
-                    "text": c.plain_text,
-                })
-            });
-        let get = |key: &str| payload.and_then(|p| p.get(key)).cloned();
-        tables.push(json!({
-            "node_id": n.id,
-            "caption": caption,
-            "column_spec": get("column_spec"),
-            "n_columns": get("n_columns"),
-            "n_rows": get("n_rows"),
-            "alignments": get("alignments"),
-            "rows": get("rows"),
-        }));
-    }
-
-    // 旧抽出器版（8b 前）の LCIR は table ノード自体を持たない — 「表が無い論文」と
-    // 誤読させないため、count 0 かつ版が古いときは再構築を明示的に案内する。
-    let outdated = doc.source.extractor_version != crate::document_ir::schema::TEX_EXTRACTOR_VERSION;
-    let note = if total == 0 && outdated {
-        format!(
-            "no table nodes, but this LCIR was built by lumencite-tex {} (tables need {}). \
-             Rebuild outdated LCIR in the app (Settings → Data) and retry.",
-            doc.source.extractor_version,
-            crate::document_ir::schema::TEX_EXTRACTOR_VERSION
-        )
-    } else {
-        "tables come from tabular/tabular*/tabularx in the TeX source (origin tex_source); \
-         longtable/tabu and nested layouts are intentionally not structured, so zero/fewer \
-         tables does not mean the paper has none. Cell text keeps LaTeX verbatim. rule_above \
-         records a full-width rule above the row; header rows are not inferred."
-            .to_string()
-    };
-    Ok(serde_json::to_string(&json!({
-        "entry_id": entry_id,
-        "attachment_id": attachment_id,
-        "has_lcir": true,
-        "source": short_source_name(&doc.source.extractor_name),
-        "extractor_version": doc.source.extractor_version,
-        "available_sources": sources_json(&versions),
-        "count": total,
-        "truncated": truncated,
-        "tables": tables,
-        "note": note,
-    }))
-    .unwrap_or_default())
-}
-
-/// Phase 10a: 文脈バンドル。**ノード id 起点**なので `entry_id`/`source` は取らない —
-/// ノードが載っている版がそのまま答えになる（エントリ起点の tex > pdf 優先で版を選び直すと、
-/// 呼び出し側が握っている id が引けない版に化ける）。組み立ては `context` の純関数が全部やる。
-async fn exec_get_node_context(pool: &SqlitePool, args: &Value) -> Result<String, ToolError> {
-    let node_id = args
-        .get("node_id")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| {
-            ToolError::InvalidArguments("missing required argument: node_id (integer)".to_string())
-        })?;
-
-    let loaded = crate::ingestion::load_node_lcir(pool, node_id)
-        .await
-        .map_err(ToolError::Execution)?;
-    let Some((version, entry_id, doc)) = loaded else {
-        return Ok(serde_json::to_string(&json!({
-            "node_id": node_id,
-            "found": false,
-            "message": "no LCIR node with this id. Node ids are per-representation and change \
-                when LCIR is rebuilt — re-run search_document_nodes / get_document_blocks to get \
-                current ids.",
-        }))
-        .unwrap_or_default());
-    };
-
-    let usize_arg = |key: &str, default: usize| -> usize {
-        args.get(key)
-            .and_then(|v| v.as_i64())
-            .filter(|n| *n >= 0)
-            .map_or(default, |n| n as usize)
-    };
-    let d = crate::context::ContextOptions::default();
-    let opts = crate::context::ContextOptions {
-        max_before: usize_arg("max_before", d.max_before),
-        max_continuation: usize_arg("max_continuation", d.max_continuation),
-        max_continuation_chars: usize_arg("max_continuation_chars", d.max_continuation_chars)
-            .max(1),
-        max_related: usize_arg("max_related", d.max_related),
-        max_premises: usize_arg("max_premises", d.max_premises),
-    };
-
-    let Some(bundle) = crate::context::build_node_context(&doc, node_id, &opts) else {
-        // version_id_for_node が引けた以上ここには来ないが、木の読み込みと不整合な場合の保険。
-        return Err(ToolError::Execution(format!(
-            "node {node_id} is not present in its own document version"
-        )));
-    };
-
-    // 書誌側の見出し（エントリ・併存表現）を封筒として足す。既存 LCIR ツールと同じキー名。
-    let versions = crate::ingestion::entry_lcir_versions(pool, entry_id)
-        .await
-        .map_err(|e| ToolError::Execution(e.to_string()))?;
-    let citation_key = crate::bibtex::resolve_citation_key(pool, entry_id).await.ok();
-
-    let mut obj = match serde_json::to_value(&bundle) {
-        Ok(Value::Object(m)) => m,
-        _ => return Err(ToolError::Execution("failed to serialize bundle".to_string())),
-    };
-    obj.insert("found".to_string(), json!(true));
-    obj.insert("entry_id".to_string(), json!(entry_id));
-    obj.insert("citation_key".to_string(), json!(citation_key));
-    obj.insert("attachment_id".to_string(), json!(version.attachment_id));
-    obj.insert(
-        "source".to_string(),
-        json!(short_source_name(&version.extractor_name)),
-    );
-    obj.insert(
-        "extractor_version".to_string(),
-        json!(version.extractor_version),
-    );
-    obj.insert("available_sources".to_string(), sources_json(&versions));
-    Ok(serde_json::to_string(&Value::Object(obj)).unwrap_or_default())
-}
 
 // ─── 認可トークン ────────────────────────────────────────────────────────────
 
@@ -2494,7 +1258,9 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        for expected in [
+        // **完全一致で押さえる**（`contains` の部分集合チェックでは、Phase 10b の移設で
+        // 手書き spec の消し忘れによる重複や、逆に委譲リストからの取りこぼしが検出できない）。
+        let expected = [
             "fulltext_search",
             "get_entry",
             "list_collections",
@@ -2502,6 +1268,8 @@ mod tests {
             "search_entries",
             "resolve_citation_key",
             "export_bibtex",
+            "find_entries_by_citation_keys",
+            "get_fulltext",
             "get_document_structure",
             "get_document_blocks",
             "search_document_nodes",
@@ -2510,9 +1278,16 @@ mod tests {
             "get_figures",
             "get_tables",
             "get_node_context",
-        ] {
-            assert!(names.contains(&expected), "missing read tool: {expected}");
-        }
+        ];
+        assert_eq!(
+            names, expected,
+            "tools/list must be exactly this set, in this order"
+        );
+        assert_eq!(
+            names.len(),
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            "tools/list must not contain duplicate names"
+        );
         // write/mutate/ocr は公開しない。
         for forbidden in ["create_entry", "update_entry", "delete_entry", "add_tag", "ocr_pdf"] {
             assert!(!names.contains(&forbidden), "must not expose: {forbidden}");
@@ -4349,6 +3124,66 @@ mod tests {
                 assert_eq!(ctx["found"], true);
                 assert_eq!(ctx["node_id"], nid);
                 assert_eq!(ctx["entry_id"], entry_id);
+
+                // ── Phase 10b: チャット経路で同じものが引けること + 根拠参照 ──
+                // MCP と同じ定義・同じ実行を共有しているかを実データで確かめる。
+                let chat_ctx = crate::llm::tools::ToolContext {
+                    pool: &pool,
+                    session_id: 0,
+                    scope_mode: "all",
+                    scope_entry_ids: &[],
+                    mcp: None,
+                    app_data_dir: &build_root,
+                };
+                let chat_call = crate::llm::ToolCallSpec {
+                    call_id: "smoke".to_string(),
+                    tool_name: "get_node_context".to_string(),
+                    arguments: json!({ "node_id": nid }),
+                };
+                let chat_text = crate::llm::tools::execute_tool(&chat_ctx, &chat_call)
+                    .await
+                    .expect("chat path must route get_node_context");
+                let chat_ctx_json: Value = serde_json::from_str(&chat_text).unwrap();
+                assert_eq!(
+                    chat_ctx_json, ctx,
+                    "chat and MCP must return byte-identical results for the same node"
+                );
+
+                let refs = crate::llm::tools::document::provenance_refs("get_node_context", &chat_text);
+                eprintln!("[phase 10b] get_node_context refs={:?}", refs);
+
+                // 各 ref-bearing ツールの実出力から根拠が取れるか。
+                for (tool, args) in [
+                    ("search_document_nodes", json!({ "query": "theorem", "max_results": 5 })),
+                    ("get_document_blocks", json!({ "entry_id": entry_id, "source": "pdf", "max_chars": 3000 })),
+                    ("get_figures", json!({ "entry_id": entry_id })),
+                ] {
+                    let call = crate::llm::ToolCallSpec {
+                        call_id: "smoke".to_string(),
+                        tool_name: tool.to_string(),
+                        arguments: args,
+                    };
+                    let out = crate::llm::tools::execute_tool(&chat_ctx, &call).await.unwrap();
+                    let r = crate::llm::tools::document::provenance_refs(tool, &out);
+                    eprintln!(
+                        "[phase 10b] {tool}: refs={} -> {:?}",
+                        r.len(),
+                        r.iter().map(|x| format!("{}:{} p{}", x.node_id, x.kind, x.page)).collect::<Vec<_>>()
+                    );
+                    // 根拠を出すなら必ず page を持つ（飛び先の無いチップを作らない）。
+                    assert!(r.iter().all(|x| x.page >= 1), "{tool}: every ref must carry a page");
+                    assert!(r.len() <= 5, "{tool}: refs are capped");
+                }
+
+                // チャットに出すツール一覧（この DB は LCIR 構築済みなので 8 種が出る）。
+                let readable = crate::ingestion::lcir_readable(&pool).await;
+                let shown: Vec<String> = crate::llm::tools::all_tool_specs(readable)
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+                eprintln!("[phase 10b] lcir_readable={readable} tools={}", shown.len());
+                assert!(readable, "the smoke DB has built LCIR, so the tools must be shown");
+                assert!(shown.contains(&"get_node_context".to_string()));
             }
         }
 

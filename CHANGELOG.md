@@ -10,7 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **LCIR — reading context around one block (Phase 10a, experimental)** — a new read tool, `get_node_context`, assembles everything needed to read and cite a single block in one call: the statement, the blocks that continue it, the proof that proves it, the definitions it rests on, the equations/figures/works it references, and the PDF region of every piece. This matters most for PDF-derived documents, where a theorem node holds only its first layout block and the rest of the statement continues into sibling blocks — often onto the next page. Every element carries its `origin` and `confidence`, so source text and inference stay distinguishable when quoted, and a `notes` list states what the bundle could not reach. Available over MCP as `get_node_context` and from the CLI as `lumencite node-context <node_id>`. No migration; nothing new is stored.
+- **LCIR — the in-app assistant can now read papers by structure (Phase 10b, experimental)** — the chat assistant gains the nine document-reading tools that were previously reachable only over MCP: `get_fulltext` plus the eight LCIR tools (`get_document_structure`, `get_document_blocks`, `search_document_nodes`, `get_node_relations`, `get_symbol_definitions`, `get_figures`, `get_tables`, `get_node_context`). The LCIR eight appear only once something has actually been built, so a library without LCIR sees exactly one new tool. Answers now distinguish the paper's own words (`tex_source`, `pdf_text_layer`) from LumenCite's estimates (`layout_model`, `llm_inference`, including generated figure alt text), and tool results respect the chat's entry scope — when hits are filtered out, the assistant is told so rather than reporting an empty library. No migration; nothing new is stored.
+- **Jump from a chat answer to the evidence in the PDF** — tool result cards show the blocks the answer rests on; clicking one opens the PDF viewer at that page with the region highlighted. Available for PDF-derived LCIR (the TeX representation carries exact LaTeX but no coordinates).
 - **`get_document_blocks` and `search_document_nodes` now return each block's `node_id`** — the stable handle you pass to `get_node_context` and `get_node_relations`. (`get_document_blocks`' existing `index` only numbers blocks within one response and was never a block id.)
+
+### Fixed
+
+- **The assistant no longer re-OCRs a PDF whose text is already indexed** — it now reads the existing text with `get_fulltext` instead. A full re-OCR replaces the attachment's index, so this used to overwrite good extracted text with vision output and bill for it. Explicitly running OCR yourself from the app is unchanged.
+- **Read-only chat tools no longer reload the whole library list after every call**, and they are no longer displayed as write operations awaiting approval.
+- **Opening a PDF page from the app no longer scrolls every other open PDF window** — the jump is now addressed to the intended window instead of broadcast to all of them.
 
 ## [0.10.0] - 2026-07-28
 

@@ -405,7 +405,35 @@ Phase 10（LLM・エージェント向け利用）の第一段。**1 ブロッ�
 - **返すもの**: `focus` / `section_path` / `before` / `continuation`（読み順で次の構造境界の手前まで＝ページ境界で切れない）/ `continuation_stopped_at` / `proofs` / `proves` / `premises` / `equations` / `figures` / `citations` / `references` / `notes`。全要素に `origin` + `confidence`、PDF 版は `page` + `bbox`（既存ツールと同じ 4 要素配列）。**どこで・なぜ続きを止めたかを必ず返す** — 「主張が終わった」「フロートのキャプションに割り込まれた」「上限で切った」は意味が違うので、黙って空にしない。
 - **前提定義は導出経路を明示する**: 辺（`refers_to_theorem` → `definition`）だけでは実測 1.4% しか埋まらないので、`via` で `reference` / `occurrence`（`symbol_occurrences` の記録）/ `symbol`（記号の表層が本文に `$X$` で現れ、定義が読み順で前にある・読み側の照合で保存はしない）を**区別したまま**返す。後 2 者は TeX 版のみ。
 - **図表参照は caption_of を解決して返す**: `{node（辺の指し先）, figure（領域・crop・alt text の持ち主）, caption（原文）}`。実測で caption の 3/4 は実体に到達できないので `figure` の欠落は常態で、`notes` に出す。
-- **やらないこと**: 2 ホップの畳み込み（証明の参照まで含めるとバンドル長が予測不能になる。`proofs` の node_id で呼び直す）／チャットへの露出（10b）／embedding・ベクトル検索・文献横断グラフ（10c・post-1.0）。
+- **やらないこと**: 2 ホップの畳み込み（証明の参照まで含めるとバンドル長が予測不能になる。`proofs` の node_id で呼び直す）／embedding・ベクトル検索・文献横断グラフ（10c・post-1.0）。チャットへの露出は Phase 10b で実装済み（下記）。
+
+### LCIR のチャット露出と provenance 付き回答（Phase 10b）
+
+Phase 10 の完成形。**アプリ内チャットが論文を構造単位で読み、根拠を示せる**ようにする。
+migration なし・新表なし・新しい永続推定なし。
+
+- **なぜ要るか**: LCIR の read ツールは MCP サーバーにしか出ておらず、アプリ内チャットからは
+  `get_fulltext` すら呼べなかった。索引済みの PDF を読む手段が無いので、チャットは
+  `fulltext_search` が空振りすると `ocr_pdf` を提案し、**既にあるテキスト層を Vision 出力で
+  上書きしながら課金する**（issue #42）。
+- **単一ソース化**: 文献本文の read ツール 9 種（`get_fulltext` + LCIR 8 種）の定義と実行を
+  `llm::tools::document` に置き、MCP サーバーはそこへ委譲する。`search` / `mutate` が既に
+  持っていた関係を広げただけで、`tools/list` の内容・並び順・各ツールの入出力は変えない。
+- **スコープ**: チャットには対象エントリを絞る機能（CR-024）があるが MCP には無い。
+  `entry_id` が確定したすべての経路で検査し、横断検索は絞ったことを `scope_filtered` で
+  応答に出す（黙って絞ると LLM が「ライブラリに無い」と答える）。
+- **一覧に出す条件は「読める版が実在するか」**。`lcir.enabled` を ON にしただけでは何も
+  構築されないので、フラグだけで判定すると `has_lcir:false` しか返さないツールの定義で
+  コンテキストを食う。
+- **provenance**: ツール契約をシステムプロンプトに必ず足し、原文由来（`tex_source` /
+  `pdf_text_layer`）と LumenCite の推定（`layout_model` / `llm_inference`）を回答中で
+  区別させる。データ側でも `get_document_blocks` の各ブロックに `origin` / `confidence` を
+  載せた（従来は `get_node_context` にしか無く、契約だけあってデータが無かった）。
+- **根拠 → PDF 領域**: ツール結果カードに根拠チップを出し、押すと PDF ビューアがその
+  ページを開いて領域を一時強調する。座標は既存ハイライトと同一系なので変換は不要。
+- **やらないこと**: TeX 版ノードからの領域ジャンプ（TeX に座標が無い。tex → pdf の位置解決は
+  post-1.0）／本体詳細画面へのインライン埋め込み（別ウィンドウで開く。チャットを閉じない）／
+  embedding・ベクトル検索（10c・post-1.0）。
 
 ### 1エントリ複数 PDF 添付（本文＋補助資料）— Phase 1
 

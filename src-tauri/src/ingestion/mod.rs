@@ -35,6 +35,31 @@ pub async fn lcir_enabled(pool: &SqlitePool) -> bool {
         == Some("1")
 }
 
+/// **読める LCIR が実在するか**（フラグ ON かつ完了済みの版が 1 本以上ある）。
+///
+/// `lcir_enabled` は「これから構築してよいか」を表すフラグで、ON にしただけでは何も
+/// 構築されない（PDF の build は設定→データの手動ボタン）。read 面の露出可否
+/// （チャットのツール一覧・Phase 10b）は「実際に読めるか」で決めないと、
+/// `has_lcir:false` しか返さないツールの定義でコンテキストを食うことになる。
+///
+/// 逆にフラグを OFF に戻したときは、既に構築済みの版があっても隠す
+/// （ユーザーが「使わない」と言った以上、外部モデルへ渡す面からは下ろす）。
+pub async fn lcir_readable(pool: &SqlitePool) -> bool {
+    if !lcir_enabled(pool).await {
+        return false;
+    }
+    sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(
+            SELECT 1 FROM document_versions
+            WHERE extraction_status IN ('completed', 'completed_with_warnings')
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+        == 1
+}
+
 /// `build_lcir_for_attachment` の結果サマリ。
 #[derive(Debug, serde::Serialize)]
 pub struct LcirBuildResult {
@@ -2004,7 +2029,7 @@ mod tests {
         let n = regenerate_node_fts_from_lcir(&pool, att).await.unwrap();
         assert_eq!(n, 1, "block(paragraph) だけ索引・page/line/document は除外");
 
-        let hits = document_nodes_fts::search_nodes(&pool, "transformer", None, None, None)
+        let hits = document_nodes_fts::search_nodes(&pool, "transformer", None, None, None, None, None)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -2034,7 +2059,7 @@ mod tests {
 
         let n = regenerate_node_fts_from_lcir(&pool, att).await.unwrap();
         assert_eq!(n, 0);
-        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None)
+        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());
@@ -2276,11 +2301,11 @@ mod tests {
 
         let n = regenerate_node_fts_from_lcir(&pool, att).await.unwrap();
         assert_eq!(n, 0, "TeX 版は索引しない");
-        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None)
+        assert!(document_nodes_fts::search_nodes(&pool, "stale", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());
-        assert!(document_nodes_fts::search_nodes(&pool, "tex paragraph", None, None, None)
+        assert!(document_nodes_fts::search_nodes(&pool, "tex paragraph", None, None, None, None, None)
             .await
             .unwrap()
             .is_empty());

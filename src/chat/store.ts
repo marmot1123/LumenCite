@@ -18,6 +18,7 @@ import {
   rowsToUiMessages,
   type ChatMessagesState,
 } from "./messages";
+import { isReadOnlyTool } from "./tools";
 
 export interface NewSessionArgs {
   title: string;
@@ -312,16 +313,11 @@ function findToolCallByCallId(
 }
 
 /** ライブラリ一覧（entries）の表示に影響し得る書き込みツールか。
- *  read 系（get_entry / fulltext_search / list_*）と、ローカル DB を変えない
- *  外部連携 mcp_* は除外する。それ以外（create/update/delete/add_tag 等）は
- *  一覧へ反映すべき書き込みとみなす。承認ポリシーの分類（approval.rs）と対応。 */
+ *  read 系（`READ_ONLY_TOOLS` / `list_*`）と、ローカル DB を変えない外部連携 mcp_* は
+ *  除外する。それ以外（create/update/delete/add_tag 等）は一覧へ反映すべき書き込みと
+ *  みなす。分類は `chat/tools.ts` に集約（backend の approval.rs と対応）。 */
 export function isLibraryMutatingTool(toolName: string): boolean {
-  if (
-    toolName === "get_entry" ||
-    toolName === "fulltext_search" ||
-    toolName.startsWith("list_") ||
-    toolName.startsWith("mcp_")
-  ) {
+  if (isReadOnlyTool(toolName) || toolName.startsWith("mcp_")) {
     return false;
   }
   return true;

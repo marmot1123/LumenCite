@@ -83,6 +83,9 @@ export function applyStreamEvent(
                 // 拒否済みのカードは done に上書きしない
                 state: (tc.state === "rejected" ? "rejected" : "done") as UiToolCall["state"],
                 result_summary: ev.result_summary,
+                // 根拠参照は backend が結果全文から取り出したもの。result_summary は
+                // 500 文字で切られているので、ここから再導出することはできない。
+                refs: ev.refs,
               }
             : tc,
         ),

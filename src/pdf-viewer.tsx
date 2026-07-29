@@ -12,11 +12,18 @@ const idStr = params.get("id");
 const id = idStr ? Number(idStr) : NaN;
 const pageStr = params.get("page");
 const initialPage = pageStr ? Number(pageStr) : undefined;
+// 一時強調する領域（チャットの根拠ジャンプ・Phase 10b）。"x,y,w,h"（PDF pt・左下原点）。
+const regionStr = params.get("region");
+const regionParts = regionStr ? regionStr.split(",").map(Number) : [];
+const initialRegion =
+  regionParts.length === 4 && regionParts.every(Number.isFinite)
+    ? (regionParts as [number, number, number, number])
+    : undefined;
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
     {Number.isFinite(id) ? (
-      <PdfViewer attachmentId={id} initialPage={initialPage} />
+      <PdfViewer attachmentId={id} initialPage={initialPage} initialRegion={initialRegion} />
     ) : (
       <div style={{ padding: 24, fontFamily: "system-ui", color: "#888" }}>
         {i18n.t("pdfViewer.noAttachmentId")}

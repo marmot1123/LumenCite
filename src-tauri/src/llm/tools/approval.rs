@@ -2,8 +2,10 @@
 //!
 //! # ポリシー（v0.2.0）
 //!
-//! - **READ 系** (`fulltext_search`, `get_entry`, `list_*` で始まる名前):
-//!   常に自動承認。whitelist で無効化不可。
+//! - **READ 系** ([`READ_ONLY_TOOLS`] と `list_*` で始まる名前):
+//!   常に自動承認。whitelist で無効化不可。読むだけでライブラリを変えないので、
+//!   1 問につき数ホップ読む使い方（Phase 10b）でも都度確認を出さない。
+//!   応答の大きさの制御は承認ではなく各ツールの件数/文字数上限で行う。
 //!
 //! - **ALWAYS-CONFIRM** (`delete_*` で始まる名前, `mcp_` で始まる名前):
 //!   常に要承認。whitelist でも override 不可。
@@ -34,6 +36,28 @@
 
 use std::collections::HashMap;
 
+/// 常に自動承認する read 系ツール（whitelist でも要承認にできない）。
+/// `list_*` 接頭辞は別途 prefix ルールで拾うのでここには含めない。
+///
+/// **frontend の `src/chat/tools.ts` の `READ_ONLY_TOOLS` と一致させること** — あちらは
+/// ツールカードの色分け（`toolKind`）と「ライブラリを書き換えたか」判定
+/// （`isLibraryMutatingTool` → 一覧の再読込）に使う。片方だけ足すと、read ツールが
+/// オレンジの write バッジで表示され、呼ぶたびに一覧を全再読込する。
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "fulltext_search",
+    "get_entry",
+    // 文献本文の read 系（Phase 10b・`llm::tools::document`）。
+    "get_fulltext",
+    "get_document_structure",
+    "get_document_blocks",
+    "search_document_nodes",
+    "get_node_relations",
+    "get_symbol_definitions",
+    "get_figures",
+    "get_tables",
+    "get_node_context",
+];
+
 /// whitelist で自動承認可否を override できるツール名の集合。
 /// `set_tool_whitelist` コマンドが受理キーを検証するのに使う（CR-002）。
 /// frontend の `OVERRIDABLE_TOOLS` と一致させること。
@@ -51,10 +75,7 @@ pub const OVERRIDABLE_TOOLS: &[&str] = &[
 /// 詳細は当モジュールのドキュメントを参照。
 pub fn should_auto_approve(tool_name: &str, whitelist_json: Option<&str>) -> bool {
     // --- ALWAYS-TRUE: read 系 ---
-    if tool_name == "fulltext_search"
-        || tool_name == "get_entry"
-        || tool_name.starts_with("list_")
-    {
+    if READ_ONLY_TOOLS.contains(&tool_name) || tool_name.starts_with("list_") {
         return true;
     }
 
@@ -113,6 +134,39 @@ mod tests {
     #[test]
     fn get_entry_is_always_approved() {
         assert!(should_auto_approve("get_entry", None));
+    }
+
+    /// Phase 10b: 文献本文の read 系も常に自動承認（1 問で数ホップ読むので、
+    /// 都度確認を出すと読解フローが成立しない）。whitelist でも覆せないこと。
+    #[test]
+    fn document_read_tools_are_always_approved() {
+        let deny_all = r#"{"get_fulltext": false, "get_node_context": false}"#;
+        for name in [
+            "get_fulltext",
+            "get_document_structure",
+            "get_document_blocks",
+            "search_document_nodes",
+            "get_node_relations",
+            "get_symbol_definitions",
+            "get_figures",
+            "get_tables",
+            "get_node_context",
+        ] {
+            assert!(should_auto_approve(name, None), "{name} must be auto-approved");
+            assert!(
+                should_auto_approve(name, Some(deny_all)),
+                "{name} must not be overridable by the whitelist"
+            );
+        }
+    }
+
+    /// read の集合と whitelist で覆せる集合は交わらない（`set_tool_whitelist` は
+    /// `OVERRIDABLE_TOOLS` しか受理しないので、混ざると設定が無言で効かなくなる）。
+    #[test]
+    fn read_only_and_overridable_sets_are_disjoint() {
+        for r in READ_ONLY_TOOLS {
+            assert!(!OVERRIDABLE_TOOLS.contains(r), "{r} is in both sets");
+        }
     }
 
     #[test]

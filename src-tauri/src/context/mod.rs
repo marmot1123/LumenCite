@@ -366,7 +366,7 @@ pub struct NodeContext {
 // ── ノード種別の分類（純関数） ──────────────────────────────────────────────
 
 /// 本文つき論理ブロック（骨格の `document`/`page`/`line` は除く）。
-/// `mcp_server::is_content_block` と同じ集合（読み順の並びを両者でずらさない）。
+/// `llm::tools::document::is_content_block` と同じ集合（読み順の並びを両者でずらさない）。
 fn is_content_block(kind: &str) -> bool {
     !matches!(kind, "document" | "page" | "line")
 }
@@ -958,7 +958,7 @@ fn context_node(n: &LcirNode, text_cap: usize) -> ContextNode {
     }
 }
 
-/// char 単位で安全に切る（`mcp_server::relation_snippet` と同じ作法）。切ったら `true`。
+/// char 単位で安全に切る（`llm::tools::document::relation_snippet` と同じ作法）。切ったら `true`。
 fn clip(text: &str, max: usize) -> (String, bool) {
     if text.chars().count() <= max {
         return (text.to_string(), false);
