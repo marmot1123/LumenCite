@@ -2659,7 +2659,8 @@ mod tests {
     /// trash が書き込まれることはない。
     /// 例:
     /// `LCIR_SMOKE_DB=/path/copy.db LCIR_SMOKE_APPDIR="$HOME/Library/Application Support/com.lumencite.app" \
-    ///  LCIR_SMOKE_ATT=8 cargo test --ignored lcir_build_real_pdf -- --nocapture`
+    ///  LCIR_SMOKE_ATT=8 cargo test --lib lcir_build_real_pdf -- --ignored --nocapture`
+    /// （`cargo test --ignored ...` は `unexpected argument` で落ちる。`--ignored` は `--` の後ろ）
     #[tokio::test]
     #[ignore = "manual pdfium smoke test; needs LCIR_SMOKE_* env + libpdfium"]
     async fn lcir_build_real_pdf() {

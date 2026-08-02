@@ -26,6 +26,67 @@ pub const MAX_RAW_RECTS_PER_PAGE: usize = 256;
 pub const CAPTION_GAP_MAX_PT: f64 = 60.0;
 /// caption ペアリングで要求する水平重なり（短い方の幅に対する比）。
 pub const CAPTION_OVERLAP_RATIO: f64 = 0.3;
+/// クランプ後に元面積のこの比率を下回った矩形は捨てる（座標変換異常の兆候）。
+pub const MIN_CLAMPED_AREA_RATIO: f64 = 0.5;
+
+/// pdfium の実効ページ box の原点（左下角）。引数は CropBox / MediaBox の左下角で、
+/// どちらも無ければ `(0, 0)`（pdfium は US Letter を原点ゼロで代替する）。
+///
+/// **生の CropBox ではなく `CropBox ∩ MediaBox` を採る。** pdfium のページ寸法
+/// （`FPDF_GetPageWidthF` = `width_pt`/`height_pt`）はこの交差の寸法だからで、
+/// 原点だけ生の CropBox から取ると寸法と原点の出所が食い違う。軸並行矩形の交差の
+/// 左下角は各成分の大きい方。
+///
+/// 実測（生存 138 版 7,345 頁・pdfium に直接問い合わせ）: 交差モデルは box を持つ
+/// 7,281 頁すべてで pdfium のページ寸法を再現し、生 CropBox モデルは 406 頁で外れる。
+/// 原点が食い違うのは 392 頁 / 2 版（CropBox が (0,0) 始まりで MediaBox の原点が
+/// 非ゼロという形。ずれ幅 78–88pt）。交差が空になる頁は 0 件。
+pub fn effective_page_box_origin(
+    crop_origin: Option<(f64, f64)>,
+    media_origin: Option<(f64, f64)>,
+) -> (f64, f64) {
+    match (crop_origin, media_origin) {
+        (Some((cl, cb)), Some((ml, mb))) => (cl.max(ml), cb.max(mb)),
+        (Some(o), None) | (None, Some(o)) => o,
+        (None, None) => (0.0, 0.0),
+    }
+}
+
+/// 埋込画像の bbox をページ境界 box へクランプする。範囲外に出た分を落とし、
+/// 元面積の [`MIN_CLAMPED_AREA_RATIO`] を下回るまで削られた矩形は捨てる（`None`）。
+///
+/// **クランプ範囲は `[0, page_w] × [0, page_h]` ではない**（debt-14）。pdfium が返す
+/// オブジェクトの bounds は絶対 user space（MediaBox 基準）である一方、`page_w`/`page_h` は
+/// ページ境界 box（CropBox）の**寸法**でしかない。したがって原点が非ゼロの PDF
+/// （裁ち落とし付きの雑誌・紀要）での有効範囲は
+/// `[box_left, box_left + page_w] × [box_bottom, box_bottom + page_h]` になる。
+/// 原点を落とすと ①ページ右端・上端の図が原点ぶんだけ切り落とされ、削られた面積が
+/// 半分を超えれば図そのものが消える ②逆に box の外（トンボ・裁ち落とし）の画像が
+/// 素通りして「ページに表示されない内容の crop」になる。
+///
+/// 戻り値は入力と同じ絶対 user space。box 原点を引いてページ画像のピクセルへ移すのは
+/// [`region_to_pixel_rect`] の仕事で、**両者は同じ原点を使わなければならない**。
+pub fn clamp_rect_to_page_box(
+    rect: BBox,
+    box_left: f64,
+    box_bottom: f64,
+    page_w: f64,
+    page_h: f64,
+) -> Option<BBox> {
+    if rect.width <= 0.0 || rect.height <= 0.0 || page_w <= 0.0 || page_h <= 0.0 {
+        return None;
+    }
+    let x0 = rect.x.max(box_left);
+    let y0 = rect.y.max(box_bottom);
+    let x1 = (rect.x + rect.width).min(box_left + page_w);
+    let y1 = (rect.y + rect.height).min(box_bottom + page_h);
+    let w = (x1 - x0).max(0.0);
+    let h = (y1 - y0).max(0.0);
+    if w * h < MIN_CLAMPED_AREA_RATIO * rect.width * rect.height {
+        return None;
+    }
+    Some(BBox::new(x0, y0, w, h))
+}
 
 /// 埋込画像 bbox 群を図領域へ: 小さすぎる/大きすぎる矩形を除外し、近接矩形を union で
 /// fixpoint マージし、上から順（y 降順→x 昇順）に返す。面積上位 `MAX_REGIONS_PER_PAGE` 件に
@@ -267,6 +328,144 @@ mod tests {
         );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0], b(100.0, 500.0, 310.0, 50.0));
+    }
+
+    // ---- effective_page_box_origin ----
+
+    #[test]
+    fn box_origin_is_the_crop_origin_when_crop_is_inside_media() {
+        // 典型: MediaBox は原点ゼロ、CropBox が内側に寄っている。
+        assert_eq!(
+            effective_page_box_origin(Some((20.0, 30.0)), Some((0.0, 0.0))),
+            (20.0, 30.0)
+        );
+    }
+
+    #[test]
+    fn box_origin_follows_media_when_crop_starts_at_zero() {
+        // 実測 2 版（382 頁 + 10 頁）: CropBox は (0,0) 始まりだが MediaBox の原点が非ゼロ。
+        // pdfium のページ寸法は交差の寸法なので、原点も交差＝MediaBox 側を採る。
+        assert_eq!(
+            effective_page_box_origin(Some((0.0, 0.0)), Some((77.811, 87.931))),
+            (77.811, 87.931)
+        );
+    }
+
+    #[test]
+    fn box_origin_falls_back_to_the_single_box_or_zero() {
+        assert_eq!(
+            effective_page_box_origin(None, Some((10.0, -51.0))),
+            (10.0, -51.0)
+        );
+        assert_eq!(
+            effective_page_box_origin(Some((-4.15, -8.42)), None),
+            (-4.15, -8.42)
+        );
+        // 両方取れない頁は pdfium が US Letter を原点ゼロで代替する（実測 64 頁）。
+        assert_eq!(effective_page_box_origin(None, None), (0.0, 0.0));
+    }
+
+    // ---- clamp_rect_to_page_box ----
+
+    #[test]
+    fn clamp_keeps_rect_fully_inside_the_page_box() {
+        let r = b(100.0, 400.0, 200.0, 150.0);
+        assert_eq!(clamp_rect_to_page_box(r, 0.0, 0.0, 595.0, 842.0), Some(r));
+    }
+
+    #[test]
+    fn clamp_trims_overhang_on_a_zero_origin_page() {
+        // 原点ゼロのページでの挙動は据え置き（大半の PDF がこちら）。
+        assert_eq!(
+            clamp_rect_to_page_box(b(-20.0, 400.0, 200.0, 150.0), 0.0, 0.0, 595.0, 842.0),
+            Some(b(0.0, 400.0, 180.0, 150.0))
+        );
+        assert_eq!(
+            clamp_rect_to_page_box(b(500.0, 400.0, 150.0, 100.0), 0.0, 0.0, 595.0, 842.0),
+            Some(b(500.0, 400.0, 95.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn clamp_uses_box_origin_for_right_and_top_edges() {
+        // CropBox [20 30 615 872]（原点 (20,30)・寸法 595x842）の雑誌 PDF。
+        // 有効範囲は x∈[20,615] / y∈[30,872] であって [0,595] / [0,842] ではない。
+        // 右端いっぱいの図（x∈[400,615]）。
+        assert_eq!(
+            clamp_rect_to_page_box(b(400.0, 100.0, 215.0, 300.0), 20.0, 30.0, 595.0, 842.0),
+            Some(b(400.0, 100.0, 215.0, 300.0)),
+            "原点を無視すると右 20pt が切り落とされる"
+        );
+        // 上端いっぱいの図（y∈[600,872]）。
+        assert_eq!(
+            clamp_rect_to_page_box(b(100.0, 600.0, 200.0, 272.0), 20.0, 30.0, 595.0, 842.0),
+            Some(b(100.0, 600.0, 200.0, 272.0)),
+            "原点を無視すると上 30pt が切り落とされる"
+        );
+    }
+
+    #[test]
+    fn clamp_trims_at_the_box_left_and_bottom_edges() {
+        // 同じ CropBox [20 30 615 872]。左端・下端を跨ぐ矩形は box の内側で切る
+        // （原点を落とすと裁ち落とし領域まで crop に入る）。
+        assert_eq!(
+            clamp_rect_to_page_box(b(0.0, 100.0, 300.0, 200.0), 20.0, 30.0, 595.0, 842.0),
+            Some(b(20.0, 100.0, 280.0, 200.0))
+        );
+        assert_eq!(
+            clamp_rect_to_page_box(b(100.0, 0.0, 200.0, 400.0), 20.0, 30.0, 595.0, 842.0),
+            Some(b(100.0, 30.0, 200.0, 370.0))
+        );
+    }
+
+    #[test]
+    fn clamp_keeps_a_figure_that_the_zero_origin_range_would_delete() {
+        // 原点が大きい PDF（CropBox の下端 300pt）では、ページ上半分の図が
+        // 「[0,page_h] の外」と判定されて面積 0 に潰れ、図そのものが消えていた。
+        assert_eq!(
+            clamp_rect_to_page_box(b(100.0, 700.0, 200.0, 90.0), 0.0, 300.0, 595.0, 500.0),
+            Some(b(100.0, 700.0, 200.0, 90.0))
+        );
+    }
+
+    #[test]
+    fn clamp_drops_a_rect_that_lies_outside_the_page_box() {
+        // box の下（トンボ・裁ち落とし領域）にある画像。原点を無視すると素通りして
+        // 「ページに表示されない内容の crop」を作ってしまう。
+        assert_eq!(
+            clamp_rect_to_page_box(b(100.0, 100.0, 200.0, 100.0), 0.0, 300.0, 595.0, 500.0),
+            None
+        );
+    }
+
+    #[test]
+    fn clamp_drops_rects_trimmed_below_the_area_ratio() {
+        // 元面積の半分未満まで削られたら捨てる（変換異常の兆候・誤配置 crop 回避）。
+        assert_eq!(
+            clamp_rect_to_page_box(b(500.0, 400.0, 300.0, 100.0), 0.0, 0.0, 595.0, 842.0),
+            None
+        );
+        // 半分を超えて残るなら採る。
+        assert_eq!(
+            clamp_rect_to_page_box(b(400.0, 400.0, 300.0, 100.0), 0.0, 0.0, 595.0, 842.0),
+            Some(b(400.0, 400.0, 195.0, 100.0))
+        );
+    }
+
+    #[test]
+    fn clamp_rejects_degenerate_input() {
+        assert_eq!(
+            clamp_rect_to_page_box(b(100.0, 100.0, 0.0, 50.0), 0.0, 0.0, 595.0, 842.0),
+            None
+        );
+        assert_eq!(
+            clamp_rect_to_page_box(b(100.0, 100.0, 50.0, -10.0), 0.0, 0.0, 595.0, 842.0),
+            None
+        );
+        assert_eq!(
+            clamp_rect_to_page_box(b(100.0, 100.0, 50.0, 50.0), 0.0, 0.0, 0.0, 842.0),
+            None
+        );
     }
 
     // ---- region_to_pixel_rect ----

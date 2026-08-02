@@ -166,6 +166,11 @@ fn extract_page_image_regions(
 ) -> Vec<ExtractedImageRegion> {
     use pdfium_render::prelude::*;
 
+    // 0. ページ境界 box の原点（CropBox が (0,0) 始まりでない雑誌 PDF の補正）。
+    //    `width_pt`/`height_pt` はこの box の**寸法**でしかないので、クランプ（1.）も
+    //    ピクセル変換（3.）もこの原点を基準にしないと座標系がずれる（debt-14）。
+    let (box_left, box_bottom) = page_box_origin(page);
+
     // 1. トップレベル Image オブジェクトの bbox を集める。
     let mut rects: Vec<BBox> = Vec::new();
     let mut raw_count = 0usize;
@@ -183,20 +188,17 @@ fn extract_page_image_regions(
         let y = r.bottom().value as f64;
         let w = (r.right().value - r.left().value) as f64;
         let h = (r.top().value - r.bottom().value) as f64;
-        if w <= 0.0 || h <= 0.0 {
+        // ページ境界 box へクランプ。大きく食み出す矩形（変換異常の兆候）は捨てる（誤配置 crop 回避）。
+        let Some(clamped) = figures::clamp_rect_to_page_box(
+            BBox::new(x, y, w, h),
+            box_left,
+            box_bottom,
+            width_pt,
+            height_pt,
+        ) else {
             continue;
-        }
-        // ページ矩形へクランプ。大きく食み出す矩形（変換異常の兆候）は捨てる（誤配置 crop 回避）。
-        let cx0 = x.max(0.0);
-        let cy0 = y.max(0.0);
-        let cx1 = (x + w).min(width_pt);
-        let cy1 = (y + h).min(height_pt);
-        let cw = (cx1 - cx0).max(0.0);
-        let ch = (cy1 - cy0).max(0.0);
-        if cw * ch < 0.5 * w * h {
-            continue;
-        }
-        rects.push(BBox::new(cx0, cy0, cw, ch));
+        };
+        rects.push(clamped);
     }
     if rects.is_empty() {
         return Vec::new();
@@ -220,10 +222,7 @@ fn extract_page_image_regions(
         return Vec::new();
     }
 
-    // 3. ページ境界 box の原点（CropBox が (0,0) 始まりでない雑誌 PDF の補正）。
-    let (box_left, box_bottom) = page_box_origin(page);
-
-    // 4. ページ全体を 1 回レンダリングし、各領域を crop する（`clip()` はビットマップを
+    // 3. ページ全体を 1 回レンダリングし、各領域を crop する（`clip()` はビットマップを
     //    縮めないため使わない）。失敗はページ単位の warning + アセット無し領域で継続。
     if let Err(e) = std::fs::create_dir_all(asset_dir) {
         warnings.push(format!(
@@ -294,17 +293,17 @@ fn extract_page_image_regions(
     regions
 }
 
-/// ページ境界 box（CropBox → MediaBox の順）の原点。取れなければ (0,0)（大半の PDF は原点ゼロ）。
+/// ページ境界 box（`CropBox ∩ MediaBox`）の原点。取れなければ (0,0)。
+/// 交差を採る理由と実測は [`figures::effective_page_box_origin`] を参照
+/// （`page.width()` が返すのは交差の幅なので、原点も交差から取らないと食い違う）。
 fn page_box_origin(page: &pdfium_render::prelude::PdfPage<'_>) -> (f64, f64) {
     let boundaries = page.boundaries();
-    let rect = boundaries
-        .crop()
-        .map(|b| b.bounds)
-        .or_else(|_| boundaries.media().map(|b| b.bounds));
-    match rect {
-        Ok(r) => (r.left().value as f64, r.bottom().value as f64),
-        Err(_) => (0.0, 0.0),
-    }
+    let origin_of =
+        |r: pdfium_render::prelude::PdfRect| (r.left().value as f64, r.bottom().value as f64);
+    figures::effective_page_box_origin(
+        boundaries.crop().ok().map(|b| origin_of(b.bounds)),
+        boundaries.media().ok().map(|b| origin_of(b.bounds)),
+    )
 }
 
 /// tmp 名に書いて `sync_all` → rename の原子的書き込み。並行ビルドの truncate 窓と
@@ -328,5 +327,110 @@ fn write_atomic(
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 手動 pdfium 実機確認: 実 PDF 1 本の図領域を、**ページ境界 box の原点を効かせた場合と
+    /// 落とした場合**の両方で数えて突き合わせる（原点 (0,0) で同じ純関数を呼べば debt-14
+    /// 修正前の挙動になる）。再構築せずに実データで効果と副作用を測るための道具で、
+    /// 8d-8 / 8d-2 が矩形を足したときの回帰確認にもそのまま使える。
+    ///
+    /// アセットは書き出さない（DB にも app data dir にも触れない・PDF を開くだけ）。
+    ///
+    /// `LCIR_FIG_PDF=/path/to.pdf cargo test --lib figure_regions_real_pdf -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual pdfium smoke test; needs LCIR_FIG_PDF + libpdfium"]
+    fn figure_regions_real_pdf() {
+        use pdfium_render::prelude::*;
+
+        let Ok(path) = std::env::var("LCIR_FIG_PDF") else {
+            eprintln!("skip: set LCIR_FIG_PDF=/path/to.pdf");
+            return;
+        };
+        let bindings = pdfium::bind_pdfium().expect("libpdfium");
+        let pdfium = Pdfium::new(bindings);
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("open PDF");
+
+        let (mut pages, mut nonzero_origin_pages, mut skipped) = (0usize, 0usize, 0usize);
+        let (mut regions_new, mut regions_old) = (0usize, 0usize);
+        let (mut changed, mut added, mut removed) = (0usize, 0usize, 0usize);
+
+        for (idx, page) in doc.pages().iter().enumerate() {
+            pages += 1;
+            let page_number = idx + 1;
+            let w = page.width().value as f64;
+            let h = page.height().value as f64;
+            if page.rotation().map_or(0.0, |r| r.as_degrees() as f64) != 0.0 {
+                skipped += 1; // 回転頁は本番でも図領域を作らない。
+                continue;
+            }
+            let (box_left, box_bottom) = page_box_origin(&page);
+            let raw_crop = page
+                .boundaries()
+                .crop()
+                .ok()
+                .map(|b| (b.bounds.left().value as f64, b.bounds.bottom().value as f64));
+            if box_left != 0.0 || box_bottom != 0.0 {
+                nonzero_origin_pages += 1;
+            }
+
+            let (mut rects_new, mut rects_old, mut raw_count) = (Vec::new(), Vec::new(), 0usize);
+            for object in page.objects().iter() {
+                if object.as_image_object().is_none() {
+                    continue;
+                }
+                raw_count += 1;
+                if raw_count > figures::MAX_RAW_RECTS_PER_PAGE {
+                    continue;
+                }
+                let Ok(quad) = object.bounds() else { continue };
+                let r = quad.to_rect();
+                let rect = BBox::new(
+                    r.left().value as f64,
+                    r.bottom().value as f64,
+                    (r.right().value - r.left().value) as f64,
+                    (r.top().value - r.bottom().value) as f64,
+                );
+                if let Some(c) = figures::clamp_rect_to_page_box(rect, box_left, box_bottom, w, h) {
+                    rects_new.push(c);
+                }
+                // 原点 (0,0) = debt-14 修正前のクランプ。
+                if let Some(c) = figures::clamp_rect_to_page_box(rect, 0.0, 0.0, w, h) {
+                    rects_old.push(c);
+                }
+            }
+            if raw_count > figures::MAX_RAW_RECTS_PER_PAGE {
+                skipped += 1;
+                continue;
+            }
+            let merged_new = figures::merge_image_regions(&rects_new, w, h);
+            let merged_old = figures::merge_image_regions(&rects_old, w, h);
+            regions_new += merged_new.len();
+            regions_old += merged_old.len();
+            if merged_new == merged_old {
+                continue;
+            }
+            // 同一 bbox は「据え置き」、片方にしか無いものを増減として数える。
+            let same = merged_new.iter().filter(|b| merged_old.contains(b)).count();
+            added += merged_new.len() - same;
+            removed += merged_old.len() - same;
+            if merged_new.len() == merged_old.len() {
+                changed += merged_new.len() - same;
+            }
+            eprintln!(
+                "p{page_number}: page={w:.2}x{h:.2} origin=({box_left:.3},{box_bottom:.3}) \
+                 raw_crop={raw_crop:?} images={raw_count}\n  old={merged_old:?}\n  new={merged_new:?}"
+            );
+        }
+
+        eprintln!(
+            "\n== {path}\n   pages={pages} (nonzero-origin {nonzero_origin_pages}, skipped {skipped})\n   \
+             regions: old={regions_old} new={regions_new}  (+{added} / -{removed} / 差替 {changed})"
+        );
+        assert!(pages > 0, "PDF に 1 ページも無い");
     }
 }

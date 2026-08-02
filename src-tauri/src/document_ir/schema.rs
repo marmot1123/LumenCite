@@ -35,7 +35,11 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 ///   `table_caption`/`figure_caption` に分類する。実ライブラリで 48 ブロック / 12 版が
 ///   `paragraph` 等に落ちていた。分類（`node_kind`）が変わるので既存コーパスは
 ///   `rebuild_outdated_lcir` で張り直せるよう版を上げる。
-pub const EXTRACTOR_VERSION: &str = "0.8.0";
+/// - `0.9.0`: debt-14。図領域のクランプ範囲を `[0, 幅] × [0, 高さ]` からページ境界 box
+///   （`CropBox ∩ MediaBox`）へ直し、その原点を生 CropBox ではなく交差から取る。
+///   原点が非ゼロの PDF で図が切り落とされ / 丸ごと消え / 逆に box 外の画像を拾っていた。
+///   図領域（`figure` ノードの bbox と crop PNG）が変わるので旧版は supersede される。
+pub const EXTRACTOR_VERSION: &str = "0.9.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。
