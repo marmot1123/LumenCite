@@ -1107,6 +1107,21 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 `immutable=1` を使う。p3 の読み出し面には `mcp_lcir_tools_e2e` と `tex_extract_real_source` も
 1 回ずつ回す（3 案とも `lcir_build_real_pdf` しか挙げていなかった）。
 
+**踏んだ落とし穴**:
+
+- **コピー DB を作り直さずに反復すると、改善が反映されない。** 抽出ロジックだけ変えて
+  `EXTRACTOR_VERSION` を据え置くと content_key が不変 → build が `reused: true` で早期 return し、
+  新しいコードを 1 行も実行しないまま「異常なし」を返す（§2.1）。**smoke のたびにコピーを作り直す。**
+- **コピー DB の置き場所は `$TMPDIR`。** Claude Code のスクラッチパッド配下に置くと、`sqlite3` からは
+  開けるのに `cargo test` のプロセスからは `SqliteError code 14 "unable to open database file"` になる。
+  Dropbox 配下も不可（761MB が同期対象になる）。**終わったら消す**（disk 使用率が 90% 台）。
+- **読み取り専用の集計だけならコピーは要らない**（`immutable=1` で実 DB を直接引く）。
+  v1.0.0 の棚卸しの実測値はほぼ全部この方法で取った。
+
+**検体の目安**: `LCIR_SMOKE_ATT=144`（図 3 件・8a/8c 向け）／`=25`（PDF・定理 18/証明 12/図 3）／
+`=145`（TeX・記号 38・1 定理に proof 2 件）／`=40`（figure 287・alt text 73・#7 のパイロット）。
+図領域の A/B だけなら DB も appdir も要らない `figure_regions_real_pdf`（`LCIR_FIG_PDF=<pdf>`・§2.10）。
+
 ---
 
 ## 10. 初版（2026-07-28）から訂正した記述
