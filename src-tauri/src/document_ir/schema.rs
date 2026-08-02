@@ -39,7 +39,11 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 ///   （`CropBox ∩ MediaBox`）へ直し、その原点を生 CropBox ではなく交差から取る。
 ///   原点が非ゼロの PDF で図が切り落とされ / 丸ごと消え / 逆に box 外の画像を拾っていた。
 ///   図領域（`figure` ノードの bbox と crop PNG）が変わるので旧版は supersede される。
-pub const EXTRACTOR_VERSION: &str = "0.9.0";
+/// - `0.10.0`: debt-18。走り柱（ランニングヘッダ/フッタ）判定の帯を、ページ寸法の 10%/90% から
+///   **ページ境界 box の原点 + 10%/90%** に直す。原点が非ゼロの PDF で帯がずれ、本文の短い行が
+///   `paragraph` → `unknown_block` に降格し、逆に box 下端すぐ上の走り柱が段落として残っていた。
+///   分類（`node_kind`）が変わるので旧版は supersede される。
+pub const EXTRACTOR_VERSION: &str = "0.10.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。

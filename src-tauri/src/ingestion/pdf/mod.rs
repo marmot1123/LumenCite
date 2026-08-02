@@ -12,12 +12,32 @@ use crate::ingestion::figures;
 /// 変更は crop の見た目だけでなく assets の再現性に効くので extractor_version と併せて上げる。
 pub const RENDER_TARGET_WIDTH: i32 = 1600;
 
+/// ページ境界 box（`CropBox ∩ MediaBox`）の原点と寸法。図領域の計算に渡す 4 値を束ねたもの
+/// （`f64` を 4 つ並べて渡すと取り違えても型が通ってしまうため）。
+/// [`ExtractedPage`] は同じ 4 値を平坦に持つ ── そちらは構造認識・ページ payload の読み手向け。
+#[derive(Clone, Copy, Debug)]
+pub struct PageBox {
+    /// 絶対 user space（MediaBox 基準）での左下角。
+    pub left: f64,
+    pub bottom: f64,
+    /// box の寸法（`page.width()`/`height()`）。**絶対座標の bbox と比べるときは原点を足すこと。**
+    pub width: f64,
+    pub height: f64,
+}
+
 /// 1 ページの抽出結果。
 pub struct ExtractedPage {
     /// 1 始まりのページ番号。
     pub page_number: i64,
     pub width_pt: f64,
     pub height_pt: f64,
+    /// ページ境界 box（`CropBox ∩ MediaBox`）の左下角。**`width_pt`/`height_pt` はこの box の
+    /// 「寸法」でしかなく、bbox は絶対 user space（MediaBox 基準）**なので、両者を比べる計算は
+    /// 必ずこの原点を足すこと（debt-14 / debt-18 はどちらもこれを落としたバグ）。
+    /// 読み手: `box_bottom` は `structure::classify_block` の走り柱判定、
+    /// 両方が図領域のクランプ（`extract_page_image_regions` へ同じ値を渡している）。
+    pub box_left: f64,
+    pub box_bottom: f64,
     pub rotation_deg: f64,
     /// ページ全文（FTS 再生成元）。
     pub plain_text: String,
@@ -83,6 +103,9 @@ pub fn extract_document(
         let width_pt = page.width().value as f64;
         let height_pt = page.height().value as f64;
         let rotation_deg = page.rotation().map_or(0.0, |r| r.as_degrees() as f64);
+        // ページ境界 box の原点。テキスト側（走り柱判定）と図領域側（クランプ）が
+        // **同じ値**を使う必要があるので、ページごとにここで 1 回だけ引く。
+        let (box_left, box_bottom) = page_box_origin(&page);
 
         let text = match page.text() {
             Ok(t) => t,
@@ -92,6 +115,8 @@ pub fn extract_document(
                     page_number,
                     width_pt,
                     height_pt,
+                    box_left,
+                    box_bottom,
                     rotation_deg,
                     plain_text: String::new(),
                     blocks: Vec::new(),
@@ -125,8 +150,12 @@ pub fn extract_document(
             Some(dir) => extract_page_image_regions(
                 &page,
                 page_number,
-                width_pt,
-                height_pt,
+                PageBox {
+                    left: box_left,
+                    bottom: box_bottom,
+                    width: width_pt,
+                    height: height_pt,
+                },
                 rotation_deg,
                 dir,
                 &mut warnings,
@@ -138,6 +167,8 @@ pub fn extract_document(
             page_number,
             width_pt,
             height_pt,
+            box_left,
+            box_bottom,
             rotation_deg,
             plain_text,
             blocks,
@@ -158,18 +189,12 @@ pub fn extract_document(
 fn extract_page_image_regions(
     page: &pdfium_render::prelude::PdfPage<'_>,
     page_number: i64,
-    width_pt: f64,
-    height_pt: f64,
+    page_box: PageBox,
     rotation_deg: f64,
     asset_dir: &std::path::Path,
     warnings: &mut Vec<String>,
 ) -> Vec<ExtractedImageRegion> {
     use pdfium_render::prelude::*;
-
-    // 0. ページ境界 box の原点（CropBox が (0,0) 始まりでない雑誌 PDF の補正）。
-    //    `width_pt`/`height_pt` はこの box の**寸法**でしかないので、クランプ（1.）も
-    //    ピクセル変換（3.）もこの原点を基準にしないと座標系がずれる（debt-14）。
-    let (box_left, box_bottom) = page_box_origin(page);
 
     // 1. トップレベル Image オブジェクトの bbox を集める。
     let mut rects: Vec<BBox> = Vec::new();
@@ -191,10 +216,10 @@ fn extract_page_image_regions(
         // ページ境界 box へクランプ。大きく食み出す矩形（変換異常の兆候）は捨てる（誤配置 crop 回避）。
         let Some(clamped) = figures::clamp_rect_to_page_box(
             BBox::new(x, y, w, h),
-            box_left,
-            box_bottom,
-            width_pt,
-            height_pt,
+            page_box.left,
+            page_box.bottom,
+            page_box.width,
+            page_box.height,
         ) else {
             continue;
         };
@@ -217,7 +242,7 @@ fn extract_page_image_regions(
     }
 
     // 2. フィルタ + マージで図領域へ。
-    let merged = figures::merge_image_regions(&rects, width_pt, height_pt);
+    let merged = figures::merge_image_regions(&rects, page_box.width, page_box.height);
     if merged.is_empty() {
         return Vec::new();
     }
@@ -251,10 +276,10 @@ fn extract_page_image_regions(
     for (i, bbox) in merged.into_iter().enumerate() {
         let Some((px, py, pw, ph)) = figures::region_to_pixel_rect(
             bbox,
-            box_left,
-            box_bottom,
-            width_pt,
-            height_pt,
+            page_box.left,
+            page_box.bottom,
+            page_box.width,
+            page_box.height,
             img.width(),
             img.height(),
         ) else {

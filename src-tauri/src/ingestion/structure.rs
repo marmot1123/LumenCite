@@ -102,7 +102,9 @@ pub fn recognize_page(page: &ExtractedPage, state: &mut RecognizerState) -> Vec<
 
     let mut out = Vec::with_capacity(line_groups.len());
     for lines in line_groups {
-        if let Some(block) = classify_block(lines, page_median_h, page.height_pt, state) {
+        if let Some(block) =
+            classify_block(lines, page_median_h, page.height_pt, page.box_bottom, state)
+        {
             out.push(block);
         }
     }
@@ -233,6 +235,7 @@ fn classify_block(
     lines: Vec<StructuredLine>,
     page_median_h: f64,
     page_height: f64,
+    box_bottom: f64,
     state: &mut RecognizerState,
 ) -> Option<StructuredBlock> {
     let text = normalize_ws(
@@ -362,10 +365,17 @@ fn classify_block(
         Mode::Body => {
             // ページ上下の極端なマージンにある短い 1 行は、ランニングヘッダ/フッタ/ページ番号の
             // 可能性が高い。段落と確定せず unknown_block に降格する（誤った型より欠損を許容）。
+            //
+            // **帯はページ境界 box の原点から測る**（debt-18）。`bbox.y` は絶対 user space
+            // （MediaBox 基準）で、`page_height` は box の**高さ**でしかないので、原点が非ゼロの
+            // PDF で `box_bottom` を落とすと帯が下へずれる ── 本文の短い行が上端帯に入って
+            // 降格し（実測 vid 149 で誤った帯 1,179 行 vs 正しい帯 272 行）、逆に box 下端すぐ上に
+            // ある本物の走り柱は下端帯に届かず段落として残る。
             let in_margin = page_height > 1.0
                 && lines.len() == 1
                 && word_count <= 8
-                && (bbox.y > page_height * 0.90 || bbox.y + bbox.height < page_height * 0.10);
+                && (bbox.y > box_bottom + page_height * 0.90
+                    || bbox.y + bbox.height < box_bottom + page_height * 0.10);
             if looks_like_prose(&text) && !in_margin {
                 mk(NodeKind::Paragraph, 0.6, None, None, lines)
             } else {
@@ -961,10 +971,23 @@ mod tests {
     }
 
     fn page(segs: Vec<ExtractedBlock>) -> ExtractedPage {
+        page_with_box(segs, 0.0, 0.0, 595.0, 842.0)
+    }
+
+    /// 原点が非ゼロのページ境界 box を持つページ（雑誌・紀要の PDF）。
+    fn page_with_box(
+        segs: Vec<ExtractedBlock>,
+        box_left: f64,
+        box_bottom: f64,
+        width_pt: f64,
+        height_pt: f64,
+    ) -> ExtractedPage {
         ExtractedPage {
             page_number: 1,
-            width_pt: 595.0,
-            height_pt: 842.0,
+            width_pt,
+            height_pt,
+            box_left,
+            box_bottom,
             rotation_deg: 0.0,
             plain_text: String::new(),
             blocks: segs,
@@ -1392,6 +1415,94 @@ mod tests {
         let p = page(vec![seg("104 A. Suzuki", 72.0, 795.0, 120.0, 10.0, 0)]);
         let blocks = recognize(&p);
         assert_eq!(blocks[0].kind, NodeKind::UnknownBlock);
+    }
+
+    /// 実データ vid 149（att6）の形。`CropBox ∩ MediaBox` の原点 (77.811, 87.931)・
+    /// 寸法 439.455 x 666.283pt。box の上端は 87.931 + 666.283 = 754.214。
+    fn nonzero_box_page(segs: Vec<ExtractedBlock>) -> ExtractedPage {
+        page_with_box(segs, 77.811, 87.931, 439.455, 666.283)
+    }
+
+    #[test]
+    fn margin_band_is_measured_from_the_page_box_origin() {
+        // 絶対 y=640 は box の中では上から 15% ほどの**本文域**（上端帯は 87.931+599.65=687.58 超）。
+        // 原点を落とすと「上端 90%（=599.65）超」と誤判定して段落を unknown_block に降格する。
+        let p = nonzero_box_page(vec![seg(
+            "This holds for all n",
+            100.0,
+            640.0,
+            200.0,
+            10.0,
+            0,
+        )]);
+        assert_eq!(recognize(&p)[0].kind, NodeKind::Paragraph);
+    }
+
+    #[test]
+    fn running_footer_just_above_the_box_bottom_is_demoted() {
+        // 逆向きの実害: box の下端 87.931 のすぐ上（絶対 y=100）にある短い 1 行は本物の走り柱。
+        // 原点を落とすと下端帯（=66.63pt 未満）に届かず、段落として残ってしまう。
+        let p = nonzero_box_page(vec![seg("104 A. Suzuki", 100.0, 100.0, 120.0, 10.0, 0)]);
+        assert_eq!(recognize(&p)[0].kind, NodeKind::UnknownBlock);
+    }
+
+    #[test]
+    fn margin_band_handles_a_negative_box_origin() {
+        // 実データ vid 183（att41）の形: CropBox `[-4.1494 -8.41611 480.534 688.849]` の頁があり
+        // box 原点は負。原点を 0 で下限クリップすると帯が上へずれ、走り柱を取り逃がす。
+        // 上端帯は -8.416 + 697.265*0.90 = 619.12pt 超（クリップすると 627.54pt 超になる）。
+        let head = page_with_box(
+            vec![seg("104 A. Suzuki", 100.0, 623.0, 120.0, 10.0, 0)],
+            -4.149,
+            -8.416,
+            484.683,
+            697.265,
+        );
+        assert_eq!(recognize(&head)[0].kind, NodeKind::UnknownBlock);
+        // 下端帯（-8.416 + 69.73 = 61.31pt 未満）も同様に box 原点から測る。
+        let foot = page_with_box(
+            vec![seg("Random walks", 100.0, 0.0, 120.0, 10.0, 0)],
+            -4.149,
+            -8.416,
+            484.683,
+            697.265,
+        );
+        assert_eq!(recognize(&foot)[0].kind, NodeKind::UnknownBlock);
+    }
+
+    #[test]
+    fn long_line_in_the_margin_band_stays_a_paragraph() {
+        // 帯の中でも 8 語を超える 1 行は走り柱ではない（既存ガードの固定）。
+        let p = page(vec![seg(
+            "The quick brown fox jumps over the lazy dog today",
+            72.0,
+            795.0,
+            300.0,
+            10.0,
+            0,
+        )]);
+        assert_eq!(recognize(&p)[0].kind, NodeKind::Paragraph);
+    }
+
+    #[test]
+    fn multi_line_block_in_the_margin_band_stays_a_paragraph() {
+        // 帯の中でも 2 行以上のブロックは走り柱ではない（既存ガードの固定）。
+        let p = page(vec![
+            seg("short text here", 72.0, 795.0, 200.0, 10.0, 0),
+            seg("second line here", 72.0, 783.0, 200.0, 10.0, 1),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks.len(), 1, "2 行が 1 ブロックに束ねられる前提: {blocks:?}");
+        assert_eq!(blocks[0].kind, NodeKind::Paragraph);
+    }
+
+    #[test]
+    fn margin_band_is_unchanged_on_a_zero_origin_page() {
+        // 原点ゼロのページ（大半の PDF）では従来と同じ判定であること。
+        let top = page(vec![seg("104 A. Suzuki", 72.0, 795.0, 120.0, 10.0, 0)]);
+        assert_eq!(recognize(&top)[0].kind, NodeKind::UnknownBlock);
+        let body = page(vec![seg("This holds for all n", 72.0, 400.0, 200.0, 10.0, 0)]);
+        assert_eq!(recognize(&body)[0].kind, NodeKind::Paragraph);
     }
 
     #[test]
