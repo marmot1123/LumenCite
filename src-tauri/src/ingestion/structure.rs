@@ -1471,6 +1471,22 @@ mod tests {
     }
 
     #[test]
+    fn block_straddling_the_band_edge_is_not_demoted() {
+        // 帯は「ブロックが丸ごと帯の中にある」ことを要求する ── 上端帯は**下端** `y` が、
+        // 下端帯は**上端** `y+h` が境界を越えていること。跨いでいるだけの行は走り柱ではない。
+        // 原点ゼロ・842pt のページなので上端帯は 757.8pt 超、下端帯は 84.2pt 未満。
+        let straddle_top = page(vec![seg("104 A. Suzuki", 72.0, 750.0, 120.0, 20.0, 0)]);
+        assert_eq!(recognize(&straddle_top)[0].kind, NodeKind::Paragraph);
+        let inside_top = page(vec![seg("104 A. Suzuki", 72.0, 760.0, 120.0, 20.0, 0)]);
+        assert_eq!(recognize(&inside_top)[0].kind, NodeKind::UnknownBlock);
+
+        let straddle_bottom = page(vec![seg("104 A. Suzuki", 72.0, 80.0, 120.0, 20.0, 0)]);
+        assert_eq!(recognize(&straddle_bottom)[0].kind, NodeKind::Paragraph);
+        let inside_bottom = page(vec![seg("104 A. Suzuki", 72.0, 60.0, 120.0, 20.0, 0)]);
+        assert_eq!(recognize(&inside_bottom)[0].kind, NodeKind::UnknownBlock);
+    }
+
+    #[test]
     fn long_line_in_the_margin_band_stays_a_paragraph() {
         // 帯の中でも 8 語を超える 1 行は走り柱ではない（既存ガードの固定）。
         let p = page(vec![seg(
