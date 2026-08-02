@@ -294,12 +294,30 @@ fn extract_page_image_regions(
 }
 
 /// ページ境界 box（`CropBox ∩ MediaBox`）の原点。取れなければ (0,0)。
-/// 交差を採る理由と実測は [`figures::effective_page_box_origin`] を参照
-/// （`page.width()` が返すのは交差の幅なので、原点も交差から取らないと食い違う）。
+///
+/// **まず `bounding()`（`FPDF_GetPageBoundingBox` → `CPDF_Page::GetBBox`）に聞く。**
+/// これは pdfium が `page.width()`/`height()` とレンダリングに使う矩形そのもので、
+/// ①`/Pages` からの box の継承 ②空の `/CropBox` の無視 ③CropBox と MediaBox の交差 を
+/// すべて pdfium 側で解決済み。対して `FPDFPage_GetCropBox`/`GetMediaBox` は**ページ辞書しか
+/// 読まない**ので、継承された box を持つ PDF では両方とも取得失敗になる（実ライブラリにも
+/// 3 添付 37 頁ある。今はその継承 box の原点がたまたま (0,0) なので実害が出ていないだけ）。
+/// crate の doc コメントは「内容の外接矩形」と書いているが誤り ── 実測で生存 138 版 7,345 頁
+/// すべてについて、寸法が `page.width()`/`height()` と一致し、原点が
+/// `CropBox ∩ MediaBox` の原点と一致した（食い違い 0 頁）。
+///
+/// 取れなかったときだけ 2 つの box から組む（[`figures::effective_page_box_origin`]）。
 fn page_box_origin(page: &pdfium_render::prelude::PdfPage<'_>) -> (f64, f64) {
     let boundaries = page.boundaries();
-    let origin_of =
-        |r: pdfium_render::prelude::PdfRect| (r.left().value as f64, r.bottom().value as f64);
+    // box の 4 値は PDF 仕様上「順序は意味を持たない」ので左下角は成分ごとの min で取る。
+    let origin_of = |r: pdfium_render::prelude::PdfRect| {
+        (
+            r.left().value.min(r.right().value) as f64,
+            r.bottom().value.min(r.top().value) as f64,
+        )
+    };
+    if let Ok(b) = boundaries.bounding() {
+        return origin_of(b.bounds);
+    }
     figures::effective_page_box_origin(
         boundaries.crop().ok().map(|b| origin_of(b.bounds)),
         boundaries.media().ok().map(|b| origin_of(b.bounds)),
@@ -414,22 +432,48 @@ mod tests {
             if merged_new == merged_old {
                 continue;
             }
-            // 同一 bbox は「据え置き」、片方にしか無いものを増減として数える。
-            let same = merged_new.iter().filter(|b| merged_old.contains(b)).count();
-            added += merged_new.len() - same;
-            removed += merged_old.len() - same;
-            if merged_new.len() == merged_old.len() {
-                changed += merged_new.len() - same;
-            }
+            // 「増えた図」と「動いた図」を分けて数える。単純な集合差だと、bbox が動いた 1 図が
+            // 新規 +1 と消滅 -1 に二重計上され、carry 破壊（動いた図の数）を読み違える。
+            // 片方にしか無いものどうしを重なりで対応づけ、対応が付いたものを「移動」とする。
+            let mut only_new: Vec<BBox> = merged_new
+                .iter()
+                .filter(|b| !merged_old.contains(b))
+                .copied()
+                .collect();
+            let mut only_old: Vec<BBox> = merged_old
+                .iter()
+                .filter(|b| !merged_new.contains(b))
+                .copied()
+                .collect();
+            let overlaps = |a: &BBox, c: &BBox| {
+                (a.x + a.width).min(c.x + c.width) > a.x.max(c.x)
+                    && (a.y + a.height).min(c.y + c.height) > a.y.max(c.y)
+            };
+            let mut moved_here = 0usize;
+            only_old.retain(|o| {
+                match only_new.iter().position(|n| overlaps(n, o)) {
+                    Some(i) => {
+                        only_new.remove(i);
+                        moved_here += 1;
+                        false // 対応が付いた ＝ 消滅ではなく移動
+                    }
+                    None => true,
+                }
+            });
+            changed += moved_here;
+            added += only_new.len();
+            removed += only_old.len();
             eprintln!(
                 "p{page_number}: page={w:.2}x{h:.2} origin=({box_left:.3},{box_bottom:.3}) \
                  raw_crop={raw_crop:?} images={raw_count}\n  old={merged_old:?}\n  new={merged_new:?}"
             );
         }
 
+        // skipped は回転頁と画像過多頁。**回転頁を本番で扱うようにしたら（8d-8）ここも直すこと** ──
+        // このツールは無条件に skip するので、回転頁で増えた図は差分に出ない。
         eprintln!(
             "\n== {path}\n   pages={pages} (nonzero-origin {nonzero_origin_pages}, skipped {skipped})\n   \
-             regions: old={regions_old} new={regions_new}  (+{added} / -{removed} / 差替 {changed})"
+             regions: old={regions_old} new={regions_new}  (新規 +{added} / 消滅 -{removed} / 移動 {changed})"
         );
         assert!(pages > 0, "PDF に 1 ページも無い");
     }

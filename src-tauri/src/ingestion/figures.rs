@@ -29,8 +29,9 @@ pub const CAPTION_OVERLAP_RATIO: f64 = 0.3;
 /// クランプ後に元面積のこの比率を下回った矩形は捨てる（座標変換異常の兆候）。
 pub const MIN_CLAMPED_AREA_RATIO: f64 = 0.5;
 
-/// pdfium の実効ページ box の原点（左下角）。引数は CropBox / MediaBox の左下角で、
-/// どちらも無ければ `(0, 0)`（pdfium は US Letter を原点ゼロで代替する）。
+/// ページ box の原点（左下角）を CropBox / MediaBox の左下角から組む**フォールバック**。
+/// 通常は pdfium に直接聞く（`pdf::page_box_origin` の `bounding()`）ので、ここへ来るのは
+/// それが失敗したときだけ。
 ///
 /// **生の CropBox ではなく `CropBox ∩ MediaBox` を採る。** pdfium のページ寸法
 /// （`FPDF_GetPageWidthF` = `width_pt`/`height_pt`）はこの交差の寸法だからで、
@@ -40,7 +41,12 @@ pub const MIN_CLAMPED_AREA_RATIO: f64 = 0.5;
 /// 実測（生存 138 版 7,345 頁・pdfium に直接問い合わせ）: 交差モデルは box を持つ
 /// 7,281 頁すべてで pdfium のページ寸法を再現し、生 CropBox モデルは 406 頁で外れる。
 /// 原点が食い違うのは 392 頁 / 2 版（CropBox が (0,0) 始まりで MediaBox の原点が
-/// 非ゼロという形。ずれ幅 78–88pt）。交差が空になる頁は 0 件。
+/// 非ゼロという形。ずれ幅 77.8–90.0pt）。交差が空になる頁は 0 件。
+///
+/// **交差モデルでも当てられない形が 2 つある**（どちらも `bounding()` なら正しく出る）:
+/// ①box が `/Pages` から継承されていると `FPDFPage_Get*Box` は両方とも失敗し `(0,0)` に落ちる
+/// ②空の `/CropBox`（`[0 0 0 0]`）を pdfium は無視するが、この関数は max に参加させてしまう。
+/// フォールバックである以上「pdfium と厳密に同じ」までは保証しない（欠損 > 誤り）。
 pub fn effective_page_box_origin(
     crop_origin: Option<(f64, f64)>,
     media_origin: Option<(f64, f64)>,
@@ -258,6 +264,21 @@ mod tests {
         BBox::new(x, y, w, h)
     }
 
+    /// クランプは切られていなくても幅を `(x+w) - x` で組み直すので、10 進で書いた実データの
+    /// 値は最下位ビットがずれることがある（出荷中のコードも同じ算術なので挙動の変化ではない）。
+    #[track_caller]
+    fn assert_bbox_near(got: Option<BBox>, want: BBox) {
+        let got = got.expect("領域が捨てられた");
+        let d = |a: f64, e: f64| (a - e).abs() < 1e-9;
+        assert!(
+            d(got.x, want.x)
+                && d(got.y, want.y)
+                && d(got.width, want.width)
+                && d(got.height, want.height),
+            "got {got:?} want {want:?}"
+        );
+    }
+
     // ---- merge_image_regions ----
 
     #[test]
@@ -415,6 +436,26 @@ mod tests {
         assert_eq!(
             clamp_rect_to_page_box(b(100.0, 0.0, 200.0, 400.0), 20.0, 30.0, 595.0, 842.0),
             Some(b(100.0, 30.0, 200.0, 370.0))
+        );
+    }
+
+    #[test]
+    fn clamp_handles_a_negative_box_origin() {
+        // MediaBox が `[0 -51 495.4 688.2]` の実データ（att46・deutsch1962 系）。
+        // 原点を 0 で下限クリップすると、y<0 の帯にある可視の画像が高さ 0 に潰れて消える。
+        assert_bbox_near(
+            clamp_rect_to_page_box(b(458.4, -37.0, 25.3, 33.5), 0.0, -51.0, 495.4, 739.2),
+            b(458.4, -37.0, 25.3, 33.5),
+        );
+        // 下端 -51 より下は box の外なので落ちる。
+        assert_eq!(
+            clamp_rect_to_page_box(b(458.4, -90.0, 25.3, 33.5), 0.0, -51.0, 495.4, 739.2),
+            None
+        );
+        // 左端も負になりうる（att41 の CropBox `[-4.1494 -8.41611 480.534 688.849]`）。
+        assert_bbox_near(
+            clamp_rect_to_page_box(b(-3.0, 100.0, 103.0, 50.0), -4.15, -8.42, 484.68, 697.27),
+            b(-3.0, 100.0, 103.0, 50.0),
         );
     }
 
