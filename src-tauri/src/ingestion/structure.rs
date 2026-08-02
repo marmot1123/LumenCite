@@ -539,7 +539,7 @@ struct CaptionHit {
     number: Option<String>,
 }
 
-/// 行頭が "Figure 1" / "Table 2:" / "Fig. 3" のような caption ラベルか。
+/// 行頭が "Figure 1" / "Table 2:" / "Fig. 3" / "TABLE III." のような caption ラベルか。
 fn detect_caption(first: &str) -> Option<CaptionHit> {
     let f = first.trim_start();
     let lower = f.to_ascii_lowercase();
@@ -558,13 +558,151 @@ fn detect_caption(first: &str) -> Option<CaptionHit> {
     } else {
         return None;
     };
+    // ラベル語はここまでの照合で ASCII と確定しているのでバイト境界で切ってよい。
+    let (label_text, rest) = f.split_at(label_len);
+    let rest = rest.trim_start();
     // ラベル直後の数文字以内に番号（数字）があること（"Figures show…" の誤検出回避）。
-    let after: String = f[label_len..].chars().take(6).collect();
-    if !after.chars().any(|c| c.is_ascii_digit()) {
+    let has_digit = f[label_len..].chars().take(6).any(|c| c.is_ascii_digit());
+    // 算用数字が無くても、全大文字ラベル + ローマ数字 + 終端記号なら caption（debt-12）。
+    let roman = roman_caption_number(label_text, rest);
+    if !has_digit && roman.is_none() {
         return None;
     }
-    let number = parse_theorem_number(f[label_len..].trim_start());
+    // 番号は算用数字を優先し、読めないときだけローマ数字で埋める（"TABLE II. 3 …" 形）。
+    let number = parse_theorem_number(rest).or(roman);
     Some(CaptionHit { kind, label, number })
+}
+
+/// 全大文字ラベルに続くローマ数字の caption 番号（"TABLE III." → `"III"`）。debt-12。
+///
+/// 算用数字に直さずローマ数字のまま返す。参照側（`graph::take_ref_number`）は ASCII 数字しか
+/// 読まないので照合には使われず、`node_kind` の正しさのためだけに取る（§8.1）。
+///
+/// ガードは 3 つで、いずれも「誤検出より欠損」側に倒してある。
+///
+/// - **ラベルが全大文字**であること。本文の文末が偶然この形になる
+///   （"… as shown in Table III. Since the extended Hermitian system H …"）ため、終端記号だけでは
+///   本文と分離できない（実ライブラリ v171 に実例）。実測では全大文字を要求すると
+///   利得 48 ブロック / 12 版に対しこの型の混入が 0 になる。
+/// - **直後に終端記号**（`.` / `:`）。"TABLE XIV shows the equivalence …" のような本文参照を弾く。
+/// - **標準形のローマ数字**であること。ローマ数字の文字だけでできた英単語（"DIM"）や
+///   非標準表記（"IIII"）を弾く。
+fn roman_caption_number(label: &str, rest: &str) -> Option<String> {
+    if !label
+        .chars()
+        .all(|c| !c.is_ascii_alphabetic() || c.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let run: String = rest
+        .chars()
+        .take_while(|c| roman_digit(*c).is_some())
+        .collect();
+    if !is_canonical_roman(&run) {
+        return None;
+    }
+    // run は ASCII なのでバイト長 = 文字数。
+    let after = &rest[run.len()..];
+    // 章番号形（"FIGURE II.2" = 第 II 章の図 2）。ローマ数字の部分だけを番号と名乗ると
+    // 章番号を図番号と偽ることになる（欠損より悪い）ので、続く算用数字の枝番も取り込む。
+    // この形は算用数字を含むため**そもそも従来から caption**（`has_digit` が真）で、
+    // ここで変わるのは番号だけ ＝ 分類の誤検出リスクは増えない。
+    // `parse_theorem_number` の付録形は大文字 1 字しか見ないので "I.1" は拾えるが "II.2" は
+    // 拾えず、直さないと同じ文書の中で 1 文字の章だけ正しい非対称になる。
+    if let Some(tail) = compound_arabic_tail(after) {
+        return Some(format!("{run}{tail}"));
+    }
+    if !after.starts_with(['.', ':']) {
+        return None;
+    }
+    Some(run)
+}
+
+/// ローマ数字の章番号に続く算用数字の枝番（"II" の後ろの ".2" / ".2.1"）。
+/// **`.` の直後が数字のときだけ**採る ── "TABLE III. 4 experiments" のように終端記号のあとに
+/// 空白を置いて文が続く形（この `.` は番号の区切りではない）と区別するため。
+fn compound_arabic_tail(after: &str) -> Option<String> {
+    let mut chars = after.chars();
+    if chars.next()? != '.' || !chars.next()?.is_ascii_digit() {
+        return None;
+    }
+    let tail: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    Some(tail.trim_end_matches('.').to_string())
+}
+
+/// ローマ数字 1 文字の値（大文字のみ）。
+fn roman_digit(c: char) -> Option<u32> {
+    Some(match c {
+        'I' => 1,
+        'V' => 5,
+        'X' => 10,
+        'L' => 50,
+        'C' => 100,
+        'D' => 500,
+        'M' => 1000,
+        _ => return None,
+    })
+}
+
+/// 減算記法を含む**標準形**の 1–3999 のローマ数字か。値に読んでから正準表記へ描き直し、
+/// 入力と一致するかで判定する（"IIII" や "DIM" のような非標準表記・英単語を弾くため）。
+fn is_canonical_roman(s: &str) -> bool {
+    // 1–3999 の正準表記は最長 15 文字（3888 = "MMMDCCCLXXXVIII"）。"MMMCMXCIX" は最大値の
+    // 表記であって最長ではない。長さで先に切って加算側の溢れも同時に防ぐ
+    // （15 文字 × 最大 1000 = 15,000 で u32 に収まる）。
+    if s.is_empty() || s.len() > 15 {
+        return false;
+    }
+    let (mut total, mut prev) = (0u32, 0u32);
+    for c in s.chars().rev() {
+        let Some(v) = roman_digit(c) else {
+            return false;
+        };
+        // 右から見て直前（右隣）より小さい文字は減算記法。減算が積み上がると総和は負になる
+        // （"IIIIIIV" = V の後ろに I が 6 つ）ので checked で弾く。非標準表記なのでどのみち
+        // 正準化判定で落ちるが、**debug ビルドでは overflow で panic する**（OCR 崩れの
+        // 実テキストから届きうる経路なので、値ではなく算術で止める）。
+        if v < prev {
+            let Some(t) = total.checked_sub(v) else {
+                return false;
+            };
+            total = t;
+        } else {
+            total += v;
+            prev = v;
+        }
+    }
+    total <= 3999 && canonical_roman_of(total) == s
+}
+
+/// 1–3999 の値の正準ローマ数字表記。
+fn canonical_roman_of(mut n: u32) -> String {
+    const TABLE: [(u32, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut out = String::new();
+    for (v, s) in TABLE {
+        while n >= v {
+            out.push_str(s);
+            n -= v;
+        }
+    }
+    out
 }
 
 /// caption のラベル語が「図（figure）の caption」か。`detect_caption` は Algorithm / Listing も
@@ -983,6 +1121,179 @@ mod tests {
         // 付録番号 "A.1" も取れる。
         assert_eq!(blocks[3].kind, NodeKind::TableCaption);
         assert_eq!(blocks[3].caption_number.as_deref(), Some("A.1"));
+    }
+
+    /// debt-12: 全大文字ラベル + ローマ数字の caption（"TABLE III." 形）。番号は算用数字に
+    /// 直さずローマ数字のまま payload に載せる（参照側は ASCII 数字しか読まないので照合には
+    /// 使われない・§8.1）。
+    #[test]
+    fn all_caps_roman_captions_are_detected() {
+        let p = build_page(&[
+            ("some earlier body sentence appears here", 10.0, 0.0),
+            ("and it continues onto a second line", 10.0, G),
+            ("and a third line to anchor the median", 10.0, G),
+            ("plus a fourth line keeping gaps small", 10.0, G),
+            ("and a fifth line to hold the median down", 10.0, G),
+            ("TABLE III. Limit distributions and 1D limits", 10.0, H),
+            ("TABLE VIII: Difference between the two cases", 10.0, H),
+            ("FIG. IV. Signs of the two coefficients here", 10.0, H),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[1].kind, NodeKind::TableCaption);
+        assert_eq!(blocks[1].caption_label.as_deref(), Some("Table"));
+        assert_eq!(blocks[1].caption_number.as_deref(), Some("III"));
+        // 終端記号は ':' でもよい（"Table 2:" と同じ扱い）。
+        assert_eq!(blocks[2].kind, NodeKind::TableCaption);
+        assert_eq!(blocks[2].caption_number.as_deref(), Some("VIII"));
+        // 図側も同じ規則（実ライブラリでは表側が大半だが規則は共通）。
+        assert_eq!(blocks[3].kind, NodeKind::FigureCaption);
+        assert_eq!(blocks[3].caption_label.as_deref(), Some("Fig"));
+        assert_eq!(blocks[3].caption_number.as_deref(), Some("IV"));
+    }
+
+    /// ラベルが全大文字でなければローマ数字 caption にしない。本文の文末が偶然この形になる
+    /// （"… as shown in Table III. Since the extended Hermitian system H …"）ためで、実ライブラリに
+    /// 実例がある（v171）。**終端記号だけでは本文と分離できない**（§8.1 の初版はここを見落としていた）。
+    #[test]
+    fn mixed_case_roman_reference_is_not_a_caption() {
+        let p = build_page(&[
+            ("Table III. Since the extended Hermitian system", 10.0, 0.0),
+            ("has the same spectrum we can classify the model", 10.0, G),
+            ("and the argument carries over without change", 10.0, G),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[0].kind, NodeKind::Paragraph);
+        assert_eq!(blocks[0].caption_label, None);
+    }
+
+    /// 終端記号のないローマ数字は本文の参照（"TABLE XIV shows the equivalence …"）。
+    /// 終端記号は '.' と ':' だけ — 読点で続く形（"TABLE VI, which lists …"）は本文なので通さない。
+    #[test]
+    fn roman_without_terminator_is_not_a_caption() {
+        for first in [
+            "TABLE XIV shows the equivalence between them",
+            "TABLE VI, which lists the remaining symmetries",
+        ] {
+            let p = build_page(&[
+                (first, 10.0, 0.0),
+                ("as an additional symmetry of the same class", 10.0, G),
+                ("which we use throughout the rest of the text", 10.0, G),
+            ]);
+            let blocks = recognize(&p);
+            assert_eq!(blocks[0].kind, NodeKind::Paragraph, "誤検出: {first}");
+            assert_eq!(blocks[0].caption_label, None, "誤検出: {first}");
+        }
+    }
+
+    /// ローマ数字は標準形だけを受ける。ローマ数字の文字だけでできた英単語（"DIM"）や
+    /// 非標準表記（"IIII"）を弾くための正準化判定。
+    #[test]
+    fn non_canonical_roman_is_not_a_caption() {
+        for first in [
+            "FIGURE DIM. of the reconstructed lattice sites",
+            "TABLE IIII. of the coefficients used in the fit",
+            "TABLE OF CONTENTS. listing every chapter here",
+        ] {
+            let p = build_page(&[
+                (first, 10.0, 0.0),
+                ("with a second line to make it a block", 10.0, G),
+                ("and a third line to anchor the median", 10.0, G),
+            ]);
+            let blocks = recognize(&p);
+            assert_eq!(blocks[0].caption_label, None, "誤検出: {first}");
+        }
+    }
+
+    /// 章番号つきの図表番号（"FIGURE II.2" = 第 II 章の図 2）。ラベル直後 6 文字に数字があるので
+    /// **従来から caption** で、変わるのは番号だけ。ローマ数字の部分だけを番号と名乗ると
+    /// 章番号を図番号と偽ることになる（欠損より悪い）。`parse_theorem_number` の付録形は
+    /// 大文字 1 字しか見ないので "I.1" は拾えるが "II.2" は拾えない ── 同じ文書の中で
+    /// 1 文字の章だけ正しい、という非対称を作らないこと。実ライブラリ v250（node 2525439）に実在。
+    #[test]
+    fn compound_roman_chapter_number_is_not_truncated() {
+        let p = build_page(&[
+            ("FIGURE II.2 Gram-Schmidt orthogonalization", 10.0, 0.0),
+            ("with a second line to make it a block", 10.0, G),
+            ("and a third line to anchor the median", 10.0, G),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[0].kind, NodeKind::FigureCaption);
+        assert_eq!(blocks[0].caption_number.as_deref(), Some("II.2"));
+
+        // 1 文字の章番号は従来どおり付録形の経路で取れる（こちらは変わらない）。
+        let p = build_page(&[
+            ("FIGURE I.1 The unit ball in three norms", 10.0, 0.0),
+            ("with a second line to make it a block", 10.0, G),
+            ("and a third line to anchor the median", 10.0, G),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[0].caption_number.as_deref(), Some("I.1"));
+
+        // 枝番として採るのは「'.' の直後が数字」のときだけ。OCR 崩れの二重ドットは
+        // 枝番と見なさずローマ数字の部分だけを採る（壊れた番号を組み立てない）。
+        let p = build_page(&[
+            ("TABLE III..2 of the measured coefficients", 10.0, 0.0),
+            ("with a second line to make it a block", 10.0, G),
+            ("and a third line to anchor the median", 10.0, G),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[0].caption_number.as_deref(), Some("III"));
+    }
+
+    /// ローマ数字の文字が長く続く列（OCR 崩れの "TABLE IIIIIIV." 等）で、減算記法の累積により
+    /// 内部の総和が負になる。**debug ビルドでは overflow で panic する**（`cargo test` も
+    /// `pnpm tauri dev` も debug なので、崩れた PDF 1 本で取り込みが落ちる経路になる）。
+    #[test]
+    fn long_roman_letter_runs_do_not_panic() {
+        for first in [
+            "TABLE IIIIIIV. of the measured coefficients",
+            "TABLE IIIIIIDDM. of the measured coefficients",
+            "FIGURE IIIIIIIIV: of the measured coefficients",
+        ] {
+            let p = build_page(&[
+                (first, 10.0, 0.0),
+                ("with a second line to make it a block", 10.0, G),
+                ("and a third line to anchor the median", 10.0, G),
+            ]);
+            let blocks = recognize(&p);
+            assert_eq!(blocks[0].caption_label, None, "誤検出: {first}");
+        }
+    }
+
+    /// 長さガードは「1–3999 の正準表記の最長 = 15 文字（3888 = `MMMDCCCLXXXVIII`）」に合わせる。
+    /// 9 文字で切ると正準表記 736 通りを弾く。表番号の実用域（I–XL は 7 文字以内）では実害が
+    /// 出ないが、算術の都合で置いた定数が受理集合の定義に化けるのを避ける。
+    #[test]
+    fn canonical_roman_longer_than_nine_chars_is_accepted() {
+        let p = build_page(&[
+            ("some earlier body sentence appears here", 10.0, 0.0),
+            ("and it continues onto a second line", 10.0, G),
+            ("and a third line to anchor the median", 10.0, G),
+            ("TABLE DCCCLXXXVIII. Coefficients of the fit", 10.0, H),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[1].kind, NodeKind::TableCaption);
+        assert_eq!(blocks[1].caption_number.as_deref(), Some("DCCCLXXXVIII"));
+    }
+
+    /// 算用数字の経路は従来どおり（全大文字ラベルでも変わらない）。加えて、ラベル直後 6 文字に
+    /// たまたま数字がある場合でも番号はローマ数字から埋める。
+    #[test]
+    fn arabic_caption_path_is_unchanged_and_roman_fills_the_number() {
+        let p = build_page(&[
+            ("some earlier body sentence appears here", 10.0, 0.0),
+            ("and it continues onto a second line", 10.0, G),
+            ("and a third line to anchor the median", 10.0, G),
+            ("FIG. 4. The apparatus used in the experiment", 10.0, H),
+            ("TABLE II. 3 configurations of the lattice", 10.0, H),
+        ]);
+        let blocks = recognize(&p);
+        assert_eq!(blocks[1].kind, NodeKind::FigureCaption);
+        assert_eq!(blocks[1].caption_number.as_deref(), Some("4"));
+        // "II. 3" はラベル直後 6 文字に数字があるので従来経路で caption にはなるが、
+        // 番号は算用数字として読めない。ローマ数字で埋める。
+        assert_eq!(blocks[2].kind, NodeKind::TableCaption);
+        assert_eq!(blocks[2].caption_number.as_deref(), Some("II"));
     }
 
     #[test]
