@@ -121,7 +121,7 @@ migration 20 本すべてに当たって確認した。0 件なら v1.0.0 のロ
 | # | PR タイトル案 | 項目 | 難易度 | 版 | 再構築 | この位置の理由 |
 |---|---|---|---|---|---|---|
 | 0 | ~~`fix(LCIR): 旧 content_key の GC に mtime 猶予 + GUI ロックの取得可否を返す`~~ **完了**（§2.8） | debt-15 / debt-24 の一部 | S / 60–90 | なし | 否 | **既存の穴**。dev と配布版 v0.10.0 が同一 app data dir を共有しており、`gc_stale_asset_dirs` は猶予なしで「今回の content_key 以外」を trash へ送る。両方が build すると crop を消し合う。後回しにするとこの窓が計画全体に開いたままになる |
-| 1 | `fix(LCIR): ローマ数字・全大文字の図表 caption（debt-12）` | debt-12 | S / 130–200 | →0.8.0 | 否 | **8d-2 より前が必須**。8d-2 は探索面を 6,321→477 ページに落とす caption アンカーを使い、その入力が `detect_caption` の分類。逆順だと FP gate を通した後にゲート条件の入力が変わる。8 項目で唯一 CI で完全に検証でき、版 bump 手順の予行にもなる |
+| 1 | ~~`fix(LCIR): ローマ数字・全大文字の図表 caption（debt-12）`~~ **完了**（§2.9） | debt-12 | S / 130–200 | →**0.8.0** | 否 | **8d-2 より前が必須**。8d-2 は探索面を 6,321→477 ページに落とす caption アンカーを使い、その入力が `detect_caption` の分類。逆順だと FP gate を通した後にゲート条件の入力が変わる。8 項目で唯一 CI で完全に検証でき、版 bump 手順の予行にもなる |
 | 2 | `fix(LCIR): 図領域のクランプをページ box 原点基準にする（debt-14）` | debt-14 | S / 160–220 | →0.9.0 | 否 | 図系の先頭。8d-2 / 8d-8 が追加する矩形も同じ `pdf/mod.rs:189-198` を通るので、先に直さないと新経路にバグを複製する。carry 破壊は実測 10 図・うち alt text 保持 6 件＝**carry 機構の本番初発火を最も安い賭けで踏める** |
 | 3 | `feat(LCIR): XObjectForm と回転ページの図領域（8d-8 / debt-9）` | 8d-8 | M / 400–520 | →0.10.0 | 否 | 8d-2 の前。figure 0 件 + caption ありの 42 版のうち **21 版（caption 211 件）はラスタ画像を持つのに top-level 列挙に出ない＝8d-8 の担当**、純ベクターは 21 版 / caption 94 件。混ぜると 8d-2 のガード閾値を誤った母集団でチューニングする |
 | 4 | `feat(LCIR): ベクター図（tikz/pgf）の領域検出（8d-2）` | 8d-2 | L / 800–1,050 | →0.11.0 | 否 | 最大の新推定器かつ**唯一 888 件の carry を全滅させうる**。他が全部正しくなってから最後に測る |
@@ -322,6 +322,79 @@ debt-19（テキスト fragment 11,963 件がページ矩形をはみ出す）�
 **`min`/`max` を判別するテスト**（1 ディレクトリに古 1 枚 + 新 1 枚）を必ず維持すること。
 1 ディレクトリ 1 ファイルのテストしか無いと `min` と `max` が同値になり、
 **この PR の中核述語が 1 文字反転しても CI が緑のまま通る**（実際に踏んだ）。
+
+### 2.9 #1（debt-12）の実装記録（2026-08-02・完了）
+
+`structure.rs` の `detect_caption` に**ローマ数字の番号経路**を足した。migration なし・
+**pdfium 抽出器版 0.7.0 → 0.8.0**（+ golden fixture 2 本）・TeX 側不変。純関数なので CI で完結する。
+
+**規則は 1 本**: 全大文字ラベル + 標準形ローマ数字 + 終端記号（`.` / `:`）。番号は算用数字に直さず
+`"III"` のまま payload に載せる（§8.1 の決定どおり。参照側 `take_ref_number` は ASCII 数字しか
+読まないので照合には使われず、**8d-7 の解決辺は +0**）。算用数字の経路は一切触っていない。
+番号の取り出しだけは算用数字優先 → 読めなければローマ数字で埋める（"TABLE II. 3 configurations …" 形は
+従来も caption にはなっていたが番号が `None` だった）。
+
+**§8.1 の初版が挙げていたガード 1 個（終端記号）では足りない。** 実装時の実測で、終端記号を
+持ちながら本文である第 2 の型が見つかった —
+"… as shown in **Table III. Since** the extended Hermitian system H …"（v171）。
+文末のピリオドが次の文の直前に来るので、終端記号だけでは caption と分離できない。
+分離しているのは**ラベルが全大文字であること**で、実測は次のとおり（生存 pdfium 版・ブロック級ノード）:
+
+| 規則 | 利得 | 本文混入の母集団 |
+|---|---|---|
+| ローマ数字 + 終端記号（大小問わず） | 50 ブロック / 14 版 | 2 行（"Table III. Since …" 型 1・caption が本文ブロックに融合した型 1） |
+| **+ ラベル全大文字**（採用） | **48 ブロック / 12 版** | **0**（残る 1 行は本文ブロックに融合した caption で、この規則が作る誤りではない） |
+
+代償は全大文字でない実例 2 件（"Fig. I. Two simulations …" と OCR 崩れの "FIGure I. lllustratinK example"）を
+取り逃すこと。誤検出より欠損（§16）に加えて、**全大文字を要求すると新規 figure caption が 0 件になる**ので
+8a の図ペアリング（`page_captions` は figure ラベルだけを見る）が動かず、**crop も alt text carry も
+1 件も動かない**という利点がある（#7 の再構築で 888 件を賭ける前に踏む変更としてこれが望ましい）。
+
+正準ローマ数字の判定（値に読んでから正準表記に描き直して一致を見る）は、ローマ数字の文字だけで
+できた全大文字の英単語（"DIM" → `CDXCIX` ≠ `DIM`）と非標準表記（"IIII"）を弾くために入れた。
+
+**分類が変わることの読み手**（`paragraph` → `table_caption`）は 5 つ。いずれも壊れない:
+
+- `graph.rs` の `FloatTargets` — 番号 `"III"` で索引に載るが ASCII 参照とは一致しない。**対象 12 版は
+  既存 `table_caption` が 0 件**なので番号衝突（`None` 墓標）も起きない。
+- `ingestion/mod.rs:602` の `page_captions`（8a ペアリング）— figure ラベルのみ。上記のとおり新規 0 件。
+- `context/mod.rs:387` の `is_structural_boundary` — 10a の文脈バンドルが表 caption で止まるようになる
+  （従来は caption を散文として飲み込んでいた）。意図した改善。
+- `export/markdown.rs:138` — 段落ではなくイタリックで出る。本文は落ちない。
+- ノード FTS（`indexable_nodes_for_version`）— `document`/`page`/`line` 以外は種別を問わず索引するので
+  検索性は不変。
+
+**レビューで出た欠陥 3 件を同じ PR で修正した**（1・2 は正準化判定 `is_canonical_roman`、3 は番号埋め）:
+
+1. **減算記法の累積で u32 が underflow し、debug ビルドで panic する。** "IIIIIIV"（V の後ろに I が
+   6 つ）で総和が負になる。`cargo test` も `pnpm tauri dev` も debug なので、**OCR の崩れた PDF 1 本で
+   取り込みが落ちる**経路だった（release では wrap して正準化判定に落ちるだけなので、
+   実害はビルド構成に依存する）。`checked_sub` で弾く ── 値ではなく算術で止める。
+2. **長さガード 9 文字は過小**で、1–3999 の正準表記のうち **736 通り**を弾いていた。
+   コメントの「3999 = `MMMCMXCIX` が最長 9 文字」は誤りで、最長は **15 文字**（3888 =
+   `MMMDCCCLXXXVIII`）。`MMMCMXCIX` は最大値の表記であって最長ではない。表番号の実用域
+   （I–XL は 7 文字以内）では実害が出ないが、算術の都合で置いた定数が受理集合の定義に化けるのは
+   避ける。15 に直した（15 文字 × 最大 1000 = 15,000 で u32 の加算も安全）。
+3. **章番号つき番号の切り詰め（"FIGURE II.2" → "II"）。3 観点が独立に見つけた唯一の実害。**
+   ローマ数字での番号埋めは**新しく caption になったブロックだけでなく、すでに caption だった
+   ブロック**にも及ぶ。`parse_theorem_number` の付録形は「大文字 **1 字** + `.` + 数字」しか見ないので
+   "I.1" は拾えるが "II.2" は拾えず、`.or(roman)` が章番号だけを埋めていた ＝
+   **欠損だった値が誤値に変わる**（§16 と逆向き。同じ文書の中で 1 文字の章だけ正しい非対称にもなる）。
+   実 DB に実在（node 2525439 / v250「FIGURE II.2 Gram-Schmidt orthogonalization.」・現 payload は番号なし）。
+   修正は**続く算用数字の枝番も取り込む**（`compound_arabic_tail`）── 欠損に戻すより正しい番号を
+   取る方を選んだ。この形は算用数字を含むので**そもそも従来から caption**（`has_digit` が真）で、
+   変わるのは番号だけ＝**分類の誤検出リスクは増えない**。枝番と見なすのは `.` の直後が数字のときだけで、
+   "TABLE III. 4 experiments"（終端記号 + 空白 + 文）や OCR 崩れの二重ドットは巻き込まない。
+   新規 48 件は 1 件も減らない（48 件はいずれも終端記号の直後が数字でない）。
+
+テストは 9 本（`ingestion::structure::tests` の `all_caps_roman_*` / `mixed_case_roman_*` /
+`roman_without_terminator_*` / `non_canonical_roman_*` / `arabic_caption_path_*` /
+`long_roman_letter_runs_do_not_panic` / `canonical_roman_longer_than_nine_chars_is_accepted` /
+`compound_roman_chapter_number_is_not_truncated`）。
+**3 つのガード + 番号埋め + 算術 2 つ + 複合番号 2 つに変異を当て、9 通りすべてが狙ったテストだけを
+落とすことを確認済**（全大文字ガード除去・終端記号ガード除去・正準判定除去・`.or(roman)` 除去・
+終端記号に `,` を追加・`checked_sub` を素の減算に戻す・長さガードを 9 に戻す・枝番の取り込み除去・
+枝番の「`.` 直後が数字」条件の緩和）。文字列は実ライブラリから採った実物を使っている。
 
 ---
 
@@ -709,7 +782,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | debt-9 | 回転ページは図領域を skip → **§4.4 で座標系は決着**。実害は 1 添付 5 ページ・figure 0 件 | M | 8d-8（切る候補） |
 | debt-10 | 8b の longtable / tabu / siunitx S 列 / 表脚注 | M | — |
 | debt-11 | 数式検索は trigram 部分一致のみ。TeX 版は node-FTS 対象外 | — | 7b の動機 |
-| debt-12 | ローマ数字・全大文字の caption 取りこぼし → **v1.0.0 スコープ**（正当化は §8.1） | S | — |
+| ~~debt-12~~ | ~~ローマ数字・全大文字の caption 取りこぼし~~ **解消**（2026-08-02・#1・§2.9・§8.1）。全大文字ラベル + 標準形ローマ数字 + 終端記号の 1 規則。走り柱と融合した caption（debt-23）は別物で残る | S | 完了 |
 | debt-13 | スキャン本 1 冊（att37）が figure の 43.7%・alt text の 58.9%・**crop 容量の 80%（444.5MB）**・**再構築時間の 94%（4,514 秒）**を占める | M | 8c/8a の費用対効果・p2 の最悪ケース |
 | debt-14 | 図領域のクランプが CropBox 原点を無視 → **v1.0.0 スコープ**。実害は非ゼロ原点 12 版・クランプ痕跡 10 図・alt text 保持 6 件 | S | 8d-2 の前提 |
 | ~~debt-15~~ | ~~`gc_stale_asset_dirs` に mtime 猶予が無い。dev と配布版が同一 app data dir を共有しているので、両方が build すると互いの content_key ディレクトリを trash に送り合う~~ **解消**（2026-08-02・#0・§2.8）。1 時間以上離れた build 同士は依然回収し合うので、恒久解は p4 の GC | S | 完了 |
@@ -726,25 +799,38 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
 `ListItem` / `Footnote` / `Citation` / `InlineMath` / `EquationGroup` / `TextBlock` はどちらも生成しない。
 
-### 8.1 debt-12 の正当化を差し替える
+### 8.1 debt-12 の正当化を差し替える（実装済・§2.9）
 
 初版は debt-12 を「8d-7 の解決率上限 93% の実体」として位置づけていたが、**3 点とも実測と食い違う**。
 
 - 「`Fig. 8.3` 形も落ちている」→ **再現しない。** `Fig. 8.3` は現行コードで通る（label_len=4 → 直後 6 文字に数字あり）。
   実 DB でも多段番号の figure_caption が 904 件中 400 件ある。落ちる実例は debt-23 の別問題。
 - 「実測 60 件」→ **48 ブロック / 13 文書**（`TABLE <ローマ>` + 終端記号 47 + `Fig. <ローマ>` 1）。
+  ただしこれは 2026-07-30 に**終端記号だけの述語**で測った値である。**出荷した規則（全大文字ラベル込み）の
+  実測は 48 ブロック / 12 版で、内訳は TABLE 48 + Fig. 0**（合計が偶然一致するだけで中身が違う。
+  §2.9 の表を参照）。
 - 「8d-7 の解決率上限の実体」→ **debt-12 単独では 8d-7 の解決辺は +0**。参照側の `take_ref_number`
   （`graph.rs:823-850`）が ASCII 数字（と付録形 "A.1"）しか読まないので、本文の "Table I" はそもそも
   参照として走査されない。参照側もローマ対応させて初めて +81 辺（1302→1383）だが、
   参照母数が 1428→1529 に増えるので**率は 91.18% → 90.45% に下がる**。
 
-**新しい正当化**: `node_kind` の正しさ。`table_caption` が 68 → 約 115 件（+69%）になる。
-図側にはほとんど影響しない（`FIG.`/`FIGURE`/`Fig.` で始まる block 級ノード 906 件のうち 892 件＝98.6% は
-既に figure_caption に分類済み）。
+**新しい正当化**: `node_kind` の正しさ。`table_caption` が **68 → 116 件（+71%）**になる
+（実装後の実測: 利得 48 ブロック / 12 版）。図側にはほとんど影響しない（`FIG.`/`FIGURE`/`Fig.` で始まる
+block 級ノード 906 件のうち 892 件＝98.6% は既に figure_caption に分類済み）。
 
-**誤検出ガードは 1 個で足りる**: ローマ数字の直後に終端記号（`.` / `:`）を要求する。
-実測でこれがローマ+終端記号 47 件（すべて caption）と「Table XIV shows the equivalence between…」1 件（本文）を
-完全に分離する。「Table I」と「Table 1」の同一視は**不要**（ローマ数字 caption を持つ 12 版すべてで、
+**ガードは 2 個要る（初版の「1 個で足りる」は誤り）。** 初版は「ローマ数字の直後の終端記号（`.` / `:`）が
+47 件の caption と『Table XIV shows the equivalence between…』1 件（本文）を完全に分離する」と書いたが、
+実装時に**終端記号を持ちながら本文である第 2 の型**が見つかった:
+
+> … as shown in **Table III. Since** the extended Hermitian system H …（v171）
+
+文末のピリオドが次の文の直前に来るので終端記号は素通りする。これを分離するのは
+**ラベルが全大文字であること**（本文の散文は "Table III"、caption は "TABLE III."）。
+両ガードを入れた実測は §2.9 の表のとおりで、全大文字を要求すると本文混入の母集団が 2 → 0 になる。
+第 3 のガードとして**標準形ローマ数字**（値に読んでから正準表記へ描き直して一致を見る）を入れ、
+ローマ数字の文字だけでできた全大文字の英単語（"DIM"）と非標準表記（"IIII"）を弾く。
+
+「Table I」と「Table 1」の同一視は**不要**（ローマ数字 caption を持つ 12 版すべてで、
 同じ版の `table_caption` ノード数 = 0 かつ本文の `Table <数字>` 参照 = 0）。
 ローマ数字パーサは caption 専用の独立関数として書き、`parse_theorem_number` には触らない
 （定理番号 "Theorem V.?" に波及して Phase 5 の分類を変えるため）。
@@ -834,6 +920,8 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 | 8d-7「再構築は必須ではない。辺は次回 rebuild で付く」 | 結果として **pdfium 完了版 138/138 が既に outdated**、`refers_to_figure` は pdfium 側に 1 本も無い。「再構築 1 回」は選択肢ではなく確定した負債 |
 | 設計概観 §6「**要検証**: 非ゼロ `/Rotate` で text bounds は回転前/後どちらか」 | **決着**: bounds は回転前 user space、`page.width()/height()` は回転適用後。pdf.js の viewport は両方吸収する |
 | debt-14「段落の bbox は影響しない」 | 図については正しいが、同じ取り違えが `structure.rs:365-368` の `in_margin` にもある（debt-18）。さらに **テキスト bbox のページ矩形はみ出し 11,963 件 / 9 版は debt-14 では直らない**（debt-19） |
+| **本書 2026-07-30 版**の debt-12「誤検出ガードは 1 個（終端記号）で足りる」 | **足りない**。終端記号を持つ本文の第 2 の型（"… as shown in Table III. Since the extended …"）があり、**ラベル全大文字**の要求が要る（実装時に実測・§8.1・§2.9） |
+| §11「`figure_caption` は 904 と 954 の 2 値が出た（未確定）」 | **決着**（集計条件の違い）: 生存 pdfium 版 = **904** / 生存 pdfium + tex = **954** / superseded 込みの全版 = **1,021**（設計概観 §10a が使っている値） |
 
 ---
 
@@ -845,7 +933,7 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 |------|-----|
 | entries / attachments | 140 / 148（PDF 140・gzip 8） |
 | `document_versions` | 291 行（pdfium: 0.6.0 completed 137 + cww 1 / 0.1.0 superseded 135 / 0.5.0 superseded 2。tex: 0.5.0 completed 2 + cww 6 / 0.1.0 sup 1 / 0.4.0 sup 7） |
-| コード側の抽出器版 | pdfium `0.7.0` / tex `0.5.0` → **PDF 138/138 が outdated・TeX は 0 件** |
+| コード側の抽出器版 | pdfium **`0.8.0`**（#1 で 0.7.0 から bump）/ tex `0.5.0` → **PDF 138/138 が outdated・TeX は 0 件** |
 | `document_nodes` | 2,663,234 行（**superseded が 2,213,085 = 83%**） |
 | `source_fragments` | 2,659,223 行（fragment_type 別: line 309,992 / block 130,904 / page 7,345 は生存版のみ） |
 | DB ファイル | 761,237,504 B（726 MiB・freelist 0）。`document_nodes` 262.4MB + `source_fragments` 173.1MB + 索引 5 本で 83.2% |
@@ -860,10 +948,11 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 | Vision alt text | 888 件 / 6,312 秒 ≒ **7.1 秒/図**。model は全件 `claude-sonnet-5`。単価 ≒$0.0068/図（総額 ≒$6 はメモリ由来でリポジトリからは未検証） |
 | バックアップ | フル zip（`VACUUM INTO` + attachments 全体・差分も dedup も無し）・keep=14・24h 間隔。現在 5 本 × 831,617,064 B = 3.9 GiB。db.sqlite は raw 737MB → 圧縮 220.6MB |
 | disk | 89 GB 空き（91% 使用） |
-| テスト本数 | 967（PR #69 のコミットメッセージ）。`#[test]`/`#[sqlx::test]`/`#[tokio::test]` の静的個数は 973 |
+| テスト本数 | **985**（#1 時点の `cargo test` 実測。#0 で 977・#1 で +8） |
 
-**未確定**: `figure_caption` は別々の調査で 904 と 954 の 2 値が出た（集計条件の違いの可能性）。
-904 は「生存 pdfium 版に限定」した値で 2 体が一致している。doc に確定値として書く前に再計測すること。
+**`figure_caption` の 904 / 954 の食い違いは決着した**（2026-08-02・集計条件の違い）:
+生存 pdfium 版 **904** / 生存 pdfium + tex **954** / superseded 込みの全版 **1,021**。
+本表と §4 は「生存 pdfium 版」基準なので 904 を採る（設計概観の Phase 10a 節にある 1,021 は全版基準）。
 
 ---
 
@@ -875,6 +964,8 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
   §8 の「(B) 化は差し替える 1 行」→ 撤回（シグネチャも `(pool, attachment_id)` へ修正）/
   §10 モジュールツリーの `post_attach`（実在しない関数）を削除 /
   Phase 8a 実装状況の「XObjectForm 内画像は追わない」の根拠が未検証の仮説であることと、
-  「tikz/pgf ベクター図はアセット 0 件が正当」が 8d-2 で撤回されることを追記
+  「tikz/pgf ベクター図はアセット 0 件が正当」が 8d-2 で撤回されることを追記。
+  **2026-08-02（#1）にさらに 2 箇所**: Phase 2 実装状況にローマ数字 caption の規則を追記 /
+  Phase 8d-7 の「解決率上限は約 93%・残りの原因は debt-12」を訂正（91.18% + debt-12 の寄与は +0）
 - `docs/LumenCite_machine_readable_document_roadmap.md` — 元ロードマップ（Phase ごとの実装項目・完了条件）
 - `docs/RELEASE.md` — §4 に pdfium 同梱の手順。v1.0.0 固有事項の節は未作成（§9）

@@ -31,7 +31,11 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 ///   `figure_caption`/`table_caption` に解決し `metadata.resolved_via` で区別）。
 ///   出力（派生の関係辺）が増えるので、既存コーパスは `rebuild_outdated_lcir` で
 ///   張り直せるよう版を上げる（**再構築は必須ではない。辺は次回再構築時に付く**）。
-pub const EXTRACTOR_VERSION: &str = "0.7.0";
+/// - `0.8.0`: debt-12。全大文字ラベル + ローマ数字の caption（"TABLE III." 形）を
+///   `table_caption`/`figure_caption` に分類する。実ライブラリで 48 ブロック / 12 版が
+///   `paragraph` 等に落ちていた。分類（`node_kind`）が変わるので既存コーパスは
+///   `rebuild_outdated_lcir` で張り直せるよう版を上げる。
+pub const EXTRACTOR_VERSION: &str = "0.8.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。
