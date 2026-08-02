@@ -97,7 +97,7 @@ v1.0.0 の看板は「LCIR 完成（Phase 9a/10 到達 + `lcir.enabled` 既定 O
 | **v1.0.0-p4** | superseded 版の GC + 容量可視化 | M | **600–800** | 不要 | なし | **v1.0.0** |
 | **debt-12** | ローマ数字・全大文字の caption 取りこぼし | S | **130–200** | 不要 | pdfium | **v1.0.0** |
 | ~~**debt-14**~~ | ~~図領域のクランプが CropBox 原点を無視~~ **完了**（§2.10） | S | **160–220** | 不要 | pdfium **0.9.0** | **v1.0.0** |
-| **debt-18** | `in_margin` の帯がページ box 原点を無視（debt-14 と同根） | S | **80–140** | 不要 | pdfium **0.10.0** | **v1.0.0**（2026-08-02 に post-1.0 から引き上げ） |
+| ~~**debt-18**~~ | ~~`in_margin` の帯がページ box 原点を無視~~ **完了**（§2.11） | S | **80–140** | 不要 | pdfium **0.10.0** | **v1.0.0** |
 
 **中間スコープに migration は 0 件**（p1 の OCR 保護を settings に置くと決めたので条件なし・§2.6-1）。
 migration 20 本すべてに当たって確認した。0 件なら v1.0.0 のロールバックは旧バイナリへの差し戻しだけで成立する。
@@ -130,7 +130,7 @@ migration 20 本すべてに当たって確認した。0 件なら v1.0.0 のロ
 | 0 | ~~`fix(LCIR): 旧 content_key の GC に mtime 猶予 + GUI ロックの取得可否を返す`~~ **完了**（§2.8） | debt-15 / debt-24 の一部 | S / 60–90 | なし | 否 | **既存の穴**。dev と配布版 v0.10.0 が同一 app data dir を共有しており、`gc_stale_asset_dirs` は猶予なしで「今回の content_key 以外」を trash へ送る。両方が build すると crop を消し合う。後回しにするとこの窓が計画全体に開いたままになる |
 | 1 | ~~`fix(LCIR): ローマ数字・全大文字の図表 caption（debt-12）`~~ **完了**（§2.9） | debt-12 | S / 130–200 | →**0.8.0** | 否 | **8d-2 より前が必須**。8d-2 は探索面を 6,321→477 ページに落とす caption アンカーを使い、その入力が `detect_caption` の分類。逆順だと FP gate を通した後にゲート条件の入力が変わる。純関数なので CI で完全に検証でき、版 bump 手順の予行にもなった |
 | 2 | ~~`fix(LCIR): 図領域のクランプをページ box 原点基準にする（debt-14）`~~ **完了**（§2.10） | debt-14 | S / 160–220 | →**0.9.0** | 否 | 図系の先頭。8d-2 / 8d-8 が追加する矩形も同じクランプ（`pdf/mod.rs`）を通るので、先に直さないと新経路にバグを複製する。**着手時の実測で「carry 破壊 10 図・alt text 6 件」は過大と判明** ── 実際に bbox が動くのは 3 図・alt text は 1 件（§2.10）。carry 機構の本番初発火という位置づけは変わらない |
-| 2.5 | `fix(LCIR): 走り柱判定の帯をページ box 原点基準にする（debt-18）` | debt-18 | S / 80–140 | →0.10.0 | 否 | **2026-08-02 に中間スコープへ追加**（§0）。debt-14 と同根で、`structure.rs:365-368` の `in_margin` が `bbox.y`（絶対）を `page_height`（box の高さ）と原点補正なしで比べている。**ここに置く理由は #7 の唯一の再構築に相乗りできる最後の窓だから** ── 分類（`node_kind`）が変わる変更なので、再構築の後に入れると 2 回目が確定する。#2 で座標系の実測系ができているので今が最も安い。図系（#3 / #4）とはファイルも母集団も別なので順序は入れ替え可。**判定式だけでは終わらない**（`ExtractedPage` に box 原点を載せて `classify_block` まで通す必要がある・§8 debt-18）。実測と落とし穴は §8 の債務表を先に読むこと |
+| 2.5 | ~~`fix(LCIR): 走り柱判定の帯をページ box 原点基準にする（debt-18）`~~ **完了**（§2.11） | debt-18 | S / 80–140 | →**0.10.0** | 否 | 2026-08-02 に中間スコープへ追加（§0）。debt-14 と同根で、`in_margin` が `bbox.y`（絶対）を `page_height`（box の高さ）と原点補正なしで比べていた。**#7 の唯一の再構築に相乗りできる最後の窓**だったのでここに置いた。予告どおり判定式だけでは終わらず、原点を `extract_document` へ引き上げて `ExtractedPage` に載せる必要があった（§2.11）。実測は **unknown_block → paragraph が 107 件 / paragraph → unknown_block が 12 件** |
 | 3 | `feat(LCIR): XObjectForm と回転ページの図領域（8d-8 / debt-9）` | 8d-8 | M / 400–520 | →0.11.0 | 否 | 8d-2 の前。figure 0 件 + caption ありの 42 版のうち **21 版（caption 211 件）はラスタ画像を持つのに top-level 列挙に出ない＝8d-8 の担当**、純ベクターは 21 版 / caption 94 件。混ぜると 8d-2 のガード閾値を誤った母集団でチューニングする |
 | 4 | `feat(LCIR): ベクター図（tikz/pgf）の領域検出（8d-2）` | 8d-2 | L / 800–1,050 | →0.12.0 | 否 | 最大の新推定器かつ**唯一 888 件の carry を全滅させうる**。他が全部正しくなってから最後に測る |
 | 5 | （PR なし）**ゲート ②a — 抽出器差分だけの限定レビュー** | 1〜4 の diff（2.5 を含む） | — | なし | 否 | ここで出た指摘は版 bump のみで吸収でき再構築を増やさない。#7 の後に回すと、抽出器への指摘 1 件で 80 分再構築 + carry 再賭け + Vision 再課金がもう 1 回確定する |
@@ -529,6 +529,82 @@ app data dir も触らない）で 1 本ずつ両方を計算して突き合わ�
 - **回転頁を無条件に skip する**。8d-8 が回転頁の図を有効にしたら、このツールも直さないと
   増えた図が差分に出ない（対象は att127 の 5 頁）。
 
+### 2.11 #2.5（debt-18）の実装記録（2026-08-03・完了）
+
+走り柱（ランニングヘッダ/フッタ）判定の帯を**ページ境界 box の原点から測る**ようにした。
+migration なし・**pdfium 抽出器版 0.9.0 → 0.10.0**（+ golden fixture 2 本）・TeX 側不変。
+
+**判定式の 2 行だけでは終わらない**（§8 の予告どおり）。`in_margin` は
+`structure::classify_block` の中にあり、そこへ届く `ExtractedPage` は box 原点を持っていなかった。
+しかも `page_box_origin` は図領域の関数の内側でしか呼ばれておらず、**`asset_dir` の無い経路
+（テキストのみの抽出）では計算すらされていなかった**。したがって:
+
+1. **原点を `extract_document` のページループへ引き上げ**、テキスト側と図領域側が
+   **同じ 1 回の計算**を共有するようにした（`extract_page_image_regions` は原点を引数で受け取る）。
+2. `ExtractedPage` に `box_left` / `box_bottom` を追加。読み手は doc コメントに名指しで書いた
+   （`box_bottom` = 走り柱判定 / 両方 = 図領域のクランプ）。
+3. 帯を `box_bottom + 高さ*0.90` / `box_bottom + 高さ*0.10` に。
+
+引き上げの副作用として図領域の関数の引数が 9 個になり clippy の `too_many_arguments` に当たったので、
+**4 値を `PageBox { left, bottom, width, height }` に束ねた**（`#[allow]` ではなく clippy の指示どおり）。
+`f64` を 4 つ並べて渡す形は取り違えても型が通るので、束ねる方が安全でもある。
+`ExtractedPage` 側は平坦なまま（ページ payload と構造認識の読み手がそのまま使う）。
+**図領域の出力は 1 ビットも変わっていない**ことを att77 で確認済（新規 +1 / 移動 1 ＝ §2.10 と同じ）。
+
+**実データでの効果（再構築せずに測った）。** `in_margin` は純粋な述語なので、実 DB のブロック
+（生存 138 版・block fragment 129,706 件）へ旧帯と新帯の両方を当てて反転するものを数えた。
+原点は pdfium の `FPDF_GetPageBoundingBox` から**頁ごと**に引く（7,345 頁・うち非ゼロ 907 頁）。
+
+| 反転 | 件数 | 版 |
+|---|---|---|
+| `unknown_block` → `paragraph`（本文が戻る） | **107** | 6 版（149:75 / 183:14 / 202:10 / 217:3 / 223:3 / 232:2） |
+| `paragraph` → `unknown_block`（走り柱を回収） | **12** | 2 版（232:10 / 183:2） |
+
+戻る本文は "Foreword" / "Preface" / "Contents" / "Graduate School of Mathematics" など。
+**107 件すべてが散文というわけではない**（"tr a =" / "where B" / "lim" のような数式断片も含む）。
+
+**12 件の側も内訳を書いておく**（レビューで「12 件はすべて走り柱の回収＝純利益」と読める、と指摘された）:
+**走り柱 8 件**（vid 232 の "J. Comput. Theor. Nanosci. 10, 1558–1570, 2013 15xx"）/ **数式断片 3 件**
+（"×v k k" / "∼ VVx" / "N(B)/N"）/ **本文 1 件**。本文の 1 件は vid 183 p43 の
+"(c) This is an exercise. Use Theorem (1.3.5)."（8 語ちょうど・1 行・当該頁の最下段）で、
+この頁は box 原点が高い（72.356）ため下端帯が 69.7pt → 142.1pt へ 72.4pt 上がって飲み込まれる。
+**新しい帯は本文も飲み込む向きの副作用を持つ**（ただし降格しても本文は失われない ── Markdown export は
+`unknown_block` も段落として出し、node-FTS も載せる。変わるのは型と confidence だけ）。
+
+反転する両方向とも、**原点ゼロの PDF で前からそうなっていた**扱いに揃うだけで、
+この PR が新しく作る歪みではない。
+
+**「帯に入る数」と「実際に反転する数」は大きく違う**（§8 の但し書きの実測）。vid 149 では
+誤った帯にだけ入る現 `unknown_block` が 566 件あるが、実際に `paragraph` へ戻るのは **75 件**。
+差の 491 件は英字が 3 文字未満で `looks_like_prose` を通らず、帯と無関係に `unknown_block` のまま。
+
+**テストは 7 本**（`margin_band_is_measured_from_the_page_box_origin` /
+`running_footer_just_above_the_box_bottom_is_demoted` / `margin_band_handles_a_negative_box_origin` /
+`block_straddling_the_band_edge_is_not_demoted` / `long_line_in_the_margin_band_stays_a_paragraph` /
+`multi_line_block_in_the_margin_band_stays_a_paragraph` / `margin_band_is_unchanged_on_a_zero_origin_page`）。座標は実データの box をそのまま使っている
+（vid 149 の `(77.811, 87.931)` / 439.455x666.283、vid 183 の負原点 `(-4.149, -8.416)` / 484.683x697.265）。
+
+**変異 11 通りがすべて狙ったテストだけを落とすことを確認済**。うち **5 通りは最初素通りした**
+（3 通りは自分で、2 通りはレビューで見つかった）:
+
+- **原点を 0 で下限クリップする変異**（`box_bottom.max(0.0)`）── 正の原点のテストしか無かった。
+  #2 と**同じ穴**（実データに負の原点があると分かっていたのに繰り返した）。
+- **語数ガード（≤8）と 1 行ガードを潰す変異** ── どちらも既存のガードだが、同じ述語を
+  書き換える PR でテストが無いのは弱いので固定した。
+- **どちらの辺を見るかを入れ替える変異**（上端帯 `y` → `y+h` / 下端帯 `y+h` → `y`）と
+  **帯の係数を変える変異**（0.10 → 0.30 等）── レビューが発見。帯は**ブロックが丸ごと帯に
+  入ること**を要求する（跨いでいるだけの行は降格しない）という意味なので、
+  境界を跨ぐ / 境界のすぐ内側の 4 ケースで固定した（`block_straddling_the_band_edge_is_not_demoted`）。
+
+**あえて固定しなかったもの**: `>` を `>=` にする変異は素通りする。ブロックの辺が帯の境界に
+**ちょうど**一致する測度ゼロのケースで、作為的なテストを足す価値がない。
+
+**回転ページの帯は依然ずれている**（`page.height()` が box の幅を返すため）。ただし実ライブラリの
+回転頁 5 頁はすべて box 原点が (0,0) なので**この PR は回転頁を 1 ビットも動かさない**。
+帯の分母を直すのは debt-9 / 8d-8（#3）の領分。
+
+**#7 の再構築で初めて実データに乗る。** それまで実 DB の分類は変わらない。
+
 ---
 
 ## 3. Phase 7（数式意味表現）— post-1.0
@@ -921,7 +997,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | ~~debt-15~~ | ~~`gc_stale_asset_dirs` に mtime 猶予が無い。dev と配布版が同一 app data dir を共有しているので、両方が build すると互いの content_key ディレクトリを trash に送り合う~~ **解消**（2026-08-02・#0・§2.8）。1 時間以上離れた build 同士は依然回収し合うので、恒久解は p4 の GC | S | 完了 |
 | **debt-16** | `heal_missing_assets` が `assets.sha256` を UPDATE しても `node_alt_texts.source_asset_sha256` が追随しない。crop が 1 枚欠けた添付を build した時点で無言の carry 破壊が仕込まれ、数週間後の再構築で「8d-2 のバグ」と誤診される | S（~40 行） | 再構築 1 回の前提 |
 | **debt-17** | 新規添付で `extract_and_index`（pdf_extract）の spawn と LCIR build が last-writer-wins レースになる。`index_attachment` は先頭で `DELETE FROM fulltext WHERE attachment_id=?` を無条件に打つので、pdf_extract が 0 字を返す個体（att93/att94）は **LCIR が正常でも検索から消える**。新規添付でしか起きないので既存 138 件の前後比較には現れない | M | **p1 の完了条件**（3 つの spawn を「足す」でなく「外す」） |
-| **debt-18** | 同じ座標系の取り違えが `structure.rs:365-368` の `in_margin` 判定にもある（`bbox.y` は絶対・`page_height` は box の高さ）。非ゼロ原点の PDF で判定帯がずれ、短い散文行が paragraph → unknown_block に降格する。**2026-08-02 に #2 で測り直した（旧記述「vid 183 で 110 件 vs 51 件」は誤り）**: 誤った帯 / 正しい帯 = vid **149: 1,179 / 272**・183: 100 / 63・202: 24 / 13・223: 22 / 13（**頁ごとの** box 原点で判定・1 行 + 8 語以下のゲート込み。版ごとに 1 つの原点で数えると vid 183 が 107 になるが、この版は頁によって原点が違う）。ただし**帯に入る数は誤降格の数ではない** ── `in_margin` に届くのは `Mode::Body` の最終分岐だけなので、誤った帯にだけ入るブロックのうち現 `unknown_block` は **566 / 32 / 10 / 6 件**（残りは heading・display_math 等で先に確定している）。さらに `looks_like_prose` も満たすものだけが paragraph へ戻る。**#7 の唯一の再構築に相乗りできる**（post-1.0 に回すと同じ効果にもう 1 回 80 分かかる）。**「判定式 2 行」で終わらない**: `ExtractedPage` は box 原点を持たず（`pdf/mod.rs`）、`page_box_origin` は図領域の関数の中でしか呼ばれていない（＝`asset_dir` が無い経路では計算すらされない）ので、**原点を `extract_document` のページループへ引き上げて `ExtractedPage` に載せ、`classify_block` まで通す**必要がある。構築箇所（テスト含む）の更新も要る | S | **v1.0.0 スコープ**（2026-08-02 に引き上げ・#2.5・§2.2） |
+| ~~**debt-18**~~ | ~~同じ座標系の取り違えが `in_margin` 判定にもある~~ **解消**（2026-08-03・#2.5・§2.11）。帯を `box_bottom + 高さ*0.90 / *0.10` に直した（`structure.rs` の `classify_block`）。実測は**帯の membership** が 誤 / 正 = vid 149: 1,179/272・183: 100/63・202: 24/13・223: 22/13（**頁ごとの**原点で判定）、**実際に反転したのは `unknown_block`→`paragraph` 107 件 / 6 版・`paragraph`→`unknown_block` 12 件 / 2 版**。予告どおり判定式だけでは終わらず、原点を `extract_document` へ引き上げて `ExtractedPage` に載せる必要があった | S | 完了 |
 | **debt-19** | **テキスト fragment 約 11,970 件（12 版・5 件以上に絞ると 9 版）がページ矩形をはみ出す**（y 方向最大 +116pt / x 方向最大 +464pt）。**発生源は `ingestion/mod.rs:547-559`** ── page ノードの fragment を「原点 `(0,0)` + box の寸法」で入れており、原点だけ絶対・寸法だけ box という debt-14 と同じ取り違えになっている（コメントの「ページ全面（MediaBox）」も実際と食い違う）。正しくは `box_left`/`box_bottom` を原点に置く。**debt-14 では直らない**（図 crop のクランプのみ） | M | 9b-4 の座標変換 |
 | **debt-20** | `content_key` の `config_hash` が全経路 `""` 固定で、`RENDER_TARGET_WIDTH` 等を変えても content_key が動かない。pdfium バイナリの tag（chromium/7934）も content_key にも `metadata_json` にも入っていない ＝ **pdfium を上げると全 crop の sha256 が変わり alt text 888 件が全滅しうるのに、それが版として表現されない** | S（metadata に tag を足すのは 1 行） | 再構築の再現性 |
 | **debt-21** | superseded 行が残る間、同一 content_key の再 build は UNIQUE 違反で必ず失敗する（`find_completed` が status で絞るので reuse に乗らない）。**古いバイナリで「旧版を再構築」を押すと全件失敗する**経路が実在する | S | p4 の GC が副作用で解消する |
@@ -1053,7 +1129,7 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 | 「数百本で数十分規模」（`run_build_batch` の doc コメント由来の見積り） | **実測 4,797 秒（80 分）/ 138 PDF、うち 1 添付が 4,514 秒** |
 | 8d-7「再構築は必須ではない。辺は次回 rebuild で付く」 | 結果として **pdfium 完了版 138/138 が既に outdated**、`refers_to_figure` は pdfium 側に 1 本も無い。「再構築 1 回」は選択肢ではなく確定した負債 |
 | 設計概観 §6「**要検証**: 非ゼロ `/Rotate` で text bounds は回転前/後どちらか」 | **決着**: bounds は回転前 user space、`page.width()/height()` は回転適用後。pdf.js の viewport は両方吸収する |
-| debt-14「段落の bbox は影響しない」 | 図については正しいが、同じ取り違えが `structure.rs:365-368` の `in_margin` にもある（debt-18）。さらに **テキスト bbox のページ矩形はみ出し 約 11,970 件 / 12 版は debt-14 では直らない**（debt-19） |
+| debt-14「段落の bbox は影響しない」 | 図については正しいが、同じ取り違えが `in_margin` にもあった（debt-18・#2.5 で解消）。さらに **テキスト bbox のページ矩形はみ出し 約 11,970 件 / 12 版は debt-14 では直らない**（debt-19） |
 | debt-14「carry 破壊は実測 10 図・うち alt text 保持 6 件」（2026-08-02 の実装時に訂正・§2.10） | **10 図 / 6 件は「ページ矩形の辺に接する図」の数**で、bbox が動く図の数ではない。12 図中 9 図は CropBox 原点が (0,0) の頁にあり、そこでは元のクランプが正しい。実際に動くのは **3 図・alt text 1 件**（crop の画素まで変わるのは 2 図・alt text 1 件）。一方で**新しく拾える図 4 件**は痕跡からは数えられていなかった |
 | debt-14「CropBox 原点を使えばよい」（同上） | **足りない**。pdfium のページ寸法は `CropBox ∩ MediaBox` の寸法なので、原点も交差から取る必要がある。生 CropBox だと **392 頁 / 2 版**（CropBox が (0,0) 始まりで MediaBox の原点が非ゼロ）で no-op になり、その 2 版は最大の被害版でもある |
 | debt-18「vid 183 で実測 110 件 vs 正しい帯 51 件」（同上） | **版も件数も誤り**。実測は vid **149 で 1,179 件 vs 272 件**（vid 183 は 100 vs **63**）。実害の本体は vid 149 で、誤った帯にだけ入る現 `unknown_block` が 566 件。**帯に入る数 ≠ 誤降格の数**（`in_margin` は `Mode::Body` の最終分岐にしか届かない） |
@@ -1071,7 +1147,7 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 |------|-----|
 | entries / attachments | 140 / 148（PDF 140・gzip 8） |
 | `document_versions` | 291 行（pdfium: 0.6.0 completed 137 + cww 1 / 0.1.0 superseded 135 / 0.5.0 superseded 2。tex: 0.5.0 completed 2 + cww 6 / 0.1.0 sup 1 / 0.4.0 sup 7） |
-| コード側の抽出器版 | pdfium **`0.9.0`**（#2 で 0.8.0 から bump）/ tex `0.5.0` → **PDF 138/138 が outdated（実 DB は全件 0.6.0）・TeX は 0 件** |
+| コード側の抽出器版 | pdfium **`0.10.0`**（#2.5 で 0.9.0 から bump）/ tex `0.5.0` → **PDF 138/138 が outdated（実 DB は全件 0.6.0）・TeX は 0 件** |
 | `document_nodes` | 2,663,234 行（**superseded が 2,213,085 = 83%**） |
 | `source_fragments` | 2,659,223 行（fragment_type 別: line 309,992 / block 130,904 / page 7,345 は生存版のみ） |
 | DB ファイル | 761,237,504 B（726 MiB・freelist 0）。`document_nodes` 262.4MB + `source_fragments` 173.1MB + 索引 5 本で 83.2% |

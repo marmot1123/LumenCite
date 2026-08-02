@@ -3198,6 +3198,8 @@ mod tests {
                 page_number: 1,
                 width_pt: 595.0,
                 height_pt: 842.0,
+                box_left: 0.0,
+                box_bottom: 0.0,
                 rotation_deg: 0.0,
                 plain_text: "page text".to_string(),
                 blocks: Vec::new(),
