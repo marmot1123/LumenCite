@@ -66,6 +66,20 @@ impl GuiLockState {
     }
 }
 
+/// `try_lock_exclusive` のエラーを「先客がいる」と「ロック機構が使えない」に振り分ける。
+///
+/// 判別は **raw OS error の一致**で行う。`ErrorKind` の比較では駄目で、Windows の
+/// 競合エラー `ERROR_LOCK_VIOLATION`(33) は std の対応表（`sys/io/error/windows.rs`）に
+/// 無く `Uncategorized` に落ちるため、**無関係な OS エラーまで「先客あり」と一致してしまう**。
+/// 誤って `HeldByOther` にすると起動時 sweep が永久に止まる（片方向に危険なので、
+/// 判別できないものは `Unavailable` に倒す）。
+fn classify_lock_error(e: &std::io::Error) -> GuiLockState {
+    match (e.raw_os_error(), fs2::lock_contended_error().raw_os_error()) {
+        (Some(actual), Some(contended)) if actual == contended => GuiLockState::HeldByOther,
+        _ => GuiLockState::Unavailable,
+    }
+}
+
 /// GUI が起動中である印の advisory ロックを保持する。プロセスが生きている限り握り続ける
 /// よう、File をプロセス寿命の static に格納する。OS がプロセス終了時に自動解放するので
 /// stale ロックは残らない。2 個目のインスタンスでロックが取れなくても起動は妨げない。
@@ -88,11 +102,7 @@ fn acquire_gui_lock(data_dir: &std::path::Path) -> GuiLockState {
     };
     if let Err(e) = file.try_lock_exclusive() {
         // 「先客がいる」以外のエラー（flock 非対応の FS 等）は判定不能として扱う。
-        return if e.kind() == fs2::lock_contended_error().kind() {
-            GuiLockState::HeldByOther
-        } else {
-            GuiLockState::Unavailable
-        };
+        return classify_lock_error(&e);
     }
     // `set` が失敗するのは 2 回目の呼び出しだけで、そのとき `file` は drop される。
     // ただし同一プロセスの 2 個目の fd では上の try_lock が既に失敗するので、
@@ -4345,6 +4355,29 @@ mod gui_lock_tests {
 
         fs2::FileExt::unlock(&holder).unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// try_lock のエラー振り分けは raw OS error の完全一致で行う。`ErrorKind` 比較だと
+    /// Windows で ERROR_LOCK_VIOLATION(33) が `Uncategorized` に落ちるため、無関係な
+    /// OS エラーまで「先客あり」に化けて起動時 sweep が永久に止まる。
+    #[test]
+    fn lock_error_is_classified_by_raw_os_error() {
+        assert_eq!(
+            classify_lock_error(&fs2::lock_contended_error()),
+            GuiLockState::HeldByOther,
+            "競合エラーだけが HeldByOther"
+        );
+        // 無関係な OS エラー（1 は unix EPERM / windows ERROR_INVALID_FUNCTION。
+        // 競合コード EWOULDBLOCK(35 / 11) / ERROR_LOCK_VIOLATION(33) のどれとも違う）。
+        assert_eq!(
+            classify_lock_error(&std::io::Error::from_raw_os_error(1)),
+            GuiLockState::Unavailable
+        );
+        // OS エラー番号を持たないエラーも判定不能側。
+        assert_eq!(
+            classify_lock_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            GuiLockState::Unavailable
+        );
     }
 
     /// ロックファイルを開けない（＝ロック機構が使えない）ときは「別インスタンスあり」と

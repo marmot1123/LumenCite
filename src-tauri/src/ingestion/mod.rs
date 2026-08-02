@@ -400,7 +400,7 @@ fn is_stale_asset_dir(dir: &Path, now: std::time::SystemTime) -> bool {
         .flatten()
         .flatten()
         .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
-        .max();
+        .min();
     let mtime = match newest.or_else(|| std::fs::metadata(dir).and_then(|m| m.modified()).ok()) {
         Some(m) => m,
         // mtime が読めないなら判断材料が無い。回収せず次回に回す。

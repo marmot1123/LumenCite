@@ -284,7 +284,11 @@ debt-19（テキスト fragment 11,963 件がページ矩形をはみ出す）�
    `GuiLockState { Acquired, HeldByOther, Unavailable }`。**`Unavailable`（開けない / flock 非対応 FS）を
    `HeldByOther` に丸めない**のが要点で、丸めるとそういう環境で起動時 sweep が永久に走らなくなり
    VACUUM 中間 DB が溜まり続ける（220 ファイル・95GB の実例がコメントに残っている）。
-   contention の判別は `fs2::lock_contended_error().kind()` との比較。
+   contention の判別は **raw OS error の完全一致**（`classify_lock_error`）。`ErrorKind` 比較は誤り
+   ── Windows の `ERROR_LOCK_VIOLATION`(33) は std の対応表（`sys/io/error/windows.rs`）に無く
+   `Uncategorized` に落ちるので、**無関係な OS エラーまで「先客あり」に一致してしまう**。
+   誤りは片方向にだけ危険（`HeldByOther` に化けると sweep が永久に止まる／`Unavailable` に
+   化けても今日と同じ挙動に戻るだけ）なので、判別できないものは `Unavailable` に倒す。
 
 **今の読み手**（`another_instance_is_live()`）は起動時 sweep（`sweep_trash` +
 `sweep_backup_workdir`）で、別インスタンスが生きていると確認できたときだけ skip する。
@@ -296,7 +300,7 @@ sweep は削除操作のたびと次回起動時に再試行されるので取�
 再レンダリング待ちの間に carry 判定が空振りする経路がここに集中する。
 恒久解は content_key ごとに生存版を DB から引く GC（p4 の射程）。
 
-テストは 6 本（`ingestion::tests::gc_*` 3 本 / `gui_lock_tests::*` 3 本）。
+テストは 7 本（`ingestion::tests::gc_*` 3 本 / `gui_lock_tests::*` 4 本）。
 猶予チェックを潰すと「残す」2 本だけが落ち「回収する」1 本は通る（＝ GC を無効化していない）ことを確認済み。
 
 ---
