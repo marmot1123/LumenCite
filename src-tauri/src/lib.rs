@@ -44,23 +44,61 @@ use tokio::sync::Notify;
 /// GUI 生存ロックのファイル名。GUI と CLI で同じパスを見る（CR-011）。
 pub const GUI_LOCK_FILE: &str = "lumencite.gui.lock";
 
+/// [`acquire_gui_lock`] の結果。「取れなかった」を 2 つに割るのが要点で、
+/// **別インスタンスが居ると確認できた場合だけ**掃除系を止める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiLockState {
+    /// このインスタンスがロックを握った。この app data dir で唯一の GUI。
+    Acquired,
+    /// 別のインスタンスが先に握っている（配布版と `pnpm tauri dev` の併用など）。
+    HeldByOther,
+    /// ロック機構自体が使えない（ファイルを開けない・flock 非対応の FS 等）。
+    /// 他インスタンスの有無は**判定できていない**ので、これを「別インスタンスあり」と
+    /// 同一視してはいけない。同一視すると、そういう環境では起動時 sweep が永久に
+    /// 走らなくなり、VACUUM 中間 DB が溜まり続ける（220 ファイル・95GB の実例あり）。
+    Unavailable,
+}
+
+impl GuiLockState {
+    /// 「別インスタンスが今このデータディレクトリを使っている」と確認できたか。
+    fn another_instance_is_live(self) -> bool {
+        self == GuiLockState::HeldByOther
+    }
+}
+
 /// GUI が起動中である印の advisory ロックを保持する。プロセスが生きている限り握り続ける
 /// よう、File をプロセス寿命の static に格納する。OS がプロセス終了時に自動解放するので
 /// stale ロックは残らない。2 個目のインスタンスでロックが取れなくても起動は妨げない。
-fn acquire_gui_lock(data_dir: &std::path::Path) {
+///
+/// 戻り値でロックを取れたかがわかる（`pnpm tauri dev` の debug ビルドと配布版は
+/// identifier が同じで、同一の app data dir・実 DB・`backups/` を共有する）。起動時の
+/// 掃除のように「別インスタンスが今まさに書いているファイル」に触りうる処理は、
+/// [`GuiLockState::another_instance_is_live`] が `false` のときだけ走らせる。
+fn acquire_gui_lock(data_dir: &std::path::Path) -> GuiLockState {
     use fs2::FileExt;
     static GUI_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
     let path = data_dir.join(GUI_LOCK_FILE);
-    if let Ok(file) = std::fs::OpenOptions::new()
+    let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
-    {
-        if file.try_lock_exclusive().is_ok() {
-            let _ = GUI_LOCK.set(file);
-        }
+    else {
+        return GuiLockState::Unavailable;
+    };
+    if let Err(e) = file.try_lock_exclusive() {
+        // 「先客がいる」以外のエラー（flock 非対応の FS 等）は判定不能として扱う。
+        return if e.kind() == fs2::lock_contended_error().kind() {
+            GuiLockState::HeldByOther
+        } else {
+            GuiLockState::Unavailable
+        };
     }
+    // `set` が失敗するのは 2 回目の呼び出しだけで、そのとき `file` は drop される。
+    // ただし同一プロセスの 2 個目の fd では上の try_lock が既に失敗するので、
+    // ここまで来て set が失敗する経路は実際には無い。
+    let _ = GUI_LOCK.set(file);
+    GuiLockState::Acquired
 }
 
 pub struct AppState {
@@ -3820,7 +3858,14 @@ pub fn run() {
             // GUI 生存フラグ（CR-011）: このロックを保持している間は「GUI 起動中」。
             // CLI の直接書込経路がこれを見て、MCP 委譲できないときに live DB を壊さないよう
             // 判断する。try_lock なので 2 個目のインスタンスでも起動を妨げない。
-            acquire_gui_lock(&data_dir);
+            // 取得可否は「掃除系を走らせてよいインスタンスか」の判定にも使う（debt-15）。
+            let gui_lock = acquire_gui_lock(&data_dir);
+            if gui_lock.another_instance_is_live() {
+                eprintln!(
+                    "GUI lock held by another LumenCite instance (same app data dir); \
+                     skipping startup sweeps"
+                );
+            }
 
             let options = SqliteConnectOptions::new()
                 .filename(data_dir.join("lumencite.db"))
@@ -3941,17 +3986,24 @@ pub fn run() {
             // バックアップの作業ファイル（VACUUM 中間 DB / 書きかけアーカイブ）も同時に
             // 回収する。中間 DB は DB と同サイズあり、途中終了のたびに溜まると
             // ディスクを食い潰す（実際に 220 ファイル・95GB 溜まった事例あり）。
-            let trash_dir = data_dir.clone();
-            std::thread::spawn(move || {
-                let n = attachment_trash::sweep_trash(&trash_dir);
-                if n > 0 {
-                    eprintln!("attachment trash: swept {n} leftover item(s) at startup");
-                }
-                let m = backup::sweep_backup_workdir(&trash_dir, backup::DEFAULT_KEEP);
-                if m > 0 {
-                    eprintln!("backup: swept {m} leftover work file(s) at startup");
-                }
-            });
+            //
+            // 「前回の残骸」を消す処理なので、別インスタンスが生きていると確認できたときは
+            // 走らせない。2 個目のインスタンスは、相手が今まさに書いている作業ファイルを
+            // 残骸と誤認しうる（debt-15）。走らせなくても sweep は削除操作のたびと
+            // 次回起動時に再試行されるだけで、取りこぼしは残らない。
+            if !gui_lock.another_instance_is_live() {
+                let trash_dir = data_dir.clone();
+                std::thread::spawn(move || {
+                    let n = attachment_trash::sweep_trash(&trash_dir);
+                    if n > 0 {
+                        eprintln!("attachment trash: swept {n} leftover item(s) at startup");
+                    }
+                    let m = backup::sweep_backup_workdir(&trash_dir, backup::DEFAULT_KEEP);
+                    if m > 0 {
+                        eprintln!("backup: swept {m} leftover work file(s) at startup");
+                    }
+                });
+            }
 
             // MCP サーバー公開 or Web クリッパーのどちらかが有効なら共用 HTTP サーバーを起動する。
             let srv_pool = pool.clone();
@@ -4246,6 +4298,68 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod gui_lock_tests {
+    use super::*;
+    use fs2::FileExt;
+
+    fn tmp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lc-gui-lock-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 誰も握っていなければ取得できる。
+    #[test]
+    fn acquire_reports_success_when_free() {
+        let dir = tmp_dir("free");
+        let state = acquire_gui_lock(&dir);
+        assert_eq!(state, GuiLockState::Acquired, "空きロックは取得できる");
+        assert!(!state.another_instance_is_live());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 別インスタンス（= 別の fd）が握っていれば取得できず、それが戻り値でわかる。
+    /// 起動そのものは妨げない（この関数は状態を返すだけ）。
+    #[test]
+    fn acquire_reports_held_by_other() {
+        let dir = tmp_dir("held");
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(GUI_LOCK_FILE))
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+
+        let state = acquire_gui_lock(&dir);
+        assert_eq!(state, GuiLockState::HeldByOther, "先客がいれば HeldByOther");
+        assert!(state.another_instance_is_live(), "掃除系は止める");
+
+        fs2::FileExt::unlock(&holder).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ロックファイルを開けない（＝ロック機構が使えない）ときは「別インスタンスあり」と
+    /// 断定しない。断定すると起動時 sweep が永久に走らなくなる。
+    #[test]
+    fn unavailable_lock_does_not_claim_another_instance() {
+        let dir = tmp_dir("unavailable").join("no-such-subdir");
+        let state = acquire_gui_lock(&dir);
+        assert_eq!(state, GuiLockState::Unavailable, "開けなければ Unavailable");
+        assert!(
+            !state.another_instance_is_live(),
+            "判定不能を「別インスタンスあり」に丸めない（sweep は走らせる）"
+        );
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
 }
 
 #[cfg(test)]
