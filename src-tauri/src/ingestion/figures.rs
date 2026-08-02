@@ -63,7 +63,7 @@ pub fn effective_page_box_origin(
 ///
 /// **クランプ範囲は `[0, page_w] × [0, page_h]` ではない**（debt-14）。pdfium が返す
 /// オブジェクトの bounds は絶対 user space（MediaBox 基準）である一方、`page_w`/`page_h` は
-/// ページ境界 box（CropBox）の**寸法**でしかない。したがって原点が非ゼロの PDF
+/// ページ境界 box（`CropBox ∩ MediaBox`）の**寸法**でしかない。したがって原点が非ゼロの PDF
 /// （裁ち落とし付きの雑誌・紀要）での有効範囲は
 /// `[box_left, box_left + page_w] × [box_bottom, box_bottom + page_h]` になる。
 /// 原点を落とすと ①ページ右端・上端の図が原点ぶんだけ切り落とされ、削られた面積が
