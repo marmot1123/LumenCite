@@ -120,7 +120,7 @@ migration 20 本すべてに当たって確認した。0 件なら v1.0.0 のロ
 
 | # | PR タイトル案 | 項目 | 難易度 | 版 | 再構築 | この位置の理由 |
 |---|---|---|---|---|---|---|
-| 0 | `fix(LCIR): 旧 content_key の GC に mtime 猶予 + GUI ロックの取得可否を返す` | debt-15 / debt-24 の一部 | S / 60–90 | なし | 否 | **既存の穴**。dev と配布版 v0.10.0 が同一 app data dir を共有しており、`gc_stale_asset_dirs` は猶予なしで「今回の content_key 以外」を trash へ送る。両方が build すると crop を消し合う。後回しにするとこの窓が計画全体に開いたままになる |
+| 0 | ~~`fix(LCIR): 旧 content_key の GC に mtime 猶予 + GUI ロックの取得可否を返す`~~ **完了**（§2.8） | debt-15 / debt-24 の一部 | S / 60–90 | なし | 否 | **既存の穴**。dev と配布版 v0.10.0 が同一 app data dir を共有しており、`gc_stale_asset_dirs` は猶予なしで「今回の content_key 以外」を trash へ送る。両方が build すると crop を消し合う。後回しにするとこの窓が計画全体に開いたままになる |
 | 1 | `fix(LCIR): ローマ数字・全大文字の図表 caption（debt-12）` | debt-12 | S / 130–200 | →0.8.0 | 否 | **8d-2 より前が必須**。8d-2 は探索面を 6,321→477 ページに落とす caption アンカーを使い、その入力が `detect_caption` の分類。逆順だと FP gate を通した後にゲート条件の入力が変わる。8 項目で唯一 CI で完全に検証でき、版 bump 手順の予行にもなる |
 | 2 | `fix(LCIR): 図領域のクランプをページ box 原点基準にする（debt-14）` | debt-14 | S / 160–220 | →0.9.0 | 否 | 図系の先頭。8d-2 / 8d-8 が追加する矩形も同じ `pdf/mod.rs:189-198` を通るので、先に直さないと新経路にバグを複製する。carry 破壊は実測 10 図・うち alt text 保持 6 件＝**carry 機構の本番初発火を最も安い賭けで踏める** |
 | 3 | `feat(LCIR): XObjectForm と回転ページの図領域（8d-8 / debt-9）` | 8d-8 | M / 400–520 | →0.10.0 | 否 | 8d-2 の前。figure 0 件 + caption ありの 42 版のうち **21 版（caption 211 件）はラスタ画像を持つのに top-level 列挙に出ない＝8d-8 の担当**、純ベクターは 21 版 / caption 94 件。混ぜると 8d-2 のガード閾値を誤った母集団でチューニングする |
@@ -159,7 +159,8 @@ pdfium の版は `0.7.0 → 0.8.0 → 0.9.0 → 0.10.0 → 0.11.0` の 4 回上�
 6. **再構築の完了条件は `failed == 0`。** `run_build_batch` は 1 添付の失敗を eprintln と `failed` カウントに
    落として続行するだけなので、20 件失敗しても UI は完了を返す。不完全なコーパスで
    「未結合 caption 642 → ?」を測ると 8d-2 の効果を誤判定する。
-7. **再構築の 80 分間は配布版を起動しない**（debt-15 の窓が開くため）。
+7. **再構築の 80 分間は配布版を起動しない。** #0 の mtime 猶予（§2.8）は「相手が書いた直後」の窓しか
+   閉じないので、80 分走らせる間に別インスタンスが build すると依然として回収し合う。
 
 ### 2.4 #7（再構築 + Vision）の実行手順
 
@@ -266,6 +267,61 @@ debt-19（テキスト fragment 11,963 件がページ矩形をはみ出す）�
 - **#3（8d-8）の着手前**: att134 でプローブを 1 回回す（§2.6-4）。
 - **#10（p3）の前**: Linux の実バンドル検証環境を確保し、`release.yml` に展開 assert を足す（§2.6-5）。
 - **#7（再構築）の前**: ゲート ②a と p4 の GC 実行。手順は §2.4。
+
+### 2.8 #0 の実装記録（2026-08-02・完了）
+
+**やったこと 2 つ。migration なし・版 bump なし・抽出出力は 1 バイトも変わらない。**
+
+1. **`gc_stale_asset_dirs` に mtime 猶予**（`ingestion/mod.rs`・debt-15）。
+   `STALE_ASSET_DIR_SECS = 60 * 60`（`backup::WORK_FILE_STALE_SECS` と同値・同理由）。
+   判定は `is_stale_asset_dir` に切り出し、**中のファイルの mtime の最大値**を見る。
+   - **`min` では駄目。** 1 添付の抽出は最長 75 分（att37・527 頁）かかるので、最初に書いた crop は
+     build 完了時点で既に猶予超過＝**長い build ほど猶予が実質ゼロ**になる。crop 容量の 80% を
+     占める最も高価な添付でだけ守られない、という最悪の壊れ方をする。
+   - **ディレクトリ自身の mtime ではなくファイルを見る**のは、ファイルの mtime のほうが
+     「いつ書かれたか」の直接の証拠だから。crop の書き出しは `write_atomic` の tmp + rename
+     （`pdf/mod.rs:325`）なので**今はディレクトリの mtime も動く**が、同名 in-place 上書きに
+     変えた途端に動かなくなる。ファイルが 1 つも無いときだけディレクトリ自身の mtime に
+     フォールバックする（書き始める直前の別インスタンスを守る）。
+   - mtime が読めない / 未来のときは**回収しない**（残せば次回 build で回収されるだけ・
+     消し違えると別インスタンスの成果物が消える、と非対称なので疑わしきは残す）。
+   - 現 content_key を守っているのは猶予ではなく**名前の一致だけ**（中身が猶予超過でも回収しない）。
+2. **`acquire_gui_lock` が状態を返す**（`lib.rs`・debt-24 の一部）。`bool` ではなく 3 値
+   `GuiLockState { Acquired, HeldByOther, Unavailable }`。**`Unavailable`（開けない / flock 非対応 FS）を
+   `HeldByOther` に丸めない**のが要点で、丸めるとそういう環境で起動時 sweep が永久に走らなくなり
+   VACUUM 中間 DB が溜まり続ける（220 ファイル・95GB の実例がコメントに残っている）。
+   contention の判別は **raw OS error の完全一致**（`classify_lock_error`）。`ErrorKind` 比較は誤り
+   ── Windows の `ERROR_LOCK_VIOLATION`(33) は std の対応表（`sys/io/error/windows.rs`）に無く
+   `Uncategorized` に落ちるので、**無関係な OS エラーまで「先客あり」に一致してしまう**。
+   誤りは片方向にだけ危険（`HeldByOther` に化けると sweep が永久に止まる／`Unavailable` に
+   化けても今日と同じ挙動に戻るだけ）なので、判別できないものは `Unavailable` に倒す。
+
+**今の読み手**（`another_instance_is_live()`）は起動時 sweep（`sweep_trash` +
+`sweep_backup_workdir`）で、別インスタンスが生きていると確認できたときだけ skip する。
+飛ばしても取りこぼしは残らないが、理由は 2 つの sweep で違う（**「削除のたびと次回起動時に
+再試行される」は `sweep_trash` にしか当たらない**）:
+
+- `sweep_trash` は削除操作のたびにも走る（`lib.rs:394` / `:898`・ゲートの外側）。
+- `sweep_backup_workdir` は起動時だけ。ただし ①それ自体が 1 時間の mtime 猶予を持つので
+  異常終了直後の作業ファイルはどのみち次の起動まで残る、②ロックを握っている相手が自分の
+  起動時に走らせている、③2 個目になりやすい dev ビルドは自動バックアップが既定オフ
+  （`lib.rs:4128` の `auto_backup_enabled`）で作業ファイルを作らない。
+
+**p2 の読み手**（バックフィルを走らせてよいインスタンスか）は同じ関数を使えるが、
+`acquire_gui_lock` は `OnceLock` を使う**再入不可**の関数なので 2 回目を呼んではいけない
+（自プロセスを `HeldByOther` と誤判定する）。呼ぶのは `setup` の 1 回だけにして、値を
+渡す形にすること。
+
+**猶予は消し合いを完全には止めない**（1 時間以上離れた 2 回の build は依然として互いを回収する）。
+止まるのは「相手が今まさに書いている / 書き終えた直後」の窓で、torn state と、
+再レンダリング待ちの間に crop が読めなくなる経路がここに集中する
+（`node_alt_texts` の carry 判定自体は sha256 の DB クエリなのでファイル欠損では外れない）。
+恒久解は content_key ごとに生存版を DB から引く GC（p4 の射程）。
+
+テストは 10 本（`ingestion::tests::gc_*` 6 本 / `gui_lock_tests::*` 4 本）。
+**`min`/`max` を判別するテスト**（1 ディレクトリに古 1 枚 + 新 1 枚）を必ず維持すること。
+1 ディレクトリ 1 ファイルのテストしか無いと `min` と `max` が同値になり、
+**この PR の中核述語が 1 文字反転しても CI が緑のまま通る**（実際に踏んだ）。
 
 ---
 
@@ -565,9 +621,10 @@ pdfium も「壊れたテキスト」を非空で返すため。かつ `fulltext
 対策は `build_lcir_for_attachment` の内側に単一 `tokio::sync::Mutex` を置くこと
 （`BACKUP_LOCK` と同じ `const_new` パターン。8 つの呼び出し口が自動的に 1 本に絞られる）。
 
-**プロセス横断の排他が無い。** `acquire_gui_lock`（`lib.rs:50-64`）は `try_lock_exclusive` の成否を捨てている。
-自動化するとこれが既定挙動になるので、成否を返して**ロックを取れたインスタンスだけがバックフィルを走らせる**
-（10–15 行）。あわせて `gc_stale_asset_dirs` に mtime 猶予を入れる（debt-15）。
+~~**プロセス横断の排他が無い。**~~ **#0 で用意済み**（§2.8）。`acquire_gui_lock` は `GuiLockState` を返すので、
+p2 は `!gui_lock.another_instance_is_live()` のときだけバックフィルを走らせればよい（配線するだけ）。
+**`Unavailable` を「別インスタンスあり」に丸めないこと**（丸めると flock 非対応 FS でバックフィルが
+永久に走らない）。`gc_stale_asset_dirs` の mtime 猶予（debt-15）も #0 で入っている。
 
 **起動時バックフィルの間引きはバックアップの前例が丸ごと流用できる**
 （`run_backup_if_due` / settings KV / `static BACKUP_LOCK` / dev ビルド既定オフ / 起動時 spawn + interval）。
@@ -655,7 +712,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | debt-12 | ローマ数字・全大文字の caption 取りこぼし → **v1.0.0 スコープ**（正当化は §8.1） | S | — |
 | debt-13 | スキャン本 1 冊（att37）が figure の 43.7%・alt text の 58.9%・**crop 容量の 80%（444.5MB）**・**再構築時間の 94%（4,514 秒）**を占める | M | 8c/8a の費用対効果・p2 の最悪ケース |
 | debt-14 | 図領域のクランプが CropBox 原点を無視 → **v1.0.0 スコープ**。実害は非ゼロ原点 12 版・クランプ痕跡 10 図・alt text 保持 6 件 | S | 8d-2 の前提 |
-| **debt-15** | `gc_stale_asset_dirs` に mtime 猶予が無い。dev と配布版が同一 app data dir を共有しているので、両方が build すると互いの content_key ディレクトリを trash に送り合う | S | **#0 で解消する** |
+| ~~debt-15~~ | ~~`gc_stale_asset_dirs` に mtime 猶予が無い。dev と配布版が同一 app data dir を共有しているので、両方が build すると互いの content_key ディレクトリを trash に送り合う~~ **解消**（2026-08-02・#0・§2.8）。1 時間以上離れた build 同士は依然回収し合うので、恒久解は p4 の GC | S | 完了 |
 | **debt-16** | `heal_missing_assets` が `assets.sha256` を UPDATE しても `node_alt_texts.source_asset_sha256` が追随しない。crop が 1 枚欠けた添付を build した時点で無言の carry 破壊が仕込まれ、数週間後の再構築で「8d-2 のバグ」と誤診される | S（~40 行） | 再構築 1 回の前提 |
 | **debt-17** | 新規添付で `extract_and_index`（pdf_extract）の spawn と LCIR build が last-writer-wins レースになる。`index_attachment` は先頭で `DELETE FROM fulltext WHERE attachment_id=?` を無条件に打つので、pdf_extract が 0 字を返す個体（att93/att94）は **LCIR が正常でも検索から消える**。新規添付でしか起きないので既存 138 件の前後比較には現れない | M | **p1 の完了条件**（3 つの spawn を「足す」でなく「外す」） |
 | **debt-18** | 同じ座標系の取り違えが `structure.rs:365-368` の `in_margin` 判定にもある。非ゼロ原点の PDF で判定帯がずれ、短い散文行が paragraph → unknown_block に降格する（vid 183 で実測 110 件 vs 正しい帯 51 件） | S | debt-14 と同根・別 PR |
@@ -664,7 +721,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | **debt-21** | superseded 行が残る間、同一 content_key の再 build は UNIQUE 違反で必ず失敗する（`find_completed` が status で絞るので reuse に乗らない）。**古いバイナリで「旧版を再構築」を押すと全件失敗する**経路が実在する | S | p4 の GC が副作用で解消する |
 | **debt-22** | page ノードの `plain_text` が `normalize_ws` を通らず C0 制御文字を含む（**非空 5,803 ページの 75.3%**。`fulltext` 側は 11.6%）。trigram 索引で語が割れる | S | **p1 の必須前提** |
 | **debt-23** | 走り柱が caption と同一ブロックに融合する（「166 8 Staggered Model Fig. 8.3 …」）。`detect_caption` は先頭行しか見ないので caption にならない。素朴な緩和（先頭行以外にも当てる）は本文中の "Fig. 3" を誤認するので危険 | M | debt-12 とは別物 |
-| **debt-24** | 長時間 LCIR ジョブの排他が 3 つの独立フラグに分裂し、相互排他は `SettingsModal.tsx:1077` の `disabled` 属性 1 行だけ。alt text ボタンは `lcirBatch` を見ていない | S〜M | **p2 の完了条件** |
+| **debt-24** | 長時間 LCIR ジョブの排他が 3 つの独立フラグに分裂し、相互排他は `SettingsModal.tsx:1077` の `disabled` 属性 1 行だけ。alt text ボタンは `lcirBatch` を見ていない。**プロセス横断の側は #0 で解消**（`acquire_gui_lock` が `GuiLockState` を返す・§2.8）。残るのはプロセス内の 3 フラグ統合 | S〜M | **p2 の完了条件** |
 
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
 `ListItem` / `Footnote` / `Citation` / `InlineMath` / `EquationGroup` / `TextBlock` はどちらも生成しない。

@@ -348,7 +348,21 @@ async fn heal_missing_assets(
     Ok(())
 }
 
+/// 旧 content_key ディレクトリを「前回の残骸」とみなすまでの猶予（debt-15）。
+///
+/// `pnpm tauri dev` の debug ビルドと配布版は identifier が同じで、同一の app data dir と
+/// 実 DB を共有する。GUI ロックは `try_lock` なので 2 個目の起動も止まらない。抽出器版の
+/// 違う 2 つのインスタンスが同じ添付を build すると、猶予が無ければ互いの crop PNG を
+/// trash へ送り合う定常ループになる（8c の alt text は crop の sha256 で carry するので、
+/// 消し合いは再レンダリング費用だけでなく carry の当たり判定にも効く）。
+///
+/// 値と理由は `backup::WORK_FILE_STALE_SECS` に揃えてある。
+const STALE_ASSET_DIR_SECS: u64 = 60 * 60;
+
 /// `.lcir/<attachment_id>/` 直下の「現 content_key 以外」のサブディレクトリを trash へ。
+/// ただし猶予（[`STALE_ASSET_DIR_SECS`]）内に書かれたものは別インスタンスが今まさに
+/// 使っている可能性があるので残す。残しても次回の build で回収されるだけで、
+/// 消し違えると別インスタンスの成果物が消える ＝ 非対称なので「疑わしきは残す」。
 fn gc_stale_asset_dirs(app_data_dir: &Path, abs_asset_dir: &Path) {
     let (Some(parent), Some(current)) = (abs_asset_dir.parent(), abs_asset_dir.file_name()) else {
         return;
@@ -356,12 +370,51 @@ fn gc_stale_asset_dirs(app_data_dir: &Path, abs_asset_dir: &Path) {
     let Ok(rd) = std::fs::read_dir(parent) else {
         return;
     };
+    let now = std::time::SystemTime::now();
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.is_dir() && entry.file_name() != current {
-            let _ = crate::attachment_trash::move_to_trash(app_data_dir, &p);
+        if !p.is_dir() || entry.file_name() == current {
+            continue;
         }
+        if !is_stale_asset_dir(&p, now) {
+            eprintln!(
+                "LCIR: keeping recently written asset dir (another instance may own it): {}",
+                p.display()
+            );
+            continue;
+        }
+        let _ = crate::attachment_trash::move_to_trash(app_data_dir, &p);
     }
+}
+
+/// アセットディレクトリが猶予を過ぎたか。
+///
+/// 見るのは**中のファイルの mtime の最大値**。ここを最古（`min`）にすると 1 添付の抽出が
+/// 最長 75 分（att37・527 頁）かかるせいで、**最初に書いた crop が build 完了時点で既に
+/// 猶予を超えている**＝長い build ほど猶予が実質ゼロになり、猶予を入れた意味が消える。
+/// 最も高価な添付でだけ守られない、という最悪の壊れ方をするので `max` でなければならない。
+///
+/// ディレクトリ自身の mtime ではなくファイルを見るのは、ファイルの mtime のほうが
+/// 「いつ書かれたか」の直接の証拠だから。crop の書き出しは `write_atomic` の tmp + rename
+/// なので今はディレクトリの mtime も動くが、同名 in-place 上書きに変えた途端に動かなくなる。
+/// ファイルが 1 つも無いときだけディレクトリ自身の mtime にフォールバックする
+/// （書き始める直前の別インスタンスを守るため）。crop ディレクトリは平坦なので 1 階層で足りる。
+fn is_stale_asset_dir(dir: &Path, now: std::time::SystemTime) -> bool {
+    let newest = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .max();
+    let mtime = match newest.or_else(|| std::fs::metadata(dir).and_then(|m| m.modified()).ok()) {
+        Some(m) => m,
+        // mtime が読めないなら判断材料が無い。回収せず次回に回す。
+        None => return false,
+    };
+    // mtime が未来（時計のずれ・別マシンからの復元）なら `duration_since` は Err。
+    // その場合も回収しない。
+    now.duration_since(mtime)
+        .is_ok_and(|age| age.as_secs() >= STALE_ASSET_DIR_SECS)
 }
 
 /// version 行 + ノード木 + 数式 + 図アセット + 関係辺を 1 トランザクションで挿入する。
@@ -1736,6 +1789,7 @@ mod tests {
     use crate::db::attachments::add_attachment;
     use crate::db::entries::create_entry;
     use crate::models::EntryInput;
+    use std::path::PathBuf;
 
     async fn setup_attachment(pool: &SqlitePool) -> i64 {
         let entry = create_entry(
@@ -3391,5 +3445,169 @@ mod tests {
         assert!(found.is_none(), "pdf 版は無い");
         assert_eq!(versions.len(), 1, "案内文用に併存一覧は返る");
         assert_eq!(short_source_name(&versions[0].extractor_name), "tex");
+    }
+
+    // ---- 旧 content_key ディレクトリの GC（debt-15） ----
+
+    /// `<root>/attachments/1/.lcir/7/<key>` を作り、中に crop PNG を 1 枚置く。
+    fn make_asset_dir(root: &Path, key: &str) -> PathBuf {
+        let dir = root
+            .join("attachments")
+            .join("1")
+            .join(".lcir")
+            .join("7")
+            .join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fig-p001-00.png"), b"png").unwrap();
+        dir
+    }
+
+    /// ファイル 1 枚の mtime を `secs` 秒前に戻す。
+    fn age_file(path: &Path, secs: u64) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+
+    /// ディレクトリ内の全ファイルの mtime を `secs` 秒前に戻す。
+    fn age_files(dir: &Path, secs: u64) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            age_file(&e.path(), secs);
+        }
+    }
+
+    fn gc_tmp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "lcir-gc-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// 猶予を過ぎた旧 content_key ディレクトリは trash へ回収する（従来どおり）。
+    #[test]
+    fn gc_collects_stale_asset_dir() {
+        let root = gc_tmp_root("stale");
+        let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
+        let old = make_asset_dir(&root, "bbbbbbbbbbbbbbbb");
+        std::fs::write(old.join("fig-p002-00.png"), b"png").unwrap();
+        age_files(&old, 2 * 60 * 60);
+
+        gc_stale_asset_dirs(&root, &current);
+
+        assert!(!old.exists(), "猶予を過ぎた旧ディレクトリは回収される");
+        assert!(current.is_dir(), "現 content_key は残る");
+        // 直接消すのではなく trash（永続 retry queue）へ入る。
+        let trashed: Vec<_> = std::fs::read_dir(crate::attachment_trash::trash_dir(&root))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(trashed, vec!["bbbbbbbbbbbbbbbb".to_string()]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **最古ではなく最新**のファイル mtime で判定する。1 添付の抽出は最長 75 分
+    /// （att37・527 頁）かかるので、最古で判定すると長い build ほど猶予が実質ゼロになり、
+    /// 別インスタンスが書き終えた直後の crop を消してしまう。
+    #[test]
+    fn gc_judges_by_newest_file_not_oldest() {
+        let root = gc_tmp_root("newest");
+        let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
+        let other = make_asset_dir(&root, "eeeeeeeeeeeeeeee");
+        // 長い build を模す: 1 枚目は 2 時間前、2 枚目は今しがた書かれた。
+        age_file(&other.join("fig-p001-00.png"), 2 * 60 * 60);
+        std::fs::write(other.join("fig-p002-00.png"), b"png").unwrap();
+
+        gc_stale_asset_dirs(&root, &current);
+
+        assert!(
+            other.is_dir(),
+            "最新ファイルが猶予内なら残す（最古で判定すると消えてしまう）"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 現 content_key は**名前の一致**だけで守られている（猶予では守られない）。
+    /// 中身が猶予を超えていても回収してはならない。
+    #[test]
+    fn gc_never_collects_current_dir_even_when_aged() {
+        let root = gc_tmp_root("agedcurrent");
+        let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
+        let old = make_asset_dir(&root, "bbbbbbbbbbbbbbbb");
+        age_files(&current, 2 * 60 * 60);
+        age_files(&old, 2 * 60 * 60);
+
+        // current の中身は猶予を超えている = 猶予では守られない状態。
+        assert!(is_stale_asset_dir(&current, std::time::SystemTime::now()));
+
+        gc_stale_asset_dirs(&root, &current);
+
+        assert!(current.is_dir(), "名前の一致ガードだけが current を守っている");
+        assert!(!old.exists(), "旧は回収される");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 書き始める直前（ファイルが 1 枚も無い）のディレクトリは、ディレクトリ自身の
+    /// mtime にフォールバックして守る。別インスタンスが今まさに作った直後を消さない。
+    #[test]
+    fn gc_keeps_freshly_created_empty_dir() {
+        let root = gc_tmp_root("empty");
+        let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
+        let empty = root
+            .join("attachments")
+            .join("1")
+            .join(".lcir")
+            .join("7")
+            .join("ffffffffffffffff");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        gc_stale_asset_dirs(&root, &current);
+
+        assert!(empty.is_dir(), "作られたばかりの空ディレクトリは残す");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 最近書かれた旧 content_key ディレクトリは残す。dev ビルドと配布版は同じ
+    /// app data dir を共有するので、猶予が無いと互いの crop を消し合う（debt-15）。
+    #[test]
+    fn gc_keeps_recently_written_asset_dir() {
+        let root = gc_tmp_root("fresh");
+        let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
+        let other = make_asset_dir(&root, "cccccccccccccccc");
+
+        gc_stale_asset_dirs(&root, &current);
+
+        assert!(other.is_dir(), "別インスタンスが書いたばかりのディレクトリは残す");
+        assert!(
+            other.join("fig-p001-00.png").is_file(),
+            "中の crop PNG も残る"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `heal_missing_assets` が再レンダリングした直後のディレクトリは残す。
+    /// 全ファイルが猶予超過でも、1 枚書き直されていれば「使われている」証拠になる。
+    #[test]
+    fn gc_keeps_dir_whose_files_were_rewritten_in_place() {
+        let root = gc_tmp_root("rewritten");
+        let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
+        let other = make_asset_dir(&root, "dddddddddddddddd");
+        std::fs::write(other.join("fig-p002-00.png"), b"png").unwrap();
+        age_files(&other, 2 * 60 * 60);
+        // heal が 1 枚だけ書き直した状態。
+        std::fs::write(other.join("fig-p001-00.png"), b"png2").unwrap();
+
+        gc_stale_asset_dirs(&root, &current);
+
+        assert!(other.is_dir(), "書き直された直後のディレクトリは残す");
+        std::fs::remove_dir_all(&root).ok();
     }
 }
