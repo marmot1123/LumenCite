@@ -690,13 +690,33 @@ async fn insert_pdf_version_tx(
         // 領域はレイアウト推定なので origin=layout_model + confidence。caption とのペアは
         // 幾何（相互最近のみ）で決め、番号は caption の "Figure N" から引き継ぐ。
         if !page.image_regions.is_empty() {
-            let fig_bboxes: Vec<document_ir::BBox> =
-                page.image_regions.iter().map(|r| r.bbox).collect();
             let cap_bboxes: Vec<document_ir::BBox> =
                 page_captions.iter().map(|(_, b, _)| *b).collect();
+            // Phase 8d-2: **ラスタ図を先に caption と結び、ベクター図は余った caption とだけ結ぶ**。
+            // 1 段でまとめて `pair_captions` に掛けると、相互最近がページ全体の大域計算なので
+            // ベクター領域を 1 個足しただけで既存ラスタ図の `caption_of` 辺が奪われうる。
+            let split = |want: figures::RegionSource| -> (Vec<usize>, Vec<document_ir::BBox>) {
+                page.image_regions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.source == want)
+                    .map(|(i, r)| (i, r.bbox))
+                    .unzip()
+            };
+            let (raster_at, raster_bboxes) = split(figures::RegionSource::Raster);
+            let (vector_at, vector_bboxes) = split(figures::RegionSource::Vector);
             let pair_map: std::collections::HashMap<usize, usize> =
-                figures::pair_captions(&fig_bboxes, &cap_bboxes)
+                figures::pair_captions_two_stage(&raster_bboxes, &vector_bboxes, &cap_bboxes)
                     .into_iter()
+                    .map(|(fi, ci)| {
+                        // 戻り値は `raster ++ vector` の連結順なので、元の並びへ引き直す。
+                        let at = if fi < raster_bboxes.len() {
+                            raster_at[fi]
+                        } else {
+                            vector_at[fi - raster_bboxes.len()]
+                        };
+                        (at, ci)
+                    })
                     .collect();
             for (ri, region) in page.image_regions.iter().enumerate() {
                 figure_index += 1;
@@ -714,6 +734,17 @@ async fn insert_pdf_version_tx(
                         serde_json::Value::from(n.to_string()),
                     );
                 }
+                // Phase 8d-2: ベクター図だけ由来を記録する。**ラスタ図の payload が完全に
+                // 不変なわけではない** ── `figure_index` は文書通しの連番なので、あるページで
+                // ベクター図が 1 個採られると**それ以降のページのラスタ図の番号がずれる**。
+                // 不変なのは `region_index` / `ordinal` / crop のファイル名 / caption ペアの方で、
+                // alt text の carry は crop の sha256 キーなので `figure_index` のずれでは壊れない。
+                if region.source == figures::RegionSource::Vector {
+                    payload.insert(
+                        "region_source".to_string(),
+                        serde_json::Value::from("vector"),
+                    );
+                }
                 let payload_json = serde_json::Value::Object(payload).to_string();
                 let figure_node_id = document_nodes::insert_node(
                     &mut *tx,
@@ -724,7 +755,7 @@ async fn insert_pdf_version_tx(
                         ordinal: (blocks.len() + ri) as i64,
                         plain_text: None,
                         language: None,
-                        confidence: Some(0.6),
+                        confidence: Some(region.source.confidence()),
                         origin: Some(Origin::LayoutModel.as_str()),
                         payload_json: Some(&payload_json),
                     },
@@ -733,6 +764,20 @@ async fn insert_pdf_version_tx(
                 .map_err(|e| e.to_string())?;
                 // 参照グラフ用ビュー（Phase 8d-7）。本文の "Figure 3" が指す**実体**の
                 // ターゲットになる。plain_text は無いのでこの行から参照が出ることはない。
+                //
+                // **ベクター図は番号を渡さない**（Phase 8d-2）。`graph::FloatTargets` は同じ番号が
+                // 2 つのノードに付くとその番号ごと墓標（`None`）にするので、渡すと
+                // 「同一版に同番号の図 caption が 2 つあり、片方だけがラスタ図と結ばれている」版
+                // （実 DB に 18 版・27 組）で、余っていた方にベクター図が付いた瞬間に
+                // **既存の `refers_to_figure` 辺が消える**。caption 側は同番号の時点で既に墓標なので
+                // フォールバックも効かない。番号は payload には載せる（`get_figures` の表示用）が、
+                // 参照解決の実体索引には入れない ── 既存の辺を守る方を採る。
+                // 恒久解は `FloatTargets::insert` を由来つきにしてラスタを勝たせることだが、
+                // それは 8d-7 の契約を変えるので 8d-2 のスコープ外にした。
+                let graph_caption_number = match region.source {
+                    figures::RegionSource::Raster => figure_number.map(|s| s.to_string()),
+                    figures::RegionSource::Vector => None,
+                };
                 graph_nodes.push(graph::GraphNode {
                     id: figure_node_id,
                     kind: NodeKind::Figure,
@@ -743,7 +788,7 @@ async fn insert_pdf_version_tx(
                     theorem_number: None,
                     cite_key: None,
                     caption_label: None,
-                    caption_number: figure_number.map(|s| s.to_string()),
+                    caption_number: graph_caption_number,
                 });
                 reading_index += 1;
                 source_fragments::insert_fragment(
@@ -828,7 +873,8 @@ async fn insert_pdf_version_tx(
                             from_node_id: page_captions[ci].0,
                             relation_type: document_ir::RelationType::CaptionOf.as_str(),
                             to_node_id: figure_node_id,
-                            confidence: Some(0.6),
+                            // 辺の確からしさは結んだ図の確からしさを超えない（8d-2）。
+                            confidence: Some(region.source.confidence()),
                             origin: Some(Origin::LayoutModel.as_str()),
                             metadata_json: None,
                         },
@@ -3205,6 +3251,7 @@ mod tests {
                 blocks: Vec::new(),
                 image_regions: vec![pdf::ExtractedImageRegion {
                     bbox: document_ir::BBox::new(100.0, 400.0, 300.0, 200.0),
+                    source: figures::RegionSource::Raster,
                     file: Some(pdf::ExtractedAssetFile {
                         file_name: "fig-p001-00.png".to_string(),
                         width_px: 800,
@@ -3237,6 +3284,122 @@ mod tests {
             asset_rel_dir: &format!("attachments/x/.lcir/{attachment_id}/{}", &ckey[..4]),
         };
         insert_pdf_version_tx(pool, &ctx, doc).await.unwrap().0
+    }
+
+    /// Phase 8d-2: ラスタ図 1 個 + ベクター図 1 個 + caption 2 つの 1 ページ。
+    /// caption は**下側がラスタ図に、上側がベクター図に**結ばれる配置にしてある。
+    fn extracted_with_raster_and_vector() -> pdf::ExtractedDocument {
+        let block = |text: &str, y: f64| pdf::ExtractedBlock {
+            text: text.to_string(),
+            bbox: document_ir::BBox::new(100.0, y, 300.0, 10.0),
+            reading_order: (800.0 - y) as i64,
+        };
+        pdf::ExtractedDocument {
+            pages: vec![pdf::ExtractedPage {
+                page_number: 1,
+                width_pt: 595.0,
+                height_pt: 842.0,
+                box_left: 0.0,
+                box_bottom: 0.0,
+                rotation_deg: 0.0,
+                plain_text: "page".to_string(),
+                // caption 2 つの間に本文 3 行を挟む。**行間の中央値で段落を割る**ので、
+                // 2 行だけだと中央値 = そのギャップになって 1 ブロックに畳まれてしまう。
+                blocks: vec![
+                    block("Figure 1: raster.", 560.0),
+                    block("Body text of the paper here.", 500.0),
+                    block("Second line of the same paragraph.", 488.0),
+                    block("Third line of the same paragraph.", 476.0),
+                    block("Figure 2: vector.", 260.0),
+                ],
+                image_regions: vec![
+                    pdf::ExtractedImageRegion {
+                        bbox: document_ir::BBox::new(100.0, 600.0, 300.0, 120.0),
+                        source: figures::RegionSource::Raster,
+                        file: Some(pdf::ExtractedAssetFile {
+                            file_name: "fig-p001-00.png".to_string(),
+                            width_px: 800,
+                            height_px: 320,
+                            sha256: "rastersha".to_string(),
+                            size_bytes: 100,
+                        }),
+                    },
+                    pdf::ExtractedImageRegion {
+                        bbox: document_ir::BBox::new(100.0, 300.0, 300.0, 120.0),
+                        source: figures::RegionSource::Vector,
+                        file: Some(pdf::ExtractedAssetFile {
+                            file_name: "vec-p001-00.png".to_string(),
+                            width_px: 800,
+                            height_px: 320,
+                            sha256: "vectorsha".to_string(),
+                            size_bytes: 200,
+                        }),
+                    },
+                ],
+            }],
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Phase 8d-2 の build 面: 2 段ペアリングの添字の引き直し・由来ごとの confidence・
+    /// `region_source` payload・**ベクター図を参照グラフの番号索引に入れないこと**を通す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn vector_regions_get_their_own_confidence_and_stay_out_of_the_number_index(
+        pool: SqlitePool,
+    ) {
+        let att = setup_attachment(&pool).await;
+        let vid = insert_version_from(
+            &pool,
+            att,
+            "ck-vector",
+            None,
+            &extracted_with_raster_and_vector(),
+        )
+        .await;
+
+        let rows: Vec<(i64, f64, String)> = sqlx::query_as(
+            "SELECT id, confidence, COALESCE(payload_json,'') FROM document_nodes
+             WHERE document_version_id = ? AND node_kind = 'figure' ORDER BY ordinal",
+        )
+        .bind(vid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "ラスタ 1 + ベクター 1");
+        let (raster_id, raster_conf, raster_payload) = &rows[0];
+        let (vector_id, vector_conf, vector_payload) = &rows[1];
+        assert_eq!(*raster_conf, figures::RASTER_REGION_CONFIDENCE);
+        assert_eq!(*vector_conf, figures::VECTOR_REGION_CONFIDENCE);
+        assert!(!raster_payload.contains("region_source"), "ラスタの payload は 8a のまま");
+        assert!(vector_payload.contains("\"region_source\":\"vector\""));
+        // 番号は両方 payload に載る（表示用）。
+        assert!(raster_payload.contains("\"figure_number\":\"1\""), "{raster_payload}");
+        assert!(vector_payload.contains("\"figure_number\":\"2\""), "{vector_payload}");
+
+        // caption_of は 2 本。**辺の confidence は結んだ図に揃う**。
+        let edges: Vec<(i64, f64)> = sqlx::query_as(
+            "SELECT to_node_id, confidence FROM node_relations
+             WHERE document_version_id = ? AND relation_type = 'caption_of' ORDER BY to_node_id",
+        )
+        .bind(vid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(edges.len(), 2, "2 段ペアリングで両方が結ばれる: {edges:?}");
+        let conf_of = |id: &i64| edges.iter().find(|e| e.0 == *id).map(|e| e.1);
+        assert_eq!(conf_of(raster_id), Some(figures::RASTER_REGION_CONFIDENCE));
+        assert_eq!(conf_of(vector_id), Some(figures::VECTOR_REGION_CONFIDENCE));
+
+        // アセットは由来ごとに別のファイル名で入る。
+        let paths: Vec<String> = sqlx::query_scalar(
+            "SELECT relative_path FROM assets WHERE document_version_id = ? ORDER BY relative_path",
+        )
+        .bind(vid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(paths[0].ends_with("fig-p001-00.png"), "{paths:?}");
+        assert!(paths[1].ends_with("vec-p001-00.png"), "{paths:?}");
     }
 
     async fn figure_node_of(pool: &SqlitePool, version_id: i64) -> i64 {

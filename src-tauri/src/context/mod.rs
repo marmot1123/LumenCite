@@ -149,8 +149,9 @@ pub struct Related {
 /// 実体と caption の両方を解決した結果を併記する。
 ///
 /// - `node` … 辺が指しているノードそのもの（無加工）。
-/// - `figure` … 領域（bbox）・crop アセット・alt text の持ち主。**到達できないことの方が多い**
-///   （実測: `figure_caption` 1,021 件のうち `caption_of` 出辺を持つのは 262 件 = 25.7%）。
+/// - `figure` … 領域（bbox）・crop アセット・alt text の持ち主。到達できないことがある
+///   （実 DB の実測は `figure_caption` 1,021 件中 262 件 = 25.7% だが、これは**再構築前**の値。
+///   コード側は 8d-8 / 8d-2 で 662 件まで増えている ＝ 再構築後は多数派が逆転する）。
 /// - `caption` … 原文のキャプション文。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FloatRef {
@@ -265,7 +266,8 @@ impl ContextNoteCode {
                 "at least one figure/table reference resolved only to a caption block, with no \
                  caption_of edge reaching the region itself, so its bbox, crop asset and alt text \
                  are unavailable; this is the norm on the tex representation (which builds no \
-                 figure nodes) and for vector figures on the pdf representation"
+                 figure nodes) and happens on the pdf representation when neither a raster image \
+                 nor a vector path cluster was detected next to the caption"
             }
             ContextNoteCode::ProvesTargetIsNotATheorem => {
                 "a proves edge points at a remark/example/definition rather than a \

@@ -425,8 +425,9 @@ fn keyword_to_kind(keyword: &str) -> Option<NodeKind> {
 ///
 /// **実体（`figure`/`table`）優先・無ければ caption（`figure_caption`/`table_caption`）**の 2 段。
 /// ただし実データ上の主経路は caption 側である: PDF の `figure` ノードは caption と幾何ペアリング
-/// できたときしか番号を持たず（実測で保有率 2 割強）、`table` ノードは PDF 側では 1 件も作られない
-/// （8d-6 未実装）。実体に当たるのは 3 本に 1 本程度で、残りは caption ノードを指す。
+/// できたときしか番号を持たず（**再構築前の実 DB での保有率 2 割強**。コード側は 8d-8 / 8d-2 で
+/// 上がるが、**8d-2 のベクター図は番号を渡さない**ので実体索引には入らない ── `ingestion/mod.rs` の
+/// `graph_caption_number` を参照）、`table` ノードは PDF 側では 1 件も作られない（8d-6 未実装）。
 /// どちらに解決したかは `metadata.resolved_via` に残す（bbox が引けるのは実体のときだけ）。
 #[derive(Default)]
 struct FloatTargets<'a> {
