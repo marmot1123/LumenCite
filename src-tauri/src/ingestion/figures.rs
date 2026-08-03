@@ -118,8 +118,15 @@ fn intersection_area(a: BBox, b: BBox) -> f64 {
 /// 返すので、そちらがデータモデルの含意であり、`PageSpace` は
 /// 「合成行列を当てると form の外へ出てしまう」と実測できたときだけ勝たせる。
 ///
-/// 実測（生存 138 版 7,345 頁・form 内 Image 109 枚）: form の行列が非恒等な 84 枚すべてで
-/// `FormLocal` が包含率 1.0 を取り、`PageSpace` が勝った子は **0 枚**。残り 8 枚は行列が恒等で同率。
+/// **片方の解釈が「測れない」ときは、それを他方の証拠にしない。** どちらかの候補矩形の総面積が
+/// 0（合成行列が特異で潰れた・生 bbox が退化）なら比較が成立しないので `None` を返す。
+/// ここを「面積 0 → 包含率 0」に落とすと、`FormLocal` 側が測れないだけの form で
+/// `PageSpace` が 1.0 を取って勝ってしまい、form ローカル座標の生矩形がそのまま
+/// ページ座標として採用される（＝この関数が防ぐはずの誤配置 crop を自分で作る）。
+///
+/// 実測（生存 138 版 7,345 頁・form 内 Image 109 枚・form 43 個）: 結論は
+/// **`FormLocal` 43 個 / `PageSpace` 0 個 / 棄却 0 個**。子 1 枚単位で見ると、合成行列でだけ
+/// form に収まるのが 96 枚・どちらの解釈でも収まるのが 13 枚・どちらでも収まらないのが 0 枚。
 pub fn calibrate_form_child_space(
     candidates: &[(BBox, BBox)],
     form_bounds: BBox,
@@ -132,8 +139,12 @@ pub fn calibrate_form_child_space(
         area_local += as_local.width.max(0.0) * as_local.height.max(0.0);
         inter_local += intersection_area(*as_local, form_bounds);
     }
-    let ratio = |inter: f64, area: f64| if area > 0.0 { inter / area } else { 0.0 };
-    let (r_page, r_local) = (ratio(inter_page, area_page), ratio(inter_local, area_local));
+    // 片方でも面積が測れなければ比較そのものが成立しない（NaN / 無限大もここで落とす）。
+    let measurable = |area: f64| area.is_finite() && area > 0.0;
+    if !measurable(area_page) || !measurable(area_local) {
+        return None;
+    }
+    let (r_page, r_local) = (inter_page / area_page, inter_local / area_local);
     if r_local >= r_page && r_local >= FORM_CONTAINMENT_MIN {
         Some(FormChildSpace::FormLocal)
     } else if r_page >= FORM_CONTAINMENT_MIN {
@@ -141,6 +152,16 @@ pub fn calibrate_form_child_space(
     } else {
         None
     }
+}
+
+/// そのページで XObjectForm の中まで辿ってよいか（Phase 8d-8）。
+///
+/// **どちらの条件も「ページごと図領域を捨てる」既存の判定と同じもの**で、そういうページでは
+/// form を辿っても結果が捨てられるだけ。ここで先に止めることで、**回転ページと画像過多ページの
+/// 出力・warning が Phase 8a 当時から 1 ビットも変わらない**ことを保証する
+/// （`extract_page_image_regions` は form 由来の矩形をこの述語が真のときしか足さない）。
+pub fn should_scan_forms(rotation_deg: f64, raw_image_count: usize) -> bool {
+    rotation_deg == 0.0 && raw_image_count <= MAX_RAW_RECTS_PER_PAGE
 }
 
 /// ページ box の原点（左下角）を CropBox / MediaBox の左下角から組む**フォールバック**。
@@ -672,6 +693,42 @@ mod tests {
             calibrate_form_child_space(&[candidate(b(10.0, 10.0, 20.0, 20.0))], b(0.0, 0.0, 0.0, 0.0)),
             None
         );
+    }
+
+    #[test]
+    fn calibration_drops_the_form_when_one_reading_cannot_be_measured() {
+        // 入れ子 form の行列が特異（`0 0 0 0 x y cm` は合法）だと合成後の矩形が線・点に潰れ、
+        // FormLocal 側の面積が 0 になる。このとき「生の矩形は form に収まる（1.0）」を根拠に
+        // `PageSpace` を選ぶと、form ローカル座標の矩形をページ座標として採ってしまう。
+        // 測れない方を反証扱いにしないこと＝ここは `None`（誤配置 crop より欠損）。
+        let form = b(0.0, 0.0, 200.0, 200.0);
+        let raw = b(50.0, 50.0, 60.0, 60.0); // そのままなら form に完全に収まる
+        let singular = [0.0, 0.0, 0.0, 0.0, 10.0, 10.0]; // 全部 1 点に潰す
+        assert_eq!(
+            calibrate_form_child_space(&[(raw, transform_bbox(raw, singular))], form),
+            None
+        );
+        // 逆向き（生 bbox が退化していて PageSpace 側が測れない）も同じく `None`。
+        let degenerate = b(50.0, 50.0, 0.0, 0.0);
+        assert_eq!(
+            calibrate_form_child_space(&[(degenerate, b(10.0, 10.0, 20.0, 20.0))], form),
+            None
+        );
+    }
+
+    // ---- should_scan_forms（8d-8 のゲート・命題「既存ページの出力を動かさない」） ----
+
+    #[test]
+    fn forms_are_scanned_only_on_pages_that_keep_their_figure_regions() {
+        // 通常のページは辿る。
+        assert!(should_scan_forms(0.0, 0));
+        assert!(should_scan_forms(0.0, 10));
+        // 回転ページは辿らない（辿っても図領域ごと捨てられる・debt-9）。
+        assert!(!should_scan_forms(90.0, 10));
+        assert!(!should_scan_forms(270.0, 0));
+        // 画像過多ページも辿らない。上限**ちょうど**は捨てられない側なので辿る。
+        assert!(should_scan_forms(0.0, MAX_RAW_RECTS_PER_PAGE));
+        assert!(!should_scan_forms(0.0, MAX_RAW_RECTS_PER_PAGE + 1));
     }
 
     #[test]

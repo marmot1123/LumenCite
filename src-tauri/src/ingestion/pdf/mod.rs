@@ -223,14 +223,14 @@ fn extract_page_image_regions(
     }
 
     // 1b. XObjectForm 内の Image（Phase 8d-8）。**ページを丸ごと捨てる条件に当たるページでは
-    //     辿らない** ── 走査が無駄になるのと、そうしておけば「回転ページ」「画像過多ページ」の
-    //     出力（と warning の有無）が 8a 当時から 1 ビットも変わらないため。
-    let skip_page = rotation_deg != 0.0 || raw_count > figures::MAX_RAW_RECTS_PER_PAGE;
-    if !skip_page {
-        // 生 Image の枚数は **top-level と form 内の合計**で既存の上限に収める。`merge_image_regions`
-        // の fixpoint マージは最悪 O(n^3) なので、上限を実質 2 倍にすると最悪ケースが 8 倍になる。
-        // **超過しても「ページを捨てる」側の判定には混ぜない**（混ぜると「250 枚 + form 5 枚」の
-        // ページが新たに丸ごと skip され、今出ている図が消える）。溢れた form 内画像を捨てるだけ。
+    //     辿らない**（`figures::should_scan_forms`）── 走査が無駄になるのと、そうしておけば
+    //     「回転ページ」「画像過多ページ」の出力と warning が 8a 当時から 1 ビットも変わらないため。
+    if figures::should_scan_forms(rotation_deg, raw_count) {
+        // 生 Image の枚数は **top-level と form 内で 1 つの予算を共有する**（別枠にはしない）。
+        // `merge_image_regions` の fixpoint マージは最悪 O(n^3) なので、上限を実質 2 倍にすると
+        // 最悪ケースが 8 倍になる。ただし**超過を「ページを捨てる」判定には混ぜない** ──
+        // 混ぜると「250 枚 + form 5 枚」のページが新たに丸ごと skip され、今出ている図が消える。
+        // 予算が尽きたら溢れた form 内画像を捨てて warning を出すだけ。
         let budget = figures::MAX_RAW_RECTS_PER_PAGE.saturating_sub(raw_count);
         rects.extend(collect_form_image_rects(
             page,
@@ -361,6 +361,11 @@ fn collect_form_image_rects(
     let mut over_budget = false;
 
     for mut object in page.objects().iter() {
+        // 予算切れの判定はループの**先頭**に置く。末尾に置くと、画像を持たない form の
+        // `continue` に飛ばされて予算枯渇後も残りの form を全部走査してしまう。
+        if over_budget {
+            break;
+        }
         if object.as_x_object_form_object().is_none() {
             continue;
         }
@@ -402,9 +407,6 @@ fn collect_form_image_rects(
             ) {
                 out.push(clamped);
             }
-        }
-        if over_budget {
-            break;
         }
     }
 
