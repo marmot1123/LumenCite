@@ -87,7 +87,24 @@ impl RecognizerState {
 
 /// 1 ページのセグメント列を論理ブロックに構造化する。`state` は文書横断で使い回す。
 pub fn recognize_page(page: &ExtractedPage, state: &mut RecognizerState) -> Vec<StructuredBlock> {
-    let lines = group_lines(page);
+    recognize_blocks(&page.blocks, page.height_pt, page.box_bottom, state)
+}
+
+/// [`recognize_page`] の本体。`ExtractedPage` を組む**前**に呼べるように、実際に読む 3 つの値
+/// （セグメント列・ページ box の高さ・box 下端）だけを取る形にしてある。
+///
+/// Phase 8d-2 が `pdf::extract_document` のページループ内で図 caption の位置を知る必要があり、
+/// そこではまだ `image_regions` が決まっていない（＝ `ExtractedPage` を組めない）ため。
+/// **同じページ列を同じ順で、それぞれ新しい [`RecognizerState`] から回す限り、抽出側の pass と
+/// build 側の pass（`ingestion::insert_pdf_version_tx`）は同じ結果になる** ── `state` の遷移が
+/// ページ列の畳み込みで決まり、他に副作用が無いため。
+pub fn recognize_blocks(
+    blocks: &[crate::ingestion::pdf::ExtractedBlock],
+    page_height_pt: f64,
+    box_bottom: f64,
+    state: &mut RecognizerState,
+) -> Vec<StructuredBlock> {
+    let lines = group_lines(blocks);
     if lines.is_empty() {
         return Vec::new();
     }
@@ -102,8 +119,7 @@ pub fn recognize_page(page: &ExtractedPage, state: &mut RecognizerState) -> Vec<
 
     let mut out = Vec::with_capacity(line_groups.len());
     for lines in line_groups {
-        if let Some(block) =
-            classify_block(lines, page_median_h, page.height_pt, page.box_bottom, state)
+        if let Some(block) = classify_block(lines, page_median_h, page_height_pt, box_bottom, state)
         {
             out.push(block);
         }
@@ -113,12 +129,12 @@ pub fn recognize_page(page: &ExtractedPage, state: &mut RecognizerState) -> Vec<
 
 // ---- 行のグルーピング（セグメント → 行） ----
 
-fn group_lines(page: &ExtractedPage) -> Vec<StructuredLine> {
+fn group_lines(blocks: &[crate::ingestion::pdf::ExtractedBlock]) -> Vec<StructuredLine> {
     let mut lines: Vec<StructuredLine> = Vec::new();
     // 現在の行に積んでいるセグメント（bbox, text, reading_order）。
     let mut cur: Vec<&crate::ingestion::pdf::ExtractedBlock> = Vec::new();
 
-    for seg in &page.blocks {
+    for seg in blocks {
         if seg.text.trim().is_empty() {
             continue;
         }
@@ -729,6 +745,24 @@ pub fn is_table_caption_label(label: Option<&str>) -> bool {
     matches!(label, Some("Table"))
 }
 
+/// 「この矩形は本文（散文・数式・参考文献）である」と読める block 級ノード種別か（Phase 8d-2）。
+///
+/// ベクター図の誤検出ガードに使う ── path クラスタが本文をどれだけ覆っているかを測り、
+/// 覆いすぎているものは「本文段を図と誤認した」として捨てる。
+///
+/// **`unknown_block` は本文に数えない。** 図の中の軸ラベル・凡例・記号は短くて散文にならないので
+/// `unknown_block` に落ちる（`looks_like_prose` を通らない）。数えると図そのものを弾いてしまう。
+/// **`figure_caption` も数えない。** caption は図に隣接し、`pair_captions` は多少の重なりを
+/// 許容している（マージ後の領域が caption に食い込む形）ので、数えると正しいペアを捨てる。
+/// 一方 **`display_math` は数える** ── 分数線・根号は path なので、数式ブロックは
+/// ベクタークラスタの最大の誤検出源になる。
+pub fn is_prose_block_kind(kind: NodeKind) -> bool {
+    !matches!(
+        kind,
+        NodeKind::UnknownBlock | NodeKind::FigureCaption | NodeKind::Figure | NodeKind::Line
+    )
+}
+
 /// 定理系ブロックの検出結果（Phase 5・PDF ヒューリスティック）。
 struct TheoremHit {
     kind: NodeKind,
@@ -1021,7 +1055,7 @@ mod tests {
             seg("world", 110.0, 800.0, 30.0, 10.0, 1),
             seg("next", 72.0, 780.0, 25.0, 10.0, 2),
         ]);
-        let lines = group_lines(&p);
+        let lines = group_lines(&p.blocks);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "Hello world");
         assert_eq!(lines[1].text, "next");
@@ -1035,7 +1069,7 @@ mod tests {
             seg("Hel", 72.0, 800.0, 15.0, 10.0, 0),
             seg("lo", 87.0, 800.0, 10.0, 10.0, 1),
         ]);
-        let lines = group_lines(&p);
+        let lines = group_lines(&p.blocks);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].text, "Hello");
     }
@@ -1049,7 +1083,7 @@ mod tests {
             ("line three of paragraph now ok", 10.0, G),
             ("a separated far away last line", 10.0, H),
         ]);
-        let lines = group_lines(&p);
+        let lines = group_lines(&p.blocks);
         let blocks = group_blocks(lines);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].len(), 3);
@@ -1636,7 +1670,7 @@ mod tests {
     fn normalize_ws_strips_control_glyphs() {
         // pdfium が吐く制御文字（\u{2} 等）は落として空白正規化する。
         let p = page(vec![seg("ψ(x)\u{2} = 2C2\u{15}", 72.0, 400.0, 120.0, 10.0, 0)]);
-        let lines = group_lines(&p);
+        let lines = group_lines(&p.blocks);
         assert_eq!(lines[0].text, "ψ(x) = 2C2");
     }
 

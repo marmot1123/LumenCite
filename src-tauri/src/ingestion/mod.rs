@@ -690,13 +690,33 @@ async fn insert_pdf_version_tx(
         // 領域はレイアウト推定なので origin=layout_model + confidence。caption とのペアは
         // 幾何（相互最近のみ）で決め、番号は caption の "Figure N" から引き継ぐ。
         if !page.image_regions.is_empty() {
-            let fig_bboxes: Vec<document_ir::BBox> =
-                page.image_regions.iter().map(|r| r.bbox).collect();
             let cap_bboxes: Vec<document_ir::BBox> =
                 page_captions.iter().map(|(_, b, _)| *b).collect();
+            // Phase 8d-2: **ラスタ図を先に caption と結び、ベクター図は余った caption とだけ結ぶ**。
+            // 1 段でまとめて `pair_captions` に掛けると、相互最近がページ全体の大域計算なので
+            // ベクター領域を 1 個足しただけで既存ラスタ図の `caption_of` 辺が奪われうる。
+            let split = |want: figures::RegionSource| -> (Vec<usize>, Vec<document_ir::BBox>) {
+                page.image_regions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.source == want)
+                    .map(|(i, r)| (i, r.bbox))
+                    .unzip()
+            };
+            let (raster_at, raster_bboxes) = split(figures::RegionSource::Raster);
+            let (vector_at, vector_bboxes) = split(figures::RegionSource::Vector);
             let pair_map: std::collections::HashMap<usize, usize> =
-                figures::pair_captions(&fig_bboxes, &cap_bboxes)
+                figures::pair_captions_two_stage(&raster_bboxes, &vector_bboxes, &cap_bboxes)
                     .into_iter()
+                    .map(|(fi, ci)| {
+                        // 戻り値は `raster ++ vector` の連結順なので、元の並びへ引き直す。
+                        let at = if fi < raster_bboxes.len() {
+                            raster_at[fi]
+                        } else {
+                            vector_at[fi - raster_bboxes.len()]
+                        };
+                        (at, ci)
+                    })
                     .collect();
             for (ri, region) in page.image_regions.iter().enumerate() {
                 figure_index += 1;
@@ -714,6 +734,14 @@ async fn insert_pdf_version_tx(
                         serde_json::Value::from(n.to_string()),
                     );
                 }
+                // Phase 8d-2: ベクター図だけ由来を記録する（ラスタ図の payload は 8a のまま
+                // ＝ 既存の図の payload は 1 バイトも変わらない）。
+                if region.source == figures::RegionSource::Vector {
+                    payload.insert(
+                        "region_source".to_string(),
+                        serde_json::Value::from("vector"),
+                    );
+                }
                 let payload_json = serde_json::Value::Object(payload).to_string();
                 let figure_node_id = document_nodes::insert_node(
                     &mut *tx,
@@ -724,7 +752,7 @@ async fn insert_pdf_version_tx(
                         ordinal: (blocks.len() + ri) as i64,
                         plain_text: None,
                         language: None,
-                        confidence: Some(0.6),
+                        confidence: Some(region.source.confidence()),
                         origin: Some(Origin::LayoutModel.as_str()),
                         payload_json: Some(&payload_json),
                     },
@@ -828,7 +856,8 @@ async fn insert_pdf_version_tx(
                             from_node_id: page_captions[ci].0,
                             relation_type: document_ir::RelationType::CaptionOf.as_str(),
                             to_node_id: figure_node_id,
-                            confidence: Some(0.6),
+                            // 辺の確からしさは結んだ図の確からしさを超えない（8d-2）。
+                            confidence: Some(region.source.confidence()),
                             origin: Some(Origin::LayoutModel.as_str()),
                             metadata_json: None,
                         },
@@ -3205,6 +3234,7 @@ mod tests {
                 blocks: Vec::new(),
                 image_regions: vec![pdf::ExtractedImageRegion {
                     bbox: document_ir::BBox::new(100.0, 400.0, 300.0, 200.0),
+                    source: figures::RegionSource::Raster,
                     file: Some(pdf::ExtractedAssetFile {
                         file_name: "fig-p001-00.png".to_string(),
                         width_px: 800,

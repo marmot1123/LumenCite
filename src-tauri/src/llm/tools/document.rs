@@ -256,10 +256,11 @@ pub fn specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "get_figures".to_string(),
             description: "Return the detected figures (LCIR) of a paper — by entry_id or \
-                citation_key. **PDF-only**: figure regions are detected from embedded raster images on \
-                each page (origin layout_model, moderate confidence), so vector figures (TikZ/pgf, \
-                common in math papers) legitimately yield zero figures — an empty list does NOT mean \
-                the paper has no figures. Each figure carries its page and bbox ([x, y, width, height] \
+                citation_key. **PDF-only**: figure regions are detected geometrically (origin layout_model, \
+                moderate confidence) from embedded raster images and, when a nearby figure caption \
+                is otherwise unpaired, from clusters of vector paths (TikZ/pgf). Detection is \
+                deliberately conservative — a vector figure with no caption is not reported, so an \
+                empty list does NOT mean the paper has no figures. Each figure carries its page and bbox ([x, y, width, height] \
                 in PDF points, bottom-left origin), the figure number when a nearby \"Figure N\" \
                 caption was paired (caption_of edge), the caption text, and its stored assets \
                 (page-crop PNGs). Asset relative_path is a path under the app data directory as \
@@ -1229,8 +1230,10 @@ async fn exec_get_figures(ctx: &ToolContext<'_>, args: &Value) -> Result<String,
         "count": total,
         "truncated": truncated,
         "figures": figures,
-        "note": "figure regions come from embedded raster images (origin layout_model); vector \
-            figures (TikZ/pgf) legitimately yield zero. asset relative_path is metadata only — \
+        "note": "figure regions come from embedded raster images and, where a figure caption \
+            would otherwise be unpaired, from vector path clusters (TikZ/pgf); both are geometric \
+            estimates (origin layout_model) and uncaptioned vector figures are not reported. \
+            asset relative_path is metadata only — \
             file existence is not guaranteed and no image bytes are returned. alt_text, when \
             present, is never the authors' wording: check its origin — llm_inference is a vision \
             model's guess (the caption is the source of truth), user_edited is the library \

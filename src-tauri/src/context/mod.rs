@@ -265,7 +265,8 @@ impl ContextNoteCode {
                 "at least one figure/table reference resolved only to a caption block, with no \
                  caption_of edge reaching the region itself, so its bbox, crop asset and alt text \
                  are unavailable; this is the norm on the tex representation (which builds no \
-                 figure nodes) and for vector figures on the pdf representation"
+                 figure nodes) and happens on the pdf representation when neither a raster image \
+                 nor a vector path cluster was detected next to the caption"
             }
             ContextNoteCode::ProvesTargetIsNotATheorem => {
                 "a proves edge points at a remark/example/definition rather than a \

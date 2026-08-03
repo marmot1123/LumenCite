@@ -49,7 +49,14 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 ///   自己校正して（そのまま / 合成行列を当てた の 2 通りを form 自身の bounds への包含率で比較）
 ///   ページ空間へ移す。図領域が増えるので旧版は supersede される
 ///   （実測: 生存 138 版で 1,202 → 1,248 領域・既存領域の移動と消滅は 0）。
-pub const EXTRACTOR_VERSION: &str = "0.11.0";
+/// - `0.12.0`: Phase 8d-2。**ベクター図（tikz/pgf）の path クラスタ**も図領域の候補にする。
+///   探索するのは「同一ページに図 caption があり、そのうちラスタ図と結ばれなかったものが残る」
+///   ページだけで、採るのはその余った caption と相互最近でペアになったクラスタだけ
+///   （caption を持たないベクター図は取り逃す ── 本文の罫線クラスタと区別する手段が無い）。
+///   ラスタ側の領域列・crop ファイル名・caption ペアには一切触らない（ベクターは後ろに足し、
+///   crop は `vec-` プレフィクスで別採番し、caption は 2 段でペアリングする）。
+///   図領域が増えるので旧版は supersede される。
+pub const EXTRACTOR_VERSION: &str = "0.12.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。
