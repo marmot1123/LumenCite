@@ -28,6 +28,141 @@ pub const CAPTION_GAP_MAX_PT: f64 = 60.0;
 pub const CAPTION_OVERLAP_RATIO: f64 = 0.3;
 /// クランプ後に元面積のこの比率を下回った矩形は捨てる（座標変換異常の兆候）。
 pub const MIN_CLAMPED_AREA_RATIO: f64 = 0.5;
+/// XObjectForm 内 Image の座標解釈（[`calibrate_form_child_space`]）が要求する最低の面積包含率。
+/// これを両解釈とも下回った form は画像ごと捨てる（誤配置 crop より欠損）。
+pub const FORM_CONTAINMENT_MIN: f64 = 0.9;
+/// 入れ子 XObjectForm を辿る最大の深さ（実ライブラリの実測は 2）。
+pub const MAX_FORM_DEPTH: usize = 8;
+
+/// PDF のアフィン変換行列 `[a, b, c, d, e, f]`。点の変換は
+/// `x' = a·x + c·y + e` / `y' = b·x + d·y + f`（PDF Reference 1.7 §4.2.3）。
+pub type Affine = [f64; 6];
+
+/// 恒等変換。
+pub const AFFINE_IDENTITY: Affine = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// XObjectForm の子オブジェクトの `bounds()` がどの座標空間で返るかの解釈。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormChildSpace {
+    /// すでにページ空間（form の行列を当ててはいけない）。
+    PageSpace,
+    /// form のコンテンツ空間（ページ空間へ移すには合成行列を当てる）。
+    FormLocal,
+}
+
+/// `inner` を先に、`outer` を後に適用する合成（行ベクトル規約なので行列積は `inner × outer`）。
+///
+/// 入れ子の XObjectForm で使う。内側 form の子は「内側 form のコンテンツ空間」に居るので、
+/// 内側 form の行列 → 外側 form の行列 の順に当てるとページ空間になる。
+pub fn compose_affine(inner: Affine, outer: Affine) -> Affine {
+    let [ia, ib, ic, id, ie, if_] = inner;
+    let [oa, ob, oc, od, oe, of_] = outer;
+    [
+        ia * oa + ib * oc,
+        ia * ob + ib * od,
+        ic * oa + id * oc,
+        ic * ob + id * od,
+        ie * oa + if_ * oc + oe,
+        ie * ob + if_ * od + of_,
+    ]
+}
+
+/// 軸並行 bbox に行列を当て、変換後の 4 隅の**外接**矩形を返す
+/// （回転・斜行を含む行列では変換後が軸並行にならないため）。
+pub fn transform_bbox(rect: BBox, m: Affine) -> BBox {
+    let [a, b, c, d, e, f] = m;
+    let (x0, y0) = (rect.x, rect.y);
+    let (x1, y1) = (rect.x + rect.width, rect.y + rect.height);
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (x, y) in corners {
+        let tx = a * x + c * y + e;
+        let ty = b * x + d * y + f;
+        min_x = min_x.min(tx);
+        min_y = min_y.min(ty);
+        max_x = max_x.max(tx);
+        max_y = max_y.max(ty);
+    }
+    BBox::new(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// `rect` の面積のうち `container` に入っている割合（0.0..=1.0）。面積ゼロの矩形は 0.0。
+pub fn containment_ratio(rect: BBox, container: BBox) -> f64 {
+    let area = rect.width.max(0.0) * rect.height.max(0.0);
+    if area <= 0.0 {
+        return 0.0;
+    }
+    intersection_area(rect, container) / area
+}
+
+fn intersection_area(a: BBox, b: BBox) -> f64 {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.width).min(b.x + b.width);
+    let y1 = (a.y + a.height).min(b.y + b.height);
+    (x1 - x0).max(0.0) * (y1 - y0).max(0.0)
+}
+
+/// Phase 8d-8 の**自己校正**: XObjectForm 内の Image の bbox がどの座標空間で返るかを、
+/// 仮説で決めずに測って選ぶ。
+///
+/// `candidates` は子ごとの `(そのままの矩形, 合成行列を当てた矩形)`。両解釈について
+/// 「form 自身の bounds に入っている面積 / 候補矩形の総面積」を出し、高い方を採る。
+/// **どちらも [`FORM_CONTAINMENT_MIN`] 未満ならその form の画像は捨てる**（`None`）──
+/// 座標空間の推定が外れている証拠なので、誤配置 crop を作るより欠損させる（§16）。
+///
+/// 面積で重み付けするのは、子が 1 枚でも複数枚でも同じ尺度にするため（多数決だと
+/// 小さいアイコン多数が大きな図 1 枚を押し切る）。同率なら [`FormChildSpace::FormLocal`] を採る
+/// ── pdfium は入れ子オブジェクトの bounds を「それが属するコンテンツストリームの空間」で
+/// 返すので、そちらがデータモデルの含意であり、`PageSpace` は
+/// 「合成行列を当てると form の外へ出てしまう」と実測できたときだけ勝たせる。
+///
+/// **片方の解釈が「測れない」ときは、それを他方の証拠にしない。** どちらかの候補矩形の総面積が
+/// 0（合成行列が特異で潰れた・生 bbox が退化）なら比較が成立しないので `None` を返す。
+/// ここを「面積 0 → 包含率 0」に落とすと、`FormLocal` 側が測れないだけの form で
+/// `PageSpace` が 1.0 を取って勝ってしまい、form ローカル座標の生矩形がそのまま
+/// ページ座標として採用される（＝この関数が防ぐはずの誤配置 crop を自分で作る）。
+///
+/// 実測（生存 138 版 7,345 頁・form 内 Image 109 枚・form 43 個）: 結論は
+/// **`FormLocal` 43 個 / `PageSpace` 0 個 / 棄却 0 個**。子 1 枚単位で見ると、合成行列でだけ
+/// form に収まるのが 96 枚・どちらの解釈でも収まるのが 13 枚・どちらでも収まらないのが 0 枚。
+pub fn calibrate_form_child_space(
+    candidates: &[(BBox, BBox)],
+    form_bounds: BBox,
+) -> Option<FormChildSpace> {
+    let (mut area_page, mut inter_page) = (0.0f64, 0.0f64);
+    let (mut area_local, mut inter_local) = (0.0f64, 0.0f64);
+    for (as_page, as_local) in candidates {
+        area_page += as_page.width.max(0.0) * as_page.height.max(0.0);
+        inter_page += intersection_area(*as_page, form_bounds);
+        area_local += as_local.width.max(0.0) * as_local.height.max(0.0);
+        inter_local += intersection_area(*as_local, form_bounds);
+    }
+    // 片方でも面積が測れなければ比較そのものが成立しない（NaN / 無限大もここで落とす）。
+    let measurable = |area: f64| area.is_finite() && area > 0.0;
+    if !measurable(area_page) || !measurable(area_local) {
+        return None;
+    }
+    let (r_page, r_local) = (inter_page / area_page, inter_local / area_local);
+    if r_local >= r_page && r_local >= FORM_CONTAINMENT_MIN {
+        Some(FormChildSpace::FormLocal)
+    } else if r_page >= FORM_CONTAINMENT_MIN {
+        Some(FormChildSpace::PageSpace)
+    } else {
+        None
+    }
+}
+
+/// そのページで XObjectForm の中まで辿ってよいか（Phase 8d-8）。
+///
+/// **どちらの条件も「ページごと図領域を捨てる」既存の判定と同じもの**で、そういうページでは
+/// form を辿っても結果が捨てられるだけ。ここで先に止めることで、**回転ページと画像過多ページの
+/// 出力・warning が Phase 8a 当時から 1 ビットも変わらない**ことを保証する
+/// （`extract_page_image_regions` は form 由来の矩形をこの述語が真のときしか足さない）。
+pub fn should_scan_forms(rotation_deg: f64, raw_image_count: usize) -> bool {
+    rotation_deg == 0.0 && raw_image_count <= MAX_RAW_RECTS_PER_PAGE
+}
 
 /// ページ box の原点（左下角）を CropBox / MediaBox の左下角から組む**フォールバック**。
 /// 通常は pdfium に直接聞く（`pdf::page_box_origin` の `bounding()`）ので、ここへ来るのは
@@ -384,6 +519,227 @@ mod tests {
         );
         // 両方取れない頁は pdfium が US Letter を原点ゼロで代替する（実測 64 頁）。
         assert_eq!(effective_page_box_origin(None, None), (0.0, 0.0));
+    }
+
+    // ---- compose_affine / transform_bbox / containment_ratio（8d-8） ----
+
+    /// 実データ（att134 p1）の form 行列: 0.4489 倍 + (317.014, 450.913) 平行移動。
+    const FORM_M: Affine = [0.4489, 0.0, 0.0, 0.4489, 317.014, 450.913];
+
+    #[test]
+    fn transform_bbox_applies_the_pdf_point_formula() {
+        // 恒等は素通り。
+        assert_eq!(
+            transform_bbox(b(10.0, 20.0, 30.0, 40.0), AFFINE_IDENTITY),
+            b(10.0, 20.0, 30.0, 40.0)
+        );
+        // 拡大 + 平行移動（実データの form 行列）。0.4489·187.2 + 317.014 = 401.048。
+        let got = transform_bbox(b(187.2, 1.1273, 44.9455, 44.9455), FORM_M);
+        let d = |a: f64, e: f64| (a - e).abs() < 1e-3;
+        assert!(
+            d(got.x, 401.048) && d(got.y, 451.419) && d(got.width, 20.176) && d(got.height, 20.176),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn transform_bbox_takes_the_hull_under_rotation() {
+        // 90° 回転 `[0 1 -1 0 0 0]`: x' = -y / y' = x。b と c を取り違えると符号が反転する。
+        let got = transform_bbox(b(1.0, 2.0, 3.0, 4.0), [0.0, 1.0, -1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(got, b(-6.0, 1.0, 4.0, 3.0));
+    }
+
+    #[test]
+    fn compose_affine_applies_inner_first() {
+        // 内側 = 2 倍、外側 = (10, 20) 平行移動。点 (1,1) は (2,2) を経て (12,22)。
+        let inner = [2.0, 0.0, 0.0, 2.0, 0.0, 0.0];
+        let outer = [1.0, 0.0, 0.0, 1.0, 10.0, 20.0];
+        let composed = compose_affine(inner, outer);
+        let p = transform_bbox(b(1.0, 1.0, 0.0, 0.0), composed);
+        assert_eq!((p.x, p.y), (12.0, 22.0));
+        // 逆順は別物（合成の順序を入れ替える変異を捕まえる）: (1,1) → (11,21) → (22,42)。
+        let swapped = transform_bbox(b(1.0, 1.0, 0.0, 0.0), compose_affine(outer, inner));
+        assert_eq!((swapped.x, swapped.y), (22.0, 42.0));
+    }
+
+    #[test]
+    fn compose_affine_with_identity_is_a_no_op() {
+        assert_eq!(compose_affine(FORM_M, AFFINE_IDENTITY), FORM_M);
+        assert_eq!(compose_affine(AFFINE_IDENTITY, FORM_M), FORM_M);
+    }
+
+    #[test]
+    fn containment_ratio_measures_area_not_corners() {
+        let container = b(0.0, 0.0, 100.0, 100.0);
+        assert_eq!(containment_ratio(b(10.0, 10.0, 20.0, 20.0), container), 1.0);
+        // 半分だけ外（x∈[90,110]）。
+        assert_eq!(containment_ratio(b(90.0, 10.0, 20.0, 20.0), container), 0.5);
+        // 完全に外。
+        assert_eq!(containment_ratio(b(200.0, 10.0, 20.0, 20.0), container), 0.0);
+        // 面積ゼロは「入っている」と言えない（0 除算も避ける）。
+        assert_eq!(containment_ratio(b(10.0, 10.0, 0.0, 20.0), container), 0.0);
+    }
+
+    // ---- calibrate_form_child_space（8d-8 の自己校正） ----
+
+    /// 実データ（att134 p1）の form bounds。
+    const FORM_BOUNDS: BBox = BBox {
+        x: 317.014,
+        y: 450.929,
+        width: 245.034,
+        height: 119.383,
+    };
+
+    fn candidate(raw: BBox) -> (BBox, BBox) {
+        (raw, transform_bbox(raw, FORM_M))
+    }
+
+    #[test]
+    fn calibration_picks_form_local_on_real_data() {
+        // att134 p1 の 6 枚。生 bbox は form の外（包含率 0.0）、行列を当てると 1.0。
+        let candidates: Vec<(BBox, BBox)> = [
+            b(187.2, 1.1273, 44.9455, 44.9455),
+            b(188.509, 79.2364, 44.9455, 44.9455),
+            b(188.509, 181.7818, 44.9455, 44.9455),
+            b(349.527, 15.3091, 33.6, 18.1091),
+            b(381.382, 236.9818, 10.9091, 19.2),
+            b(149.891, 10.9455, 36.0, 22.9091),
+        ]
+        .into_iter()
+        .map(candidate)
+        .collect();
+        assert_eq!(
+            calibrate_form_child_space(&candidates, FORM_BOUNDS),
+            Some(FormChildSpace::FormLocal)
+        );
+    }
+
+    #[test]
+    fn calibration_picks_page_space_when_the_matrix_reading_leaves_the_form() {
+        // 生 bbox がすでに form の中にあり、行列を当てると外へ出る形。
+        let form = b(0.0, 0.0, 200.0, 200.0);
+        let m = [1.0, 0.0, 0.0, 1.0, 1000.0, 0.0]; // 右へ 1000pt
+        let candidates = vec![(b(50.0, 50.0, 60.0, 60.0), transform_bbox(b(50.0, 50.0, 60.0, 60.0), m))];
+        assert_eq!(
+            calibrate_form_child_space(&candidates, form),
+            Some(FormChildSpace::PageSpace)
+        );
+    }
+
+    #[test]
+    fn calibration_drops_the_form_when_neither_reading_fits() {
+        // どちらの解釈でも form の外に大きくはみ出す ＝ 座標空間の推定が外れている。
+        let form = b(0.0, 0.0, 200.0, 200.0);
+        let raw = b(150.0, 150.0, 200.0, 200.0); // 4 分の 1 しか入らない
+        let m = [1.0, 0.0, 0.0, 1.0, 500.0, 500.0];
+        assert_eq!(
+            calibrate_form_child_space(&[(raw, transform_bbox(raw, m))], form),
+            None
+        );
+    }
+
+    #[test]
+    fn calibration_is_area_weighted_not_a_majority_vote() {
+        // 小さいアイコン 3 枚は生 bbox が form 内、大きな図 1 枚は行列を当てたときだけ form 内。
+        // 面積で重み付けするので大きな図が勝ち、多数決だと負ける。
+        let form = b(0.0, 0.0, 400.0, 400.0);
+        let m = [1.0, 0.0, 0.0, 1.0, -1000.0, 0.0];
+        let mut candidates: Vec<(BBox, BBox)> = (0..3)
+            .map(|i| {
+                let r = b(10.0 + 20.0 * i as f64, 10.0, 8.0, 8.0);
+                (r, transform_bbox(r, m))
+            })
+            .collect();
+        let big = b(1050.0, 50.0, 300.0, 300.0);
+        candidates.push((big, transform_bbox(big, m)));
+        assert_eq!(
+            calibrate_form_child_space(&candidates, form),
+            Some(FormChildSpace::FormLocal)
+        );
+    }
+
+    #[test]
+    fn calibration_tolerates_a_child_that_slightly_overflows_the_form() {
+        // 行列を当てた矩形が form の縁を 5% ほど食み出す（bounds の丸め・線幅）。閾値 0.9 を通る。
+        let form = b(0.0, 0.0, 200.0, 200.0);
+        let raw = b(-300.0, 0.0, 100.0, 100.0); // そのままでは form の外（包含率 0）
+        let m = [1.0, 0.0, 0.0, 1.0, 405.0, 50.0]; // x∈[105,205] → 5% だけ外
+        assert_eq!(
+            calibrate_form_child_space(&[(raw, transform_bbox(raw, m))], form),
+            Some(FormChildSpace::FormLocal)
+        );
+    }
+
+    #[test]
+    fn calibration_accepts_exactly_the_threshold() {
+        // 包含率が**ちょうど** FORM_CONTAINMENT_MIN のとき採る（閾値は閉区間）。
+        // 9000/10000 は 0.9 リテラルと同じ double になるので比較は厳密。
+        let form = b(0.0, 0.0, 100.0, 90.0);
+        let raw = b(-1000.0, 0.0, 100.0, 100.0); // そのままでは form の外
+        let m = [1.0, 0.0, 0.0, 1.0, 1000.0, 0.0]; // 当てると 9000/10000 = 0.9 だけ内側
+        assert_eq!(containment_ratio(transform_bbox(raw, m), form), FORM_CONTAINMENT_MIN);
+        assert_eq!(
+            calibrate_form_child_space(&[(raw, transform_bbox(raw, m))], form),
+            Some(FormChildSpace::FormLocal)
+        );
+    }
+
+    #[test]
+    fn calibration_rejects_degenerate_input() {
+        let form = b(0.0, 0.0, 200.0, 200.0);
+        assert_eq!(calibrate_form_child_space(&[], form), None);
+        // form の bounds が面積ゼロなら何も入らない。
+        assert_eq!(
+            calibrate_form_child_space(&[candidate(b(10.0, 10.0, 20.0, 20.0))], b(0.0, 0.0, 0.0, 0.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn calibration_drops_the_form_when_one_reading_cannot_be_measured() {
+        // 入れ子 form の行列が特異（`0 0 0 0 x y cm` は合法）だと合成後の矩形が線・点に潰れ、
+        // FormLocal 側の面積が 0 になる。このとき「生の矩形は form に収まる（1.0）」を根拠に
+        // `PageSpace` を選ぶと、form ローカル座標の矩形をページ座標として採ってしまう。
+        // 測れない方を反証扱いにしないこと＝ここは `None`（誤配置 crop より欠損）。
+        let form = b(0.0, 0.0, 200.0, 200.0);
+        let raw = b(50.0, 50.0, 60.0, 60.0); // そのままなら form に完全に収まる
+        let singular = [0.0, 0.0, 0.0, 0.0, 10.0, 10.0]; // 全部 1 点に潰す
+        assert_eq!(
+            calibrate_form_child_space(&[(raw, transform_bbox(raw, singular))], form),
+            None
+        );
+        // 逆向き（生 bbox が退化していて PageSpace 側が測れない）も同じく `None`。
+        let degenerate = b(50.0, 50.0, 0.0, 0.0);
+        assert_eq!(
+            calibrate_form_child_space(&[(degenerate, b(10.0, 10.0, 20.0, 20.0))], form),
+            None
+        );
+    }
+
+    // ---- should_scan_forms（8d-8 のゲート・命題「既存ページの出力を動かさない」） ----
+
+    #[test]
+    fn forms_are_scanned_only_on_pages_that_keep_their_figure_regions() {
+        // 通常のページは辿る。
+        assert!(should_scan_forms(0.0, 0));
+        assert!(should_scan_forms(0.0, 10));
+        // 回転ページは辿らない（辿っても図領域ごと捨てられる・debt-9）。
+        assert!(!should_scan_forms(90.0, 10));
+        assert!(!should_scan_forms(270.0, 0));
+        // 画像過多ページも辿らない。上限**ちょうど**は捨てられない側なので辿る。
+        assert!(should_scan_forms(0.0, MAX_RAW_RECTS_PER_PAGE));
+        assert!(!should_scan_forms(0.0, MAX_RAW_RECTS_PER_PAGE + 1));
+    }
+
+    #[test]
+    fn calibration_falls_back_to_form_local_when_both_readings_fit() {
+        // form の行列が恒等なら 2 つの解釈は同一。同率は FormLocal（＝この場合は恒等）に倒す。
+        let form = b(0.0, 0.0, 200.0, 200.0);
+        let raw = b(50.0, 50.0, 60.0, 60.0);
+        assert_eq!(
+            calibrate_form_child_space(&[(raw, transform_bbox(raw, AFFINE_IDENTITY))], form),
+            Some(FormChildSpace::FormLocal)
+        );
     }
 
     // ---- clamp_rect_to_page_box ----

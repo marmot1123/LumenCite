@@ -43,7 +43,13 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 ///   **ページ境界 box の原点 + 10%/90%** に直す。原点が非ゼロの PDF で帯がずれ、本文の短い行が
 ///   `paragraph` → `unknown_block` に降格し、逆に box 下端すぐ上の走り柱が段落として残っていた。
 ///   分類（`node_kind`）が変わるので旧版は supersede される。
-pub const EXTRACTOR_VERSION: &str = "0.10.0";
+/// - `0.11.0`: Phase 8d-8。**XObjectForm 内の Image** も図領域の候補にする。`\includegraphics` の
+///   図が form に包まれる PDF では、トップレベル列挙だけだと図が 1 枚も見つからない。
+///   子の bbox は form のコンテンツ空間で返るので、座標空間を仮説で決めず form ごとに
+///   自己校正して（そのまま / 合成行列を当てた の 2 通りを form 自身の bounds への包含率で比較）
+///   ページ空間へ移す。図領域が増えるので旧版は supersede される
+///   （実測: 生存 138 版で 1,202 → 1,248 領域・既存領域の移動と消滅は 0）。
+pub const EXTRACTOR_VERSION: &str = "0.11.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。
