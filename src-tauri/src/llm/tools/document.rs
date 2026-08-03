@@ -1130,7 +1130,8 @@ async fn exec_get_symbol_definitions(ctx: &ToolContext<'_>, args: &Value) -> Res
 /// 図一覧（Phase 8a）。図領域は PDF 版のみに存在するため常に pdf 版を読む
 /// （`get_document_blocks` の page フィルタが pdf を強制するのと同じ分担）。
 /// アセットの `relative_path` はメタデータ参照でファイルの存在は保証しない（欠損許容・
-/// base64 は返さない）。ベクター図（tikz）はアセット 0 件が正当。
+/// base64 は返さない）。**ベクター図（tikz/pgf）も 8d-2 以降は figure になる**（`vec-` の crop を持つ）。
+/// ただし caption と結ばれたものだけなので、caption の無いベクター図は依然として現れない。
 async fn exec_get_figures(ctx: &ToolContext<'_>, args: &Value) -> Result<String, ToolError> {
     let pool = ctx.pool;
     let entry_id = resolve_entry_id(pool, args).await?;

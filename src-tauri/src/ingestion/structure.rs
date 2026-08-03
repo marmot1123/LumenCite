@@ -98,6 +98,11 @@ pub fn recognize_page(page: &ExtractedPage, state: &mut RecognizerState) -> Vec<
 /// **同じページ列を同じ順で、それぞれ新しい [`RecognizerState`] から回す限り、抽出側の pass と
 /// build 側の pass（`ingestion::insert_pdf_version_tx`）は同じ結果になる** ── `state` の遷移が
 /// ページ列の畳み込みで決まり、他に副作用が無いため。
+///
+/// **テキスト抽出に失敗したページで両者が食い違わないことも保証されている。** 抽出側は
+/// そのページで本関数を呼ばずに次へ進むが、build 側は `blocks` が空のまま呼ぶ ── そのとき
+/// `group_lines` が空を返して**`state` に触れずに**早期 return するので、`state` の遷移は同じ。
+/// この性質に依存しているので、空入力で `state` を触る変更を入れてはいけない。
 pub fn recognize_blocks(
     blocks: &[crate::ingestion::pdf::ExtractedBlock],
     page_height_pt: f64,
@@ -750,8 +755,12 @@ pub fn is_table_caption_label(label: Option<&str>) -> bool {
 /// ベクター図の誤検出ガードに使う ── path クラスタが本文をどれだけ覆っているかを測り、
 /// 覆いすぎているものは「本文段を図と誤認した」として捨てる。
 ///
-/// **`unknown_block` は本文に数えない。** 図の中の軸ラベル・凡例・記号は短くて散文にならないので
-/// `unknown_block` に落ちる（`looks_like_prose` を通らない）。数えると図そのものを弾いてしまう。
+/// **`unknown_block` は本文に数えない。** 図の中の記号・数式断片は `looks_like_prose`
+/// （英字 3 文字以上）を通らず `unknown_block` に落ちるので、数えると図そのものを弾いてしまう。
+/// **ただしこれで図内テキストを全部除けるわけではない** ── "number of papers" のような
+/// 軸ラベル・凡例は英字 3 文字以上なので `paragraph` になる。ガードが面積比
+/// （`figures::VECTOR_MAX_PROSE_COVER`）なのはそのためで、図の中の小さな注記が数個あっても
+/// 面積では効かない。**逆に、注記が図面積の 35% を超えるほど密な小さい図は落ちる**（既知の限界）。
 /// **`figure_caption` も数えない。** caption は図に隣接し、`pair_captions` は多少の重なりを
 /// 許容している（マージ後の領域が caption に食い込む形）ので、数えると正しいペアを捨てる。
 /// 一方 **`display_math` は数える** ── 分数線・根号は path なので、数式ブロックは
@@ -990,6 +999,24 @@ fn median(v: &mut [f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prose_block_kinds_exclude_what_a_figure_is_made_of() {
+        // 8d-2 の本文被覆ガードの入力。**除外集合が緩むと図が自分の中身で弾かれる**。
+        assert!(!is_prose_block_kind(NodeKind::UnknownBlock), "図中の記号・数式断片");
+        assert!(!is_prose_block_kind(NodeKind::FigureCaption), "図に隣接し重なりも許容している");
+        assert!(!is_prose_block_kind(NodeKind::Figure));
+        assert!(!is_prose_block_kind(NodeKind::Line));
+        // **`display_math` は本文に数える** ── 分数線・根号は path なので、数式ブロックは
+        // ベクタークラスタの最大の誤検出源。
+        assert!(is_prose_block_kind(NodeKind::DisplayMath));
+        assert!(is_prose_block_kind(NodeKind::Paragraph));
+        assert!(is_prose_block_kind(NodeKind::BibliographyEntry));
+        assert!(is_prose_block_kind(NodeKind::Section));
+        assert!(is_prose_block_kind(NodeKind::Theorem));
+        assert!(is_prose_block_kind(NodeKind::TableCaption));
+    }
+
     use crate::ingestion::pdf::{ExtractedBlock, ExtractedPage};
 
     /// 段落内の行間ギャップと、ブロック区切りのギャップ（テスト用の代表値）。

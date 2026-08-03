@@ -228,11 +228,12 @@ fn extract_page_image_regions(
     asset_dir: &std::path::Path,
     warnings: &mut Vec<String>,
 ) -> Vec<ExtractedImageRegion> {
+    use pdfium_render::prelude::*;
+
     let PageTextLayout {
         figure_captions,
         prose_blocks,
     } = text_layout;
-    use pdfium_render::prelude::*;
 
     // 1. トップレベル Image オブジェクトの bbox を集める。
     let mut rects: Vec<BBox> = Vec::new();
@@ -307,9 +308,9 @@ fn extract_page_image_regions(
     if !figure_captions.is_empty()
         && !figures::unpaired_caption_indices(&merged, figure_captions).is_empty()
     {
-        let (rects, path_count) = collect_path_rects(page, page_box);
+        let (path_rects, path_count) = collect_path_rects(page, page_box);
         if figures::should_scan_vector_paths(rotation_deg, path_count) {
-            vector_rects = rects;
+            vector_rects = path_rects;
         } else {
             warnings.push(format!(
                 "page {page_number}: too many path objects ({path_count}); vector figure detection skipped"
@@ -500,25 +501,62 @@ fn collect_path_rects(
             push_clamped(rect, &mut out);
             continue;
         }
-        // **中身がベクターだけの XObjectForm は、form 自身の bounds を 1 個の候補にする。**
-        // `\includegraphics{*.pdf}` の図はこの形になる。子を 1 つずつ拾ってページ空間へ移す
-        // （8d-8 が Image に対してやっている自己校正）ことはしない ── form の `bounds()` は
-        // すでにページ空間で、そこが図の外接矩形そのものだから。
+        // **中身がベクターだけの XObjectForm は、見える子の外接矩形を 1 個の候補にする。**
+        // `\includegraphics{*.pdf}` の図はこの形になる。
+        //
+        // **form 自身の `bounds()` は使えない。** pdfium はそれを**全子オブジェクトの union**
+        // として返すので、組版が版面を消すために置いた**純白の塗り・白抜きストローク**が
+        // 1 つでもあると bounds がインクの外まで広がる。実データ（vid275 p35）では
+        // form bounds を単独で決めているのが純白の塗り矩形で、可視インクの外接矩形
+        // 111.8×627.7+368.1×129.2 に対し bounds は 460.8×331.5 ＝ **面積の 69% が図でない**
+        // （空白帯 + caption + 節見出し + 本文 2 行が crop に入る）。
+        // クリップも効かない ── form 自身にクリップが付くのは実測 926 個中 11 個だけ。
+        //
+        // 子の bbox は 8d-8 と同じく form のコンテンツ空間で返るので、座標空間は仮説で決めず
+        // **form ごとに自己校正**する（[`figures::calibrate_form_child_space`]）。
         // **Image を持つ form は対象外**（8d-8 が既にその画像をラスタ矩形として拾っており、
         // form 全体を足すと同じ図を二重に数える）。
         if object.as_x_object_form_object().is_none() {
             continue;
         }
-        let (images, paths) = count_form_ink_children(&mut object);
-        if images > 0 || paths == 0 {
+        let Ok(form_quad) = object.bounds() else { continue };
+        let form_bounds = quad_to_bbox(form_quad);
+        let form_matrix = affine_of(&object);
+        let (images, children) = collect_form_vector_children(&mut object, form_matrix);
+        if !figures::form_is_vector_only(images, children.len()) {
             continue;
         }
         count += 1;
         if count > figures::MAX_RAW_PATHS_PER_PAGE {
             continue;
         }
-        let Ok(quad) = object.bounds() else { continue };
-        push_clamped(quad_to_bbox(quad), &mut out);
+        let candidates: Vec<(BBox, BBox)> = children
+            .iter()
+            .map(|(raw, m)| (*raw, figures::transform_bbox(*raw, *m)))
+            .collect();
+        let Some(space) = figures::calibrate_form_child_space(&candidates, form_bounds) else {
+            continue; // 座標空間が測れない form は捨てる（誤配置 crop より欠損）
+        };
+        let in_page: Vec<BBox> = candidates
+            .iter()
+            .map(|(as_page, as_local)| match space {
+                figures::FormChildSpace::PageSpace => *as_page,
+                figures::FormChildSpace::FormLocal => *as_local,
+            })
+            .collect();
+        let Some(hull) = figures::bbox_hull(&in_page) else {
+            continue;
+        };
+        // form 自身にクリップが付いていれば掛ける（実測では稀だが、掛かる形は実在する）。
+        let rect = match clip_path_rect(&object) {
+            ClipRect::None => hull,
+            ClipRect::Empty => continue,
+            ClipRect::Rect(c) => match figures::intersect_rect(hull, c) {
+                Some(r) => r,
+                None => continue,
+            },
+        };
+        push_clamped(rect, &mut out);
     }
     (out, count)
 }
@@ -545,27 +583,31 @@ fn path_object_has_ink(object: &pdfium_render::prelude::PdfPageObject<'_>) -> bo
     )
 }
 
-/// XObjectForm の子孫にある `(Image の数, 見える path の数)`（Phase 8d-2）。
-/// 入れ子は [`figures::MAX_FORM_DEPTH`] まで辿り、走査する子の総数は
-/// [`figures::MAX_FORM_CHILDREN_SCANNED`] で打ち切る（打ち切ると「Image は無い」と
-/// 誤って結論しうるが、そのときは form を図にしない側 ── `images > 0` で落とす側 ── ではなく
-/// **拾う側**に倒れるので、打ち切り時は Image ありとみなして捨てる）。
-fn count_form_ink_children(
+/// XObjectForm の子孫から `(Image の数, **見える** path の `(生 bbox, ページ空間へ移す合成行列)`)`
+/// を集める（Phase 8d-2）。入れ子は [`figures::MAX_FORM_DEPTH`] まで行列を合成しながら降り、
+/// 走査する子の総数は [`figures::MAX_FORM_CHILDREN_SCANNED`] で打ち切る
+/// （打ち切ると「Image は無い」と誤って結論しうるので、打ち切り時は Image ありとみなして捨てる）。
+///
+/// **見えない子（白抜き・透明）を外すのがこの関数の主目的**。pdfium の form `bounds()` は
+/// 全子オブジェクトの union なので、白抜き 1 つで図の外接矩形が壊れる。
+fn collect_form_vector_children(
     form_object: &mut pdfium_render::prelude::PdfPageObject<'_>,
-) -> (usize, usize) {
+    form_matrix: figures::Affine,
+) -> (usize, Vec<(BBox, figures::Affine)>) {
     use pdfium_render::prelude::*;
 
-    let (mut images, mut paths) = (0usize, 0usize);
-    let mut stack: Vec<(PdfPageObject<'_>, usize)> = Vec::new();
+    let mut images = 0usize;
+    let mut paths: Vec<(BBox, figures::Affine)> = Vec::new();
+    let mut stack: Vec<(PdfPageObject<'_>, figures::Affine, usize)> = Vec::new();
     if let Some(form) = form_object.as_x_object_form_object_mut() {
         for i in form.as_range() {
             if let Ok(child) = form.get(i) {
-                stack.push((child, 1));
+                stack.push((child, form_matrix, 1));
             }
         }
     }
     let mut scanned = 0usize;
-    while let Some((mut child, depth)) = stack.pop() {
+    while let Some((mut child, to_page, depth)) = stack.pop() {
         scanned += 1;
         if scanned > figures::MAX_FORM_CHILDREN_SCANNED {
             // 全部は見られなかった ＝ Image の有無を言い切れない。捨てる側に倒す。
@@ -575,17 +617,20 @@ fn count_form_ink_children(
             PdfPageObjectType::Image => images += 1,
             PdfPageObjectType::Path => {
                 if path_object_has_ink(&child) {
-                    paths += 1;
+                    if let Ok(quad) = child.bounds() {
+                        paths.push((quad_to_bbox(quad), to_page));
+                    }
                 }
             }
             PdfPageObjectType::XObjectForm => {
                 if depth >= figures::MAX_FORM_DEPTH {
                     continue;
                 }
+                let composed = figures::compose_affine(affine_of(&child), to_page);
                 if let Some(inner) = child.as_x_object_form_object_mut() {
                     for i in inner.as_range() {
                         if let Ok(g) = inner.get(i) {
-                            stack.push((g, depth + 1));
+                            stack.push((g, composed, depth + 1));
                         }
                     }
                 }
@@ -619,10 +664,25 @@ fn clip_path_rect(object: &pdfium_render::prelude::PdfPageObject<'_>) -> ClipRec
     let Some(clip) = object.get_clip_path() else {
         return ClipRect::None;
     };
+    // **クリップが無いオブジェクトでも `get_clip_path()` は `Some` を返す。**
+    // pdfium の `FPDFClipPath_CountPaths` はクリップ無しに `-1` を返し、pdfium-render は
+    // それを `as u16` で受けるので（`pdf/path/clip_path.rs`）**65,535 になる**。
+    // 番人を置かないと、クリップの無い path 1 個につき 65,535 回の空ループを回す
+    // （実測: 実ライブラリの path の 96% がこの値。1 ページ 500 本なら 3,300 万回）。
+    // サブパスが 65,535 個ある実在のクリップは無いので、この値は「クリップ無し」の別名。
+    let count = clip.len();
+    if count == 0 || count == u16::MAX {
+        return ClipRect::None;
+    }
     let mut acc: Option<BBox> = None;
     let mut any = false;
     for i in clip.as_range() {
         let Ok(segments) = clip.get(i) else { continue };
+        // 同じ型の崩れが 1 段内側にもある（`FPDFClipPath_CountPathSegments` は `u32` へ落ちる）。
+        let seg_count = segments.len();
+        if seg_count == 0 || seg_count == u32::MAX {
+            continue;
+        }
         let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
         let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
         let mut points = 0usize;
@@ -996,6 +1056,7 @@ mod tests {
         assert!(pages > 0, "PDF に 1 ページも無い");
     }
 
+
     /// Phase 8d-2 の着手前プローブ: ページ上の**全オブジェクトを種別ごとに測る**。
     /// ベクター図の手掛かり（path クラスタ）と誤検出源（本文の罫線・段組の枠）を
     /// 設計の前に実データで数えるための道具で、判定ロジックは一切持たない
@@ -1305,10 +1366,14 @@ mod tests {
                 height: h,
             };
             // 本番と同じ手順で caption / 本文ブロックを作る（state はページ順に持ち回る）。
-            let blocks = match page.text() {
-                Ok(t) => text_segments_to_blocks(&t),
-                Err(_) => Vec::new(),
+            // **本番はテキスト抽出に失敗したページを図領域ごと諦める**（`extract_document`）。
+            // ハーネスもそこで打ち切らないと、そのページの領域を old にも new にも数えてしまい
+            // 「old = 出荷中の挙動そのもの」が崩れる。
+            let Ok(text) = page.text() else {
+                skipped += 1;
+                continue;
             };
+            let blocks = text_segments_to_blocks(&text);
             let structured =
                 crate::ingestion::structure::recognize_blocks(&blocks, h, box_bottom, &mut recognizer);
             let captions: Vec<BBox> = structured
@@ -1413,7 +1478,11 @@ mod tests {
             let pnew = figures::pair_captions_two_stage(&merged_old, &vectors, &captions);
             paired_old += pold.len();
             paired_new += pnew.len();
-            // 既存ラスタ図のペアが奪われていないか（2 段ペアリングの主張の実測）。
+            // **この差は構造上必ず 0 になる**（`pair_captions_two_stage` は 1 段目の結果を
+            // そのまま返り値の先頭に積むため）。したがってこれは「2 段ペアリングが正しい」証拠
+            // ではなく、**2 段の実装が 1 段に退化していないことの番人**にすぎない。
+            // 「1 段だと実際に奪われる」ことの証拠は純関数のテスト
+            // `figures::tests::a_vector_region_cannot_steal_a_caption_from_a_raster_figure` の方。
             let old_pairs: std::collections::HashSet<(usize, usize)> = pold.into_iter().collect();
             stolen += old_pairs
                 .iter()

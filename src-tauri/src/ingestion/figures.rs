@@ -518,6 +518,30 @@ pub fn pair_captions(figures: &[BBox], captions: &[BBox]) -> Vec<(usize, usize)>
 
 // ---- Phase 8d-2: ベクター図領域の検出と受理 ----
 
+/// 矩形列の外接矩形（空なら `None`）。
+pub fn bbox_hull(rects: &[BBox]) -> Option<BBox> {
+    let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1, mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for r in rects {
+        x0 = x0.min(r.x);
+        y0 = y0.min(r.y);
+        x1 = x1.max(r.x + r.width);
+        y1 = y1.max(r.y + r.height);
+    }
+    (x1 > x0 && y1 > y0).then(|| BBox::new(x0, y0, x1 - x0, y1 - y0))
+}
+
+/// その XObjectForm を「中身がベクターだけ」とみなして、**見える子の外接矩形**を
+/// 図領域の候補にしてよいか（Phase 8d-2）。
+///
+/// **Image を子孫に持つ form は対象外。** 8d-8 がその画像を既にラスタ矩形として拾っているので、
+/// form 全体も足すと**同じ図を二重に数える**（`fig-` と `vec-` の crop が 2 枚出て
+/// Vision の課金も 2 回になる）。見える path が 1 つも無い form も対象外
+/// （白抜きだけ・テキストだけの form）。
+pub fn form_is_vector_only(image_children: usize, visible_path_children: usize) -> bool {
+    image_children == 0 && visible_path_children > 0
+}
+
 /// そのページで path オブジェクトを走査してよいか（Phase 8d-2）。
 ///
 /// [`should_scan_forms`] とは**別の述語**にしてある。あちらは「回転ページ・画像過多ページの
@@ -1531,6 +1555,15 @@ mod tests {
             compose_figure_regions(&[], &vector, &edge, &caps, 612.0, 792.0).len(),
             1
         );
+        // **閾値と 1.0 の間にも点を置く**（半分が本文）。ここが無いと、閾値を 0.95 に
+        // 緩める変異が「全面が本文」のケースだけで素通りする。
+        let half = vec![b(100.0, 300.0, 300.0, 60.0)];
+        let cover = coverage_ratio(cluster_vector_rects(&vector, 612.0, 792.0)[0], &half);
+        assert!(
+            cover > VECTOR_MAX_PROSE_COVER && cover < 0.95,
+            "閾値と 1.0 の間: {cover}"
+        );
+        assert!(compose_figure_regions(&[], &vector, &half, &caps, 612.0, 792.0).is_empty());
     }
 
     #[test]
@@ -1568,6 +1601,121 @@ mod tests {
         assert!(!should_scan_vector_paths(90.0, 10));
         // ラスタ側の門とは別の定数を使う（混ぜると 8d-8 の「出力不変」の保証が壊れる）。
         const { assert!(MAX_RAW_PATHS_PER_PAGE > MAX_RAW_RECTS_PER_PAGE) };
+    }
+
+    #[test]
+    fn bbox_hull_ignores_nothing_and_rejects_degenerate_input() {
+        assert_eq!(bbox_hull(&[]), None);
+        assert_eq!(
+            bbox_hull(&[b(10.0, 10.0, 20.0, 20.0), b(100.0, 5.0, 10.0, 10.0)]),
+            Some(b(10.0, 5.0, 100.0, 25.0))
+        );
+        // 面積ゼロの hull は領域にしない。
+        assert_eq!(bbox_hull(&[b(10.0, 10.0, 0.0, 0.0)]), None);
+    }
+
+    #[test]
+    fn the_visible_hull_is_smaller_than_a_form_bounds_padded_by_white() {
+        // 実データ（vid275 p35）の形: form の bounds を**純白の塗り矩形**が単独で決めており、
+        // 見えるインクはその内側の一部だけ。form bounds を採ると面積の 69% が図でなくなる。
+        let form_bounds = b(39.883, 510.407, 460.800, 331.483);
+        let visible = b(111.8, 627.7, 368.1, 129.2);
+        // hull は `(x+w) - x` で幅を組み直すので最下位ビットがずれる（他の幾何と同じ）。
+        assert_bbox_near(bbox_hull(&[visible]), visible);
+        let hull = bbox_hull(&[visible]).expect("hull");
+        let form_area = form_bounds.width * form_bounds.height;
+        assert!(hull.width * hull.height < 0.35 * form_area, "{hull:?}");
+    }
+
+    #[test]
+    fn a_form_that_also_holds_an_image_is_not_a_vector_candidate() {
+        // Image を持つ form を採ると、8d-8 が既に拾ったのと**同じ図に 2 枚の crop** が出て
+        // Vision の課金も 2 回になる。
+        assert!(form_is_vector_only(0, 3));
+        assert!(!form_is_vector_only(1, 3));
+        assert!(!form_is_vector_only(0, 0), "見える path が無い form は手掛かりにならない");
+        assert!(!form_is_vector_only(usize::MAX, 3), "子を数え切れなかった form は捨てる");
+    }
+
+    #[test]
+    fn only_captions_left_over_by_the_raster_pass_can_anchor_a_vector_region() {
+        // ラスタ図が既に取っている caption を相手にすると、build 側は 2 段でペアリングするので
+        // その caption はラスタ図に行き、**caption を持たない余分な figure + crop + 課金**が生える。
+        let merged = merge_image_regions(&[b(100.0, 600.0, 300.0, 120.0)], 612.0, 792.0);
+        let caps = vec![b(100.0, 560.0, 300.0, 24.0)];
+        assert!(unpaired_caption_indices(&merged, &caps).is_empty(), "余りは無い");
+        // その caption のすぐ下（ラスタ図とは重ならない位置）にベクタークラスタを置く。
+        let vector = vec![
+            b(100.0, 420.0, 300.0, 1.0),
+            b(100.0, 539.0, 300.0, 1.0),
+            b(100.0, 420.0, 1.0, 120.0),
+        ];
+        assert_eq!(cluster_vector_rects(&vector, 612.0, 792.0).len(), 1, "クラスタは成立する");
+        assert_eq!(
+            compose_figure_regions(&merged, &vector, &[], &caps, 612.0, 792.0).len(),
+            1,
+            "余った caption が無いので採らない"
+        );
+    }
+
+    #[test]
+    fn a_small_overlap_with_a_raster_region_is_tolerated() {
+        // 重なり判定の**下側**も固定する（上側だけだと閾値を 0.01 にする変異が素通りする）。
+        let merged = merge_image_regions(&[b(100.0, 600.0, 300.0, 120.0)], 612.0, 792.0);
+        let caps = vec![
+            b(100.0, 570.0, 300.0, 24.0),
+            b(100.0, 400.0, 300.0, 24.0),
+        ];
+        // 図はラスタ図の下。上辺だけが 6pt 重なる（面積比 ≒ 0.05）。
+        let vector = vec![
+            b(100.0, 440.0, 300.0, 1.0),
+            b(100.0, 605.0, 300.0, 1.0),
+            b(100.0, 440.0, 1.0, 166.0),
+        ];
+        let cluster = cluster_vector_rects(&vector, 612.0, 792.0);
+        assert_eq!(cluster.len(), 1);
+        let overlap = coverage_ratio(cluster[0], &merged);
+        assert!(
+            overlap > 0.0 && overlap < VECTOR_RASTER_OVERLAP_MAX,
+            "少しだけ重なる配置になっている: {overlap}"
+        );
+        assert_eq!(
+            compose_figure_regions(&merged, &vector, &[], &caps, 612.0, 792.0).len(),
+            2,
+            "少しの重なりでは捨てない"
+        );
+    }
+
+    #[test]
+    fn prose_cover_just_under_the_threshold_is_kept() {
+        // 本文被覆の**下側**も固定する（0.95 にする変異を捕まえる）。
+        let (_, vector, caps) = two_figure_page();
+        let cluster = cluster_vector_rects(&vector, 612.0, 792.0);
+        assert_eq!(cluster.len(), 1);
+        // クラスタ面積の 30%（閾値 0.35 のすぐ下）を本文が覆う配置。
+        let a = cluster[0];
+        let prose = vec![b(a.x, a.y, a.width, a.height * 0.30)];
+        let cover = coverage_ratio(a, &prose);
+        assert!(
+            cover < VECTOR_MAX_PROSE_COVER && cover > 0.25,
+            "閾値のすぐ下: {cover}"
+        );
+        assert_eq!(
+            compose_figure_regions(&[], &vector, &prose, &caps, 612.0, 792.0).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_full_page_path_does_not_swallow_the_real_figure_on_the_same_page() {
+        // マージ**前**の面積フィルタが無いと、全面の背景 path（クリップで小さく見せている
+        // 巨大パスを含む）と図が 1 クラスタに畳まれ、マージ**後**の 0.9 判定でまとめて捨てられて
+        // **図が失われる**。全面矩形だけのページでは両者の区別が付かないので、図と同居させる。
+        let mut rects = v181_grid();
+        rects.push(b(1.0, 1.0, 610.0, 790.0)); // ページ面積の 99.5%
+        let got = cluster_vector_rects(&rects, 612.0, 792.0);
+        assert_eq!(got.len(), 1, "図だけが残る: {got:?}");
+        assert_bbox_near(Some(got[0]), b(250.33, 568.17, 120.35, 120.35));
     }
 
     #[test]

@@ -55,7 +55,8 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 ///   （caption を持たないベクター図は取り逃す ── 本文の罫線クラスタと区別する手段が無い）。
 ///   ラスタ側の領域列・crop ファイル名・caption ペアには一切触らない（ベクターは後ろに足し、
 ///   crop は `vec-` プレフィクスで別採番し、caption は 2 段でペアリングする）。
-///   図領域が増えるので旧版は supersede される。
+///   図領域が増えるので旧版は supersede される（実測: 生存 138 版で 1,248 → 1,628 領域・
+///   図 caption とのペア 281 → 661・既存領域の移動と消滅は 0）。
 pub const EXTRACTOR_VERSION: &str = "0.12.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
