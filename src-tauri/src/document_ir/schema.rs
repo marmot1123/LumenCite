@@ -63,7 +63,14 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 ///   （実測: 純ベクター form 171 個・クリップ付きの子 2,872 件。hull が縮む form が 73 個あり、
 ///   最悪は 43,462×18,575pt → 216.7×119.3pt ＝ クランプの 50% ルールで**図が丸ごと消えていた**）。
 ///   ベクター図領域が変わるので旧版は supersede される。
-pub const EXTRACTOR_VERSION: &str = "0.13.0";
+/// - `0.14.0`: debt-22。**page ノードの `plain_text` から C0 制御文字を落として保存する**
+///   （`\n` / `\t` 以外の U+0000..U+001F を除去し `\r\n` / `\r` を `\n` に寄せる）。
+///   pdfium はマップできない数式グリフを `\u{2}` 等で吐き、それが**語の内側に刺さる**ため
+///   FTS5 の trigram 索引で語が割れ、9a の JSON export と `get_node_context` の page-focus では
+///   生のまま外に出ていた（実測: 非空 5,803 ページの 78.8% に C0・`\r` は 5,786 ページ）。
+///   保存値が変わるので旧版は supersede される。**改行は潰さない**
+///   （`normalize_ws` を流用すると `get_fulltext` の本文が 1 行の塊になる）。
+pub const EXTRACTOR_VERSION: &str = "0.14.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。

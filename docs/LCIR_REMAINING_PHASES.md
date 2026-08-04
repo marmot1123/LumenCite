@@ -1185,6 +1185,73 @@ S8（2 段ペアリングの添字の引き直し。**ベクターが先に並�
   （7,345 頁が 7,207 頁に見えた ＝ ちょうど文書数ぶん）。番人行を足して直した
   （[[feedback_libtest_eats_the_first_line]]）。
 
+### 2.15 #5 PR-b（debt-22）の実装記録（2026-08-04・完了）
+
+**page ノードの `plain_text` を保存の時点で掃除する。** `\n` / `\t` 以外の C0 制御文字
+（U+0000..U+001F）を落とし、`\r\n` / 単独 `\r` を `\n` に寄せる（`structure::clean_page_text`）。
+抽出器版 **0.13.0 → 0.14.0**。
+
+**索引側（p1）だけでは塞がらない。** ゲート ②a の実 DB 調査で読み手を全部並べたところ、
+生の `plain_text` が外に出る経路が索引の他に 2 つあった:
+
+- **9a の JSON export**（`export::lcir_json_pretty` ← Tauri `export_lcir_json` ← UI の
+  `DetailPanel.tsx` から実呼出 / CLI `export-lcir json`）── ユーザーの出力ファイルに載る。
+- **`get_node_context` の page-focus**（`context/mod.rs` の focus は id 直引きで content-block
+  ガードが無く、page ノード id を渡すと生 `plain_text` を返す。ツールは page id を配らないが
+  id は連番で隣接・推測可）。
+
+索引側で正規化すると、以後 `LcirDocument` を読む全員に正規化義務が分散する
+（[[feedback_name_the_reader_first]] / [[feedback_classification_rule_all_uses]] と同型）。
+**保存値を直す方を採った。**
+
+**`normalize_ws` は流用できない。** あちらは空白を 1 個に潰すので、page に掛けると
+`get_fulltext` が返す `"[page N]\n{content}"` が 1 行の塊になり、チャット LLM / MCP へ渡す
+本文の可読性を落とす。block / line は 1 ブロック = 1 行なので潰してよい、という非対称がある。
+
+#### 実データの効果（実 DB の page 5,803 件に本番の関数をそのまま流した）
+
+`#[ignore]` の `clean_page_text_corpus` に hex ダンプを食わせる（プローブ側に第 2 の実装を作らない）。
+
+| | 値 |
+|---|---|
+| 非空 page | **5,803**（§11 と一致 = 生存検算） |
+| C0 を含む page（`\t` `\n` `\r` を除く定義） | **4,570 → 0** |
+| `\r` を含む page | 5,786 |
+| 実際に文字列が変わった page | 5,786 |
+| 落とした C0 文字 / `\r` 文字 | 95,648 / 363,634 |
+| 掃除の結果 空になった page | **0** |
+
+**4,570（78.8%）は ②a の実 DB 調査が出した数と一致した。** 定義を揃えるまでは 5,786 に見えて
+食い違っていた ── `\r` を C0 に数えていたためで、**`\r` は改行コードの揺れであって
+「語を割る汚染」とは別の話**（[[feedback_measure_at_the_varying_unit]] と同型の取り違え）。
+
+実際に落ちた文字は予測どおり**語の内側**に刺さっていた:
+`"the half-line consis\u{2}tent with Szegedy's"` / `"PUC with real Verblun\u{2}sky coefficients"` /
+`"h for constant coeffi\u{2}cients reduces to"`。trigram 索引ではここで語が割れて検索から落ちる。
+
+#### 図には無リスク
+
+page の `plain_text` は**図領域・bbox・caption ペアリング・crop のどの入力にもならない**
+（図系は `segments` / `blocks` 経路で独立）。したがって crop の sha256 も 888 件の alt text carry も動かない。
+
+#### テストと変異
+
+純関数側は `clean_page_text_drops_c0_but_keeps_line_structure`（語内 C0・改行/タブ保持・
+`\r\n` の 1 個化・VT/FF/NUL・**DEL と C1 は落とさない**・全部 C0 なら空）と
+`normalize_ws_would_flatten_a_page_but_clean_page_text_does_not`（流用してはいけない理由の固定）。
+配線側は `page_text_is_stored_without_c0_control_characters`（保存点）/
+`a_page_made_only_of_control_characters_is_stored_as_null`（空になった page は `NULL`）/
+`page_fts_regeneration_strips_c0_from_legacy_page_nodes`（**抽出器 0.13.0 以前の汚れた page を
+索引に持ち込まない**保険。割れていた語が実際に引けるようになることまで assert する）。
+テスト 1,073 → **1,078** 本。
+
+#### 残る限界
+
+- **DEL(U+007F) と C1 は落とさない。** debt-22 の実測（C0 のみ）と母集団を揃えて
+  「直した後は 0 件」を同じ定義で検算できるようにするため。実データでの出現は未計測。
+- **実 DB の page が実際に綺麗になるのは #7 の再構築の後**（保存値の修正なので）。
+  それまでの間に p1 を回しても索引側の保険で汚れは入らない。
+
 ---
 
 ## 3. Phase 7（数式意味表現）— post-1.0
@@ -1470,12 +1537,19 @@ Linux のリソースディレクトリ 3 通りを探索（単体テスト 6 �
   初版の「破壊的 migration になるので採らない」は正しい。普通の側表なら非破壊という第 3 の選択肢もあるが、
   **これは採らないと決めた**（§2.6-1）。
 
-**初版に無い最重要の落とし穴**: pdfium の page 全文には Unicode マップの無いグリフ（リガチャ・数式）が
-C0 制御文字として残る。`structure.rs:786 normalize_ws` が block/line からは落としているが、
-**page ノードはこの正規化を通らない**。実測で非空 LCIR page 5,803 のうち **4,367 ページ（75.3%）**が
-C0 制御文字を含む（`fulltext` 側は 11.6%）。trigram 索引なので `con\x02dition` は "condition" にヒットせず、
-**素朴に派生化すると現状より検索が悪くなる**（debt-22）。
-対策は「page の子 block を ordinal 順に連結する」（block は正規化済み・page 文字数の 98.4% をカバー）。
+~~**初版に無い最重要の落とし穴**~~ **解消済み**（2026-08-04・#5 の PR-b・§2.15）。
+pdfium の page 全文には Unicode マップの無いグリフ（リガチャ・数式）が C0 制御文字として残り、
+`normalize_ws` を通る block/line と違って **page ノードは無正規化で保存されていた**（debt-22）。
+trigram 索引なので `con\x02dition` は "condition" にヒットせず、**素朴に派生化すると
+現状より検索が悪くなる**という指摘だった。**保存点で落とすことにした**ので p1 側の対処は要らない
+（当初案の「page の子 block を ordinal 順に連結する」も不要）。
+
+**p1 の受け入れ条件**（数字で置く）: 派生化した後の `fulltext.content` に C0 制御文字
+（U+0000..U+001F から `\t` `\n` `\r` を除く）を含む行が **0 件**であること。
+無正規化で切り替えると **13.3% → 78.8% に跳ねる**（現 `fulltext` = pdf-extract 由来は 5,710 行中 758 行 =
+13.3% / LCIR page は非空 5,803 ページ中 4,570 ページ = 78.8%）。**#7 の再構築より前に p1 を回すと
+実 DB には 0.13.0 以前の汚れた page が残っている**ので、`regenerate_page_fts_from_lcir` 側の
+保険（同じクリーナーを索引直前にも掛ける）を外さないこと。
 
 **派生化の実利は実測できる**（読み取り専用 SQL のみ・DB コピー不要）: ページ単位で 112 ページが新規索引、
 2 ページが「LCIR 空だから既存行を残す」規則に依存、5,691 ページが重複。添付単位では
@@ -1610,7 +1684,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | **debt-19** | **テキスト fragment 約 11,970 件（12 版・5 件以上に絞ると 9 版）がページ矩形をはみ出す**（y 方向最大 +116pt / x 方向最大 +464pt）。**発生源は `ingestion/mod.rs:547-559`** ── page ノードの fragment を「原点 `(0,0)` + box の寸法」で入れており、原点だけ絶対・寸法だけ box という debt-14 と同じ取り違えになっている（コメントの「ページ全面（MediaBox）」も実際と食い違う）。正しくは `box_left`/`box_bottom` を原点に置く。**debt-14 では直らない**（図 crop のクランプのみ） | M | 9b-4 の座標変換 |
 | **debt-20** | `content_key` の `config_hash` が全経路 `""` 固定で、`RENDER_TARGET_WIDTH` 等を変えても content_key が動かない。pdfium バイナリの tag（chromium/7934）も content_key にも `metadata_json` にも入っていない ＝ **pdfium を上げると全 crop の sha256 が変わり alt text 888 件が全滅しうるのに、それが版として表現されない** | S（metadata に tag を足すのは 1 行） | 再構築の再現性 |
 | **debt-21** | superseded 行が残る間、同一 content_key の再 build は UNIQUE 違反で必ず失敗する（`find_completed` が status で絞るので reuse に乗らない）。**古いバイナリで「旧版を再構築」を押すと全件失敗する**経路が実在する | S | p4 の GC が副作用で解消する |
-| **debt-22** | page ノードの `plain_text` が `normalize_ws` を通らず C0 制御文字を含む（**非空 5,803 ページの 78.8%**・`\r` は 5,786/5,803 頁。`fulltext` 側は 13.3%）。trigram 索引で語が割れる。**索引側だけの正規化では塞がらない読み手が 2 つある**（9a の JSON export / `get_node_context` の page-focus）ので**保存値を #7 より前に直す**と決めた（2026-08-04・§2.3-8・PR-b） | S | **#7 より前（PR-b）** |
+| ~~**debt-22**~~ | ~~page ノードの `plain_text` が `normalize_ws` を通らず C0 制御文字を含む~~ **解消**（2026-08-04・#5 の PR-b・§2.15）。保存点で `structure::clean_page_text` を通す（`\n` / `\t` 以外の C0 を除去 + `\r\n` / `\r` → `\n`）。**改行は潰さない**（`normalize_ws` 流用は `get_fulltext` の本文を 1 行の塊にする）。索引側（`regenerate_page_fts_from_lcir`）にも保険で同じクリーナーを掛けた ── #7 の再構築より前に p1 を回しても汚れが索引に入らないようにするため。実測は 4,570 → **0 ページ** | S | **完了** |
 | **debt-23** | 走り柱が caption と同一ブロックに融合する（「166 8 Staggered Model Fig. 8.3 …」）。`detect_caption` は先頭行しか見ないので caption にならない。素朴な緩和（先頭行以外にも当てる）は本文中の "Fig. 3" を誤認するので危険。**実測（2026-08-04）: 候補 164 ブロック / 終端記号を持つ caption 形 51 行 / 真の融合は目視で ~20-30 に対し、素朴修正の誤爆母集団は ~130-150 = 3〜6 倍**。誤 caption は 8d-2 のアンカーになり偽ベクター図 → 偽 crop → Vision 課金を生むので、**post-1.0 に確定**（§2.3-8） | M | **post-1.0** |
 | **debt-24** | 長時間 LCIR ジョブの排他が 3 つの独立フラグに分裂し、相互排他は `SettingsModal.tsx:1077` の `disabled` 属性 1 行だけ。alt text ボタンは `lcirBatch` を見ていない。**プロセス横断の側は #0 で解消**（`acquire_gui_lock` が `GuiLockState` を返す・§2.8）。残るのはプロセス内の 3 フラグ統合 | S〜M | **p2 の完了条件** |
 | **debt-26** | （**2026-08-03・#4 で母集団が固まった**。8d-2 の後にコーパス全体で 1 回決める、という位置づけは不変で、対象は 1,248 → **1,628 領域**になった。8d-2 が回収したのは「ベクターで描かれていた図」なので、この項の「画像はあるのに図にならない」21 版のうち何版が残っているかは**再計測が要る**）**top-level に Image はあるのに図領域が 1 つも出ない版が 21 版ある**（未結合の図 caption 103 件・2026-08-03 の実測で 8d-8 / 8d-2 のどちらの担当でもないと判明・§4.1）。`MIN_DIM_PT`(16pt) / `MAX_PAGE_AREA_RATIO`(0.9) / クランプのいずれかで全部落ちている。極端な例は vid203/att61（796 枚）・vid250/att110（416 枚）・vid198/att56（262 枚）で、図がタイル画像に刻まれている疑いが濃い。逆端は vid149/att6 のように画像が 1 枚しか無い版（caption 41 件はベクター図＝ 8d-2 側）。**閾値をいじるとコーパス全体 1,248 領域の採否が動く**ので、8d-2 で図領域の母集団が固まってから 1 回で決めること | M（実測が主・調整は数行） | 8d-2 の後 |
@@ -1779,7 +1853,7 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 |------|-----|
 | entries / attachments | 140 / 148（PDF 140・gzip 8） |
 | `document_versions` | 291 行（pdfium: 0.6.0 completed 137 + cww 1 / 0.1.0 superseded 135 / 0.5.0 superseded 2。tex: 0.5.0 completed 2 + cww 6 / 0.1.0 sup 1 / 0.4.0 sup 7） |
-| コード側の抽出器版 | pdfium **`0.13.0`**（#5 で 0.12.0 から bump）/ tex `0.5.0` → **PDF 138/138 が outdated（実 DB は全件 0.6.0）・TeX は 0 件** |
+| コード側の抽出器版 | pdfium **`0.14.0`**（#5 の PR-a で 0.13.0・PR-b で 0.14.0）/ tex `0.5.0` → **PDF 138/138 が outdated（実 DB は全件 0.6.0）・TeX は 0 件** |
 | `document_nodes` | 2,663,234 行（**superseded が 2,213,085 = 83%**） |
 | `source_fragments` | 2,659,223 行（fragment_type 別: line 309,992 / block 130,904 / page 7,345 は生存版のみ） |
 | DB ファイル | 761,237,504 B（726 MiB・freelist 0）。`document_nodes` 262.4MB + `source_fragments` 173.1MB + 索引 5 本で 83.2% |
@@ -1795,12 +1869,12 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 | 非ゼロ page box 原点の版 | 生 CropBox で 138 中 12（8.7%）／`CropBox ∩ MediaBox` では 14。そこに figure 370 件・alt text 137 件。ページ矩形の辺に接する図は 10（4 辺で数えると 12）・うち alt text 6 件だが、**debt-14 の修正で実際に動くのは 3 図・alt text 1 件**（§2.10・接触 12 図中 9 図は原点ゼロの頁） |
 | debt-14 修正の実データ差分 | 図領域 **1,198 → 1,202**（138 版 7,345 頁）。差が出たのは 6 添付のみ（新規 4・bbox 変化 3・消滅 0）。旧側 1,198 は実 DB の figure 数と一致 |
 | 回転ページ | 1 添付 5 ページのみ（att127・`/Rotate 90`）。figure 0 件・回転 skip warning 0 件。**その 5 頁には top-level Image も form 内 Image も 0 枚**（2026-08-03・debt-9 を post-1.0 に落とす根拠） |
-| LCIR page の C0 制御文字率 | 非空 5,803 ページの **75.3%**（`fulltext` 側は 11.6%） |
+| LCIR page の C0 制御文字率 | 非空 5,803 ページの **78.8%（4,570 ページ）**・`\r` は 5,786 ページ（`fulltext` 側は **13.3%** = 5,710 行中 758）。**#5 の PR-b で保存点に掃除を入れたので、本番の関数を流すと 4,570 → 0**（実 DB に反映されるのは #7 の再構築後・§2.15）。旧記載の 75.3% / 11.6% は集計条件の違い |
 | 全ライブラリ再構築 | **4,797 秒（80 分）/ 138 PDF・7,345 ページ**。うち att37（527 ページのスキャン本）が 4,514 秒 = **94%**。残り 137 本は合計 ≒283 秒 |
 | Vision alt text | 888 件 / 6,312 秒 ≒ **7.1 秒/図**。model は全件 `claude-sonnet-5`。単価 ≒$0.0068/図（総額 ≒$6 はメモリ由来でリポジトリからは未検証） |
 | バックアップ | フル zip（`VACUUM INTO` + attachments 全体・差分も dedup も無し）・keep=14・24h 間隔。現在 5 本 × 831,617,064 B = 3.9 GiB。db.sqlite は raw 737MB → 圧縮 220.6MB |
 | disk | 89 GB 空き（91% 使用） |
-| テスト本数 | **1,073**（#5 時点の `cargo test --lib` 実測。#0 で 977・#1 で +8・#2 で +12・#2.5 で +7・#3 で +15・#4 で +32・**#5 で +22**）。**旧記載の 1,043 /「#4 で +24」は誤り** ── #4 の実測は 1,051 で増分は +32 だった（§10） |
+| テスト本数 | **1,078**（#5 時点の `cargo test --lib` 実測。#0 で 977・#1 で +8・#2 で +12・#2.5 で +7・#3 で +15・#4 で +32・**#5 で +27**（PR-a +22 / PR-b +5））。**旧記載の 1,043 /「#4 で +24」は誤り** ── #4 の実測は 1,051 で増分は +32 だった（§10） |
 
 **`figure_caption` の 904 / 954 の食い違いは決着した**（2026-08-02・集計条件の違い）:
 生存 pdfium 版 **904** / 生存 pdfium + tex **954** / superseded 込みの全版 **1,021**。

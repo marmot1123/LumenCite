@@ -982,6 +982,41 @@ fn normalize_ws(s: &str) -> String {
         .join(" ")
 }
 
+/// page ノードの `plain_text` 用の軽量クリーナー（debt-22）。
+///
+/// **[`normalize_ws`] は使えない。** あちらは空白を 1 個に潰すので、page に掛けると
+/// `get_fulltext` が返す `"[page N]\n{content}"` が 1 行の塊になり、チャット LLM / MCP に
+/// 渡す本文の可読性を落とす（block / line 側は 1 ブロック = 1 行なので潰してよい）。
+///
+/// ここで落とすのは**紙に出ないのに検索と LLM 入力を汚すものだけ**:
+///
+/// 1. `\n` / `\t` 以外の **C0 制御文字**（U+0000..U+001F）。pdfium はマップできない
+///    数式グリフを `\u{2}` 等で吐き、それが**語の内側に刺さる**（実データに `"consis\u{2}tent"`）。
+///    FTS5 の trigram 索引では語が割れて検索から落ちる。
+/// 2. `\r\n` / 単独 `\r` → `\n`（改行コードの揺れ。実 DB では非空 5,803 ページ中
+///    **5,786 ページ**に `\r` がある）。
+///
+/// **DEL(U+007F) と C1 は落とさない** ── debt-22 の実測（C0 のみ）と母集団を一致させ、
+/// 「直した後は 0 件」を同じ定義で検算できるようにするため。
+pub fn clean_page_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next(); // \r\n を 1 個の \n にする
+                }
+                out.push('\n');
+            }
+            '\n' | '\t' => out.push(c),
+            c if (c as u32) < 0x20 => {} // 残りの C0 は落とす
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// 中央値（空なら 0.0）。呼び出し側の Vec を破壊的にソートする。
 fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
@@ -1734,6 +1769,117 @@ mod tests {
         assert!(!blocks
             .iter()
             .any(|b| matches!(b.kind, NodeKind::Theorem | NodeKind::Lemma | NodeKind::Proof)));
+    }
+
+    /// debt-22: page の `plain_text` から C0 制御文字を落とす。**改行は保つ**。
+    #[test]
+    fn clean_page_text_drops_c0_but_keeps_line_structure() {
+        // pdfium がマップできない数式グリフを語の内側に吐く形（実データ）。
+        // trigram 索引ではここで語が割れて検索から落ちる。
+        assert_eq!(clean_page_text("consis\u{2}tent"), "consistent");
+        assert_eq!(clean_page_text("ψ(x)\u{2} = 2C2\u{15}"), "ψ(x) = 2C2");
+        // 改行とタブは残す（`normalize_ws` との違いがここ）。
+        assert_eq!(
+            clean_page_text("first line\nsecond\tcolumn\n\nthird"),
+            "first line\nsecond\tcolumn\n\nthird"
+        );
+        // 改行コードの揺れは \n に寄せる（\r\n が 2 個の改行にならないこと）。
+        assert_eq!(clean_page_text("a\r\nb\rc\nd"), "a\nb\nc\nd");
+        // 垂直タブ・改ページも C0 なので落ちる。
+        assert_eq!(clean_page_text("a\u{b}b\u{c}c"), "abc");
+        assert_eq!(clean_page_text("a\u{0}b"), "ab");
+        // **DEL と C1 は落とさない**（debt-22 の実測が C0 のみを数えているので母集団を揃える）。
+        assert_eq!(clean_page_text("a\u{7f}b\u{85}c"), "a\u{7f}b\u{85}c");
+        // 制御文字だけのページは空になる（呼び出し側が `None` にする）。
+        assert!(clean_page_text("\u{2}\u{15}\u{c}").is_empty());
+        // 変化の無い入力は素通り。
+        assert_eq!(clean_page_text("plain ascii text"), "plain ascii text");
+    }
+
+    /// debt-22 の実データ計測（手動）。実 DB から吸い出した page の `plain_text` に
+    /// **本番の [`clean_page_text`] をそのまま**流し、効果と副作用を数える
+    /// （プローブ側に第 2 の実装を作らない）。
+    ///
+    /// 入力は 1 行 1 ページの hex ダンプ:
+    /// ```sh
+    /// sqlite3 "file:$DB?mode=ro" "SELECT hex(CAST(dn.plain_text AS BLOB))
+    ///   FROM document_nodes dn JOIN document_versions dv ON dv.id = dn.document_version_id
+    ///   WHERE dv.extractor_name='lumencite-pdfium'
+    ///     AND dv.extraction_status IN ('completed','completed_with_warnings')
+    ///     AND dn.node_kind='page' AND TRIM(dn.plain_text) != '';" > pages.hex
+    /// LCIR_PAGE_HEX=pages.hex cargo test --lib clean_page_text_corpus -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual measurement; needs LCIR_PAGE_HEX dumped from the live DB"]
+    fn clean_page_text_corpus() {
+        let Ok(path) = std::env::var("LCIR_PAGE_HEX") else {
+            eprintln!("skip: set LCIR_PAGE_HEX=/path/to/pages.hex");
+            return;
+        };
+        eprintln!("C0_BEGIN"); // libtest は 1 行目を食う
+        // **債務の定義に揃える**: C0 = U+0000..U+001F から `\t` `\n` `\r` を除いたもの。
+        // `\r` を混ぜると「汚染率」が 5,786 / 5,803 に見えて 78.8% という実測とずれる
+        // （`\r` は改行コードの揺れであって、語を割る汚染とは別の話）。
+        let strict_c0 = |c: char| (c as u32) < 0x20 && c != '\n' && c != '\t' && c != '\r';
+        let has_c0 = |s: &str| s.chars().any(&strict_c0);
+        let (mut pages, mut before, mut after, mut changed, mut cr, mut emptied) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut removed_c0, mut removed_cr, mut examples) = (0usize, 0usize, Vec::new());
+        for line in std::fs::read_to_string(&path).expect("hex dump").lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let bytes: Vec<u8> = (0..line.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&line[i..i + 2], 16).expect("hex"))
+                .collect();
+            let src = String::from_utf8_lossy(&bytes).into_owned();
+            pages += 1;
+            // `\r` は「揺れ」なので C0 の汚染率とは別に数える（実測 5,786 / 5,803 ページ）。
+            if src.contains('\r') {
+                cr += 1;
+            }
+            if has_c0(&src) {
+                before += 1;
+            }
+            let out = clean_page_text(&src);
+            if has_c0(&out) {
+                after += 1;
+            }
+            removed_c0 += src.chars().filter(|c| strict_c0(*c)).count();
+            removed_cr += src.chars().filter(|c| *c == '\r').count();
+            if out != src {
+                changed += 1;
+                if examples.len() < 3 {
+                    let at = src.char_indices().find(|(_, c)| strict_c0(*c)).map(|(i, _)| i);
+                    if let Some(i) = at {
+                        let lo = src[..i].char_indices().rev().nth(20).map_or(0, |(j, _)| j);
+                        let hi = src[i..].char_indices().nth(20).map_or(src.len(), |(j, _)| i + j);
+                        examples.push(format!("{:?}", &src[lo..hi]));
+                    }
+                }
+            }
+            if out.trim().is_empty() && !src.trim().is_empty() {
+                emptied += 1;
+            }
+        }
+        eprintln!(
+            "C0\tpages={pages}\tc0_before={before}\tc0_after={after}\tchanged={changed}\t\
+             cr_pages={cr}\tremoved_c0={removed_c0}\tremoved_cr={removed_cr}\temptied={emptied}"
+        );
+        for e in &examples {
+            eprintln!("C0_SAMPLE\t{e}");
+        }
+        assert_eq!(after, 0, "掃除の後に C0 が残っている");
+    }
+
+    /// `normalize_ws` を page に流用してはいけない理由を固定する（改行が潰れる）。
+    #[test]
+    fn normalize_ws_would_flatten_a_page_but_clean_page_text_does_not() {
+        let page = "Introduction\n\nWe study quantum walks.";
+        assert_eq!(normalize_ws(page), "Introduction We study quantum walks.");
+        assert_eq!(clean_page_text(page), page);
     }
 
     #[test]
