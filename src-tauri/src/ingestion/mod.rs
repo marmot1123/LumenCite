@@ -519,10 +519,15 @@ async fn insert_pdf_version_tx(
             "rotation_deg": page.rotation_deg,
         })
         .to_string();
-        let page_text = if page.plain_text.trim().is_empty() {
+        // **保存の前に C0 制御文字を落とす**（debt-22）。索引側（p1）だけで正規化すると、
+        // 9a の JSON export（`export_lcir_json`・UI から実呼出）と `get_node_context` の
+        // page-focus に生値が残り、以後の `LcirDocument` の読み手全員に正規化義務が分散する。
+        // 改行は保つ（[`structure::clean_page_text`] の doc コメント参照）。
+        let cleaned_page_text = structure::clean_page_text(&page.plain_text);
+        let page_text = if cleaned_page_text.trim().is_empty() {
             None
         } else {
-            Some(page.plain_text.as_str())
+            Some(cleaned_page_text.as_str())
         };
         let page_node_id = document_nodes::insert_node(
             &mut *tx,
@@ -1438,9 +1443,15 @@ pub async fn regenerate_page_fts_from_lcir(
         .await
         .map_err(|e| e.to_string())?;
     // page ノードの ordinal は 0 始まり。fulltext.page は 1 始まり（= ordinal + 1）。
+    // **保険でここでも C0 を落とす**（debt-22）。保存側（`insert_pdf_version_tx`）で既に
+    // 落としているので通常は恒等だが、**#7 の再構築より前に p1 を回すと実 DB には
+    // 抽出器 0.13.0 以前の汚れた page が残っている**ため、索引にだけは持ち込まない。
     let rows: Vec<(i64, String)> = pages
         .into_iter()
-        .filter_map(|p| p.plain_text.map(|t| (p.ordinal + 1, t)))
+        .filter_map(|p| {
+            p.plain_text
+                .map(|t| (p.ordinal + 1, structure::clean_page_text(&t)))
+        })
         .collect();
     let n = rows.len() as i64;
     fulltext::index_attachment(pool, attachment_id, &rows)
@@ -2017,6 +2028,82 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].attachment_id, att);
         assert_eq!(hits[0].page, 1, "page ノードの ordinal+1 が fulltext.page になる");
+    }
+
+    /// debt-22 の保険: **抽出器 0.13.0 以前で保存された汚れた page** を索引に持ち込まない。
+    ///
+    /// p1（#8）は #7 の再構築より**後**に入るが、それまでの間に手で回されうるし、
+    /// 実 DB には 0.6.0 時点の page が 138 版ぶん残っている。索引側にも同じ正規化を重ねて、
+    /// **`fulltext` の汚染率が 13.3% → 78.8% に跳ねる**のを防ぐ。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn page_fts_regeneration_strips_c0_from_legacy_page_nodes(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let vid = document_versions::insert_version(
+            &pool,
+            &NewDocumentVersion {
+                attachment_id: att,
+                content_key: "ck-legacy",
+                schema_version: document_ir::schema::SCHEMA_VERSION,
+                source_sha256: "sha",
+                source_mime_type: "application/pdf",
+                extractor_name: document_ir::schema::EXTRACTOR_NAME,
+                extractor_version: "0.6.0", // 実 DB に残っている版
+                config_hash: "",
+                parent_version_id: None,
+                status: ExtractionStatus::Completed,
+                warnings_json: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        let root = document_nodes::insert_node(
+            &pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: None,
+                node_kind: NodeKind::Document.as_str(),
+                ordinal: 0,
+                plain_text: None,
+                language: None,
+                confidence: None,
+                origin: None,
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        // 語の内側に C0 が刺さった保存値（実データの形）。
+        document_nodes::insert_node(
+            &pool,
+            &NewDocumentNode {
+                document_version_id: vid,
+                parent_id: Some(root),
+                node_kind: NodeKind::Page.as_str(),
+                ordinal: 0,
+                plain_text: Some("The result is consis\u{2}tent\r\nwith theory."),
+                language: None,
+                confidence: None,
+                origin: Some("pdf_text_layer"),
+                payload_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(regenerate_page_fts_from_lcir(&pool, att).await.unwrap(), 1);
+        let content: String =
+            sqlx::query_scalar("SELECT content FROM fulltext WHERE attachment_id = ?")
+                .bind(att)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content, "The result is consistent\nwith theory.");
+        // 割れていた語が引けるようになる（trigram 索引に C0 が入ると落ちる）。
+        let hits = fulltext::search_fulltext(&pool, "consistent", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "C0 が残っていると語が割れて引けない");
     }
 
     /// 手組みの LCIR（page > block > line）から node-FTS を再生成でき、block だけが索引され
@@ -3263,6 +3350,53 @@ mod tests {
             }],
             warnings: Vec::new(),
         }
+    }
+
+    /// debt-22: **保存の時点で** page の `plain_text` から C0 制御文字が落ちていること。
+    ///
+    /// 索引側（p1）だけで正規化すると、9a の JSON export と `get_node_context` の
+    /// page-focus に生値が残る。ここは「読み手を名指しできない正規化義務を分散させない」ための
+    /// 保存点の配線テストで、純関数側は `structure::tests::clean_page_text_*` が固定する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn page_text_is_stored_without_c0_control_characters(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let mut doc = extracted_with_crop("sha-c0");
+        doc.pages[0].plain_text = "Quantum\u{2} walks\r\nare consis\u{2}tent\r\n".to_string();
+        let vid = insert_version_from(&pool, att, "ck-c0", None, &doc).await;
+
+        let text: Option<String> = sqlx::query_scalar(
+            "SELECT plain_text FROM document_nodes
+             WHERE document_version_id = ? AND node_kind = 'page'",
+        )
+        .bind(vid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let text = text.expect("page に本文がある");
+        assert_eq!(
+            text, "Quantum walks\nare consistent\n",
+            "C0 は落ちるが改行は残る"
+        );
+        assert!(!text.chars().any(|c| (c as u32) < 0x20 && c != '\n' && c != '\t'));
+    }
+
+    /// 中身が制御文字だけのページは `plain_text = NULL` になる（掃除の結果、空になる）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_page_made_only_of_control_characters_is_stored_as_null(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let mut doc = extracted_with_crop("sha-empty");
+        doc.pages[0].plain_text = "\u{2}\u{15}\u{c}".to_string();
+        let vid = insert_version_from(&pool, att, "ck-empty", None, &doc).await;
+
+        let text: Option<String> = sqlx::query_scalar(
+            "SELECT plain_text FROM document_nodes
+             WHERE document_version_id = ? AND node_kind = 'page'",
+        )
+        .bind(vid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(text, None);
     }
 
     /// 抽出結果を 1 版として挿入する（`build_pdf_version` のうち pdfium と FS を除いた部分）。
