@@ -990,14 +990,14 @@ fn normalize_ws(s: &str) -> String {
 ///
 /// ここで落とすのは**紙に出ないのに検索と LLM 入力を汚すものだけ**:
 ///
-/// 1. `\n` / `\t` 以外の **C0 制御文字**（U+0000..U+001F）。pdfium はマップできない
-///    数式グリフを `\u{2}` 等で吐き、それが**語の内側に刺さる**（実データに `"consis\u{2}tent"`）。
-///    FTS5 の trigram 索引では語が割れて検索から落ちる。
+/// 1. `\n` / `\t` 以外の**制御文字**（Unicode Cc = C0 U+0000..U+001F + DEL + C1
+///    U+0080..U+009F）。pdfium はマップできない数式グリフを `\u{2}` 等で吐き、それが
+///    **語の内側に刺さる**（実データに `"consis\u{2}tent"`）。FTS5 の trigram 索引では
+///    語が割れて検索から落ちる。**判定は [`normalize_ws`] と同じ `char::is_control()`** ──
+///    block / line からは前から DEL も C1 も落ちており、page だけ残すと同じ文書の中で
+///    種別によって文字集合が違うことになる（実データにも DEL 53 ページ / C1 17 ページある）。
 /// 2. `\r\n` / 単独 `\r` → `\n`（改行コードの揺れ。実 DB では非空 5,803 ページ中
 ///    **5,786 ページ**に `\r` がある）。
-///
-/// **DEL(U+007F) と C1 は落とさない** ── debt-22 の実測（C0 のみ）と母集団を一致させ、
-/// 「直した後は 0 件」を同じ定義で検算できるようにするため。
 pub fn clean_page_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -1010,7 +1010,7 @@ pub fn clean_page_text(s: &str) -> String {
                 out.push('\n');
             }
             '\n' | '\t' => out.push(c),
-            c if (c as u32) < 0x20 => {} // 残りの C0 は落とす
+            c if c.is_control() => {} // 残りの Cc（C0 + DEL + C1）は落とす
             c => out.push(c),
         }
     }
@@ -1788,8 +1788,11 @@ mod tests {
         // 垂直タブ・改ページも C0 なので落ちる。
         assert_eq!(clean_page_text("a\u{b}b\u{c}c"), "abc");
         assert_eq!(clean_page_text("a\u{0}b"), "ab");
-        // **DEL と C1 は落とさない**（debt-22 の実測が C0 のみを数えているので母集団を揃える）。
-        assert_eq!(clean_page_text("a\u{7f}b\u{85}c"), "a\u{7f}b\u{85}c");
+        // **DEL と C1 も落とす**（`normalize_ws` が block / line から落としているのと同じ規則。
+        // page だけ残すと同じ文書の中で種別によって文字集合が違うことになる）。
+        assert_eq!(clean_page_text("a\u{7f}b\u{85}c"), "abc");
+        // 制御文字でない Unicode（NBSP・全角）はそのまま残す。
+        assert_eq!(clean_page_text("a\u{a0}b　c"), "a\u{a0}b　c");
         // 制御文字だけのページは空になる（呼び出し側が `None` にする）。
         assert!(clean_page_text("\u{2}\u{15}\u{c}").is_empty());
         // 変化の無い入力は素通り。
@@ -1822,6 +1825,12 @@ mod tests {
         // （`\r` は改行コードの揺れであって、語を割る汚染とは別の話）。
         let strict_c0 = |c: char| (c as u32) < 0x20 && c != '\n' && c != '\t' && c != '\r';
         let has_c0 = |s: &str| s.chars().any(&strict_c0);
+        // 実際に落とす集合（Cc から `\t` `\n` `\r` を除いたもの）でも数える。
+        let has_cc = |s: &str| {
+            s.chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r')
+        };
+        let (mut cc_before, mut cc_after) = (0usize, 0usize);
         let (mut pages, mut before, mut after, mut changed, mut cr, mut emptied) =
             (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         let (mut removed_c0, mut removed_cr, mut examples) = (0usize, 0usize, Vec::new());
@@ -1843,9 +1852,15 @@ mod tests {
             if has_c0(&src) {
                 before += 1;
             }
+            if has_cc(&src) {
+                cc_before += 1;
+            }
             let out = clean_page_text(&src);
             if has_c0(&out) {
                 after += 1;
+            }
+            if has_cc(&out) {
+                cc_after += 1;
             }
             removed_c0 += src.chars().filter(|c| strict_c0(*c)).count();
             removed_cr += src.chars().filter(|c| *c == '\r').count();
@@ -1866,12 +1881,13 @@ mod tests {
         }
         eprintln!(
             "C0\tpages={pages}\tc0_before={before}\tc0_after={after}\tchanged={changed}\t\
-             cr_pages={cr}\tremoved_c0={removed_c0}\tremoved_cr={removed_cr}\temptied={emptied}"
+             cr_pages={cr}\tremoved_c0={removed_c0}\tremoved_cr={removed_cr}\temptied={emptied}\t\
+             cc_before={cc_before}\tcc_after={cc_after}"
         );
         for e in &examples {
             eprintln!("C0_SAMPLE\t{e}");
         }
-        assert_eq!(after, 0, "掃除の後に C0 が残っている");
+        assert_eq!((after, cc_after), (0, 0), "掃除の後に制御文字が残っている");
     }
 
     /// `normalize_ws` を page に流用してはいけない理由を固定する（改行が潰れる）。
