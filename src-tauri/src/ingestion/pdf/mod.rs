@@ -246,18 +246,12 @@ fn extract_page_image_regions(
         if raw_count > figures::MAX_RAW_RECTS_PER_PAGE {
             continue; // 数だけ数えて後で警告（スライス化ラスタ）。
         }
-        let Ok(quad) = object.bounds() else { continue };
         // ページ境界 box へクランプ。大きく食み出す矩形（変換異常の兆候）は捨てる（誤配置 crop 回避）。
-        let Some(clamped) = figures::clamp_rect_to_page_box(
-            quad_to_bbox(quad),
-            page_box.left,
-            page_box.bottom,
-            page_box.width,
-            page_box.height,
-        ) else {
-            continue;
-        };
-        rects.push(clamped);
+        if let Some(clamped) =
+            top_level_image_rect(object.bounds().ok().map(quad_to_bbox), page_box)
+        {
+            rects.push(clamped);
+        }
     }
 
     // 1b. XObjectForm 内の Image（Phase 8d-8）。**ページを丸ごと捨てる条件に当たるページでは
@@ -305,16 +299,13 @@ fn extract_page_image_regions(
     // 2b. Phase 8d-2: ラスタ図と結ばれなかった図 caption が残るページだけ path を走査する。
     //     caption が 1 つも無いページ・全部結ばれたページでは 1 オブジェクトも触らない。
     let mut vector_rects: Vec<BBox> = Vec::new();
-    if !figure_captions.is_empty()
-        && !figures::unpaired_caption_indices(&merged, figure_captions).is_empty()
-    {
+    if should_probe_vector_paths(&merged, figure_captions) {
         let (path_rects, path_count) = collect_path_rects(page, page_box);
-        if figures::should_scan_vector_paths(rotation_deg, path_count) {
-            vector_rects = path_rects;
-        } else {
-            warnings.push(format!(
+        match accept_vector_rects(rotation_deg, path_count, path_rects) {
+            Some(accepted) => vector_rects = accepted,
+            None => warnings.push(format!(
                 "page {page_number}: too many path objects ({path_count}); vector figure detection skipped"
-            ));
+            )),
         }
     }
     let regions = figures::compose_figure_regions(
@@ -451,6 +442,66 @@ fn text_segments_to_blocks(text: &pdfium_render::prelude::PdfPageText<'_>) -> Ve
     blocks
 }
 
+/// ページ境界 box へのクランプ（**本番で [`figures::clamp_rect_to_page_box`] を呼ぶ唯一の口**）。
+///
+/// 原点は `page_box.left` / `page_box.bottom` ── ここを `(0.0, 0.0)` に戻すのが debt-14 の
+/// 退行そのもの。純関数と本番の間に配線が 3 本（top-level Image / form 内 Image / path）
+/// あった頃は、3 本とも原点を落としても純関数のテストが全部緑のままだった（ゲート ②a の
+/// 変異 P2）。口を 1 つにして、その 1 つをテストで固定する。
+fn clamp_to_page_box(rect: BBox, page_box: PageBox) -> Option<BBox> {
+    figures::clamp_rect_to_page_box(
+        rect,
+        page_box.left,
+        page_box.bottom,
+        page_box.width,
+        page_box.height,
+    )
+}
+
+/// トップレベル Image 1 個 → 図領域候補（Phase 8a）。pdfium から読むのは `bounds` だけで、
+/// 判定はここに集める（`bounds` が読めなければ捨てる・ページ box へクランプする）。
+fn top_level_image_rect(bounds: Option<BBox>, page_box: PageBox) -> Option<BBox> {
+    clamp_to_page_box(bounds?, page_box)
+}
+
+/// トップレベル path 1 個 → 図領域候補（Phase 8d-2）。pdfium から読むのは
+/// 「インクがあるか」「bounds」「クリップ」の 3 つだけで、**判定はすべてここに集める**。
+///
+/// 3 段で削る。どれも「bbox がインクの位置を表していない」ケースを外すためのもの:
+/// ①見えない path（白抜きストローク・透明）②クリップとの交差（pdfium の `bounds()` は
+/// クリップを考慮しない）③ページ境界 box へのクランプ。
+fn top_level_path_rect(
+    has_ink: bool,
+    bounds: Option<BBox>,
+    clip: &ClipRect,
+    page_box: PageBox,
+) -> Option<BBox> {
+    if !has_ink {
+        return None;
+    }
+    clamp_to_page_box(apply_clip_rect(bounds?, clip)?, page_box)
+}
+
+/// そのページで path を走査する価値があるか（Phase 8d-2 の caption アンカー）。
+/// **オブジェクトに触る前の門**なので、caption が 1 つも無いページと、図 caption が全部
+/// ラスタ図と結ばれたページでは path を 1 本も読まない（探索面 6,321 → 477 ページ）。
+fn should_probe_vector_paths(merged: &[BBox], figure_captions: &[BBox]) -> bool {
+    !figure_captions.is_empty() && !figures::unpaired_caption_indices(merged, figure_captions).is_empty()
+}
+
+/// 走査し終えた path 矩形を採るか、ページごと諦めるか（Phase 8d-2 の上限の門の配線）。
+/// `None` ＝ 諦め（呼び出し側が warning を出す）。
+///
+/// 述語 [`figures::should_scan_vector_paths`] 自体は純関数のテストで固定してあったが、
+/// **本番の配線は無防備で、条件を恒真にしても全緑だった**（ゲート ②a の変異 P3）。
+fn accept_vector_rects(
+    rotation_deg: f64,
+    path_count: usize,
+    rects: Vec<BBox>,
+) -> Option<Vec<BBox>> {
+    figures::should_scan_vector_paths(rotation_deg, path_count).then_some(rects)
+}
+
 /// Phase 8d-2: ページ上の path オブジェクトから、ベクター図の手掛かりになる矩形を集める。
 /// 戻り値は `(矩形列, 生の path オブジェクト数)`。後者は上限判定
 /// （[`figures::should_scan_vector_paths`]）に使うので、上限を超えたページでも数え切る。
@@ -469,36 +520,31 @@ fn collect_path_rects(
 
     let mut out: Vec<BBox> = Vec::new();
     let mut count = 0usize;
-    let push_clamped = |rect: BBox, out: &mut Vec<BBox>| {
-        if let Some(clamped) = figures::clamp_rect_to_page_box(
-            rect,
-            page_box.left,
-            page_box.bottom,
-            page_box.width,
-            page_box.height,
-        ) {
-            out.push(clamped);
-        }
-    };
     for mut object in page.objects().iter() {
         if object.as_path_object().is_some() {
             count += 1;
             if count > figures::MAX_RAW_PATHS_PER_PAGE {
                 continue; // 数だけ数える（呼び出し側がページごと捨てる）。
             }
-            if !path_object_has_ink(&object) {
-                continue;
-            }
-            let Ok(quad) = object.bounds() else { continue };
-            let rect = match clip_path_rect(&object) {
-                ClipRect::None => quad_to_bbox(quad),
-                ClipRect::Empty => continue, // クリップが空 = 何も描かれない
-                ClipRect::Rect(c) => match figures::intersect_rect(quad_to_bbox(quad), c) {
-                    Some(r) => r,
-                    None => continue,
-                },
+            // 判定は純関数側（[`top_level_path_rect`]）。ここは pdfium から読むだけ。
+            // **見えない path のクリップは読まない** ── `clip_path_rect` は
+            // `get_clip_path()` がクリップ無しにも `Some` を返す都合で番人を置くほど
+            // ホットな呼び出しで、どうせ捨てる path のために払う理由が無い
+            // （純関数側も `has_ink` で先に落とすので出力は同じ）。
+            let has_ink = path_object_has_ink(&object);
+            let clip = if has_ink {
+                clip_path_rect(&object)
+            } else {
+                ClipRect::None
             };
-            push_clamped(rect, &mut out);
+            if let Some(rect) = top_level_path_rect(
+                has_ink,
+                object.bounds().ok().map(quad_to_bbox),
+                &clip,
+                page_box,
+            ) {
+                out.push(rect);
+            }
             continue;
         }
         // **中身がベクターだけの XObjectForm は、見える子の外接矩形を 1 個の候補にする。**
@@ -523,17 +569,15 @@ fn collect_path_rects(
         let form_bounds = quad_to_bbox(form_quad);
         let form_matrix = affine_of(&object);
         let (images, children) = collect_form_vector_children(&mut object, form_matrix);
-        if !figures::form_is_vector_only(images, children.len()) {
+        if !figures::form_is_vector_only(images, visible_path_children(&children)) {
             continue;
         }
         count += 1;
         if count > figures::MAX_RAW_PATHS_PER_PAGE {
             continue;
         }
-        let candidates: Vec<(BBox, BBox)> = children
-            .iter()
-            .map(|(raw, m)| (*raw, figures::transform_bbox(*raw, *m)))
-            .collect();
+        // 見えない子を外すのも子 path のクリップを掛けるのもここ（[`form_vector_candidates`]）。
+        let candidates = form_vector_candidates(&children);
         let Some(space) = figures::calibrate_form_child_space(&candidates, form_bounds) else {
             continue; // 座標空間が測れない form は捨てる（誤配置 crop より欠損）
         };
@@ -548,15 +592,14 @@ fn collect_path_rects(
             continue;
         };
         // form 自身にクリップが付いていれば掛ける（実測では稀だが、掛かる形は実在する）。
-        let rect = match clip_path_rect(&object) {
-            ClipRect::None => hull,
-            ClipRect::Empty => continue,
-            ClipRect::Rect(c) => match figures::intersect_rect(hull, c) {
-                Some(r) => r,
-                None => continue,
-            },
+        // **こちらはページ空間の hull に対して掛ける** ── form のクリップは form を置く側の
+        // コンテンツストリーム（＝ページ）に属するため、子のクリップとは空間が違う。
+        let Some(rect) = apply_clip_rect(hull, &clip_path_rect(&object)) else {
+            continue;
         };
-        push_clamped(rect, &mut out);
+        if let Some(clamped) = clamp_to_page_box(rect, page_box) {
+            out.push(clamped);
+        }
     }
     (out, count)
 }
@@ -583,21 +626,79 @@ fn path_object_has_ink(object: &pdfium_render::prelude::PdfPageObject<'_>) -> bo
     )
 }
 
-/// XObjectForm の子孫から `(Image の数, **見える** path の `(生 bbox, ページ空間へ移す合成行列)`)`
-/// を集める（Phase 8d-2）。入れ子は [`figures::MAX_FORM_DEPTH`] まで行列を合成しながら降り、
-/// 走査する子の総数は [`figures::MAX_FORM_CHILDREN_SCANNED`] で打ち切る
-/// （打ち切ると「Image は無い」と誤って結論しうるので、打ち切り時は Image ありとみなして捨てる）。
+/// XObjectForm の子 path 1 個ぶんの**生データ**（Phase 8d-2）。
 ///
-/// **見えない子（白抜き・透明）を外すのがこの関数の主目的**。pdfium の form `bounds()` は
-/// 全子オブジェクトの union なので、白抜き 1 つで図の外接矩形が壊れる。
+/// **可視性の判定もクリップの適用もせず、読んだままを運ぶ。** 判定は
+/// [`form_vector_candidates`] に閉じ込めてあり、①プローブ（`form_child_clip_probe`）が
+/// 同じ 1 つの走査結果から座標空間の両仮説を測れる ②pdfium 無しのテストが
+/// 「見えない子を外す」「クリップを掛ける」配線に届く、の 2 つを両立させるため
+/// （ゲート ②a の変異 P5 は、この配線がテスト 0 本だったために生き残った）。
+struct FormVectorChild {
+    /// 子が属するコンテンツストリーム（= form のコンテンツ空間）で返る生 bbox。
+    raw: BBox,
+    /// その子に効いているクリップ。**`raw` と同じ空間**（`form_child_clip_probe` で実測）。
+    /// `has_ink` が false の子は下流で必ず落ちるので、そこでは読まずに `None` を入れてある。
+    clip: ClipRect,
+    /// `raw` をページ空間へ移す合成行列。
+    to_page: figures::Affine,
+    /// 紙の上に見える線・面を持つか（[`path_object_has_ink`]）。
+    has_ink: bool,
+}
+
+/// 生 bbox にクリップを掛ける（Phase 8d-2）。`None` = 紙に出ない（クリップが空・交差が空）。
+/// **トップレベル path と form の子で同じ規則**を使うための seam。
+///
+/// 8d-2 の初版は form の子でこれを呼んでいなかった（ゲート ②a の confirmed 指摘）。
+/// `\includegraphics{matplotlib.pdf}` のように **axes クリップ付きの巨大 data path** を持つ
+/// included-PDF で、可視インクの hull がクリップ前の生 bbox ぶん膨らむ ── 実測（§2.14）では
+/// vid137 p14 の form が 43,462×18,575pt という桁違いの hull になっており、
+/// クランプの 50% ルールに落ちて**図が丸ごと消えていた**。
+fn apply_clip_rect(raw: BBox, clip: &ClipRect) -> Option<BBox> {
+    match clip {
+        ClipRect::None => Some(raw),
+        ClipRect::Empty => None,
+        ClipRect::Rect(c) => figures::intersect_rect(raw, *c),
+    }
+}
+
+/// 純ベクター form かどうかの判定に使う「**見える** path の子の数」（Phase 8d-2）。
+fn visible_path_children(children: &[FormVectorChild]) -> usize {
+    children.iter().filter(|c| c.has_ink).count()
+}
+
+/// form の子 path から自己校正用の候補 `(そのまま, 合成行列を当てたもの)` を作る（Phase 8d-2）。
+///
+/// ここが form 側の判定を全部持つ: **①見えない子（白抜き・透明）を外す**
+/// **②クリップを掛ける**（ページ空間へ移す前の生空間で交差させるので、
+/// 呼び出し側の `FormChildSpace` がどちらに転んでも同じ 1 回の交差で一貫する）。
+fn form_vector_candidates(children: &[FormVectorChild]) -> Vec<(BBox, BBox)> {
+    children
+        .iter()
+        .filter(|c| c.has_ink)
+        .filter_map(|c| {
+            let raw = apply_clip_rect(c.raw, &c.clip)?;
+            Some((raw, figures::transform_bbox(raw, c.to_page)))
+        })
+        .collect()
+}
+
+/// XObjectForm の子孫から `(Image の数, path の [`FormVectorChild`])` を集める（Phase 8d-2）。
+/// 入れ子は [`figures::MAX_FORM_DEPTH`] まで行列を合成しながら降り、走査する子の総数は
+/// [`figures::MAX_FORM_CHILDREN_SCANNED`] で打ち切る（打ち切ると「Image は無い」と誤って
+/// 結論しうるので、打ち切り時は Image ありとみなして捨てる）。
+///
+/// **この関数は pdfium から読むだけで、何も捨てない。** 可視性とクリップの判定は
+/// [`form_vector_candidates`] にある ── pdfium 無しのテストが判定に届くようにするため。
+/// なお「見えない子を外す」こと自体は 8d-2 の要（pdfium の form `bounds()` は全子の union
+/// なので、白抜き 1 つで図の外接矩形が壊れる）。
 fn collect_form_vector_children(
     form_object: &mut pdfium_render::prelude::PdfPageObject<'_>,
     form_matrix: figures::Affine,
-) -> (usize, Vec<(BBox, figures::Affine)>) {
+) -> (usize, Vec<FormVectorChild>) {
     use pdfium_render::prelude::*;
 
     let mut images = 0usize;
-    let mut paths: Vec<(BBox, figures::Affine)> = Vec::new();
+    let mut paths: Vec<FormVectorChild> = Vec::new();
     let mut stack: Vec<(PdfPageObject<'_>, figures::Affine, usize)> = Vec::new();
     if let Some(form) = form_object.as_x_object_form_object_mut() {
         for i in form.as_range() {
@@ -616,10 +717,21 @@ fn collect_form_vector_children(
         match child.object_type() {
             PdfPageObjectType::Image => images += 1,
             PdfPageObjectType::Path => {
-                if path_object_has_ink(&child) {
-                    if let Ok(quad) = child.bounds() {
-                        paths.push((quad_to_bbox(quad), to_page));
-                    }
+                // トップレベルと同じく、**見えない子のクリップは読まない**
+                // （`form_vector_candidates` が `has_ink` で先に落とすので出力は同じ。
+                // form は子を 4,096 個まで辿るので、1 個あたりの FFI を無駄に増やさない）。
+                let has_ink = path_object_has_ink(&child);
+                if let Ok(quad) = child.bounds() {
+                    paths.push(FormVectorChild {
+                        raw: quad_to_bbox(quad),
+                        clip: if has_ink {
+                            clip_path_rect(&child)
+                        } else {
+                            ClipRect::None
+                        },
+                        to_page,
+                        has_ink,
+                    });
                 }
             }
             PdfPageObjectType::XObjectForm => {
@@ -641,6 +753,40 @@ fn collect_form_vector_children(
     (images, paths)
 }
 
+/// クリップパスの本数が「クリップ無し」を意味するか（Phase 8d-2 の番人）。
+///
+/// **クリップが無いオブジェクトでも `get_clip_path()` は `Some` を返す。**
+/// pdfium の `FPDFClipPath_CountPaths` はクリップ無しに `-1` を返し、pdfium-render は
+/// それを `as u16` で受けるので（`pdf/path/clip_path.rs:52-53`）**65,535 になる**。
+/// 番人を置かないと、クリップの無い path 1 個につき 65,535 回の空ループを回す
+/// （実測: 実ライブラリの path の 96% がこの値。1 ページ 500 本なら 3,300 万回）。
+/// サブパスが 65,535 個ある実在のクリップは無いので、この値は「クリップ無し」の別名。
+fn clip_path_count_is_absent(count: u16) -> bool {
+    count == 0 || count == u16::MAX
+}
+
+/// サブパスのセグメント数が「読めない」を意味するか（Phase 8d-2 の番人・1 段内側）。
+///
+/// **こちらで実際に効いているのは `0` の方だけ。** 外側と違い pdfium-render の
+/// `PdfClipPathSegments::len()` は `FPDFClipPath_CountPathSegments` の `-1` を
+/// `.try_into().unwrap_or(0)` で受けるので（`pdf/path/clip_path.rs:170-176`・0.8.37 で確認）、
+/// `u32::MAX` にはならない。外側と同じ崩れがあると書いていた元のコメントは誤りだった
+/// （ゲート ②a の指摘）。`u32::MAX` 側は crate がキャストに戻った場合の保険として残す。
+fn clip_segment_count_is_absent(count: u32) -> bool {
+    count == 0 || count == u32::MAX
+}
+
+/// そのセグメントの**端点だけでクリップ領域を下から抑えられる**か（Phase 8d-2・ゲート ②a）。
+///
+/// `FPDFPathSegment_GetPoint` は 1 セグメント 1 点しか返さないので、ベジエの制御点は取れない。
+/// 曲線は端点の外側へ膨らむため、端点だけで組んだ矩形は**真のクリップ領域より小さい**。
+/// 種別が読めない（`Unknown`）ときも同じ扱いにする ── 抑えられると言い切れないものを
+/// 「抑えられる」に倒すと、クリップが切っていないインクを削る側に外れる。
+fn clip_segment_is_boundable(t: pdfium_render::prelude::PdfPathSegmentType) -> bool {
+    use pdfium_render::prelude::PdfPathSegmentType;
+    matches!(t, PdfPathSegmentType::LineTo | PdfPathSegmentType::MoveTo)
+}
+
 /// オブジェクトに効いているクリップ領域の外接矩形（Phase 8d-2）。
 enum ClipRect {
     /// クリップパスが付いていない。
@@ -653,34 +799,30 @@ enum ClipRect {
 /// クリップパスの矩形近似。**サブパスは AND（交差）** ── PDF の `W` は現在のクリップと
 /// 交差するので、全サブパスの点の hull を取ると領域を過大評価する。
 ///
-/// 2 つの近似が入る。どちらも**クリップを狭める向き＝path を小さく見積もる向き**なので、
-/// 「クリップされた巨大パスを図に混ぜない」という目的には安全側に効く:
-/// ①ベジエの制御点は取れない（`FPDFPathSegment_GetPoint` は 1 セグメント 1 点）ので、
-/// 曲線のクリップは端点の hull になり本来より小さい。②矩形近似なので斜めのクリップは
-/// 外接矩形になる（こちらは逆に大きい側だが、実データのクリップは軸並行の矩形だった）。
+/// **直線だけでできたクリップしか使わない。** ベジエの制御点は取れない
+/// （`FPDFPathSegment_GetPoint` は 1 セグメント 1 点）ので、曲線を含むクリップを端点の hull で
+/// 代表すると**真の領域より小さい矩形**になり、交差に使うとクリップが切っていないインクまで削る。
+/// ~~「小さい側に外すのは安全側」~~ ── これは 8d-2 の初版が top-level path にだけ
+/// クリップを掛けていたときの理屈で、**form の hull に掛けると図が切れる**（ゲート ②a・§2.14。
+/// vid123 p171 と vid112 p9 でグラフの曲線の端が crop から欠けた）。曲線を含むクリップは
+/// [`ClipRect::None`] にして削るのをやめる。
+///
+/// 残る近似は矩形化だけ ── 斜めのクリップは外接矩形になる（真の領域より**大きい**側なので
+/// インクは削らない）。実データのクリップは軸並行の矩形だった。
 fn clip_path_rect(object: &pdfium_render::prelude::PdfPageObject<'_>) -> ClipRect {
     use pdfium_render::prelude::*;
 
     let Some(clip) = object.get_clip_path() else {
         return ClipRect::None;
     };
-    // **クリップが無いオブジェクトでも `get_clip_path()` は `Some` を返す。**
-    // pdfium の `FPDFClipPath_CountPaths` はクリップ無しに `-1` を返し、pdfium-render は
-    // それを `as u16` で受けるので（`pdf/path/clip_path.rs`）**65,535 になる**。
-    // 番人を置かないと、クリップの無い path 1 個につき 65,535 回の空ループを回す
-    // （実測: 実ライブラリの path の 96% がこの値。1 ページ 500 本なら 3,300 万回）。
-    // サブパスが 65,535 個ある実在のクリップは無いので、この値は「クリップ無し」の別名。
-    let count = clip.len();
-    if count == 0 || count == u16::MAX {
+    if clip_path_count_is_absent(clip.len()) {
         return ClipRect::None;
     }
     let mut acc: Option<BBox> = None;
     let mut any = false;
     for i in clip.as_range() {
         let Ok(segments) = clip.get(i) else { continue };
-        // 同じ型の崩れが 1 段内側にもある（`FPDFClipPath_CountPathSegments` は `u32` へ落ちる）。
-        let seg_count = segments.len();
-        if seg_count == 0 || seg_count == u32::MAX {
+        if clip_segment_count_is_absent(segments.len()) {
             continue;
         }
         let (mut x0, mut y0) = (f64::INFINITY, f64::INFINITY);
@@ -688,6 +830,15 @@ fn clip_path_rect(object: &pdfium_render::prelude::PdfPageObject<'_>) -> ClipRec
         let mut points = 0usize;
         for j in segments.as_range() {
             let Ok(seg) = segments.get(j) else { continue };
+            // **曲線を含むクリップは矩形で抑えられない。** `FPDFPathSegment_GetPoint` は
+            // 1 セグメント 1 点しか返さず、ベジエの制御点は取れないので、端点だけで組んだ
+            // 矩形は真のクリップ領域より**小さい**。これを交差に使うと、クリップが
+            // 切っていないインクまで削る ── 実データ（vid123 p171・vid112 p9）で
+            // グラフの曲線の端が crop から欠けた（crop を焼いて初めて分かった）。
+            // 下から抑えられない以上、**この形のクリップは使わない**（削るのをやめる）。
+            if !clip_segment_is_boundable(seg.segment_type()) {
+                return ClipRect::None;
+            }
             let (x, y) = (seg.x().value as f64, seg.y().value as f64);
             x0 = x0.min(x);
             y0 = y0.min(y);
@@ -778,13 +929,7 @@ fn collect_form_image_rects(
                 figures::FormChildSpace::PageSpace => as_page,
                 figures::FormChildSpace::FormLocal => as_local,
             };
-            if let Some(clamped) = figures::clamp_rect_to_page_box(
-                rect,
-                page_box.left,
-                page_box.bottom,
-                page_box.width,
-                page_box.height,
-            ) {
+            if let Some(clamped) = clamp_to_page_box(rect, page_box) {
                 out.push(clamped);
             }
         }
@@ -946,6 +1091,276 @@ fn write_atomic(
 mod tests {
     use super::*;
 
+    // ---------------------------------------------------------------------
+    // pdfium アダプタ層の配線（ゲート ②a）。
+    //
+    // このモジュールは長らく**非 `#[ignore]` のテストが 1 本も無かった**。純関数層
+    // （`figures.rs` / `structure.rs`）の変異はすべて killed になる一方で、
+    // 「純関数を本番がどう呼んでいるか」＝配線の変異は 14 件すべて生き残った。
+    // 以下は本番が通る seam を pdfium 無しで固定するためのテスト。
+    // ---------------------------------------------------------------------
+
+    fn b(x: f64, y: f64, w: f64, h: f64) -> BBox {
+        BBox::new(x, y, w, h)
+    }
+
+    /// クランプも交差も幅を `(x+w) - x` で組み直すので、10 進で書いた値は最下位ビットが
+    /// ずれる（`figures::tests::assert_bbox_near` と同じ理由）。
+    #[track_caller]
+    fn assert_bbox_near(got: Option<BBox>, want: BBox) {
+        let got = got.expect("領域が捨てられた");
+        let d = |a: f64, e: f64| (a - e).abs() < 1e-9;
+        assert!(
+            d(got.x, want.x) && d(got.y, want.y) && d(got.width, want.width) && d(got.height, want.height),
+            "got {got:?}, want {want:?}"
+        );
+    }
+
+    /// 実データ由来のページ box（vid119 p1: CropBox の左下が原点でない PDF）。
+    fn shifted_page_box() -> PageBox {
+        PageBox {
+            left: 0.0,
+            bottom: -51.0,
+            width: 495.4,
+            height: 739.2,
+        }
+    }
+
+    /// debt-14: クランプの原点は `page_box.left/bottom` であって `(0,0)` ではない。
+    ///
+    /// **これがゲート ②a の変異 P2** ── 本番の 3 つの呼び出し口を全部 `(0.0, 0.0)` に
+    /// 戻しても 1,051 本が全緑だった。純関数 `clamp_rect_to_page_box` 側は原点付きで
+    /// テストされていたが、本番がその原点を渡していることは誰も見ていなかった。
+    #[test]
+    fn clamp_to_page_box_passes_the_real_origin_not_zero() {
+        let pb = shifted_page_box();
+        // ページ box の下端は y=-51。y=-37 の図はページの中にあり、切られず残る。
+        assert_bbox_near(clamp_to_page_box(b(458.4, -37.0, 25.3, 33.5), pb), b(458.4, -37.0, 25.3, 33.5));
+        // 原点を (0,0) に戻すと同じ矩形はページの下端より下＝面積 0 で捨てられる。
+        // つまり上の 1 行は「原点が効いている」ことの証拠になっている。
+        assert_eq!(
+            figures::clamp_rect_to_page_box(b(458.4, -37.0, 25.3, 33.5), 0.0, 0.0, 495.4, 739.2),
+            None
+        );
+    }
+
+    /// トップレベル Image の配線（8a）: bounds が読めなければ捨て、読めればページ box へ
+    /// クランプする。クランプの原点は上と同じく `page_box` 由来。
+    #[test]
+    fn top_level_image_rect_drops_unreadable_bounds_and_clamps_with_the_origin() {
+        let pb = shifted_page_box();
+        assert_eq!(top_level_image_rect(None, pb), None);
+        assert_bbox_near(
+            top_level_image_rect(Some(b(458.4, -37.0, 25.3, 33.5)), pb),
+            b(458.4, -37.0, 25.3, 33.5),
+        );
+        // ページ box から大きく食み出す矩形は捨てる（MIN_CLAMPED_AREA_RATIO）。
+        assert_eq!(top_level_image_rect(Some(b(458.4, -90.0, 25.3, 33.5)), pb), None);
+    }
+
+    /// トップレベル path の配線（8d-2）: 見えない path は 1 本も拾わない。
+    #[test]
+    fn top_level_path_rect_needs_visible_ink() {
+        let pb = shifted_page_box();
+        assert_eq!(
+            top_level_path_rect(false, Some(b(100.0, 100.0, 200.0, 150.0)), &ClipRect::None, pb),
+            None
+        );
+        assert_eq!(
+            top_level_path_rect(true, Some(b(100.0, 100.0, 200.0, 150.0)), &ClipRect::None, pb),
+            Some(b(100.0, 100.0, 200.0, 150.0))
+        );
+        assert_eq!(top_level_path_rect(true, None, &ClipRect::None, pb), None);
+    }
+
+    /// トップレベル path の配線（8d-2）: **クリップと交差させてから**使う。
+    ///
+    /// **これがゲート ②a の変異 P6** ── `ClipRect` の分岐を生の bbox に置き換えても全緑
+    /// だった。数字は実データ（vid238 p6）の「クリップで小さく見せている巨大パス」:
+    /// 生 bounds は 96.9×1,845.9pt でページ 3 枚ぶんの高さがあり、クリップ後は 96.9×124.6pt。
+    #[test]
+    fn top_level_path_rect_intersects_the_clip_path() {
+        let pb = PageBox {
+            left: 0.0,
+            bottom: 0.0,
+            width: 595.0,
+            height: 842.0,
+        };
+        let raw = b(120.0, -500.0, 96.9, 1845.9);
+        let clip = ClipRect::Rect(b(120.0, 600.0, 96.9, 124.6));
+        assert_bbox_near(
+            top_level_path_rect(true, Some(raw), &clip, pb),
+            b(120.0, 600.0, 96.9, 124.6),
+        );
+        // クリップを掛けないと生 bounds はページ box から大きく食み出し、
+        // クランプの 50% ルールでページごと捨てられる（= 図が消える側の失敗）。
+        assert_eq!(top_level_path_rect(true, Some(raw), &ClipRect::None, pb), None);
+        // クリップ領域が空 = そのオブジェクトは描かれない。
+        assert_eq!(top_level_path_rect(true, Some(raw), &ClipRect::Empty, pb), None);
+        // クリップと生 bounds が交わらない = 紙に出ない。
+        assert_eq!(
+            top_level_path_rect(true, Some(raw), &ClipRect::Rect(b(400.0, 600.0, 50.0, 50.0)), pb),
+            None
+        );
+    }
+
+    fn child(raw: BBox, clip: ClipRect, to_page: figures::Affine, has_ink: bool) -> FormVectorChild {
+        FormVectorChild {
+            raw,
+            clip,
+            to_page,
+            has_ink,
+        }
+    }
+
+    /// form の子の配線（8d-2）: 見えない子（白抜き・透明）は hull に入れない。
+    ///
+    /// **これがゲート ②a の変異 P5** ── `path_object_has_ink` の呼び出しを消しても全緑
+    /// だった。述語自体（`figures::path_has_visible_ink`）はテスト済みで、配線が無防備だった。
+    #[test]
+    fn form_vector_candidates_drop_inkless_children() {
+        let m = figures::AFFINE_IDENTITY;
+        let kids = vec![
+            child(b(10.0, 10.0, 20.0, 20.0), ClipRect::None, m, true),
+            // 版面を消すための純白の塗り。これを入れると hull が図の外まで広がる。
+            child(b(0.0, 0.0, 500.0, 700.0), ClipRect::None, m, false),
+        ];
+        assert_eq!(visible_path_children(&kids), 1);
+        let got = form_vector_candidates(&kids);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, b(10.0, 10.0, 20.0, 20.0));
+        assert_eq!(
+            figures::bbox_hull(&got.iter().map(|(r, _)| *r).collect::<Vec<_>>()),
+            Some(b(10.0, 10.0, 20.0, 20.0)),
+            "白抜きを外さないと hull が 500×700 に膨らむ"
+        );
+    }
+
+    /// form の子の配線（ゲート ②a の confirmed 指摘）: 子 path にも**クリップを掛ける**。
+    ///
+    /// 8d-2 の初版はトップレベルにだけクリップを掛けており、`\includegraphics{*.pdf}` の
+    /// 内側にある axes クリップ付きの巨大 data path を生 bbox のまま hull に入れていた。
+    /// 数字は実データ（vid137 p14 の form）を縮めたもので、生のままだと hull が
+    /// 43,462×18,575pt になりページ box へのクランプで**図が丸ごと消えていた**。
+    ///
+    /// 交差は**合成行列を当てる前の生空間**で行う（クリップも子 bbox と同じコンテンツ空間で
+    /// 返ることを `form_child_clip_probe` で実測した）。
+    #[test]
+    fn form_vector_candidates_clip_children_before_transforming_them() {
+        // 生空間 → ページ空間は 0.5 倍 + 平行移動。
+        let m: figures::Affine = [0.5, 0.0, 0.0, 0.5, 100.0, 200.0];
+        let kids = vec![child(
+            b(-43_000.0, -17_000.0, 43_400.0, 18_500.0),
+            ClipRect::Rect(b(0.0, 0.0, 400.0, 300.0)),
+            m,
+            true,
+        )];
+        let got = form_vector_candidates(&kids);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, b(0.0, 0.0, 400.0, 300.0), "生空間で交差させる");
+        assert_eq!(
+            got[0].1,
+            b(100.0, 200.0, 200.0, 150.0),
+            "ページ空間の候補もクリップ後の矩形から作る（先に変換すると桁違いの hull になる）"
+        );
+    }
+
+    /// form の子の配線: クリップが空・交差が空の子は落とす（トップレベルと同じ規則）。
+    #[test]
+    fn form_vector_candidates_drop_children_that_are_clipped_away() {
+        let m = figures::AFFINE_IDENTITY;
+        let kids = vec![
+            child(b(10.0, 10.0, 20.0, 20.0), ClipRect::Empty, m, true),
+            child(
+                b(10.0, 10.0, 20.0, 20.0),
+                ClipRect::Rect(b(500.0, 500.0, 50.0, 50.0)),
+                m,
+                true,
+            ),
+            child(b(60.0, 60.0, 20.0, 20.0), ClipRect::None, m, true),
+        ];
+        let got = form_vector_candidates(&kids);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, b(60.0, 60.0, 20.0, 20.0));
+        // 「見える子の数」はクリップの前に数える（form が純ベクターかの判定材料であって、
+        // 紙に出るかとは別の話）。
+        assert_eq!(visible_path_children(&kids), 3);
+    }
+
+    /// 8d-2 の caption アンカー: caption が無いページと、全部ラスタ図と結ばれたページでは
+    /// path オブジェクトに 1 つも触らない（探索面を 6,321 → 477 ページに落とす門）。
+    #[test]
+    fn vector_paths_are_probed_only_when_a_figure_caption_is_left_unpaired() {
+        let fig = b(100.0, 500.0, 200.0, 200.0);
+        let cap_under_fig = b(100.0, 480.0, 200.0, 12.0);
+        let cap_elsewhere = b(100.0, 100.0, 200.0, 12.0);
+        assert!(!should_probe_vector_paths(&[fig], &[]), "caption 0 件なら走査しない");
+        assert!(
+            !should_probe_vector_paths(&[fig], &[cap_under_fig]),
+            "caption が全部ラスタ図と結ばれたら走査しない"
+        );
+        assert!(
+            should_probe_vector_paths(&[fig], &[cap_under_fig, cap_elsewhere]),
+            "余った caption があるページだけ走査する"
+        );
+        assert!(should_probe_vector_paths(&[], &[cap_elsewhere]));
+    }
+
+    /// 8d-2 の上限の門の**配線**（ゲート ②a の変異 P3）: 述語 `should_scan_vector_paths` は
+    /// 純関数として固定済みだったが、本番が結果を捨てていることは無防備で、条件を恒真に
+    /// しても全緑だった。
+    #[test]
+    fn too_many_paths_makes_the_page_give_up_its_vector_rects() {
+        let rects = vec![b(10.0, 10.0, 100.0, 100.0)];
+        assert_eq!(
+            accept_vector_rects(0.0, figures::MAX_RAW_PATHS_PER_PAGE, rects.clone()),
+            Some(rects.clone())
+        );
+        assert_eq!(
+            accept_vector_rects(0.0, figures::MAX_RAW_PATHS_PER_PAGE + 1, rects.clone()),
+            None,
+            "上限超過ページは矩形を捨てて warning にする"
+        );
+        assert_eq!(
+            accept_vector_rects(90.0, 1, rects),
+            None,
+            "回転ページはベクター走査の結果も採らない"
+        );
+    }
+
+    /// クリップ番人（ゲート ②a の変異 P1）: `get_clip_path()` は**クリップの無い
+    /// オブジェクトにも `Some` を返す**。番人を外すと出力は変わらないが、path 1 本につき
+    /// 65,535 回の空ループが復活する（1 ページ 500 本で約 3,300 万回）。
+    #[test]
+    fn clip_path_counts_that_mean_no_clip() {
+        assert!(clip_path_count_is_absent(0));
+        assert!(clip_path_count_is_absent(u16::MAX), "pdfium の -1 が u16 に落ちた値");
+        assert!(!clip_path_count_is_absent(1));
+        assert!(!clip_path_count_is_absent(4));
+        // 内側は crate が -1 を 0 に丸めるので、実際に効くのは 0 の方だけ。
+        assert!(clip_segment_count_is_absent(0));
+        assert!(clip_segment_count_is_absent(u32::MAX));
+        assert!(!clip_segment_count_is_absent(1));
+    }
+
+    /// **曲線を含むクリップは使わない**（ゲート ②a・§2.14）。端点だけで組んだ矩形は
+    /// 真のクリップ領域より小さいので、交差に使うとクリップが切っていないインクを削る。
+    /// 実データ（vid123 p171 / vid112 p9）でグラフの曲線の端が crop から欠けた。
+    #[test]
+    fn only_straight_clip_segments_can_bound_a_clip_rect() {
+        use pdfium_render::prelude::PdfPathSegmentType;
+        assert!(clip_segment_is_boundable(PdfPathSegmentType::LineTo));
+        assert!(clip_segment_is_boundable(PdfPathSegmentType::MoveTo));
+        assert!(
+            !clip_segment_is_boundable(PdfPathSegmentType::BezierTo),
+            "ベジエは制御点が取れないので端点の hull は下からの抑えにならない"
+        );
+        assert!(
+            !clip_segment_is_boundable(PdfPathSegmentType::Unknown),
+            "読めない種別を『抑えられる』に倒すとインクを削る側に外れる"
+        );
+    }
+
     /// XObjectForm の座標空間プローブ（8d-8・doc §2.6-4 / §2.12）: form の bounds / matrix と、
     /// その中の Image 子孫の bounds が**どの座標空間で返るか**を測る。
     ///
@@ -1077,6 +1492,9 @@ mod tests {
             return;
         };
         let tag = std::env::var("LCIR_TAG").unwrap_or_else(|_| "-".to_string());
+        // **libtest は各実行の 1 行目を食う。** 番人を置かないと文書ごとに 1 ページぶんの
+        // `CENSUS` 行が静かに落ちる（138 本回して 7,345 頁が 7,207 頁に見えた）。
+        eprintln!("CENSUS_BEGIN\t{tag}");
         let dump = std::env::var("LCIR_DUMP").is_ok();
         // 明細は「図 caption のあるページ」だけに絞れる（caption アンカーの設計上、
         // 出力が出うるのはそのページだけなので、それ以外を吐いても読むものが増えるだけ）。
@@ -1102,6 +1520,7 @@ mod tests {
             let rot = page.rotation().map_or(0.0, |r| r.as_degrees() as f64);
             let (ox, oy) = page_box_origin(&page);
             let (mut n_img, mut n_path, mut n_text, mut n_form, mut n_other) = (0, 0, 0, 0, 0);
+            let mut color_err = 0;
             // path の粗い形状分布（短辺で刻む）。0 は水平/垂直の罫線。
             let (mut hair, mut tiny, mut small, mut med, mut large) = (0, 0, 0, 0, 0);
 
@@ -1114,6 +1533,13 @@ mod tests {
                     PdfPageObjectType::XObjectForm => n_form += 1,
                     PdfPageObjectType::Path => {
                         n_path += 1;
+                        // `path_object_has_ink` は色が読めない path を「黒インク」に倒す
+                        // （見える側に倒す）。倒した先が「巨大な白消し矩形」だと 8d-2 が
+                        // 実データで潰したクラスタ橋渡しが再発しうる（ゲート ②a の指摘）ので、
+                        // **その入口がコーパスに何件あるか**をここで数える。
+                        if object.stroke_color().is_err() || object.fill_color().is_err() {
+                            color_err += 1;
+                        }
                         if let Some(b) = bounds {
                             let m = b.width.min(b.height);
                             match m {
@@ -1245,10 +1671,156 @@ mod tests {
             eprintln!(
                 "CENSUS\t{tag}\t{p}\t{rot}\t{w:.2}\t{h:.2}\t{ox:.3}\t{oy:.3}\t\
                  {n_img}\t{n_path}\t{n_text}\t{n_form}\t{n_other}\t\
-                 {hair}\t{tiny}\t{small}\t{med}\t{large}"
+                 {hair}\t{tiny}\t{small}\t{med}\t{large}\t{color_err}"
             );
         }
         eprintln!("CENSUS_DONE\t{tag}\t{path}");
+    }
+
+    /// ゲート ②a の着手前プローブ: **form の子 path に付くクリップが、子 bbox と同じ
+    /// コンテンツ空間で返るのか、ページ空間で返るのか**を実データで決める。
+    ///
+    /// 仮説で決められない。間違った空間で交差すると交差が空になり、**図が丸ごと消える**
+    /// （欠損は集計値では気づけない）。判別は 8d-8 / 8d-2 の自己校正と同じ理屈で、
+    /// 実測が `FormLocal` 43 / `PageSpace` 0 ＝ 生 bbox とページ空間が別物である以上、
+    /// クリップ矩形がどちらに寄るかは被覆率で分かれる。
+    ///
+    /// 本番と同じ `collect_form_vector_children` を呼ぶ（プローブ側に第 2 の走査を作らない）。
+    /// クリップを掛けた／掛けない hull の差も出すので、修正の効き幅もここで分かる。
+    ///
+    /// `LCIR_FIG_PDF=/path/to.pdf [LCIR_TAG=vid] \
+    ///  cargo test --lib form_child_clip_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual pdfium probe; needs LCIR_FIG_PDF + libpdfium"]
+    fn form_child_clip_probe() {
+        use pdfium_render::prelude::*;
+
+        let Ok(path) = std::env::var("LCIR_FIG_PDF") else {
+            eprintln!("skip: set LCIR_FIG_PDF=/path/to.pdf");
+            return;
+        };
+        let tag = std::env::var("LCIR_TAG").unwrap_or_else(|_| "-".to_string());
+        // **libtest は各実行の 1 行目を食う。** 集計行が静かに落ちないよう先に捨て行を置く。
+        eprintln!("FCLIP_BEGIN\t{tag}");
+        let bindings = pdfium::bind_pdfium().expect("libpdfium");
+        let pdfium = Pdfium::new(bindings);
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("open PDF");
+
+        let area = |b: BBox| b.width.max(0.0) * b.height.max(0.0);
+        let cover = |a: BBox, b: BBox| {
+            let d = area(a);
+            if d <= 0.0 {
+                return -1.0; // 測れない（0 除算を「被覆 0」に落とさない）
+            }
+            figures::intersect_rect(a, b).map_or(0.0, area) / d
+        };
+        // 集計: 純ベクター form の数 / 子 path の総数 / クリップ Rect / クリップ Empty /
+        //       「生空間仮説の方が被覆が高い子」/「ページ空間仮説の方が高い子」/ hull が縮んだ form
+        let (mut forms, mut vec_forms, mut kids, mut clipped, mut empty) = (0, 0, 0, 0, 0);
+        let (mut win_raw, mut win_page, mut tie) = (0usize, 0usize, 0usize);
+        let (mut hull_shrunk, mut hull_lost) = (0usize, 0usize);
+
+        for (idx, page) in doc.pages().iter().enumerate() {
+            let p = idx + 1;
+            for (fi, mut object) in page.objects().iter().enumerate() {
+                if object.as_x_object_form_object().is_none() {
+                    continue;
+                }
+                forms += 1;
+                let Ok(form_quad) = object.bounds() else { continue };
+                let form_bounds = quad_to_bbox(form_quad);
+                let form_matrix = affine_of(&object);
+                let (images, children) = collect_form_vector_children(&mut object, form_matrix);
+                if !figures::form_is_vector_only(images, visible_path_children(&children)) {
+                    continue;
+                }
+                vec_forms += 1;
+                kids += visible_path_children(&children);
+                let mut form_clipped = 0usize;
+                for (ci, c) in children.iter().filter(|c| c.has_ink).enumerate() {
+                    let as_page = figures::transform_bbox(c.raw, c.to_page);
+                    let cr = match &c.clip {
+                        ClipRect::None => continue,
+                        ClipRect::Empty => {
+                            empty += 1;
+                            eprintln!("FCHILD\t{tag}\t{p}\t{fi}\t{ci}\tempty");
+                            continue;
+                        }
+                        ClipRect::Rect(r) => *r,
+                    };
+                    clipped += 1;
+                    form_clipped += 1;
+                    // 「クリップは自分が包む対象と大きく重なる」ことを使って空間を当てる。
+                    let ov_raw = cover(c.raw, cr);
+                    let ov_page = cover(as_page, cr);
+                    match (ov_raw, ov_page) {
+                        (a, b) if a > b => win_raw += 1,
+                        (a, b) if b > a => win_page += 1,
+                        _ => tie += 1,
+                    }
+                    eprintln!(
+                        "FCHILD\t{tag}\t{p}\t{fi}\t{ci}\trect\t\
+                         {:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t\
+                         {:.2}\t{:.2}\t{:.2}\t{:.2}\t{ov_raw:.4}\t{ov_page:.4}",
+                        c.raw.x, c.raw.y, c.raw.width, c.raw.height,
+                        as_page.x, as_page.y, as_page.width, as_page.height,
+                        cr.x, cr.y, cr.width, cr.height
+                    );
+                }
+                if form_clipped == 0 {
+                    continue;
+                }
+                // クリップを掛けない場合と掛けた場合で、本番が採る hull がどう変わるか。
+                let pick = |cands: &[(BBox, BBox)], space: figures::FormChildSpace| {
+                    let v: Vec<BBox> = cands
+                        .iter()
+                        .map(|(as_page, as_local)| match space {
+                            figures::FormChildSpace::PageSpace => *as_page,
+                            figures::FormChildSpace::FormLocal => *as_local,
+                        })
+                        .collect();
+                    figures::bbox_hull(&v)
+                };
+                // before = クリップを掛けない（8d-2 初版の挙動）/ after = 本番の純関数そのもの。
+                let raw_cands: Vec<(BBox, BBox)> = children
+                    .iter()
+                    .filter(|c| c.has_ink)
+                    .map(|c| (c.raw, figures::transform_bbox(c.raw, c.to_page)))
+                    .collect();
+                let clipped_cands = form_vector_candidates(&children);
+                let before = figures::calibrate_form_child_space(&raw_cands, form_bounds)
+                    .and_then(|s| pick(&raw_cands, s));
+                let after = figures::calibrate_form_child_space(&clipped_cands, form_bounds)
+                    .and_then(|s| pick(&clipped_cands, s));
+                match (before, after) {
+                    (Some(b), Some(a)) => {
+                        if area(a) < area(b) - 0.01 {
+                            hull_shrunk += 1;
+                        }
+                        eprintln!(
+                            "FCFORM\t{tag}\t{p}\t{fi}\t{}\t{form_clipped}\t\
+                             {:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.4}",
+                            children.len(),
+                            b.x, b.y, b.width, b.height,
+                            a.x, a.y, a.width, a.height,
+                            if area(b) > 0.0 { area(a) / area(b) } else { -1.0 }
+                        );
+                    }
+                    (Some(_), None) => {
+                        hull_lost += 1;
+                        eprintln!("FCFORM\t{tag}\t{p}\t{fi}\t{}\t{form_clipped}\tLOST", children.len());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        eprintln!(
+            "\nFCLIP\t{tag}\tforms={forms}\tvec_forms={vec_forms}\tkids={kids}\t\
+             clipped={clipped}\tempty={empty}\t\
+             win_raw={win_raw}\twin_page={win_page}\ttie={tie}\t\
+             hull_shrunk={hull_shrunk}\thull_lost={hull_lost}"
+        );
+        eprintln!("FCLIP_DONE\t{tag}\t{path}");
     }
 
     /// プローブ用: 与えた矩形を実際に crop PNG に焼いて目で確かめる（8d-2 の設計検証）。
@@ -1469,6 +2041,27 @@ mod tests {
                 eprintln!(
                     "VEC\t{tag}\t{page_number}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
                     b.x, b.y, b.width, b.height
+                );
+            }
+            // **crop の画素位置まで出す**（ゲート ②a の指摘）。bbox が 1pt も動かないのに
+            // crop の画素だけがずれる変更は bbox の集合差では原理的に検出できない ──
+            // #2（debt-14）の `page_box_origin` を `crop()`/`media()` から `bounding()` へ
+            // 付け替えた変更がまさにその型で、carry の鍵は bbox ではなく crop の sha256 の方。
+            // 2 回の実行の `REG` 行を突き合わせれば「bbox 一致・画素移動」が拾える。
+            // レンダリングはしない（7,345 頁ぶんは重い）ので画像サイズは本番と同じ
+            // `RENDER_TARGET_WIDTH` 基準の公称値を使う。**pdfium の丸めとは 1px ずれうるが、
+            // 両方の実行で同じ式なので差分の検出能力は変わらない。**
+            let img_w = RENDER_TARGET_WIDTH as u32;
+            let img_h = ((RENDER_TARGET_WIDTH as f64) * h / w.max(1.0)).round().max(1.0) as u32;
+            for (i, r) in composed.iter().enumerate() {
+                let px = figures::region_to_pixel_rect(r.bbox, box_left, box_bottom, w, h, img_w, img_h)
+                    .map_or_else(
+                        || "-\t-\t-\t-".to_string(),
+                        |(x, y, pw, ph)| format!("{x}\t{y}\t{pw}\t{ph}"),
+                    );
+                eprintln!(
+                    "REG\t{tag}\t{page_number}\t{i}\t{:?}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{px}",
+                    r.source, r.bbox.x, r.bbox.y, r.bbox.width, r.bbox.height
                 );
             }
 

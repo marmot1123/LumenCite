@@ -1771,4 +1771,191 @@ mod tests {
         let captions = vec![b(100.0, 380.0, 300.0, 24.0)]; // 上端 404 > 図下端 400
         assert_eq!(pair_captions(&figures, &captions), vec![(0, 0)]);
     }
+
+    // ---- 閾値を**両側から**留める（ゲート ②a の変異 M6/M8/M9/M10/M11 と P4）----
+    //
+    // 8d-2 のテストは「明らかに通る点」と「明らかに落ちる点」しか置いておらず、
+    // 閾値そのものを動かす変異が全部生き残った（0.2 を 0.9 に緩めても 1,051 本が全緑）。
+    // 以下は**緩める向きと絞る向きの両方**に点を置く。**定数シンボルではなくリテラル**で
+    // 書く ── シンボルで書くと定数を変える変異と一緒に動いてしまい何も留めない。
+
+    /// [`VECTOR_MIN_DIM_PT`] = 24pt を**下側**から留める（変異 M6: 24 → 16 が全緑だった）。
+    /// 16pt に緩めるとコーパス全体で 5 領域増えるが、少なくとも 1 件は図ではなく図の断片。
+    #[test]
+    fn vector_clusters_shorter_than_24pt_are_dropped_in_both_directions() {
+        let (w, h) = (595.0, 842.0);
+        // 短辺 20pt（16 と 24 の間）。緩める変異でだけ通る点。
+        assert!(
+            cluster_vector_rects(&[b(100.0, 400.0, 200.0, 20.0)], w, h).is_empty(),
+            "短辺 20pt のクラスタは図にしない"
+        );
+        // 短辺 24pt ちょうどは通す（絞る変異でだけ落ちる点）。
+        assert_eq!(
+            cluster_vector_rects(&[b(100.0, 400.0, 200.0, 24.0)], w, h),
+            vec![b(100.0, 400.0, 200.0, 24.0)]
+        );
+        assert_eq!(VECTOR_MIN_DIM_PT, 24.0);
+    }
+
+    /// [`VECTOR_RULE_MAX_THICKNESS_PT`] = 3pt を**上側**から留める（変異 M8: 3.0 → 0.7 が全緑）。
+    /// 既存のテストは厚さ 0.6pt の罫線しか使っておらず、0.7〜3.0pt の帯が無防備だった。
+    /// 1pt の罫が罫線とみなされなくなると、左右の段の図を 1 クラスタに橋渡しする。
+    #[test]
+    fn a_two_point_page_wide_rule_does_not_bridge_two_figures() {
+        let (w, h) = (595.0, 842.0);
+        let left = b(40.0, 400.0, 200.0, 150.0);
+        let right = b(350.0, 400.0, 200.0, 150.0);
+        // 2 つの図の間を通るページ幅の罫（厚さ 2pt）。両方に 12pt 以内で接する位置に置く。
+        let rule = b(20.0, 396.0, 560.0, 2.0);
+        let got = cluster_vector_rects(&[left, right, rule], w, h);
+        assert_eq!(got.len(), 2, "厚さ 2pt の罫線も橋にしない: {got:?}");
+        // 厚さ 3.1pt は「線 1 本」ではなく面を持つ矩形とみなし、罫線から外す（下側の点）。
+        let thick = b(20.0, 396.0, 560.0, 3.1);
+        assert_eq!(
+            cluster_vector_rects(&[left, right, thick], w, h).len(),
+            1,
+            "3pt を超える帯は罫線扱いしないので橋になる"
+        );
+        assert_eq!(VECTOR_RULE_MAX_THICKNESS_PT, 3.0);
+    }
+
+    /// [`coverage_ratio`] は複数ブロックの被覆を**足し上げる**（変異 M9: sum → max が全緑）。
+    /// 本文 3 段が 15% ずつ覆うクラスタは、最大値で見ると 15% でも実際には 45% 覆われている。
+    #[test]
+    fn coverage_ratio_accumulates_across_blocks() {
+        let region = b(0.0, 0.0, 100.0, 100.0);
+        let blocks = vec![
+            b(0.0, 0.0, 100.0, 15.0),
+            b(0.0, 30.0, 100.0, 15.0),
+            b(0.0, 60.0, 100.0, 15.0),
+        ];
+        let got = coverage_ratio(region, &blocks);
+        assert!((got - 0.45).abs() < 1e-9, "got {got}");
+        assert!(got > VECTOR_MAX_PROSE_COVER, "本文被覆の門に掛かる側でなければ意味がない");
+    }
+
+    /// 上の被覆が本番の受理規則に効いていること（変異 M9 を `compose_figure_regions` 側でも留める）。
+    #[test]
+    fn a_cluster_covered_by_three_prose_blocks_is_rejected() {
+        let (w, h) = (595.0, 842.0);
+        let cluster = b(100.0, 400.0, 200.0, 200.0);
+        let caption = b(100.0, 370.0, 200.0, 20.0);
+        // 各 15%・合計 45%（最大は 15% なので max 意味論では通ってしまう）。
+        let prose = vec![
+            b(100.0, 400.0, 200.0, 30.0),
+            b(100.0, 470.0, 200.0, 30.0),
+            b(100.0, 540.0, 200.0, 30.0),
+        ];
+        assert!(
+            compose_figure_regions(&[], &[cluster], &prose, &[caption], w, h).is_empty(),
+            "本文が合計 45% を占めるクラスタは図にしない"
+        );
+        // 本文が 1 段だけ（15%）なら通る＝落としているのが被覆の門であることの確認。
+        assert_eq!(
+            compose_figure_regions(&[], &[cluster], &prose[..1], &[caption], w, h).len(),
+            1
+        );
+    }
+
+    /// [`VECTOR_RASTER_OVERLAP_MAX`] = 0.2 を**中間帯**で留める（変異 M10: 0.2 → 0.9 が全緑）。
+    /// 既存のテストは重なり ≈0.05 と ≈1.0 しか置いておらず、(0.2, 0.9] が無防備だった。
+    #[test]
+    fn a_cluster_half_covered_by_a_raster_figure_is_rejected() {
+        let (w, h) = (595.0, 842.0);
+        let raster = b(100.0, 500.0, 200.0, 100.0);
+        // 面積 200×200 のクラスタの上半分（50%）がラスタ図と重なる。
+        let cluster = b(100.0, 400.0, 200.0, 200.0);
+        let caption = b(100.0, 370.0, 200.0, 20.0);
+        // caption を 2 つ置き、1 つはラスタ図と結ばせて leftover を確実に残す。
+        let raster_caption = b(100.0, 480.0, 200.0, 14.0);
+        let got = compose_figure_regions(
+            &[raster],
+            &[cluster],
+            &[],
+            &[raster_caption, caption],
+            w,
+            h,
+        );
+        assert_eq!(
+            got.iter().filter(|r| r.source == RegionSource::Vector).count(),
+            0,
+            "50% 重なるクラスタは捨てる（union もしない）: {got:?}"
+        );
+        // 重なりが 10% なら通る＝落としているのが重なりの門であることの確認。
+        let apart = b(100.0, 300.0, 200.0, 200.0);
+        let got = compose_figure_regions(
+            &[raster],
+            &[apart],
+            &[],
+            &[raster_caption, b(100.0, 270.0, 200.0, 20.0)],
+            w,
+            h,
+        );
+        assert_eq!(got.iter().filter(|r| r.source == RegionSource::Vector).count(), 1);
+        assert_eq!(VECTOR_RASTER_OVERLAP_MAX, 0.2);
+    }
+
+    /// [`FORM_CONTAINMENT_MIN`] = 0.9 を**両側**から留める（変異 M11: 0.9 → 0.5 が全緑）。
+    /// 棄却側のテストは包含率 0.5 未満、合格側は 1.0 近傍しか置いておらず、
+    /// 0.5〜0.9 の棄却帯が見えていなかった。8d-8 の form 画像と 8d-2 の form hull の
+    /// **両方の座標空間選択**を司る閾値なので、緩むと誤配置 crop が出る。
+    #[test]
+    fn form_calibration_rejects_containment_below_nine_tenths() {
+        let form = b(0.0, 0.0, 100.0, 100.0);
+        // as_page 側は form の外（包含率 0）、as_local 側だけが部分的に収まる。
+        let outside = b(500.0, 500.0, 10.0, 10.0);
+        // 85% しか収まらない → 棄却（0.5 に緩める変異でだけ FormLocal になる）。
+        assert_eq!(
+            calibrate_form_child_space(&[(outside, b(0.0, -15.0, 100.0, 100.0))], form),
+            None
+        );
+        // 92% 収まれば FormLocal（0.95 などに絞る変異でだけ落ちる点）。
+        assert_eq!(
+            calibrate_form_child_space(&[(outside, b(0.0, -8.0, 100.0, 100.0))], form),
+            Some(FormChildSpace::FormLocal)
+        );
+        assert_eq!(FORM_CONTAINMENT_MIN, 0.9);
+    }
+
+    /// **並びは必ず raster → vector**（ゲート ②a の変異 S8 の片割れ）。
+    ///
+    /// `ingestion::insert_pdf_version_tx` の添字の引き直しはこの規約に乗っており、
+    /// 規約が破れると caption のペアが別の図に付く。ラスタ側は入力の順序ごと不変
+    /// （8c の alt text carry が `region_index` に乗っているため）。
+    #[test]
+    fn composed_regions_always_list_raster_before_vector() {
+        let (w, h) = (595.0, 842.0);
+        let raster = vec![b(100.0, 600.0, 200.0, 120.0), b(100.0, 100.0, 200.0, 120.0)];
+        // ページの**上の方**にあるベクタークラスタ（読み順ならラスタ 2 個目より前）。
+        let cluster = b(320.0, 620.0, 200.0, 120.0);
+        let captions = vec![
+            b(100.0, 570.0, 200.0, 20.0),
+            b(100.0, 70.0, 200.0, 20.0),
+            b(320.0, 590.0, 200.0, 20.0),
+        ];
+        let got = compose_figure_regions(&raster, &[cluster], &[], &captions, w, h);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0].bbox, raster[0]);
+        assert_eq!(got[1].bbox, raster[1]);
+        assert_eq!(got[0].source, RegionSource::Raster);
+        assert_eq!(got[1].source, RegionSource::Raster);
+        assert_eq!(
+            got[2].source,
+            RegionSource::Vector,
+            "視覚順ではページ上部でも、ベクターは必ずラスタの後ろ"
+        );
+    }
+
+    /// [`MAX_RAW_PATHS_PER_PAGE`] の**値**を留める（変異 P4: 512 → 5000 が全緑）。
+    /// 門のテストは定数シンボルで書かれており、絶対値を留めていたのは
+    /// 「[`MAX_RAW_RECTS_PER_PAGE`] より大きい」という順序だけだった。
+    /// 512 は fixpoint マージが最悪 O(n^3) であることから来る（n=512 で ~4.5e7 回）。
+    #[test]
+    fn the_path_scan_ceiling_is_pinned_to_its_complexity_budget() {
+        assert_eq!(MAX_RAW_PATHS_PER_PAGE, 512);
+        assert!(should_scan_vector_paths(0.0, 512));
+        assert!(!should_scan_vector_paths(0.0, 513));
+        // 実ライブラリには 1 ページ 5,874 本の版（vid222）が実在し、そこは捨てる。
+        assert!(!should_scan_vector_paths(0.0, 5_874));
+    }
 }
