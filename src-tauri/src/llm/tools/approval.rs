@@ -10,7 +10,7 @@
 //! - **ALWAYS-CONFIRM** (`delete_*` で始まる名前, `mcp_` で始まる名前):
 //!   常に要承認。whitelist でも override 不可。
 //!
-//! - **DEFAULT-AUTO write 系** (`add_tag`, `update_notes`, `attach_ocr_text`, `add_to_collection`):
+//! - **DEFAULT-AUTO write 系** (`add_tag`, `update_notes`, `add_to_collection`):
 //!   既定 `true`（自動承認）。whitelist でそのツール名を `false` にすることで
 //!   都度承認に切り替え可能。
 //!
@@ -64,7 +64,6 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
 pub const OVERRIDABLE_TOOLS: &[&str] = &[
     "add_tag",
     "update_notes",
-    "attach_ocr_text",
     "add_to_collection",
     "create_entry",
     "update_entry",
@@ -92,7 +91,7 @@ pub fn should_auto_approve(tool_name: &str, whitelist_json: Option<&str>) -> boo
     // --- DEFAULT-AUTO write 系 ---
     let default_auto = matches!(
         tool_name,
-        "add_tag" | "update_notes" | "attach_ocr_text" | "add_to_collection"
+        "add_tag" | "update_notes" | "add_to_collection"
     );
     if default_auto {
         // whitelist の値が false なら都度承認に切り替え
@@ -224,9 +223,13 @@ mod tests {
         assert!(should_auto_approve("update_notes", None));
     }
 
+    /// かつて OVERRIDABLE_TOOLS に居た死にキー。この名前のツールは一度も定義されて
+    /// おらず（実在するのは `ocr_pdf`）、未知ツールとして要承認に落ちること。
     #[test]
-    fn attach_ocr_text_defaults_to_auto() {
-        assert!(should_auto_approve("attach_ocr_text", None));
+    fn attach_ocr_text_is_an_unknown_tool() {
+        assert!(!should_auto_approve("attach_ocr_text", None));
+        let wl = r#"{"attach_ocr_text": true}"#;
+        assert!(!should_auto_approve("attach_ocr_text", Some(wl)));
     }
 
     #[test]

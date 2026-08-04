@@ -1310,7 +1310,7 @@ Linux のリソースディレクトリ 3 通りを探索（単体テスト 6 �
 
 初版の記述は行番号も規模も実コードとずれていた（§10）。実態は次のとおり。
 
-- seam `regenerate_page_fts_from_lcir` は **`ingestion/mod.rs:1317-1351`**、シグネチャは **`(pool, attachment_id)`**、
+- seam `regenerate_page_fts_from_lcir` は **`ingestion/mod.rs:1416-1450`**（2026-08-04 再計測。#0〜#4 で約 100 行下がった）、シグネチャは **`(pool, attachment_id)`**、
   **本番呼び出し元は 0 件**（テスト 2 箇所のみ）。設計概観 §8 の「(B) 化は差し替える 1 行」は撤回が要る。
 - `fulltext` に**内容を書く**本番経路は **6 call site / 4 コードパス**:
   `extract_and_index` ×3（`lib.rs:736` add_attachment / `lib.rs:788` download_arxiv_pdf /

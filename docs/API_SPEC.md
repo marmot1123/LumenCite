@@ -899,7 +899,9 @@ DB を `PRAGMA query_only = ON` の読取専用プールで直接開く（読取
 
 1. `--force` → 直接 DB 書込（アプリ起動中なら一覧陳腐化の旨を stderr 警告）。
 2. MCP サーバー到達可（keychain トークン有 + `ping` 成功）→ **HTTP 委譲**。サーバーが `mcp_server.write_enabled` ゲート適用＋`.bib` 同期＋GUI 更新。ゲート off なら「有効化 or `--force`」を明示。
-3. 到達不可 → **直接 DB 書込** + `.bib` 同期（best-effort）。
+3. 到達不可 → **GUI 生存を独立に判定**（`GUI_LOCK_FILE` の advisory ロックを try_lock・CR-011）。
+   - GUI 停止を確認できた → **直接 DB 書込** + `.bib` 同期（best-effort）。
+   - GUI 起動中（MCP は無効だがアプリは開いている）→ **fail closed** で `--force` を要求。MCP 到達不可を一律「アプリ停止」と解釈して live DB に書き、UI 陳腐化 / WAL 競合を招くのを防ぐ。判定不能の異常時も安全側（起動中扱い）。
 
 どちらも `tools/call`（JSON-RPC）を組み、HTTP は POST、直接は `mcp_server::handle_rpc_with_write(pool, dir, write_on=true, req)` を呼ぶ（ツール実装・監査ログ・`mutated` を共有）。ポートは `settings.mcp_server.port`（既定 `DEFAULT_PORT=3917`）、トークンは keychain `mcp_server.token`。
 
