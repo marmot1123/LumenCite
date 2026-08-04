@@ -1405,6 +1405,49 @@ mod tests {
         );
     }
 
+    /// **空入力のページは `state` に触れない**（ゲート ②a の変異 S7）。
+    ///
+    /// これは doc コメントが明記している不変量で、しかも 8d-2 の 2 pass 同値性が丸ごと
+    /// これに乗っている ── 抽出側はテキスト抽出に失敗したページで `recognize_blocks` を
+    /// **呼ばずに**次へ進み、build 側は `blocks` が空のまま**呼ぶ**。空入力で state が
+    /// 動くと、テキスト抽出に失敗したページを 1 枚挟んだだけで両者の分類が食い違う。
+    /// 変異（空の早期 return で state をリセット）は 1,051 本すべて緑のまま通っていた。
+    #[test]
+    fn an_empty_page_does_not_reset_the_recognizer_state() {
+        // 行間の中央値で段落を割るので、2 行だけだと 1 ブロックに畳まれて
+        // "References" が見出しにならない。既存テストと同じ 4 行の形にする。
+        let refs = build_page(&[
+            ("References", 12.0, 0.0),
+            ("1. Smith, J. and Doe, A. Foo Bar. 2020", 10.0, H),
+            ("2. Lee, C. and Kim, D. Baz Qux. 2021", 10.0, G),
+            ("3. Park, E. Quux Corge Grault. 2022", 10.0, G),
+        ]);
+        let after = build_page(&[("4. Adams, F. Garply Waldo. 2023", 10.0, 0.0)]);
+
+        // (a) 空ページを挟んで回す（= build 側の pass）。
+        let mut with_empty = RecognizerState::new();
+        assert_eq!(recognize_page(&refs, &mut with_empty)[0].kind, NodeKind::Heading);
+        let empty = page(Vec::new());
+        assert!(recognize_page(&empty, &mut with_empty).is_empty());
+        let a = recognize_page(&after, &mut with_empty);
+
+        // (b) 空ページを飛ばして回す（= 抽出側の pass）。
+        let mut skipping = RecognizerState::new();
+        recognize_page(&refs, &mut skipping);
+        let b = recognize_page(&after, &mut skipping);
+
+        assert_eq!(
+            a[0].kind,
+            NodeKind::BibliographyEntry,
+            "空ページで参考文献モードが失われている（失われると番号付き節に誤検出される）"
+        );
+        assert_eq!(
+            a.iter().map(|x| x.kind).collect::<Vec<_>>(),
+            b.iter().map(|x| x.kind).collect::<Vec<_>>(),
+            "空ページを挟むかどうかで分類が変わってはいけない"
+        );
+    }
+
     #[test]
     fn references_make_bibliography_entries_and_suppress_numbering() {
         let p = build_page(&[

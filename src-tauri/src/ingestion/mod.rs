@@ -3341,6 +3341,96 @@ mod tests {
         }
     }
 
+    /// 同じ図番号の caption が 2 つあり、片方だけがラスタ図と結ばれている版
+    /// （実 DB に 18 版・27 組）。ベクター図に番号を渡すとこの形で既存の辺が消える。
+    fn extracted_with_two_figure_ones() -> pdf::ExtractedDocument {
+        let mut doc = extracted_with_raster_and_vector();
+        let page = &mut doc.pages[0];
+        page.blocks[0].text = "Figure 1: raster.".to_string();
+        page.blocks[1].text = "As shown in Figure 1, the setup works.".to_string();
+        page.blocks[4].text = "Figure 1: vector.".to_string();
+        doc
+    }
+
+    /// **ベクター図は参照グラフの番号索引に入れない**（ゲート ②a の変異 S6）。
+    ///
+    /// `graph::FloatTargets` は同じ番号が 2 つのノードに付くとその番号ごと墓標（`None`）に
+    /// するので、ベクター図にも番号を渡すと「同番号の図 caption が 2 つあり片方だけが
+    /// ラスタ図と結ばれている」版で**既存の `refers_to_figure` 辺が消える**。
+    /// 変異（ベクターにも番号を渡す）は 1,051 本すべて緑のまま通っていた ── 既存テストは
+    /// payload しか見ておらず、参照グラフを 1 行も assert していなかった。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_vector_figure_does_not_tombstone_a_number_a_raster_figure_owns(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let vid = insert_version_from(&pool, att, "ck-dup", None, &extracted_with_two_figure_ones())
+            .await;
+
+        let figures: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, COALESCE(payload_json,'') FROM document_nodes
+             WHERE document_version_id = ? AND node_kind = 'figure' ORDER BY ordinal",
+        )
+        .bind(vid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(figures.len(), 2, "ラスタ 1 + ベクター 1");
+        let (raster_id, raster_payload) = &figures[0];
+        // 番号自体は両方の payload に載る（`get_figures` の表示用）。索引に入れないだけ。
+        assert!(raster_payload.contains("\"figure_number\":\"1\""), "{raster_payload}");
+        assert!(figures[1].1.contains("\"figure_number\":\"1\""), "{:?}", figures[1].1);
+
+        let doc = load_lcir_document(&pool, att).await.unwrap().unwrap();
+        let refs: Vec<_> = doc
+            .relations
+            .iter()
+            .filter(|r| r.relation_type == "refers_to_figure")
+            .collect();
+        assert_eq!(
+            refs.len(),
+            1,
+            "本文の \"Figure 1\" はラスタ図に解決する（ベクターに番号を渡すと墓標で 0 本になる）: {refs:?}"
+        );
+        assert_eq!(refs[0].to_node_id, *raster_id);
+    }
+
+    /// 2 段ペアリングの戻り値は `raster ++ vector` の連結順なので、**元の並びへ引き直す**
+    /// 必要がある（ゲート ②a の変異 S8）。
+    ///
+    /// 本番の `compose_figure_regions` は必ずラスタを先に置くため引き直しは現状恒等写像で、
+    /// `let at = fi` に潰しても 1,051 本が全緑だった＝この関数の正しさが別ファイルの
+    /// 並び規約だけに支えられていた。ここでは**ベクターが先に並んだ入力**を与えて、
+    /// 引き直し自体を留める（並び規約の方は
+    /// `figures::tests::composed_regions_always_list_raster_before_vector` で別に留める）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn caption_pairs_survive_a_vector_first_region_order(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let mut doc = extracted_with_raster_and_vector();
+        doc.pages[0].image_regions.reverse(); // [vector, raster]
+        let vid = insert_version_from(&pool, att, "ck-vecfirst", None, &doc).await;
+
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT COALESCE(payload_json,'') FROM document_nodes
+             WHERE document_version_id = ? AND node_kind = 'figure' ORDER BY ordinal",
+        )
+        .bind(vid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("\"region_source\":\"vector\""), "{:?}", rows[0]);
+        assert!(
+            rows[0].contains("\"figure_number\":\"2\""),
+            "先頭のベクター領域は下側の caption と結ぶ: {:?}",
+            rows[0]
+        );
+        assert!(!rows[1].contains("region_source"), "{:?}", rows[1]);
+        assert!(
+            rows[1].contains("\"figure_number\":\"1\""),
+            "後ろのラスタ領域は上側の caption と結ぶ: {:?}",
+            rows[1]
+        );
+    }
+
     /// Phase 8d-2 の build 面: 2 段ペアリングの添字の引き直し・由来ごとの confidence・
     /// `region_source` payload・**ベクター図を参照グラフの番号索引に入れないこと**を通す。
     #[sqlx::test(migrations = "./migrations")]

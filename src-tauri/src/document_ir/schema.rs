@@ -57,7 +57,13 @@ pub const EXTRACTOR_NAME: &str = "lumencite-pdfium";
 ///   crop は `vec-` プレフィクスで別採番し、caption は 2 段でペアリングする）。
 ///   図領域が増えるので旧版は supersede される（実測: 生存 138 版で 1,248 → 1,628 領域・
 ///   図 caption とのペア 281 → 661・既存領域の移動と消滅は 0）。
-pub const EXTRACTOR_VERSION: &str = "0.12.0";
+/// - `0.13.0`: ゲート ②a の指摘。**XObjectForm の子 path にもクリップを掛ける**。8d-2 は
+///   トップレベル path にだけクリップを交差させており、`\includegraphics{*.pdf}` の内側にある
+///   axes クリップ付きの巨大 path が生 bbox のまま可視インクの hull に入っていた
+///   （実測: 純ベクター form 171 個・クリップ付きの子 2,872 件。hull が縮む form が 73 個あり、
+///   最悪は 43,462×18,575pt → 216.7×119.3pt ＝ クランプの 50% ルールで**図が丸ごと消えていた**）。
+///   ベクター図領域が変わるので旧版は supersede される。
+pub const EXTRACTOR_VERSION: &str = "0.13.0";
 
 /// TeX 抽出器の名前（Phase 4・arXiv TeX ソース）。pdfium 版と**別 `document_version` として併存**
 /// する（ADR #8）。supersede・rebuild 判定は抽出器ごとに独立。
