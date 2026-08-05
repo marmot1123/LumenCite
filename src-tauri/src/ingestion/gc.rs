@@ -162,6 +162,16 @@ async fn delete_version_children(
         }
     }
 
+    // **「消す前の数」ではなく実際に減った数を返す。** 前者だとチャンクのループが
+    // 途中で抜けても報告値は満額のままで、取りこぼしが集計に出ない
+    // （行ごと消す版では最後の版削除がカスケードで後始末をしてしまうため、
+    //   残数を数えるこの引き算だけが取りこぼしを可視化する）。
+    let nodes_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM document_nodes WHERE document_version_id = ?")
+            .bind(version_id)
+            .fetch_one(pool)
+            .await?;
+
     // ノードにぶら下がらない版直下の行（ノード削除では消えない）。
     let mut tx = pool.begin().await?;
     let asset_rows = sqlx::query("DELETE FROM assets WHERE document_version_id = ?")
@@ -179,7 +189,7 @@ async fn delete_version_children(
     }
     tx.commit().await?;
 
-    Ok((nodes_before, asset_rows))
+    Ok((nodes_before - nodes_after, asset_rows))
 }
 
 /// 版の行そのものを消す。`parent_version_id` は `NO ACTION` なので、
@@ -808,9 +818,14 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(
+            storage_stats::gc_target_versions(&pool).await.unwrap().is_empty(),
+            "そもそも対象一覧に入らない（再評価で拾うのではなく）"
+        );
         let dir = std::env::temp_dir();
         let out = run_gc(&pool, &dir, noop).await.unwrap();
         assert_eq!(out.versions_removed, 0);
+        assert_eq!(out.versions_skipped, 0);
         assert!(version_exists(&pool, old).await);
     }
 
@@ -868,9 +883,18 @@ mod tests {
         let only = insert_ver(&pool, att, "ck", ExtractionStatus::Superseded, None).await;
         insert_tree(&pool, only, 1).await;
 
+        // **対象一覧に入らないこと自体を主張する。** 削除直前の再評価も同じ条件を見るので、
+        // 「結果として消えていない」だけだと述語 (iii) が効いているのか
+        // 再評価が拾っているのか区別できない（変異 S2 がここで生き残った）。
+        assert!(
+            storage_stats::gc_target_versions(&pool).await.unwrap().is_empty(),
+            "そもそも対象一覧に入らない"
+        );
+
         let dir = std::env::temp_dir();
         let out = run_gc(&pool, &dir, noop).await.unwrap();
         assert_eq!(out.versions_removed, 0);
+        assert_eq!(out.versions_skipped, 0, "再評価で拾うのではなく最初から対象外");
         assert!(version_exists(&pool, only).await);
         assert_eq!(nodes_of(&pool, only).await, 3);
         assert_eq!(
@@ -956,6 +980,85 @@ mod tests {
         assert_eq!(out.nodes_removed, 22, "報告値は削除前の実数");
         assert_eq!(nodes_of(&pool, old).await, 0);
         assert!(!version_exists(&pool, old).await);
+    }
+
+    /// **チャンクの中に親と子が同居しても取りこぼさない。**
+    ///
+    /// `DELETE ... WHERE id IN (SELECT ... LIMIT n)` は副問い合わせを先に評価するので、
+    /// 選ばれた集合の中に親子が居ると、親の削除が子を CASCADE で消し、
+    /// **`rows_affected` は `n` より小さくなる**（カスケードは数えられない）。
+    /// ここで「`rows_affected < chunk` なら終わり」と判定すると、まだ残っている
+    /// ノードを置き去りにしたままループを抜ける。だから**残数で判定している**。
+    ///
+    /// 罠が 2 つある。
+    /// ①**木の根から始まる素直な形だと 1 回のカスケードで全部消えてしまい**、
+    ///   この違いが現れない。だから**平坦なノードの後ろに親子の組を置いて**
+    ///   チャンク境界に親子を跨がせる。
+    /// ②**行ごと消す版だと、最後の版削除がカスケードで取りこぼしを片付けてしまう**。
+    ///   だから carry 元にして**行を残す版（tombstone）**で試す。
+    ///   ①だけ・②だけでは変異が生き残る（実際に 2 回生き残らせた）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn gc_does_not_stop_early_when_a_chunk_cascades_into_itself(pool: SqlitePool) {
+        let att = setup_attachment(&pool, "P").await;
+        let old = insert_ver(&pool, att, "ck-old", ExtractionStatus::Superseded, None).await;
+        let live = insert_ver(&pool, att, "ck-new", ExtractionStatus::Completed, Some(old)).await;
+        let live_page = insert_tree(&pool, live, 0).await;
+        // old を carry 元にして行を残させる（= 取りこぼしが後始末で隠れない）。
+        crate::db::node_alt_texts::insert_alt_text(
+            &pool,
+            &crate::db::node_alt_texts::NewAltText {
+                node_id: live_page,
+                document_version_id: live,
+                source_asset_sha256: "sha",
+                text: "carry",
+                origin: Origin::LlmInference.as_str(),
+                confidence: None,
+                model: None,
+                carried_from_version_id: Some(old),
+            },
+        )
+        .await
+        .unwrap();
+
+        let flat = |i: i64| NewDocumentNode {
+            document_version_id: old,
+            parent_id: None,
+            node_kind: NodeKind::Paragraph.as_str(),
+            ordinal: i,
+            plain_text: Some("x"),
+            language: None,
+            confidence: None,
+            origin: Some(Origin::PdfTextLayer.as_str()),
+            payload_json: None,
+        };
+        // id 昇順: 平坦 3 個 → 平坦 1 個 + 親 + 子 2 個 → 平坦 2 個。
+        for i in 0..4 {
+            insert_node(&pool, &flat(i)).await.unwrap();
+        }
+        let parent = insert_node(&pool, &flat(4)).await.unwrap();
+        for i in 0..2 {
+            insert_node(
+                &pool,
+                &NewDocumentNode {
+                    parent_id: Some(parent),
+                    ordinal: i,
+                    ..flat(i)
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for i in 5..7 {
+            insert_node(&pool, &flat(i)).await.unwrap();
+        }
+        assert_eq!(nodes_of(&pool, old).await, 9);
+
+        let dir = std::env::temp_dir();
+        let out = run_gc_with_chunk(&pool, &dir, 3, noop).await.unwrap();
+        assert_eq!(out.versions_tombstoned, 1, "前提: 行を残す版として処理される");
+        assert_eq!(out.nodes_removed, 9, "報告値は実際に減った数");
+        assert_eq!(nodes_of(&pool, old).await, 0, "1 ノードも置き去りにしない");
+        assert!(version_exists(&pool, old).await, "行は残る");
     }
 
     /// 進捗は版単位で 0 から total まで流れる。
@@ -1158,6 +1261,139 @@ mod tests {
         assert_eq!(out.nodes_removed, preview.nodes, "見積りと実削除が一致する");
         assert_eq!(out.versions_skipped, 0);
         assert_eq!(nodes_of(&pool, protected).await, 11, "守られた版は無傷");
+    }
+
+    // ---- 実 DB のコピーに本番のコードをそのまま流すプローブ ----
+
+    /// 実ライブラリのコピーで GC を完走させ、件数・所要時間・回収量を測る。
+    ///
+    /// **本番の `run_gc` をそのまま呼ぶ**（第 2 の実装を作らない）。手書きの SQL で
+    /// 測ると、述語もチャンクの切り方も本番と違うものを測ることになる。
+    ///
+    /// ```sh
+    /// cp ~/Library/Application\ Support/com.lumencite.app/lumencite.db "$TMPDIR/gc-probe.db"
+    /// cd src-tauri && LCIR_GC_DB="$TMPDIR/gc-probe.db" \
+    ///   cargo test --lib lcir_gc_on_a_copy_of_the_real_library -- --ignored --nocapture
+    /// rm -f "$TMPDIR"/gc-probe.db*
+    /// ```
+    ///
+    /// **コピーは `$TMPDIR` に置くこと。** スクラッチパッド配下は `sqlite3` からは開けるのに
+    /// `cargo test` のプロセスからは `code 14 unable to open database file` になり、
+    /// Dropbox 配下は 761MB が同期対象になる。
+    #[tokio::test]
+    #[ignore = "manual probe against a copy of the real library; needs LCIR_GC_DB"]
+    async fn lcir_gc_on_a_copy_of_the_real_library() {
+        let Ok(db) = std::env::var("LCIR_GC_DB") else {
+            eprintln!("skip: set LCIR_GC_DB=<実 DB のコピー>");
+            return;
+        };
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&db)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(30));
+        let pool = SqlitePool::connect_with(opts).await.unwrap();
+
+        // 1 行目は libtest に食われるので捨て行を置く。
+        eprintln!("GC_PROBE_BEGIN");
+
+        let before = storage_stats::db_size(&pool).await.unwrap();
+        let preview = storage_stats::gc_preview(&pool).await.unwrap();
+        eprintln!(
+            "GC_BEFORE file={} used={} free={} versions={} removable={} tombstoned={} \
+             nodes={} asset_rows={} asset_bytes={} alt_protected={} orphan_skipped={}",
+            before.file_bytes(),
+            before.used_bytes(),
+            before.free_bytes(),
+            preview.versions,
+            preview.versions_removable,
+            preview.versions_tombstoned,
+            preview.nodes,
+            preview.asset_rows,
+            preview.asset_bytes,
+            preview.alt_texts_protected,
+            preview.orphan_versions_skipped,
+        );
+
+        // 索引の有無で所要時間が 2.6 倍変わるので、張ったかどうかを明示して測る。
+        if std::env::var("LCIR_GC_NO_INDEX").is_err() {
+            crate::db::symbols::try_create_scope_node_index(&pool)
+                .await
+                .unwrap();
+            eprintln!("GC_INDEX symbols_scope_node=created");
+        } else {
+            eprintln!("GC_INDEX symbols_scope_node=absent");
+        }
+
+        let started = std::time::Instant::now();
+        let slowest = std::sync::Mutex::new((0i64, 0f64));
+        let last = std::sync::Mutex::new(std::time::Instant::now());
+        let app_dir = std::env::temp_dir().join("lcir-gc-probe-appdir");
+        let out = run_gc(&pool, &app_dir, |done, _total| {
+            let mut l = last.lock().unwrap();
+            let dt = l.elapsed().as_secs_f64();
+            *l = std::time::Instant::now();
+            let mut s = slowest.lock().unwrap();
+            if dt > s.1 {
+                *s = (done, dt);
+            }
+        })
+        .await
+        .unwrap();
+        let elapsed = started.elapsed().as_secs_f64();
+        let (slow_at, slow_secs) = *slowest.lock().unwrap();
+
+        let after = storage_stats::db_size(&pool).await.unwrap();
+        let live_nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM document_nodes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let live_frags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_fragments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let alt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_alt_texts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let sup: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM document_versions WHERE extraction_status = 'superseded'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        eprintln!(
+            "GC_AFTER elapsed_s={elapsed:.2} slowest_version_s={slow_secs:.2} at={slow_at} \
+             removed={} tombstoned={} skipped={} nodes={} asset_rows={} files={} fts_orphans={} \
+             freed={} file={} used={} free={} live_nodes={live_nodes} live_frags={live_frags} \
+             alt_texts={alt} superseded_left={sup}",
+            out.versions_removed,
+            out.versions_tombstoned,
+            out.versions_skipped,
+            out.nodes_removed,
+            out.asset_rows_removed,
+            out.files_trashed,
+            out.fts_orphans_removed,
+            out.freed_bytes,
+            after.file_bytes(),
+            after.used_bytes(),
+            after.free_bytes(),
+        );
+
+        // **外部で分かっている不変量を集計に入れる**（生存確認のセンチネル）。
+        assert_eq!(
+            out.nodes_removed, preview.nodes,
+            "見積りと実削除が一致する（実データでも）"
+        );
+        assert_eq!(alt, 888, "alt text は 1 行も減らない（実 DB の既知の値）");
+        // **GC ではファイルは縮まない**（free page になるだけ）。増える方向には動きうる ──
+        // このプローブは `symbols(scope_node_id)` の索引を張るので、その 1 ページぶん。
+        assert!(
+            after.file_bytes() >= before.file_bytes(),
+            "GC でファイルが縮んではいけない（before={} after={}）",
+            before.file_bytes(),
+            after.file_bytes()
+        );
     }
 
     // ---- 純関数 ----

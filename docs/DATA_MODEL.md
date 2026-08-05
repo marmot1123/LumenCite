@@ -368,7 +368,7 @@ OS キーチェーン側のサービス名: `com.lumencite.app`、アカウン�
 | `source_mime_type` | TEXT NOT NULL | |
 | `extractor_name` / `extractor_version` | TEXT NOT NULL | `lumencite-pdfium`（PDF）/ `lumencite-tex`（arXiv TeX ソース・Phase 4）。version は**抽出ロジックの semver**（抽出器ごとに独立採番・supersede 判定基準・クレート版とは別）。supersede は抽出器をまたがない（別添付に紐づくため） |
 | `config_hash` | TEXT NOT NULL DEFAULT '' | 抽出設定のハッシュ |
-| `parent_version_id` | INTEGER FK → document_versions | supersede チェーン |
+| `parent_version_id` | INTEGER FK → document_versions | supersede チェーン。**`ON DELETE` 指定が無い（= NO ACTION）**ので、この列から指されている版は素朴な `DELETE` では消せない（v1.0.0-p4 の GC は同一 tx の pre-step で NULL 化する）。読み手はリポジトリ内に 0 件 |
 | `extraction_status` | TEXT NOT NULL | `pending`/`processing`/`completed`/`completed_with_warnings`/`failed`/`superseded` |
 | `warnings_json` / `metadata_json` | TEXT | 警告ログ / 座標系記述子・ページ数等 |
 | `created_at` | TEXT | `datetime('now')` |
@@ -512,6 +512,16 @@ paragraph/theorem/proof 等のノードから、それが参照する equation/t
 - 書き込みは **tmp 名 + `sync_all()` + `fs::rename` の原子的パターン**（並行 build の truncate 窓・電源断の torn file を防ぐ）。content_key でディレクトリが決まるため**決定的・冪等**（同一 content_key の再 build は同一パスに上書き）。
 - **GC**: build 成功 commit 後に `.lcir/<attachment_id>/` 直下の現 content_key 以外のサブディレクトリを trash（superseded 版のファイル回収。DB の assets 行は provenance として残す＝読み出しは latest completed のみなので参照されない）。build 失敗時は書いたファイルを best-effort 削除。添付単体削除時は `.lcir/<attachment_id>/` を trash。削除と build の競合で残る孤児はエントリ purge で回収（許容）。
 - **reuse 経路の self-heal**: content_key 一致で reuse する際、当該版の assets 行のファイル存在を確認し、欠損があれば再抽出してファイルのみ再生成（DB 行は sha256/width/height/size_bytes を更新）。それでも `relative_path` の**存在は保証しない**（欠損許容・読み手はファイル欠損に耐えること）。
+  **指紋が動いたら `node_alt_texts.source_asset_sha256` も同一 tx で付け替える**（v1.0.0-p4・debt-16）── 置き去りにすると次の再構築で carry が無言で外れ、課金済みの説明を捨てて再課金する。
+  `content_key` は `config_hash` が `""` 固定で pdfium の tag も含まないので、**「同一 content_key なら同じ絵」は保証されていない**（debt-20）。
+  なお `metadata_json`（`render_target_width` 等）は heal で更新されない（debt-29）。
+- **superseded 版の GC**（v1.0.0-p4）: 版を回収するとき、消してよい crop は
+  **「削除対象版の `relative_path` 集合 − 生存版の `relative_path` 集合」**で決める。
+  ディレクトリのキーは `(attachment_id, content_key[..16])` であって版 id ではなく、
+  `(attachment_id, content_key)` の UNIQUE 索引は起動時 best-effort なので、
+  **同一ディレクトリを superseded 版と生存版が共有しうる**（content_key からディレクトリ名を
+  組んで消すと生存版の crop を消す）。`assets.document_version_id` は CASCADE なので
+  **削除前にパスを控える**こと。
 
 #### `node_alt_texts` — 図の代替テキスト（Phase 8c / migration 0020）
 

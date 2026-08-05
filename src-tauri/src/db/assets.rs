@@ -559,6 +559,39 @@ mod tests {
         assert_eq!(alt_sha_of(&pool, node).await, "same-sha");
     }
 
+    /// 版スコープが効いていること。
+    ///
+    /// **`node_alt_texts.document_version_id` が「そのノードの版」と一致することを
+    /// スキーマは強制していない**（両方とも独立した列で、揃えているのは挿入経路の作法だけ）。
+    /// 通常のデータではノードリンク条件だけで版は絞れてしまうので、ここでは
+    /// その不変条件が破れた行を 1 つ置いて、版スコープが独立に効くことを固定する。
+    /// 破れていた場合に版スコープが無いと、**他の版の行を書き換える**。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refresh_scopes_the_retarget_to_the_version_even_if_the_row_is_inconsistent(
+        pool: SqlitePool,
+    ) {
+        let att = setup_attachment(&pool, "P").await;
+        let v1 = setup_version(&pool, att, "ck1").await;
+        let v2 = setup_version(&pool, att, "ck2").await;
+        let rel = "attachments/1/.lcir/1/deadbeef/fig-p001-00.png";
+        let node = setup_figure_with_alt_text(&pool, v1, rel, "old-sha", "llm_inference").await;
+        // v1 のノードに紐づく alt text が、版としては v2 を指している行（不整合）。
+        sqlx::query("UPDATE node_alt_texts SET document_version_id = ? WHERE node_id = ?")
+            .bind(v2)
+            .bind(node)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // v1 側にも asset を持たせて、ノードリンク条件だけなら当たる状態にする。
+        let n = refresh_asset_file(&pool, v1, rel, "new-sha", (900, 700), 2000)
+            .await
+            .unwrap();
+
+        assert_eq!(n.assets, 1);
+        assert_eq!(n.alt_texts, 0, "版が違う行は付け替えない");
+        assert_eq!(alt_sha_of(&pool, node).await, "old-sha");
+    }
+
     /// **別の絵を指している alt text は付け替えない。**
     ///
     /// 同じ版・同じノードでも、alt text の指紋がこの crop の旧指紋と一致しないなら

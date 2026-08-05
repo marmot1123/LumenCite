@@ -1269,7 +1269,10 @@ function DataTab() {
               lcirBatch !== null ||
               fetchTexRunning ||
               altTextRunning ||
-              storage?.gc.versions === 0
+              // 未取得（null）のうちも押させない。押しても確認ボックスは
+              // `confirmGc && storage` で出ないので、無反応のボタンになるため。
+              !storage ||
+              storage.gc.versions === 0
             }
           >
             {gcRunning
