@@ -58,6 +58,49 @@ const ACCENT_SWATCHES: { id: AccentName; color: string; labelKey: "settings.appe
 ];
 
 
+/** `lcir_storage_stats` の返り値（Rust 側は snake_case のまま出す）。 */
+interface StorageStats {
+  file_bytes: number;
+  used_bytes: number;
+  free_bytes: number;
+  gc: {
+    versions: number;
+    versions_removable: number;
+    versions_tombstoned: number;
+    nodes: number;
+    asset_rows: number;
+    asset_bytes: number;
+    alt_texts_protected: number;
+    carry_refs_protected: number;
+    orphan_versions_skipped: number;
+  };
+}
+
+/** `run_lcir_gc` の返り値。 */
+interface GcOutcome {
+  versions_removed: number;
+  versions_tombstoned: number;
+  versions_skipped: number;
+  nodes_removed: number;
+  asset_rows_removed: number;
+  files_trashed: number;
+  fts_orphans_removed: number;
+  freed_bytes: number;
+}
+
+/** バイト数を人が読める単位にする（1 KiB = 1024 B・小数 1 桁）。 */
+function formatBytes(n: number): string {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let v = Math.abs(n);
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  const s = i === 0 ? String(Math.round(v)) : v.toFixed(1);
+  return `${n < 0 ? "-" : ""}${s} ${units[i]}`;
+}
+
 function Section({ title, description, children }: {
   title: string;
   description?: string;
@@ -728,6 +771,27 @@ function DataTab() {
       void un.then((f) => f());
     };
   }, []);
+  // ストレージの内訳と、superseded 版の GC（v1.0.0-p4）。
+  // GC は非可逆なので、確認は復元と同じインライン danger ボックスにする
+  // （window.confirm は WKWebView で素通りすることがある）。
+  const [storage, setStorage] = useState<StorageStats | null>(null);
+  const [gcRunning, setGcRunning] = useState(false);
+  const [gcProgress, setGcProgress] = useState<{ done: number; total: number } | null>(null);
+  const [confirmGc, setConfirmGc] = useState(false);
+  // 実測 0.06 秒の COUNT だけで組んであるので mount で引いてよい
+  // （表ごとの内訳を出す dbstat は数秒かかるので使っていない）。
+  const refreshStorage = () => {
+    invoke<StorageStats>("lcir_storage_stats").then(setStorage).catch(() => {});
+  };
+  useEffect(refreshStorage, []);
+  useEffect(() => {
+    const un = listen<{ done: number; total: number }>("lcir-gc-progress", (e) =>
+      setGcProgress(e.payload),
+    );
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
 
   const errMsg = (e: unknown) =>
     typeof e === "string" ? e : (e as Error)?.message ?? String(e);
@@ -980,6 +1044,44 @@ function DataTab() {
     }
   };
 
+  const handleGcConfirmed = async () => {
+    setConfirmGc(false);
+    setGcRunning(true);
+    setMessage(null);
+    setError(null);
+    setGcProgress(null);
+    try {
+      const r = await invoke<GcOutcome>("run_lcir_gc");
+      if (r.versions_removed === 0 && r.versions_tombstoned === 0) {
+        setMessage(t("settings.data.gcNone"));
+      } else {
+        setMessage(
+          t("settings.data.gcDone", {
+            removed: r.versions_removed,
+            tombstoned: r.versions_tombstoned,
+            nodes: r.nodes_removed.toLocaleString(),
+            freed: formatBytes(r.freed_bytes),
+          }) +
+            // 0 でないときだけ出す（0 が普通なので、常時表示すると重要な値が埋もれる）。
+            (r.versions_skipped > 0
+              ? ` ${t("settings.data.gcSkipped", { skipped: r.versions_skipped })}`
+              : ""),
+        );
+      }
+    } catch (e) {
+      const s = errMsg(e);
+      setError(
+        s.includes("already_running")
+          ? t("settings.data.gcRunning")
+          : t("settings.data.gcError", { error: s }),
+      );
+    } finally {
+      setGcRunning(false);
+      setGcProgress(null);
+      refreshStorage();
+    }
+  };
+
   return (
     <>
       <Section title={t("settings.data.backup")} description={t("settings.data.backupDesc")}>
@@ -1048,7 +1150,7 @@ function DataTab() {
         <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
           <SecondaryBtn
             onClick={() => handleLcirBatch("build")}
-            disabled={!lcirEnabled || lcirBatch !== null}
+            disabled={!lcirEnabled || lcirBatch !== null || gcRunning}
           >
             {lcirBatch === "build"
               ? lcirProgress
@@ -1061,7 +1163,7 @@ function DataTab() {
           </SecondaryBtn>
           <SecondaryBtn
             onClick={() => handleLcirBatch("rebuild")}
-            disabled={!lcirEnabled || lcirBatch !== null}
+            disabled={!lcirEnabled || lcirBatch !== null || gcRunning}
           >
             {lcirBatch === "rebuild"
               ? lcirProgress
@@ -1074,7 +1176,7 @@ function DataTab() {
           </SecondaryBtn>
           <SecondaryBtn
             onClick={handleFetchTex}
-            disabled={!lcirEnabled || fetchTexRunning || lcirBatch !== null}
+            disabled={!lcirEnabled || fetchTexRunning || lcirBatch !== null || gcRunning}
           >
             {fetchTexRunning
               ? texProgress
@@ -1106,7 +1208,7 @@ function DataTab() {
         <div style={{ marginTop: 6 }}>
           <SecondaryBtn
             onClick={handleGenerateAltTexts}
-            disabled={!lcirEnabled || !altTextEnabled || altTextRunning}
+            disabled={!lcirEnabled || !altTextEnabled || altTextRunning || gcRunning}
           >
             {altTextRunning
               ? altTextProgress
@@ -1118,6 +1220,90 @@ function DataTab() {
               : t("settings.data.altText")}
           </SecondaryBtn>
         </div>
+      </Section>
+
+      {/* ストレージ（v1.0.0-p4）。**LCIR Section の内側に入れない** —
+          `lcir.enabled` を切った人ほど「もう要らない旧版が場所を食っている」を
+          見たいので、GC と容量表示はフラグで gate しない。 */}
+      <Section title={t("settings.data.storage")} description={t("settings.data.storageDesc")}>
+        {storage && (
+          <div style={{ fontSize: 11.5, color: "var(--text-mute)", lineHeight: 1.7 }}>
+            <div>
+              {t("settings.data.storageSize", {
+                file: formatBytes(storage.file_bytes),
+                used: formatBytes(storage.used_bytes),
+                free: formatBytes(storage.free_bytes),
+              })}
+            </div>
+            {storage.gc.versions > 0 ? (
+              <div>
+                {t("settings.data.storageReclaimable", {
+                  versions: storage.gc.versions,
+                  nodes: storage.gc.nodes.toLocaleString(),
+                })}
+                {storage.gc.versions_tombstoned > 0 && (
+                  <> {t("settings.data.storageTombstone", {
+                    tombstoned: storage.gc.versions_tombstoned,
+                  })}</>
+                )}
+              </div>
+            ) : (
+              <div>{t("settings.data.storageNothingToReclaim")}</div>
+            )}
+            {/* 安全述語。0 が正常なので、0 でないときだけ出す。 */}
+            {storage.gc.alt_texts_protected > 0 && (
+              <div>
+                {t("settings.data.storageProtected", {
+                  altTexts: storage.gc.alt_texts_protected,
+                })}
+              </div>
+            )}
+          </div>
+        )}
+        <div style={{ marginTop: 8 }}>
+          <SecondaryBtn
+            onClick={() => setConfirmGc(true)}
+            disabled={
+              gcRunning ||
+              confirmGc ||
+              lcirBatch !== null ||
+              fetchTexRunning ||
+              altTextRunning ||
+              storage?.gc.versions === 0
+            }
+          >
+            {gcRunning
+              ? gcProgress
+                ? t("settings.data.gcBusyProgress", {
+                    done: gcProgress.done,
+                    total: gcProgress.total,
+                  })
+                : t("settings.data.gcBusy")
+              : t("settings.data.gc")}
+          </SecondaryBtn>
+        </div>
+        {confirmGc && storage && (
+          <div style={{
+            padding: "10px 12px", borderRadius: 6, marginTop: 8,
+            background: "var(--danger-bg)", border: "1px solid var(--danger-border)",
+          }}>
+            {/* **予告は行数で出す。** GC 前に「何 MB 空く」は按分推定しか作れず、
+                実測で 6.5% 上振れした（free page になるのは丸ごと空いたページだけ）。
+                バイトは実行後に freelist の実測差分として報告する。 */}
+            <div style={{ fontSize: 12, color: "var(--text)", lineHeight: 1.55, marginBottom: 8 }}>
+              {t("settings.data.gcConfirm", {
+                versions: storage.gc.versions,
+                nodes: storage.gc.nodes.toLocaleString(),
+              })}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <SecondaryBtn onClick={() => setConfirmGc(false)}>{t("common.cancel")}</SecondaryBtn>
+              <SecondaryBtn onClick={handleGcConfirmed}>
+                {t("settings.data.gcProceed")}
+              </SecondaryBtn>
+            </div>
+          </div>
+        )}
       </Section>
 
       {message && (

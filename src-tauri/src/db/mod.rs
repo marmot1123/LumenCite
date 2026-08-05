@@ -15,6 +15,7 @@ pub mod node_alt_texts;
 pub mod node_relations;
 pub mod settings;
 pub mod source_fragments;
+pub mod storage_stats;
 pub mod symbols;
 pub mod tags;
 

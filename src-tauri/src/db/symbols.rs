@@ -111,6 +111,31 @@ pub async fn occurrences_for_version(
     .await
 }
 
+/// `symbols(scope_node_id)` に索引を張る（migration 0018 の抜け・v1.0.0-p4）。
+///
+/// `scope_node_id` は `document_nodes(id)` を `ON DELETE SET NULL` で参照している。
+/// SQLite は**子キーに索引が無いと親 1 行の削除ごとに子表を全走査する**ので、
+/// LCIR の版を消すと `symbols` の全走査が削除ノード数だけ繰り返される
+/// （実 DB では 2.21M × 356 行）。`document_nodes` を参照する子キーで索引が無いのは
+/// ここ 1 本だけで、0018 は `version` と `defined_at` にしか張っていない。
+///
+/// 実測（実 DB のコピーで superseded 145 版を GC）: **125 秒 → 48 秒**、
+/// 1 版あたり最大 **16.7 秒 → 5.7 秒**、5 秒超の版 6 → 2。
+/// GC 以外でも効く（エントリ削除 → 添付 → 版のカスケードは同じ経路を通る）。
+///
+/// migration ではなく起動時の `CREATE INDEX IF NOT EXISTS` にしてあるのは、
+/// **v1.0.0 の migration を 0 件に保つ**ため（配布版 v0.10.0 と DB を共有しており、
+/// `_sqlx_migrations` が進むと旧バイナリが `NewerSchema` で起動不能になる）。
+/// 索引の追加は `_sqlx_migrations` を動かさないので旧バイナリと併用できる。
+/// UNIQUE ではないので既存データがどうあっても失敗しない
+/// （`try_create_content_key_unique_index` と違い重複チェックが要らない）。
+pub async fn try_create_scope_node_index(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_symbols_scope_node ON symbols(scope_node_id)")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
