@@ -877,9 +877,13 @@ function DataTab() {
     setMessage(null);
     setError(null);
     try {
-      const r = await invoke<{ total: number; indexed: number; needs_ocr: number; failed: number }>(
-        "index_missing_attachments",
-      );
+      const r = await invoke<{
+        total: number;
+        indexed: number;
+        needs_ocr: number;
+        failed: number;
+        skipped: number;
+      }>("index_missing_attachments");
       if (r.total === 0) {
         setMessage(t("settings.data.indexMissingNone"));
       } else {
@@ -889,11 +893,51 @@ function DataTab() {
             total: r.total,
             needsOcr: r.needs_ocr,
             failed: r.failed,
+            skipped: r.skipped,
           }),
         );
       }
     } catch (e) {
       setError(t("settings.data.indexMissingError", { error: errMsg(e) }));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /** 全文索引を LCIR の page ノードから張り直す（v1.0.0-p1）。 */
+  const handleRederiveFulltext = async () => {
+    setBusy("rederive_fulltext");
+    setMessage(null);
+    setError(null);
+    try {
+      const r = await invoke<{
+        total: number;
+        derived: number;
+        skipped_ocr: number;
+        skipped_empty: number;
+        skipped_existing: number;
+        failed: number;
+      }>("rederive_fulltext_from_lcir");
+      if (r.total === 0) {
+        setMessage(t("settings.data.fulltextDeriveNone"));
+      } else {
+        setMessage(
+          t("settings.data.fulltextDeriveDone", {
+            derived: r.derived,
+            total: r.total,
+            skippedOcr: r.skipped_ocr,
+            skippedEmpty: r.skipped_empty,
+            failed: r.failed,
+          }),
+        );
+      }
+    } catch (e) {
+      const s = errMsg(e);
+      setError(
+        s.includes("already_running")
+          ? t("settings.data.lcirBatchRunning")
+          : t("settings.data.fulltextDeriveError", { error: s }),
+      );
     } finally {
       setBusy(null);
     }
@@ -1229,6 +1273,28 @@ function DataTab() {
                   })
                 : t("settings.data.altTextBusy")
               : t("settings.data.altText")}
+          </SecondaryBtn>
+        </div>
+        {/* 全文索引の再導出（v1.0.0-p1）。pdfium を使わない純 SQL なので秒オーダーで、
+            進捗イベントは出さない。OCR 由来の索引と本文が空の添付は触らない。 */}
+        <div style={{ fontSize: 11, color: "var(--text-mute)", marginTop: 10, lineHeight: 1.55 }}>
+          {t("settings.data.fulltextDeriveDesc")}
+        </div>
+        <div style={{ marginTop: 6 }}>
+          <SecondaryBtn
+            onClick={handleRederiveFulltext}
+            disabled={
+              !lcirEnabled ||
+              busy !== null ||
+              lcirBatch !== null ||
+              fetchTexRunning ||
+              altTextRunning ||
+              gcRunning
+            }
+          >
+            {busy === "rederive_fulltext"
+              ? t("settings.data.fulltextDeriveBusy")
+              : t("settings.data.fulltextDerive")}
           </SecondaryBtn>
         </div>
       </Section>

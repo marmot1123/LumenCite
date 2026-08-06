@@ -153,16 +153,42 @@ pub async fn run_ocr(
 
     // 5. トランザクションで置き換え。全ページ OCR なら丸ごと、部分 OCR なら
     //    該当ページのみ差し替え（従来は部分 OCR でも全ページ消していた）。
-    match pages {
-        None => crate::db::fulltext::index_attachment(pool, attachment_id, &results).await?,
-        Some(_) => {
-            crate::db::fulltext::update_attachment_pages(pool, attachment_id, &results).await?
-        }
-    }
+    save_ocr_pages(pool, attachment_id, &results, pages.is_some()).await?;
 
     Ok(format!(
         "OCR'd {page_count} page(s); {total_chars} characters indexed for entry {entry_id}."
     ))
+}
+
+/// OCR 結果を保存する。全ページ OCR なら添付ごと置き換え、部分 OCR なら該当ページのみ差し替え。
+///
+/// あわせて**この添付の索引は OCR 由来**だと記録する（p1）。記録しないと、LCIR からの派生や
+/// 添付経路の pdf_extract が後から上書きしてしまう。ページ単位の部分 OCR でも添付ごと
+/// 保護されるのは承知の上での保守側への倒し込み（§2.6-1）── ユーザーが OCR を回した添付は
+/// 「この PDF のテキスト層は信用できない」と明示的に宣言した添付だから。
+pub(crate) async fn save_ocr_pages(
+    pool: &sqlx::SqlitePool,
+    attachment_id: i64,
+    results: &[(i64, String)],
+    partial: bool,
+) -> Result<(), sqlx::Error> {
+    if partial {
+        crate::db::fulltext::update_attachment_pages(pool, attachment_id, results).await?;
+    } else {
+        crate::db::fulltext::index_attachment(pool, attachment_id, results).await?;
+    }
+    // **中身を 1 行も残せなかった OCR では記録しない。** 空文字のページは索引に入らないので
+    // （`replace_pages` / `update_attachment_pages` は空をスキップする）、記録だけ立てると
+    // 「中身 0 行の索引を守り続ける」状態になり、その添付は再索引もできなくなる。
+    if crate::db::fulltext::indexed_page_count(pool, attachment_id).await? == 0 {
+        return crate::db::fulltext::clear_fulltext_source(pool, attachment_id).await;
+    }
+    crate::db::fulltext::set_fulltext_source(
+        pool,
+        attachment_id,
+        crate::db::fulltext::FulltextSource::Ocr,
+    )
+    .await
 }
 
 /// OCR / Vision 用のプロバイダとモデル（未設定なら chat 用にフォールバック）。
@@ -229,6 +255,83 @@ mod tests {
     use crate::db::fulltext::index_attachment;
     use crate::models::EntryInput;
     use sqlx::SqlitePool;
+
+    /// p1: OCR の保存は**全ページ / 部分ページのどちらでも**「この添付は OCR 由来」を
+    /// 記録する。記録しないと LCIR 派生や添付経路の pdf_extract が後から上書きし、
+    /// ユーザーが課金して起こした転写が消える（§2.6-1）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn saving_ocr_marks_the_attachment_as_ocr_sourced(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Scanned book".to_string(),
+                entry_type: "book".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let full = add_attachment(&pool, entry.id, "a/f.pdf", "f.pdf", "application/pdf")
+            .await
+            .unwrap();
+        let partial = add_attachment(&pool, entry.id, "a/p.pdf", "p.pdf", "application/pdf")
+            .await
+            .unwrap();
+
+        save_ocr_pages(&pool, full.id, &[(1, "full transcript".to_string())], false)
+            .await
+            .unwrap();
+        save_ocr_pages(&pool, partial.id, &[(3, "page 3 only".to_string())], true)
+            .await
+            .unwrap();
+
+        for att in [full.id, partial.id] {
+            assert_eq!(
+                crate::db::fulltext::get_fulltext_source(&pool, att)
+                    .await
+                    .unwrap(),
+                Some(crate::db::fulltext::FulltextSource::Ocr),
+                "attachment {att} が OCR 由来として記録されていない"
+            );
+        }
+    }
+
+    /// **中身を 1 行も残せなかった OCR は「OCR 由来」と記録しない。**
+    /// 記録だけ立てると、中身 0 行の索引を守り続けて、その添付は再索引もできなくなる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_ocr_that_transcribed_nothing_does_not_mark_the_attachment(pool: SqlitePool) {
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Blank scan".to_string(),
+                entry_type: "book".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = add_attachment(&pool, entry.id, "a/b.pdf", "b.pdf", "application/pdf")
+            .await
+            .unwrap();
+
+        save_ocr_pages(&pool, att.id, &[(1, "   ".to_string())], false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::db::fulltext::indexed_page_count(&pool, att.id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::db::fulltext::get_fulltext_source(&pool, att.id)
+                .await
+                .unwrap(),
+            None,
+            "守る中身が無いのに記録を立ててはいけない"
+        );
+    }
 
     /// issue #42: 索引済みの PDF を LLM に丸ごと OCR し直させない。
     /// 全ページ OCR は添付の索引を置き換えるので、テキスト層が Vision 出力で消える。

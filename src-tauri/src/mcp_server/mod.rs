@@ -1003,7 +1003,7 @@ fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
                     .join("attachments")
                     .join(job.entry_id.to_string())
                     .join(&att.file_name);
-                crate::db::fulltext::extract_and_index(&pool, abs, att.id).await;
+                crate::ingestion::index_fulltext_for_attachment(&pool, abs, att.id, false).await;
                 if let Some(app) = &app {
                     let _ = app.emit("entries-changed", ());
                 }

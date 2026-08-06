@@ -88,6 +88,8 @@ pub async fn delete_attachment_with_fulltext(
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    // 索引の出どころの記録（settings KV・p1）も同じ tx で落とす。
+    crate::db::fulltext::clear_fulltext_source_tx(&mut tx, id).await?;
     let rows = sqlx::query("DELETE FROM attachments WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)

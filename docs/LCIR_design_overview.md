@@ -108,6 +108,7 @@ LCIR はこれらを失わずに保存する基盤を作る。**最優先は高�
 | v1.0.0 #5 PR-b debt-22（page の制御文字クリーナー） | #83 | `9a0aac5` | 2026-08-04 | — | → `0.14.0` |
 | v1.0.0 #6 p4 superseded 版の GC + 容量可視化 / debt-16 | #84 | `6a976e0` | 2026-08-06 | — | 不変（`0.14.0`・抽出出力は変わらない） |
 | **v1.0.0 #7 実 DB の再構築 + Vision（コード変更なし・記録のみ）** | **#85** | `aca3e61` | 2026-08-06 | — | **実 DB が `0.6.0` → `0.14.0`（138/138）** |
+| v1.0.0 #8 p1 全文検索の索引源を LCIR 優先に / debt-17 | #88 | （後追い） | 2026-08-07 | — | 不変（`0.14.0`・抽出出力は変わらない） |
 
 **#7 は実データを動かした唯一のステップ**（`LCIR_REMAINING_PHASES.md` §2.17）。ここまでの版 bump 5 回は
 すべて**コード側だけ**で、実 DB の LCIR は 8a（`0.6.0`）のまま止まっていた。#7 で図領域 1,198 → **1,629**・
@@ -332,9 +333,9 @@ SQLite が正本だが、export/デバッグ/テスト用に次の JSON を生�
 
 FTS5 は正本ではなく LCIR から生成される検索インデックス、というのが最終形。ただし移行はロードマップ §12 に従い**段階的**に行う。
 
-- **第一段は並走(A)**: 既存 `fulltext` は今まで通り `pdf_extract` → `db::fulltext::index_attachment` で生成し続ける。LCIR は pdfium で**追加の side-build**。フラグ ON でも**検索挙動は変わらない**（実験トグルとして必須）。→ フラグ ON 時は同一 PDF を 2 回抽出（pdf-extract=検索用 / pdfium=LCIR 用）。実験期間の対価として許容。
-- **派生化(B) への seam**: `ingestion::regenerate_page_fts_from_lcir(pool, attachment_id)` を第一段で実装・単体テストした（Phase 1 完了条件「FTS5 を削除しても LCIR から再構築できる」を証明）。ただし既定ソースにはしておらず、**本番呼び出し元は現在も 0 件**（テスト 3 箇所のみ・2026-08-06 再計測）。
-- **「(B) 化は 1 行の差し替え」は撤回する**（2026-07-30 の実コード調査）。実際には ①`fulltext` に**内容を書く**本番経路が **書き込み 5 箇所 / 4 コードパス / 入口 7** ある（`extract_and_index` の 1 箇所に入口 3 経路・`index_attachment` コマンド・`index_missing_attachments`・`run_ocr` ×2。行番号は `LCIR_REMAINING_PHASES.md` の p1 節を正本とする）②`db::fulltext::index_attachment` は先頭で `DELETE FROM fulltext WHERE attachment_id = ?` を無条件に打つので、そのまま差し替えると LCIR が空を返す添付（スキャン本）の索引が丸ごと消える＝非破壊更新への切替が要る ~~③pdfium の `page` ノードは `structure::normalize_ws` を通らないため C0 制御文字を含み、素朴に派生化すると trigram 索引で語が割れて**現状より検索が悪くなる**~~ **解消**（2026-08-04・debt-22・抽出器版 `0.14.0`）。保存点で `structure::clean_page_text` を通す（`\n` / `\t` 以外の C0 を除去 + `\r\n` / `\r` → `\n`・**改行は潰さない**）。実測は非空 5,803 ページ中 **4,570 ページ（78.8%）→ 0**（`fulltext` 側は 13.3%）。索引側にも保険で同じクリーナーを掛けてあるので、#7 の再構築より前に p1 を回しても汚れは入らない。当初案の「page の子 block を連結する」は不要になった④既存コーパスに派生索引を行き渡らせるバッチが存在しない（`attachments_without_completed_lcir` は完了版のある添付を除外し、`attachments_with_outdated_lcir` は版 bump 無しでは 0 件）⑤OCR 由来行を守る手段が無い（`fulltext` に provenance が無く、既存行が OCR 由来かは実 DB からも判定できない）。**規模は 900–1,250 行**（最小スライスでも 400–480 行）。段取り・落とし穴・OCR 保護の 3 択は `docs/LCIR_REMAINING_PHASES.md` の v1.0.0-p1 節を参照。ロードマップ §12 の「新旧品質を比較してから既定化」は維持する（比較自体は実 DB の読み取り専用 SQL だけでできる — LCIR page テキストと `pdf_extract` 由来 `fulltext` は既に同じ DB に共存している）。
+- ~~**第一段は並走(A)**~~ → **(B) 派生化へ移行済み**（2026-08-07・v1.0.0-p1・#8）。第一段では既存 `fulltext` を `pdf_extract` で生成し続け、LCIR は pdfium の**追加 side-build**にしていた（フラグ ON でも検索挙動が変わらない実験トグル）。
+- **派生化(B)（現行）**: pdf_extract を使う本番経路 5 つはすべて **`ingestion::index_fulltext_for_attachment`** を通り（OCR 保存と再導出バッチは別 writer で、tx 内の判定が守る）、①索引が **OCR 由来**と記録されていれば触らない → ②`lcir.enabled` かつ LCIR の page に本文があれば **`regenerate_page_fts_from_lcir` で派生** → ③どちらでもなければ従来どおり `pdf_extract`、の 3 段で決める。**出どころは `settings.fulltext.source.<attachment_id>`（`lcir`/`ocr`）** に記録し（FTS5 に provenance 列を足せないため・migration 0 件）、pdf_extract 側は**判定と書き込みを同一 tx**にして LCIR/OCR 由来の索引に譲る（debt-17）。LCIR を build したときも同じ派生を張り直す。既存ライブラリへは**起動時 1 回の自動処理（索引が無い添付を埋めるだけ）**と設定→データの手動ボタン（`rederive_fulltext_from_lcir`・こちらは置き換えまでやる）で行き渡らせる。実 DB の実測は **C0 を含む行 729 → 0 / 索引を持つ添付 133 → 135 / 12〜20 秒 / ページの消失 0**、頻出語 12 語は全語純増（既存ページで新たに引ける 512 対 引けなくなった 216）（`LCIR_REMAINING_PHASES.md` §2.18）。
+- **「(B) 化は 1 行の差し替え」は撤回した**（2026-07-30 の実コード調査 → 2026-08-07 に #8 で実装）。**実績は 1,990 行追加 / 214 行削除**（テスト込み・`git diff main...HEAD --numstat -- src-tauri src`。見積り 900–1,250 の約 1.6 倍。超過分の大半はコミット後レビューの反映とテスト）。以下は着手前に洗い出した 5 つの障害で、①②④⑤は #8 で解いた（§2.18）。実際には ①`fulltext` に**内容を書く**本番経路が **書き込み 5 箇所 / 4 コードパス / 入口 7** ある（`extract_and_index` の 1 箇所に入口 3 経路・`index_attachment` コマンド・`index_missing_attachments`・`run_ocr` ×2。行番号は `LCIR_REMAINING_PHASES.md` の p1 節を正本とする）②`db::fulltext::index_attachment` は先頭で `DELETE FROM fulltext WHERE attachment_id = ?` を無条件に打つので、そのまま差し替えると LCIR が空を返す添付（スキャン本）の索引が丸ごと消える＝非破壊更新への切替が要る ~~③pdfium の `page` ノードは `structure::normalize_ws` を通らないため C0 制御文字を含み、素朴に派生化すると trigram 索引で語が割れて**現状より検索が悪くなる**~~ **解消**（2026-08-04・debt-22・抽出器版 `0.14.0`）。保存点で `structure::clean_page_text` を通す（`\n` / `\t` 以外の C0 を除去 + `\r\n` / `\r` → `\n`・**改行は潰さない**）。実測は非空 5,803 ページ中 **4,570 ページ（78.8%）→ 0**（`fulltext` 側は 13.3%）。索引側にも保険で同じクリーナーを掛けてあるので、#7 の再構築より前に p1 を回しても汚れは入らない。当初案の「page の子 block を連結する」は不要になった④既存コーパスに派生索引を行き渡らせるバッチが存在しない（`attachments_without_completed_lcir` は完了版のある添付を除外し、`attachments_with_outdated_lcir` は版 bump 無しでは 0 件）⑤OCR 由来行を守る手段が無い（`fulltext` に provenance が無く、既存行が OCR 由来かは実 DB からも判定できない）。**規模は 900–1,250 行**（最小スライスでも 400–480 行）。段取り・落とし穴・OCR 保護の 3 択は `docs/LCIR_REMAINING_PHASES.md` の v1.0.0-p1 節を参照。ロードマップ §12 の「新旧品質を比較してから既定化」は維持する（比較自体は実 DB の読み取り専用 SQL だけでできる — LCIR page テキストと `pdf_extract` 由来 `fulltext` は既に同じ DB に共存している）。
 - **ページ FTS(§7.1) と意味 FTS(§7.2)**: 第一段はページ単位（既存 `fulltext` 互換）。**Phase 2 で `document_nodes_fts`（段落/見出し/caption 単位）と `regenerate_node_fts_from_lcir` を実装済**。既存 `fulltext`（ページ粒度・pdf-extract 由来）と併存する追加の派生索引で、LCIR build 時に張る。`document`/`page`/`line` を除く本文つきブロックを索引し、`search_lcir_nodes` がヒットに `node_kind` と PDF 上の `bbox` を返す（検索→ブロックハイライトに直結）。既存 `fulltext` の検索挙動は不変。
 - **TeX 版（Phase 4）は派生索引に載せない**: 同一エントリの PDF 版と本文が重複ヒットし、bbox も持たないため、`lumencite-tex` の version は `document_nodes_fts`/`fulltext` の対象外（`regenerate_node_fts_from_lcir` は非 pdfium 版しか無い添付では索引をクリアして 0 を返す）。検索は PDF 版・構造/数式の読み出しは TeX 優先、という分担。TeX 本文の検索が要る場合は将来 entry 単位の優先版だけを索引する方式で再検討する。
 
@@ -372,8 +373,9 @@ src-tauri/src/
     alt_text.rs # Phase 8c: LcirAltText ビュー（図の代替テキスト・AI 生成）
   ingestion/
     mod.rs      ★  # build_lcir_for_attachment・regenerate_page_fts_from_lcir・lcir_enabled
-                   # （※ `post_attach` という関数は存在しない。事実上の共有 post-attach フックは
-                   #    db/fulltext.rs の extract_and_index で、LCIR build はまだそこに乗っていない = v1.0.0-p2）
+                   # index_fulltext_for_attachment（索引ソースの決定点・v1.0.0-p1）
+                   # （※ `post_attach` という関数は存在しない。共有の post-attach フックはこの決定点で、
+                   #    LCIR build はまだそこに乗っていない = v1.0.0-p2）
     figures.rs  # Phase 8a: 図領域マージ・pt→px 変換・caption ペアリング（純関数）
     pdf/
       mod.rs    ★  # extract_document(path, asset_dir) -> ExtractedDocument（pdfium・spawn_blocking 下）

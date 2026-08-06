@@ -9,10 +9,21 @@ pub async fn index_attachment(
     pages: &[(i64, String)],
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    replace_pages(&mut tx, attachment_id, pages).await?;
+    tx.commit().await?;
+    Ok(())
+}
 
+/// 添付の全ページを与えられた内容で置き換える（tx 内の共通部）。
+/// 空文字列のページはスキップする。
+async fn replace_pages(
+    conn: &mut sqlx::SqliteConnection,
+    attachment_id: i64,
+    pages: &[(i64, String)],
+) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM fulltext WHERE attachment_id = ?")
         .bind(attachment_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     for (page, content) in pages {
@@ -23,11 +34,10 @@ pub async fn index_attachment(
             .bind(content)
             .bind(attachment_id)
             .bind(page)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     }
 
-    tx.commit().await?;
     Ok(())
 }
 
@@ -61,30 +71,219 @@ pub async fn update_attachment_pages(
     Ok(())
 }
 
-/// PDF を抽出して全文索引に取り込む（添付成功後の自動索引・CR-027）。best-effort。
-/// テキストレイヤーが無い / 抽出失敗（スキャン PDF 等）は黙って諦める（OCR で後追い可能）。
-/// 全経路（手動添付・arXiv 取得・クリッパー）が同じ post-attach 索引を通るよう共有する。
-pub async fn extract_and_index(pool: &SqlitePool, abs_path: std::path::PathBuf, attachment_id: i64) {
-    let extracted =
-        tokio::task::spawn_blocking(move || pdf_extract::extract_text_by_pages(&abs_path)).await;
-    if let Ok(Ok(pages_text)) = extracted {
-        let pages: Vec<(i64, String)> = pages_text
-            .into_iter()
-            .enumerate()
-            .map(|(i, t)| ((i + 1) as i64, t))
-            .collect();
-        let _ = index_attachment(pool, attachment_id, &pages).await;
+/// 添付ごとの「全文索引の出どころ」（p1）。
+///
+/// `fulltext` は FTS5 仮想表で provenance 列を持てない（列の追加は
+/// `virtual tables may not be altered` で拒否される）ため、添付単位の記録を settings KV
+/// （`fulltext.source.<attachment_id>`）に置く ＝ **migration 0 件**（§2.6-1 の決定）。
+///
+/// 記録するのは「上書きされたら困る」2 つだけ。pdf_extract 由来は既定なので記録しない
+/// （キー無し = pdf_extract 由来、または未索引）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FulltextSource {
+    /// LCIR の page ノードから派生（p1 の既定ソース）。
+    Lcir,
+    /// ユーザーが明示的に回した OCR の出力。**LCIR 派生で上書きしない**
+    /// （OCR を回した添付 = 「この PDF のテキスト層は信用できない」という宣言）。
+    Ocr,
+}
+
+impl FulltextSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FulltextSource::Lcir => "lcir",
+            FulltextSource::Ocr => "ocr",
+        }
     }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "lcir" => Some(FulltextSource::Lcir),
+            "ocr" => Some(FulltextSource::Ocr),
+            _ => None,
+        }
+    }
+}
+
+fn fulltext_source_key(attachment_id: i64) -> String {
+    format!(
+        "{}{attachment_id}",
+        crate::db::settings::FULLTEXT_SOURCE_KEY_PREFIX
+    )
+}
+
+/// この添付の索引が何由来かを返す（記録が無ければ `None` = pdf_extract 由来 or 未索引）。
+pub async fn get_fulltext_source(
+    pool: &SqlitePool,
+    attachment_id: i64,
+) -> Result<Option<FulltextSource>, sqlx::Error> {
+    let raw = crate::db::settings::get_setting(pool, &fulltext_source_key(attachment_id)).await?;
+    Ok(raw.as_deref().and_then(FulltextSource::parse))
+}
+
+/// 索引の出どころを記録する。
+pub async fn set_fulltext_source(
+    pool: &SqlitePool,
+    attachment_id: i64,
+    source: FulltextSource,
+) -> Result<(), sqlx::Error> {
+    crate::db::settings::set_setting(pool, &fulltext_source_key(attachment_id), source.as_str())
+        .await
+}
+
+/// 索引の出どころの記録を消す（守る中身が無くなったときの後始末）。
+pub async fn clear_fulltext_source(
+    pool: &SqlitePool,
+    attachment_id: i64,
+) -> Result<(), sqlx::Error> {
+    crate::db::settings::delete_setting(pool, &fulltext_source_key(attachment_id)).await
+}
+
+/// 索引の出どころの記録を tx 内で消す（添付削除・索引削除の後始末）。
+///
+/// 記録を残したまま索引だけ消すと、`index_attachment_from_pdf_extract` が
+/// **中身がもう無い索引を守り続けて**その添付を永久に未索引にする。
+pub(crate) async fn clear_fulltext_source_tx(
+    conn: &mut sqlx::SqliteConnection,
+    attachment_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(fulltext_source_key(attachment_id))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// エントリ配下の全添付ぶんの記録を tx 内で消す（エントリの hard delete の後始末・
+/// `fulltext` / `document_nodes_fts` と同じ扱い）。
+pub(crate) async fn clear_fulltext_sources_for_entry_tx(
+    conn: &mut sqlx::SqliteConnection,
+    entry_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM settings WHERE key IN (
+            SELECT ? || a.id FROM attachments a WHERE a.entry_id = ?
+        )",
+    )
+    .bind(crate::db::settings::FULLTEXT_SOURCE_KEY_PREFIX)
+    .bind(entry_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// pdf_extract 由来のページで索引を置き換える。ただし **LCIR / OCR 由来の索引は上書きしない**
+/// （debt-17 の last-writer-wins 回避）。
+///
+/// 置き換えたら `true`、譲ったら `false`。判定と書き込みは同一トランザクションで行う
+/// （spawn した pdf_extract は数十秒かかるので、抽出前に 1 度読むだけでは競合を塞げない）。
+///
+/// `replace_existing` は「ユーザーがこの添付を名指しで再索引した」経路だけ `true`。
+/// **OCR 由来は名指しでも守る**（守る対象はユーザーが課金して起こした転写）。
+pub async fn index_attachment_from_pdf_extract(
+    pool: &SqlitePool,
+    attachment_id: i64,
+    pages: &[(i64, String)],
+    replace_existing: bool,
+) -> Result<bool, sqlx::Error> {
+    let key = fulltext_source_key(attachment_id);
+    // **`BEGIN IMMEDIATE`**（既定の DEFERRED ではない）。読んでから書く tx を deferred で始めると、
+    // 読みスナップショットを取った後に他の接続が commit した場合、昇格時に `SQLITE_BUSY_SNAPSHOT`
+    // が返る ── これは busy handler の対象外なので `busy_timeout` では待てず即失敗する。
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let current: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let blocked = match current.as_deref().and_then(FulltextSource::parse) {
+        Some(FulltextSource::Ocr) => true,
+        Some(FulltextSource::Lcir) => !replace_existing,
+        None => false,
+    };
+    if blocked {
+        // 譲る（tx は drop でロールバック）。
+        return Ok(false);
+    }
+
+    replace_pages(&mut tx, attachment_id, pages).await?;
+    // 置き換えたので出どころは既定（pdf_extract 由来）に戻る。
+    sqlx::query("DELETE FROM settings WHERE key = ?")
+        .bind(&key)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// LCIR の page ノード由来のページで索引を差し替え、**出どころの記録を同一 tx で**立てる。
+///
+/// 2 文に分けると「索引は LCIR 由来なのに記録がまだ無い」窓ができ、その隙に走った
+/// pdf_extract が上書きしてしまう（debt-17 と同じ形の競合）。
+/// OCR 由来として記録済みの添付には書かない（`false` を返す）。
+///
+/// **LCIR が本文を持たないページの既存行は残す**（debt-34）。pdfium がそのページだけ空を返す
+/// ことがあり、添付ごと置き換えると pdf_extract / OCR で入っていた本文が消える（実 DB で 2 ページ）。
+/// 残す行にも `clean` を通す ── 残すのは旧抽出器由来の行なので、通さないと
+/// 「派生後の索引に C0 制御文字を含む行が 0 件」という受け入れ条件が崩れる。
+pub async fn index_attachment_from_lcir(
+    pool: &SqlitePool,
+    attachment_id: i64,
+    pages: &[(i64, String)],
+    clean: fn(&str) -> String,
+) -> Result<bool, sqlx::Error> {
+    let key = fulltext_source_key(attachment_id);
+    // `BEGIN IMMEDIATE`（理由は `index_attachment_from_pdf_extract` と同じ）。
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let current: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(&key)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if current.as_deref().and_then(FulltextSource::parse) == Some(FulltextSource::Ocr) {
+        return Ok(false);
+    }
+
+    let covered: std::collections::HashSet<i64> = pages.iter().map(|(p, _)| *p).collect();
+    let existing: Vec<(i64, String)> =
+        sqlx::query_as("SELECT page, content FROM fulltext WHERE attachment_id = ?")
+            .bind(attachment_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let mut merged: Vec<(i64, String)> = pages.to_vec();
+    merged.extend(
+        existing
+            .into_iter()
+            .filter(|(p, _)| !covered.contains(p))
+            .map(|(p, c)| (p, clean(&c))),
+    );
+
+    replace_pages(&mut tx, attachment_id, &merged).await?;
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(&key)
+    .bind(FulltextSource::Lcir.as_str())
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(true)
 }
 
 pub async fn unindex_attachment(
     pool: &SqlitePool,
     attachment_id: i64,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM fulltext WHERE attachment_id = ?")
         .bind(attachment_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    // 出どころの記録も同時に落とす（守る中身がもう無いため）。
+    clear_fulltext_source_tx(&mut tx, attachment_id).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -116,6 +315,17 @@ pub async fn rebuild_fulltext_fts_once(pool: &SqlitePool) -> Result<bool, sqlx::
 
     settings::set_setting(pool, settings::FTS_FULLTEXT_REBUILT_KEY, "1").await?;
     Ok(true)
+}
+
+/// 今この添付に入っている索引済みページ数。
+pub async fn indexed_page_count(
+    pool: &SqlitePool,
+    attachment_id: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
+        .bind(attachment_id)
+        .fetch_one(pool)
+        .await
 }
 
 pub async fn is_indexed(pool: &SqlitePool, attachment_id: i64) -> Result<bool, sqlx::Error> {
@@ -702,5 +912,170 @@ mod tests {
 
         let missing = attachments_without_fulltext(&pool).await.unwrap();
         assert!(!missing.iter().any(|(id, _)| *id == att_id));
+    }
+
+    // ---- v1.0.0-p1（索引の出どころ）------------------------------------------
+
+    /// **索引を消したら出どころの記録も消す。**
+    /// 残すと `index_attachment_from_pdf_extract` が永久に譲り続け、その添付は
+    /// もう二度と索引されない（守るはずの中身がもう無いのに守り続ける）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unindexing_clears_the_source_record(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Paper").await;
+        index_attachment(&pool, att, &[(1, "derived body".to_string())])
+            .await
+            .unwrap();
+        set_fulltext_source(&pool, att, FulltextSource::Lcir)
+            .await
+            .unwrap();
+
+        unindex_attachment(&pool, att).await.unwrap();
+
+        assert_eq!(get_fulltext_source(&pool, att).await.unwrap(), None);
+        assert!(
+            index_attachment_from_pdf_extract(&pool, att, &[(1, "fresh text".to_string())], false)
+                .await
+                .unwrap(),
+            "記録が消えていれば pdf_extract で張り直せる"
+        );
+    }
+
+    /// **名指しの再索引（`replace_existing`）は LCIR 由来を張り直せるが、OCR 由来は守る。**
+    ///
+    /// 一律に守ると、詳細パネルの再索引ボタンが黙って何もしない経路ができる（LCIR を後から
+    /// OFF にした人が古い派生索引から抜け出せない）。逆に一律に許すと、ユーザーが課金して
+    /// 起こした OCR の転写がボタン 1 つで消える。判定は書き込みと同じ tx の 1 箇所に置く。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn explicit_reindex_replaces_lcir_but_not_ocr(pool: SqlitePool) {
+        let (_, lcir_att) = setup_attachment(&pool, "Derived").await;
+        index_attachment(&pool, lcir_att, &[(1, "derived body".to_string())])
+            .await
+            .unwrap();
+        set_fulltext_source(&pool, lcir_att, FulltextSource::Lcir)
+            .await
+            .unwrap();
+
+        // 自動経路（`replace_existing = false`）は譲る。
+        assert!(
+            !index_attachment_from_pdf_extract(
+                &pool,
+                lcir_att,
+                &[(1, "stale output".to_string())],
+                false
+            )
+            .await
+            .unwrap()
+        );
+        // 名指し（`true`）は張り直し、出どころの記録も既定に戻す。
+        assert!(
+            index_attachment_from_pdf_extract(
+                &pool,
+                lcir_att,
+                &[(1, "reindexed body".to_string())],
+                true
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(get_fulltext_source(&pool, lcir_att).await.unwrap(), None);
+        assert_eq!(
+            search_fulltext(&pool, "reindexed", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // OCR 由来は名指しでも守る。
+        let (_, ocr_att) = setup_attachment(&pool, "Scanned").await;
+        index_attachment(&pool, ocr_att, &[(1, "ocr transcript".to_string())])
+            .await
+            .unwrap();
+        set_fulltext_source(&pool, ocr_att, FulltextSource::Ocr)
+            .await
+            .unwrap();
+
+        assert!(
+            !index_attachment_from_pdf_extract(
+                &pool,
+                ocr_att,
+                &[(1, "garbage layer".to_string())],
+                true
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            get_fulltext_source(&pool, ocr_att).await.unwrap(),
+            Some(FulltextSource::Ocr)
+        );
+        assert_eq!(
+            search_fulltext(&pool, "transcript", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// ゴミ箱の一括 purge でも記録を残さない（`purge_one` 側の後始末）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn purging_trash_clears_source_records(pool: SqlitePool) {
+        let (entry_id, att) = setup_attachment(&pool, "Trashed").await;
+        let (_, kept_att) = setup_attachment(&pool, "Kept").await;
+        set_fulltext_source(&pool, att, FulltextSource::Ocr)
+            .await
+            .unwrap();
+        set_fulltext_source(&pool, kept_att, FulltextSource::Lcir)
+            .await
+            .unwrap();
+        crate::db::entries::trash_entry(&pool, entry_id).await.unwrap();
+
+        crate::db::entries::purge_trash(&pool).await.unwrap();
+
+        assert_eq!(get_fulltext_source(&pool, att).await.unwrap(), None);
+        assert_eq!(
+            get_fulltext_source(&pool, kept_att).await.unwrap(),
+            Some(FulltextSource::Lcir),
+            "ゴミ箱に無いエントリの記録まで消してはいけない"
+        );
+    }
+
+    /// 添付を消したら出どころの記録も残さない（settings に孤児キーを溜めない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deleting_an_attachment_clears_the_source_record(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Paper").await;
+        set_fulltext_source(&pool, att, FulltextSource::Ocr)
+            .await
+            .unwrap();
+
+        crate::db::attachments::delete_attachment_with_fulltext(&pool, att)
+            .await
+            .unwrap();
+
+        assert_eq!(get_fulltext_source(&pool, att).await.unwrap(), None);
+    }
+
+    /// エントリの hard delete でも同じ（`fulltext` / `document_nodes_fts` と同じ扱い）。
+    /// **消すのはそのエントリ配下だけ**（他のエントリの記録を巻き添えにしない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deleting_an_entry_clears_source_records_of_its_attachments(pool: SqlitePool) {
+        let (entry_id, att) = setup_attachment(&pool, "Paper").await;
+        let (_, other_att) = setup_attachment(&pool, "Other paper").await;
+        set_fulltext_source(&pool, att, FulltextSource::Lcir)
+            .await
+            .unwrap();
+        set_fulltext_source(&pool, other_att, FulltextSource::Ocr)
+            .await
+            .unwrap();
+
+        crate::db::entries::delete_entry(&pool, entry_id).await.unwrap();
+
+        assert_eq!(get_fulltext_source(&pool, att).await.unwrap(), None);
+        assert_eq!(
+            get_fulltext_source(&pool, other_att).await.unwrap(),
+            Some(FulltextSource::Ocr),
+            "別エントリの記録まで消してはいけない"
+        );
     }
 }
