@@ -250,11 +250,11 @@ restore 単位を GC / 再構築 / Vision の 3 つに割る。
 `run_ocr` が「この添付は OCR 由来」を settings KV に記録し、LCIR からの派生化はその添付を丸ごと skip する（~30 行）。
 ページ単位の側表 `0021` は**採らない**。理由は代償が即時かつ計画全体に及ぶこと —
 `pnpm tauri dev` を 1 回起動した瞬間に共有実 DB へ適用され、インストール済み配布版 v0.10.0 が
-`NewerSchema`（`lib.rs:3325`）で起動不能になり、以後 p0 の実機検証で配布版が使えなくなる。
+`NewerSchema`（`lib.rs:3418`・2026-08-06 再計測）で起動不能になり、以後 p0 の実機検証で配布版が使えなくなる。
 一方で守る対象は条件付き（今の実害は 2 行で、顕在化するのはスキャン本 4 冊 = 1,532 ページを OCR した後）。
 添付単位で十分と判断する意味論的根拠: **ユーザーが OCR を回した添付は「この PDF のテキスト層は信用できない」と
 明示的に宣言した添付**なので、そこに LCIR 由来の索引を上書きしない方が正しい。
-代償はページ単位の部分 OCR（`ocr.rs:159`）でも添付ごと skip になること（その添付に LCIR の改善が届かない）。
+代償はページ単位の部分 OCR（`llm/tools/ocr.rs:159`）でも添付ごと skip になること（その添付に LCIR の改善が届かない）。
 **この決定により中間スコープの migration は 0 件で確定**し、v1.0.0 のロールバックは旧バイナリ差し戻しだけで成立する。
 
 **2. `8d-2` は既存ラスタ領域と union しない。**
@@ -1877,12 +1877,25 @@ Linux のリソースディレクトリ 3 通りを探索（単体テスト 6 �
 
 初版の記述は行番号も規模も実コードとずれていた（§10）。実態は次のとおり。
 
-- seam `regenerate_page_fts_from_lcir` は **`ingestion/mod.rs:1416-1450`**（2026-08-04 再計測。#0〜#4 で約 100 行下がった）、シグネチャは **`(pool, attachment_id)`**、
-  **本番呼び出し元は 0 件**（テスト 2 箇所のみ）。設計概観 §8 の「(B) 化は差し替える 1 行」は撤回が要る。
-- `fulltext` に**内容を書く**本番経路は **6 call site / 4 コードパス**:
-  `extract_and_index` ×3（`lib.rs:736` add_attachment / `lib.rs:788` download_arxiv_pdf /
-  `mcp_server/mod.rs:1006` clipper）/ `index_attachment` コマンド / `index_missing_attachments` /
-  `run_ocr` の 2 箇所。
+**⚠ 行番号は PR ごとにずれる（この節だけで 3 回ずれた）。着手時は必ず関数名で grep し直すこと。**
+以下は **2026-08-06・`f795d06`（#7 完了時点）で再計測**した値。
+
+- seam `regenerate_page_fts_from_lcir` は **`ingestion/mod.rs:1445-1485`**（doc コメント 1445-1449 + 本体 1450-1485。
+  2026-08-04 時点の「1416-1450」から #5 PR-b / #6 で約 30 行下がった）、シグネチャは **`(pool, attachment_id)`**、
+  **本番呼び出し元は 0 件**（テスト 3 箇所のみ ── `:2047` / `:2118` / `:2524`）。
+  設計概観 §8 の「(B) 化は差し替える 1 行」は撤回が要る。
+  なお seam の内側は既に `structure::clean_page_text` を通している（`:1477`・debt-22 の保険）。
+- `fulltext` に**内容を書く**本番経路は **書き込み 5 箇所 / 4 コードパス / 入口 7**:
+  - `db/fulltext.rs:76`（`extract_and_index` 内の `index_attachment`）── 入口は 3 経路
+    （`lib.rs:784` `add_attachment` / `lib.rs:836` `download_arxiv_pdf` / `mcp_server/mod.rs:1006` クリッパー）
+  - `lib.rs:1001`（`index_attachment` コマンド・`fn` は `:975`）
+  - `lib.rs:1062`（`index_missing_attachments`・`fn` は `:1024`）
+  - `llm/tools/ocr.rs:157`（`run_ocr` 全ページ = `index_attachment` で添付ごと置換）
+  - `llm/tools/ocr.rs:159`（`run_ocr` 部分ページ = `update_attachment_pages` で該当ページのみ差替）
+
+  共有 writer は `db::fulltext::index_attachment`（`db/fulltext.rs:13` で `DELETE FROM fulltext WHERE attachment_id = ?`
+  を無条件に打ってから入れ直す ＝ debt-17 の実体）。削除のみの経路は別に 4 箇所ある
+  （`db/fulltext.rs:84` `unindex_attachment` / `db/attachments.rs:83` / `db/entries.rs:1010` / `:1398`）。
 - FTS5 仮想表に列は足せない（実測で `virtual tables may not be altered` を確認）ので、
   初版の「破壊的 migration になるので採らない」は正しい。普通の側表なら非破壊という第 3 の選択肢もあるが、
   **これは採らないと決めた**（§2.6-1）。
@@ -1897,20 +1910,26 @@ trigram 索引なので `con\x02dition` は "condition" にヒットせず、**�
 **p1 の受け入れ条件**（数字で置く）: 派生化した後の `fulltext.content` に C0 制御文字
 （U+0000..U+001F から `\t` `\n` `\r` を除く）を含む行が **0 件**であること。
 無正規化で切り替えると **13.3% → 78.8% に跳ねる**（現 `fulltext` = pdf-extract 由来は 5,710 行中 758 行 =
-13.3% / LCIR page は非空 5,803 ページ中 4,570 ページ = 78.8%）。**#7 の再構築より前に p1 を回すと
-実 DB には 0.13.0 以前の汚れた page が残っている**ので、`regenerate_page_fts_from_lcir` 側の
-保険（同じクリーナーを索引直前にも掛ける）を外さないこと。
+13.3% / LCIR page は非空 5,803 ページ中 4,570 ページ = 78.8%）。~~**#7 の再構築より前に p1 を回すと
+実 DB には 0.13.0 以前の汚れた page が残っている**~~ **#7 で実 DB は 138/138 が 0.14.0 になったので
+この前提は消えた**（汚れた page は 4,570 → 0 ページ・§2.17）。それでも
+`regenerate_page_fts_from_lcir` 側の保険（同じクリーナーを索引直前にも掛ける）は**外さないこと** ──
+他ユーザーの DB や旧版から復元した DB には依然 0.13.0 以前の page が入りうる。
 
 **派生化の実利は実測できる**（読み取り専用 SQL のみ・DB コピー不要）: ページ単位で 112 ページが新規索引、
 2 ページが「LCIR 空だから既存行を残す」規則に依存、5,691 ページが重複。添付単位では
 **att93（15p/23.8k字）と att94（42p/55.2k字）は pdf_extract が全滅・pdfium が成功**という実利がある。
+**⚠ この 3 つの数字は #7 の再構築より前（2026-08-04 以前）の実 DB で測った値**で、
+再構築で LCIR 側の page が入れ替わっている以上そのままでは使えない。**#8 の着手時に測り直す**
+（`#[ignore]` プローブから本番関数を呼ぶ・§2.1 の作法）。
 
 **OCR 由来行の保護 = settings の添付単位フラグ**（2026-08-02 決定・§2.6-1）。
 初版の回避策「LCIR テキストが空のページは既存行を残す」は**効かない** — テキスト層が壊れた PDF では
 pdfium も「壊れたテキスト」を非空で返すため。かつ `fulltext` には provenance を記録する場所が無く、
 **既存 5,710 行のどれが OCR 由来かは実 DB からも判定できない**（調査で試みて不可）。
-そこで `run_ocr` の書き込み 2 箇所で「この添付は OCR 由来」を settings KV に記録し、派生化はその添付を
-丸ごと skip する（~30 行・DDL 不要）。ページ単位の部分 OCR（`ocr.rs:159`）でも添付ごと skip になるのは
+そこで `run_ocr` の書き込み 2 箇所（`llm/tools/ocr.rs:157` / `:159`）で「この添付は OCR 由来」を
+settings KV に記録し、派生化はその添付を
+丸ごと skip する（~30 行・DDL 不要）。ページ単位の部分 OCR（`llm/tools/ocr.rs:159`）でも添付ごと skip になるのは
 承知の上での保守側への倒し込み。今の実害は 2 行で、顕在化するのはスキャン本 4 冊
 （att37/42/109/121・非空 LCIR ページが 0/527・0/608・0/373・0/24）を OCR した後。
 
@@ -2183,9 +2202,9 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 
 | 初版の記述 | 実際（2026-07-30 実測） |
 |---|---|
-| p1 seam は `ingestion/mod.rs:1277-1306` | **1317-1351**（Phase 10a/10b で約 40 行ずれた） |
+| p1 seam は `ingestion/mod.rs:1277-1306` | ~~**1317-1351**（Phase 10a/10b で約 40 行ずれた）~~ **この訂正値も 2 回腐った**（→ 1416-1450 → **1445-1485**）。**行番号の正本は §7 の p1 節に 1 箇所だけ置く**（2026-08-06・#8 の着手前に再計測） |
 | 設計概観 §8「`regenerate_page_fts_from_lcir(pool, version_id)`」「(B) 化は差し替える 1 行」 | シグネチャは **`(pool, attachment_id)`**、本番呼び出し元は **0 件**。「1 行」は撤回が要る |
-| p1「呼び出し元 5 箇所の書き換え」 | `fulltext` に内容を書く本番経路は **6 call site / 4 コードパス** |
+| p1「呼び出し元 5 箇所の書き換え」 | ~~**6 call site / 4 コードパス**~~ **数え方が曖昧だった**（2026-08-06 に数え直し）。`fulltext` に内容を書く本番経路は **書き込み 5 箇所 / 4 コードパス / 入口 7**（`extract_and_index` が 3 経路から呼ばれるため。内訳は §7 の p1 節） |
 | p2「PDF は完全に手動（設定→データのボタン）」 | 手動 **2 経路**（+ 詳細パネルの添付行ボタン・PR #61） |
 | p2「TeX ソースだけ 3 経路」／`API_SPEC.md:442` | **4 経路**（`fetch_missing_arxiv_sources` が抜けている） |
 | p2「`post_attach` への組み込み」 | **`post_attach` という関数は存在しない**。実体は `db::fulltext::extract_and_index` |
