@@ -712,7 +712,10 @@ function UpdatesTab() {
 }
 
 function DataTab() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  // 桁区切りは i18next の現在言語に合わせる（引数なしの toLocaleString だと
+  // 同じ文の中で言語と数値書式が別の設定源から来る）。
+  const num = (n: number) => n.toLocaleString(i18n.language);
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1067,7 +1070,7 @@ function DataTab() {
           t("settings.data.gcDone", {
             removed: r.versions_removed,
             tombstoned: r.versions_tombstoned,
-            nodes: r.nodes_removed.toLocaleString(),
+            nodes: num(r.nodes_removed),
             freed: formatBytes(r.freed_bytes),
           }) +
             // 0 でないときだけ出す（0 が普通なので、常時表示すると重要な値が埋もれる）。
@@ -1094,7 +1097,7 @@ function DataTab() {
     <>
       <Section title={t("settings.data.backup")} description={t("settings.data.backupDesc")}>
         <div style={{ display: "flex", gap: 6 }}>
-          <SecondaryBtn onClick={handleBackupNow} disabled={busy === "backup"}>
+          <SecondaryBtn onClick={handleBackupNow} disabled={busy === "backup" || gcRunning}>
             {busy === "backup" ? t("common.loading") : t("settings.data.backupNow")}
           </SecondaryBtn>
           <SecondaryBtn onClick={handleOpenFolder}>
@@ -1102,7 +1105,7 @@ function DataTab() {
           </SecondaryBtn>
           <SecondaryBtn
             onClick={() => setConfirmRestore(true)}
-            disabled={busy === "restore" || confirmRestore}
+            disabled={busy === "restore" || confirmRestore || gcRunning}
           >
             {busy === "restore" ? t("common.loading") : t("settings.data.restore")}
           </SecondaryBtn>
@@ -1145,7 +1148,7 @@ function DataTab() {
       </Section>
 
       <Section title={t("settings.data.fulltext")} description={t("settings.data.fulltextDesc")}>
-        <SecondaryBtn onClick={handleIndexMissing} disabled={busy === "index_missing"}>
+        <SecondaryBtn onClick={handleIndexMissing} disabled={busy === "index_missing" || gcRunning}>
           {busy === "index_missing" ? t("settings.data.indexMissingBusy") : t("settings.data.indexMissing")}
         </SecondaryBtn>
       </Section>
@@ -1247,7 +1250,7 @@ function DataTab() {
               <div>
                 {t("settings.data.storageReclaimable", {
                   versions: storage.gc.versions,
-                  nodes: storage.gc.nodes.toLocaleString(),
+                  nodes: num(storage.gc.nodes),
                 })}
                 {storage.gc.versions_tombstoned > 0 && (
                   <> {t("settings.data.storageTombstone", {
@@ -1277,6 +1280,7 @@ function DataTab() {
             disabled={
               gcRunning ||
               confirmGc ||
+              busy !== null ||
               lcirBatch !== null ||
               fetchTexRunning ||
               altTextRunning ||
@@ -1307,8 +1311,15 @@ function DataTab() {
             <div style={{ fontSize: 12, color: "var(--text)", lineHeight: 1.55, marginBottom: 8 }}>
               {t("settings.data.gcConfirm", {
                 versions: storage.gc.versions,
-                nodes: storage.gc.nodes.toLocaleString(),
+                nodes: num(storage.gc.nodes),
               })}
+              {/* trash 送りになる crop は非可逆の主な実体なので、0 でなければ必ず出す。 */}
+              {storage.gc.asset_rows > 0 && (
+                <> {t("settings.data.gcConfirmCrops", {
+                  crops: num(storage.gc.asset_rows),
+                  size: formatBytes(storage.gc.asset_bytes),
+                })}</>
+              )}
             </div>
             <div style={{ display: "flex", gap: 6 }}>
               <SecondaryBtn onClick={() => setConfirmGc(false)}>{t("common.cancel")}</SecondaryBtn>

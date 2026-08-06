@@ -930,13 +930,14 @@
       "gc": "Reclaim old versions",
       "gcBusy": "Reclaiming…",
       "gcBusyProgress": "Reclaiming… ({{done}}/{{total}})",
-      "gcConfirm": "This deletes the contents of {{versions}} superseded version(s) ({{nodes}} node rows) and cannot be undone. Versions holding figure descriptions are excluded. Versions that carried-over descriptions point back to keep their record, but their contents — nodes and cropped figure images — are deleted. Cropped images are moved to a holding area that is not retained for any length of time. The database file will not shrink, but the space becomes reusable and is reclaimed by the next backup and the next rebuild.",
+      "gcConfirm": "This deletes the contents of {{versions}} superseded version(s) ({{nodes}} node rows) and cannot be undone. Versions holding figure descriptions are excluded. Versions that carried-over descriptions point back keep their record, but their contents are deleted. Cropped images are moved to a holding area that is not retained for any length of time. The database file will not shrink, but the space becomes reusable and is reclaimed by the next backup (and, if you use LCIR, by the next rebuild).",
       "gcProceed": "Delete",
       "gcDone": "Deleted {{removed}} superseded version(s) and emptied {{tombstoned}} more ({{nodes}} node rows, reusable space up by {{freed}}).",
       "gcSkipped": "{{skipped}} version(s) were skipped because their state changed during the run.",
       "gcNone": "There were no superseded versions to reclaim.",
       "gcRunning": "Another LCIR job is running. Please try again once it finishes.",
-      "gcError": "Failed to reclaim old versions: {{error}}"
+      "gcError": "Failed to reclaim old versions: {{error}}",
+      "gcConfirmCrops": "{{crops}} cropped figure image(s) ({{size}}) will be deleted as well."
     },
     "about": {
       "appTitle": "LumenCite",

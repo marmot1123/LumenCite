@@ -56,8 +56,12 @@ pub struct GcOutcome {
     pub versions_skipped: i64,
     pub nodes_removed: i64,
     pub asset_rows_removed: i64,
-    /// trash へ送った crop ファイルの数。
+    /// **実際に** trash へ送った crop ファイルの数。
     pub files_trashed: i64,
+    /// `assets` 行はあったが実体が既に無かった crop の数（8a の build 時 GC が先に
+    /// 回収済みの正常ケース）。**`files_trashed` と分けて数える**のが要点で、
+    /// 合算すると「1 枚も当たらなかった」異常が正常と同じ見た目になる。
+    pub files_already_gone: i64,
     /// 掃除した node-FTS の孤児行数（生存確認のセンチネル。通常 0）。
     pub fts_orphans_removed: i64,
     /// 再利用可になったバイト数（`freelist` の増分 × `page_size`）。
@@ -105,6 +109,11 @@ async fn still_collectable(pool: &SqlitePool, version_id: i64) -> Result<bool, s
                 AND dv.extraction_status = 'superseded'
                 AND NOT EXISTS (
                     SELECT 1 FROM node_alt_texts n WHERE n.document_version_id = dv.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM node_alt_texts n
+                      JOIN document_nodes dn ON dn.id = n.node_id
+                     WHERE dn.document_version_id = dv.id
                 )
                 AND EXISTS (
                     SELECT 1 FROM document_versions live
@@ -335,6 +344,14 @@ async fn run_gc_with_chunk<F>(
 where
     F: Fn(i64, i64),
 {
+    // **所要時間はこの索引に全面的に依存している**（無いと 125 秒・版あたり最大 16.7 秒。
+    // 有ると 48 秒・最大 5.7 秒）。起動時にも張るが、そちらは spawn した best-effort で
+    // 失敗しても eprintln だけなので、**GC 自身が入口で保証する**。
+    // `CREATE INDEX IF NOT EXISTS` なので既にあれば数ミリ秒。
+    crate::db::symbols::try_create_scope_node_index(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
     let before = storage_stats::db_size(pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -380,6 +397,15 @@ where
             .collect();
         for rel in reclaimable_files(&dead_paths, &live) {
             let abs = app_data_dir.join(&rel);
+            // **実在したものだけ数える。** `move_to_trash` は対象が無いとき何もせず `Ok(())` を
+            // 返すので、素直に数えると「試行回数」になる。8a の build 時 GC が旧 content_key
+            // ディレクトリを既に trash 済みで `assets` 行だけが provenance として残る、という
+            // のは**正常な状態**（DATA_MODEL）なので、#7 の後はこれが多数派になる。
+            // 「1 枚も当たらなかった」と「全部当たった」が同じ見た目だと異常に気づけない。
+            if !abs.is_file() {
+                out.files_already_gone += 1;
+                continue;
+            }
             match attachment_trash::move_to_trash(app_data_dir, &abs) {
                 Ok(()) => out.files_trashed += 1,
                 Err(e) => eprintln!("LCIR GC: crop の回収に失敗 {rel}: {e}"),
@@ -395,13 +421,14 @@ where
 
     eprintln!(
         "LCIR GC: {} 版削除 / {} 版は行を残した / {} 版 skip / ノード {} / アセット行 {} / \
-         ファイル {} / FTS 孤児 {} / 再利用可 +{} B",
+         ファイル {}（実体なし {}） / FTS 孤児 {} / 再利用可 +{} B",
         out.versions_removed,
         out.versions_tombstoned,
         out.versions_skipped,
         out.nodes_removed,
         out.asset_rows_removed,
         out.files_trashed,
+        out.files_already_gone,
         out.fts_orphans_removed,
         out.freed_bytes,
     );
@@ -809,6 +836,58 @@ mod tests {
         assert_eq!(out.nodes_removed, 0);
         assert!(version_exists(&pool, old).await);
         assert_eq!(nodes_of(&pool, old).await, 3, "木も無傷");
+        let alt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_alt_texts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(alt, 1, "課金済みの説明が残る");
+    }
+
+    /// (i) は **ノード経由でも**守る。
+    ///
+    /// `node_alt_texts` は `node_id` と `document_version_id` を独立に持ち、
+    /// **両者が一致することをスキーマは強制していない**。version 列だけを見ると
+    /// 「この版に alt text は無い」と判定するのに、ノードを消したカスケードで
+    /// 実際には消える、という取り違えが起きる。今のデータでは no-op だが
+    /// 失うと復旧不能なので両方見る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn gc_protects_an_alt_text_reachable_only_through_its_node(pool: SqlitePool) {
+        let att = setup_attachment(&pool, "P").await;
+        let old = insert_ver(&pool, att, "ck-old", ExtractionStatus::Superseded, None).await;
+        let page = insert_tree(&pool, old, 1).await;
+        let live = insert_ver(&pool, att, "ck-new", ExtractionStatus::Completed, Some(old)).await;
+
+        assert_eq!(
+            storage_stats::gc_target_versions(&pool).await.unwrap(),
+            vec![old],
+            "前提: alt text が無ければ対象"
+        );
+
+        // ノードは旧版のものだが、version 列は生存版を指している不整合な行。
+        crate::db::node_alt_texts::insert_alt_text(
+            &pool,
+            &crate::db::node_alt_texts::NewAltText {
+                node_id: page,
+                document_version_id: live,
+                source_asset_sha256: "sha",
+                text: "課金済み",
+                origin: Origin::LlmInference.as_str(),
+                confidence: None,
+                model: None,
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            storage_stats::gc_target_versions(&pool).await.unwrap().is_empty(),
+            "version 列は別を指していても、ノードがこの版にあるなら守る"
+        );
+        let dir = std::env::temp_dir();
+        let out = run_gc(&pool, &dir, noop).await.unwrap();
+        assert_eq!(out.versions_removed, 0);
+        assert_eq!(out.versions_skipped, 0, "対象一覧の時点で外れる");
         let alt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM node_alt_texts")
             .fetch_one(&pool)
             .await
@@ -1335,8 +1414,29 @@ mod tests {
         .await
         .unwrap();
 
+        // **実体が既に無い crop** も 1 枚混ぜる（8a の build 時 GC が先に回収した正常ケース）。
+        // これを `files_trashed` に数えてしまうと「1 枚も当たらなかった」異常が
+        // 正常と同じ見た目になる。
+        let gone_rel = "attachments/1/.lcir/1/aaaa/fig-p003-00.png";
+        insert_asset(
+            &pool,
+            &NewAsset {
+                document_version_id: old,
+                sha256: "s",
+                mime_type: "image/png",
+                relative_path: gone_rel,
+                width: Some(1),
+                height: Some(1),
+                size_bytes: Some(3),
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+
         let out = run_gc(&pool, app, noop).await.unwrap();
-        assert_eq!(out.files_trashed, 1);
+        assert_eq!(out.files_trashed, 1, "実際に動かしたのは 1 枚だけ");
+        assert_eq!(out.files_already_gone, 1, "実体の無かった 1 枚は別に数える");
         assert!(app.join(shared_rel).is_file(), "生存版が指す crop は消さない");
         assert!(!app.join(dead_rel).exists(), "誰も指さない crop は trash へ");
     }

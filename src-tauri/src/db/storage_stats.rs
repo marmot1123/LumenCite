@@ -104,6 +104,16 @@ pub const GC_TARGET_PREDICATE: &str = "
     AND NOT EXISTS (
         SELECT 1 FROM node_alt_texts n WHERE n.document_version_id = dv.id
     )
+    -- **ノード経由でも見る。** `node_alt_texts` は `node_id`（`document_nodes` を CASCADE で
+    -- 参照）と `document_version_id` の両方を持つが、**両者が一致することをスキーマは
+    -- 強制していない**（揃えているのは挿入経路の作法だけ）。破れた行があると、上の条件は
+    -- 「この版に alt text は無い」と言うのに、ノードを消したカスケードで実際には消える。
+    -- 今のデータでは no-op（実 DB で不一致 0 件）だが、消えたら復旧不能なので両方見る。
+    AND NOT EXISTS (
+        SELECT 1 FROM node_alt_texts n
+          JOIN document_nodes dn ON dn.id = n.node_id
+         WHERE dn.document_version_id = dv.id
+    )
     AND EXISTS (
         SELECT 1 FROM document_versions live
          WHERE live.attachment_id = dv.attachment_id
