@@ -2,6 +2,7 @@
 //! 派生 FTS 再生成・read 面の組み立て。既存 `fulltext` 経路は触らず、LCIR は追加の side-build。
 
 pub mod figures;
+pub mod gc;
 pub mod graph;
 pub mod pdf;
 pub mod structure;
@@ -292,9 +293,19 @@ async fn build_pdf_version(pool: &SqlitePool, ctx: &PdfBuildCtx<'_>) -> Result<(
 }
 
 /// reuse 経路のアセット self-heal（Phase 8a・best-effort）。この版の assets 行が指すファイルが
-/// 1 つでも欠けていたら再抽出して同一パスへ書き直す（同一 content_key = 抽出は決定的なので
-/// ファイル名・領域は再現する）。DB は sha256/寸法/サイズだけ更新し、version 行・ノード・辺は
-/// 不変。バックアップ復元後の部分欠損や手動削除からの回復経路（fulltext FTS5 self-heal と同型）。
+/// 1 つでも欠けていたら再抽出して同一パスへ書き直す。DB は sha256/寸法/サイズだけ更新し、
+/// version 行・ノード・辺は不変。バックアップ復元後の部分欠損や手動削除からの回復経路
+/// （fulltext FTS5 self-heal と同型）。
+///
+/// **「同一 content_key なら描き直しても同じ絵になる」は保証されていない**（debt-20）。
+/// `config_hash` は全経路 `""` 固定で、`RENDER_TARGET_WIDTH` も pdfium バイナリの tag も
+/// content_key に入っていない。したがって heal は指紋を動かしうる ── そのとき
+/// `node_alt_texts.source_asset_sha256` を置き去りにすると carry が無言で外れる（debt-16）。
+/// 追随は `db::assets::refresh_asset_file` が 1 枚ごとの tx で行う。
+///
+/// 残る限界: 再抽出の領域数がずれてファイル名が 1 つ詰まると、`fig-p001-00.png` の行が
+/// **別の絵**の指紋で上書きされる。debt-16 の修正はこの誤りを忠実に伝播させるだけで直せない
+/// （恒久解は content_key に pdfium tag と `RENDER_TARGET_WIDTH` を入れる = debt-20）。
 async fn heal_missing_assets(
     pool: &SqlitePool,
     app_data_dir: &Path,
@@ -325,11 +336,12 @@ async fn heal_missing_assets(
         .map_err(|e| format!("asset heal task panicked: {e}"))?
         .map_err(|e| format!("asset heal extraction failed: {e}"))?;
     let mut refreshed = 0u64;
+    let mut retargeted = 0u64;
     for page in &extracted.pages {
         for region in &page.image_regions {
             if let Some(file) = &region.file {
                 let rel = format!("{rel_dir}/{}", file.file_name);
-                refreshed += crate::db::assets::refresh_asset_file(
+                let n = crate::db::assets::refresh_asset_file(
                     pool,
                     version_id,
                     &rel,
@@ -339,11 +351,23 @@ async fn heal_missing_assets(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+                refreshed += n.assets;
+                retargeted += n.alt_texts;
             }
         }
     }
+    // **新規に当たった件数と、前から在った行の値が変わった件数を別々に出す**
+    // （合算すると「1 行も当たらなかった」が「変化なし」と同じ見た目になる）。
+    if refreshed != rows.len() as u64 {
+        eprintln!(
+            "LCIR: asset self-heal matched {refreshed} of {} row(s) for version {version_id} \
+             (relative_path mismatch?)",
+            rows.len()
+        );
+    }
     eprintln!(
-        "LCIR: asset self-heal re-rendered files for version {version_id} ({refreshed} row(s) refreshed)"
+        "LCIR: asset self-heal re-rendered files for version {version_id} \
+         ({refreshed} asset row(s) refreshed, {retargeted} alt text row(s) retargeted)"
     );
     Ok(())
 }
@@ -3728,6 +3752,57 @@ mod tests {
         let lcir = load_lcir_document(&pool, att).await.unwrap().unwrap();
         let fig = lcir.nodes.iter().find(|n| n.kind == "figure").unwrap();
         assert!(fig.alt_text.is_none());
+    }
+
+    /// debt-16 の回帰: **self-heal が crop を描き直して指紋が動いても carry は生き残る。**
+    ///
+    /// `heal_missing_assets` 本体は実 PDF と pdfium を要求するので、その DB 側の作用
+    /// （`refresh_asset_file`）だけを直に当てる。heal を入口にすると
+    /// 「行が 0 件」「全ファイルが存在する」の 2 段の早期 return で本体に届かず、
+    /// テストが空になる。
+    ///
+    /// 修正前はここで新版の alt text が 0 件になる ＝ 課金済みの説明を捨てて
+    /// `figures_missing_alt_text` が同じ絵を再課金対象に戻す。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn alt_text_survives_a_heal_that_changes_the_crop_fingerprint(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let v1 = insert_version_from(&pool, att, "ck1-aaaa", None, &extracted_with_crop("sha-a"))
+            .await;
+        let fig1 = figure_node_of(&pool, v1).await;
+        add_generated_alt_text(&pool, fig1, v1, "sha-a").await;
+
+        // self-heal: 欠けた crop を描き直したら指紋が変わった（pdfium を上げた等・debt-20）。
+        let rel = format!("attachments/x/.lcir/{att}/ck1-/fig-p001-00.png");
+        let n = crate::db::assets::refresh_asset_file(&pool, v1, &rel, "sha-b", (800, 534), 4321)
+            .await
+            .unwrap();
+        assert_eq!(n.assets, 1, "assets 行が当たること（パスがずれていない）");
+        assert_eq!(n.alt_texts, 1, "alt text の指紋も追随すること");
+
+        // 次の再構築は描き直した絵（sha-b）を出す。
+        let v2 = insert_version_from(
+            &pool,
+            att,
+            "ck2-bbbb",
+            Some(v1),
+            &extracted_with_crop("sha-b"),
+        )
+        .await;
+
+        let carried = crate::db::node_alt_texts::alt_texts_for_version(&pool, v2)
+            .await
+            .unwrap();
+        assert_eq!(carried.len(), 1, "heal を挟んでも carry される（再課金しない）");
+        assert_eq!(carried[0].text, "Diagram of two coupled cavities.");
+        assert_eq!(carried[0].source_asset_sha256, "sha-b");
+        assert_eq!(carried[0].carried_from_version_id, Some(v1));
+        assert!(
+            crate::db::node_alt_texts::alt_texts_for_version(&pool, v1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "carry できたので旧版の生成行は刈られる"
+        );
     }
 
     /// 手編集（user_edited）は carry の対象外だが、刈られもしない（人の記述を勝手に消さない）。

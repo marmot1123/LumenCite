@@ -1199,6 +1199,62 @@ async fn rebuild_outdated_lcir(
     .await
 }
 
+/// ストレージの内訳（DB ファイルの使用中 / 再利用可 + LCIR の GC 見積り・v1.0.0-p4）。
+///
+/// **`lcir.enabled` で gate しない** — 実験フラグを切った人ほど「もう要らない LCIR の
+/// 旧版が場所を食っている」を見たいので。読み取りだけなので排他も要らない。
+#[tauri::command]
+async fn lcir_storage_stats(state: State<'_, AppState>) -> Result<StorageStats, String> {
+    let db_size = db::storage_stats::db_size(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let gc = db::storage_stats::gc_preview(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(StorageStats {
+        file_bytes: db_size.file_bytes(),
+        used_bytes: db_size.used_bytes(),
+        free_bytes: db_size.free_bytes(),
+        gc,
+    })
+}
+
+/// [`lcir_storage_stats`] の返り値。
+#[derive(serde::Serialize)]
+struct StorageStats {
+    file_bytes: i64,
+    used_bytes: i64,
+    free_bytes: i64,
+    gc: db::storage_stats::GcPreview,
+}
+
+/// LCIR（v1.0.0-p4）: superseded 版を GC して容量を回収する。**非可逆**。
+///
+/// 排他は 3 つとも見る。`LCIR_BATCH_RUNNING` は既存の [`begin_lcir_batch`] を流用して
+/// 4 本目の static を増やさない（`already_running` のフロント側変換にもそのまま乗る）。
+/// alt text と TeX 取得を別に見るのは、**どちらも SettingsModal の外から呼べる**ため
+/// （`DetailPanel` の 3 箇所）で、UI の `disabled` では塞げない。
+///
+/// なお `build_lcir_for_attachment` にはフラグが 1 つも無く UI からも塞げないので、
+/// そこは `run_gc` 側の「削除直前の再評価」が最後の砦になる（debt-24）。
+#[tauri::command]
+async fn run_lcir_gc(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ingestion::gc::GcOutcome, String> {
+    if VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst) || TEX_FETCH_RUNNING.load(Ordering::SeqCst) {
+        return Err("already_running".to_string());
+    }
+    let _guard = begin_lcir_batch()?;
+    ingestion::gc::run_gc(&state.db, &state.app_data_dir, move |done, total| {
+        let _ = app.emit(
+            "lcir-gc-progress",
+            serde_json::json!({ "done": done, "total": total }),
+        );
+    })
+    .await
+}
+
 /// LCIR（実験・Phase 2）: ノード単位（段落・見出し・caption 等）の全文検索。ヒットは
 /// `node_kind`・`page`・（あれば）PDF 上の領域 `bbox` を返すので、該当ブロックを直接ハイライトできる。
 #[tauri::command]
@@ -3965,6 +4021,12 @@ pub fn run() {
                     Ok(false) => {}
                     Err(e) => eprintln!("LCIR content_key unique index failed: {e}"),
                 }
+                // symbols(scope_node_id) は migration 0018 が張り忘れた唯一の子キー索引で、
+                // 無いと版削除がノード 1 件ごとに symbols を全走査する（GC 実測 125 → 48 秒）。
+                // UNIQUE ではないので既存データがどうあっても失敗しない。
+                if let Err(e) = db::symbols::try_create_scope_node_index(&lcir_pool).await {
+                    eprintln!("LCIR symbols scope index failed: {e}");
+                }
             });
 
             // BibTeX 自動同期のコーディネーター。各ミューテーションが sync_tx.send() で
@@ -4299,6 +4361,8 @@ pub fn run() {
             get_lcir_document,
             build_missing_lcir,
             rebuild_outdated_lcir,
+            lcir_storage_stats,
+            run_lcir_gc,
             search_lcir_nodes,
             get_lcir_node_region,
             get_lcir_enabled,

@@ -134,7 +134,7 @@ migration 20 本すべてに当たって確認した。0 件なら v1.0.0 のロ
 | 3 | ~~`feat(LCIR): XObjectForm 内の画像を図領域にする（8d-8）`~~ **完了**（§2.12） | 8d-8 | M → **S** / 260 | →**0.11.0** | 否 | 8d-2 の前。混ぜると 8d-2 のガード閾値を誤った母集団でチューニングする。**着手時の実測で母集団の見積りが外れていた** ── 「ラスタ画像を持つのに top-level 列挙に出ない 21 版 / caption 211 件」は誤りで、form 内に画像がある版は **8 版（うち figure 0 件は 6 版・caption 134 件）**（§2.12）。**回転ページ（debt-9）は同梱しない**（5 頁とも画像が 0 枚＝回収できる図が 0 件） |
 | 4 | ~~`feat(LCIR): ベクター図（tikz/pgf）の領域検出（8d-2）`~~ **完了**（§2.13） | 8d-2 | L → **M** / 約 640 | →**0.12.0** | 否 | 最大の新推定器かつ**唯一 888 件の carry を全滅させうる**位置づけだったが、**union しない**設計（§2.6-2）と 2 段 caption ペアリングにより**既存領域の移動 0 件・消滅 0 件＝ carry 破壊 0 件**で収まった。着手時のプローブで判明した誤検出源は 3 つとも「bbox がインクの位置を表さない」形（白抜きストローク / クリップ未考慮 / ページ横断の罫線）で、設計段階では 1 つも予期していなかった |
 | 5 | ~~（PR なし）**ゲート ②a — 抽出器差分だけの限定レビュー**~~ **完了**（§2.14）。指摘反映は PR 2 本（**PR-a** クリップ交差 + 配線テスト → **0.13.0** / **PR-b** debt-22 の C0 クリーナー → 0.14.0） | 1〜4 の diff（2.5 を含む） | — | →**0.13.0** / **0.14.0** | 否 | ここで出た指摘は版 bump のみで吸収でき再構築を増やさない。#7 の後に回すと、抽出器への指摘 1 件で 80 分再構築 + carry 再賭け + Vision 再課金がもう 1 回確定する。**実際に confirmed medium が 1 件出て、それは「図が丸ごと消える」型だった**（§2.14） |
-| 6 | `feat(LCIR): superseded 版の GC と容量可視化（p4）` + **実 DB で GC を 1 回実行** | p4 | M / 600–800 | なし | 否 | **再構築の前に実行する**（§2.3）。削除対象 145 版は今 alt text 0 行 / assets 0 行＝述語がバグっても損失が実測ゼロ。加えて約 526MB を free page 化してから約 450k ノードを積むので DB が育たない |
+| 6 | ~~`feat(LCIR): superseded 版の GC と容量可視化（p4）`~~ **PR は完了**（§2.16）。**実 DB での GC 実行は #7 の直前に残っている** | p4 + debt-16 | M / 約 720 | なし | 否 | **再構築の前に実行する**（§2.3）。削除対象 145 版は今 alt text 0 行 / assets 0 行＝述語がバグっても損失が実測ゼロ。加えて約 494MB を free page 化してから約 450k ノードを積むので DB が育たない。**着手時の実測で所要が 27 秒→125 秒（索引を張って 48 秒）と 4.6 倍ずれていた**（§2.16） |
 | 7 | （PR なし）**唯一の再構築 80 分 + Vision 1 回** | — | — | なし | **実行** | 版を 5 回上げても実データは動いていない。ここで人が 1 回押す |
 | 8 | `feat(LCIR): 全文検索の索引源を LCIR 優先にする（p1）` | p1 | M / 900–1,250 | なし | 否 | 再構築の**後**。p1 の再導出は pdfium 不要の純 SQL（秒オーダー）なので再構築に相乗りさせる利得がほぼ無い一方、debt-17 / debt-22 の解消を含むので独立してレビューしたい。OCR 保護を settings に置く決定（§2.6-1）により **migration は不要**になり、配布版 v0.10.0 との併用も壊れない |
 | 9 | `feat(LCIR): LCIR の自動 build（p2）` | p2 | L / 420–620 | なし | 否 | p1 の後。p1 が build 経路（`:160` reuse / `:224` 新版）に page-FTS を配線済みなら p2 は索引を意識しなくてよい。逆順だと p2 が pdf_extract 前提の配線を書き p1 で剥がす |
@@ -168,9 +168,9 @@ pdfium の版は `0.7.0 → 0.8.0 → 0.9.0 → 0.10.0 → 0.11.0 → 0.12.0` �
 5. **`heal_missing_assets` の穴を図系 PR 群のどこかで塞ぐ**（debt-16・~40 行 + テスト）。
    塞がないと、開発期間中に crop が 1 枚欠けた添付を build した時点で無言の carry 破壊が仕込まれ、
    原因から数週間離れた再構築時に「8d-2 のバグ」と誤診される。
-   **⚠ 図系 PR は #4（8d-2）で終わったが、debt-16 は入れていない**（8d-2 のスコープ外で、
-   混ぜると 1 つの PR で見る面が増えすぎるため）。**#6（p4）の PR か、その前の独立した S の PR で
-   #7 より前に必ず塞ぐこと。** これは #7 の前提であって「あると良い」ではない。
+   ~~**⚠ 図系 PR は #4（8d-2）で終わったが、debt-16 は入れていない**~~
+   **解消**（2026-08-05・#6・§2.16）。`refresh_asset_file` が指紋を動かしたら
+   `node_alt_texts.source_asset_sha256` も同一 tx で付け替える。
 6. **再構築の完了条件は `failed == 0`。** `run_build_batch` は 1 添付の失敗を eprintln と `failed` カウントに
    落として続行するだけなので、20 件失敗しても UI は完了を返す。不完全なコーパスで
    「未結合 caption 642 → ?」を測ると 8d-2 の効果を誤判定する。
@@ -207,8 +207,9 @@ restore 単位を GC / 再構築 / Vision の 3 つに割る。
 ```
 (a) 手動バックアップ取得 → zip サイズと db.sqlite 圧縮後サイズを控える
 (b) 配布版 LumenCite を終了（以降 (f) まで起動しない）
-(c) p4 の GC を実行 → 検算: superseded 145→0 / document_nodes 2,663,234→約 450,149 /
-    node_alt_texts が 888 のまま減っていないこと
+(c) p4 の GC を実行（設定 → データ → ストレージ）→ 検算: superseded 145→0 /
+    document_nodes 2,663,234→**450,149（ぴったり）** / node_alt_texts が 888 のまま減っていないこと /
+    再利用可が **+471.0 MiB**。所要は約 70 秒（コピーでの実測・§2.16）
 (d) 手動バックアップ取得
 (e) att40 でパイロット再構築 → carry 件数を確認（**期待はちょうど 73**。debt-14 で att40 の図 1 件の
     bbox は動くが crop の画素は変わらないことを §2.10 で確認済なので、72 以下なら想定外の事故）
@@ -1262,6 +1263,211 @@ page の `plain_text` は**図領域・bbox・caption ペアリング・crop の
 
 ---
 
+### 2.16 #6（p4 + debt-16）の実装記録（2026-08-05・完了）
+
+**superseded 版の GC + 容量可視化と、`heal_missing_assets` の指紋追随。**
+migration 0 件・**抽出器版は 0.14.0 据え置き**（抽出出力は 1 バイトも変わらない）。
+
+#### 着手前のプローブが所要時間の見積りを 4.6 倍ずらしていた
+
+§7 の「cascade delete は約 27 秒（実測外挿）／版単位の tx に割れば 1 回約 0.18 秒」は
+**どちらも誤り**だった。実 DB のコピーで測ると **125 秒 / 版あたり最大 16.7 秒**で、
+**6 版が `busy_timeout`（sqlx 既定 5 秒）を超える**。版単位に割るだけでは足りない。
+
+原因は `symbols(scope_node_id)` が**未索引**だったこと。SQLite は子キーに索引が無いと
+親 1 行の削除ごとに子表を全走査するので、2.21M ノード × `symbols` 356 行 = 787M 行訪問になる。
+`document_nodes` を参照する子キーで索引が無いのは**ここ 1 本だけ**（0018 は `version` と
+`defined_at` にしか張っていない）。張ると **125 秒 → 48 秒・最大 16.7 秒 → 5.7 秒**。
+
+| | 索引なし | 索引あり |
+|---|---|---|
+| 全体 | 125.09 s | **47.78 s** |
+| 版あたり最大 | 16.72 s | **5.73 s** |
+| 5 秒超の版 | 6 | 2 |
+
+**それでも 2 版が 5 秒を超える**ので、索引に加えて**ノード数でチャンクを切る**（50,000）。
+
+#### そのチャンクは最初 1 行も分割していなかった（コミット後レビューの high）
+
+`DELETE ... WHERE id IN (SELECT id ... LIMIT ?)` を **id 昇順**で切っていたので、
+1 チャンク目に木の根（`document` ノード）が入り、**その 1 行の削除が版の全ノードを
+自己参照 CASCADE で消していた**。実 DB の版 34（272,583 ノード）で確認:
+
+| 並び | `changes()` | 残り |
+|---|---|---|
+| 昇順 | **1** | **0**（1 tx で全部消えた・7.95 秒） |
+| 降順 | 378 | 222,583（ちょうど 50,000 減る） |
+
+つまり「版あたり 7.95 秒は 6 チャンクの合計なので 1 tx は約 1.3 秒」という初出の記述は
+**誤り**で、実際は 1 版まるごとが 1 tx（最大 7.95 秒）＝ `busy_timeout` 5 秒を超えていた。
+`ORDER BY id DESC` にして葉から剥がす。**チャンクごとの実時間を測り直した**結果、
+版 34 の 6 チャンクは **0.28 / 0.60 / 0.63 / 0.62 / 0.63 / 0.28 秒**（全体 71.05 → 58.66 秒）。
+
+**結果だけを見るテストでは検出できない** ── 昇順でも正しく全消えするので、
+「全部消えたか」を主張するテストは全部緑のままだった。だから
+「1 回の DELETE で消える件数が chunk を超えないこと」を直接測るテストを置いた。
+索引は migration ではなく起動時の `CREATE INDEX IF NOT EXISTS`
+（`db::symbols::try_create_scope_node_index`）にした ── v1.0.0 の migration を 0 件に保つため。
+索引の追加は `_sqlx_migrations` を動かさないので配布版 v0.10.0 と併用できる。
+UNIQUE ではないので既存データがどうあっても失敗せず、`try_create_content_key_unique_index` と
+違って重複チェックも要らない。
+
+#### やったこと
+
+- **`ingestion::gc`**（新設）。対象は `superseded` かつ ①自分の `node_alt_texts` が 0 件
+  ②その添付に生存版がある ③まだ回収するものが残っている。
+- **carry 元は子だけ消して版の行を残す**（tombstone）。`carried_from_version_id` は
+  `ON DELETE SET NULL` なので、消すと carry 行が「NULL = この版で生成」というスキーマの
+  契約を偽る。**今は該当 0 件だが #7 の再構築後は最初の生成版がすべてこれになる** ──
+  `carried_from_version_id` は `prev.carried_from_version_id.unwrap_or(prev.document_version_id)`
+  ＝ **常に最初の生成版**を指すので、諦める設計だと 45 万ノードが二度と回収できなくなる。
+  回収量はほぼ同じ（容量の 83% は `document_nodes` + `source_fragments`）。
+  **これは §2.3 に書かれていない「#6 を #7 より前に置く根拠」のもう 1 本**でもある。
+- **`parent_version_id` の pre-step NULL 化**。NO ACTION なので、生存版からも削除対象どうしでも
+  参照されていると DELETE が落ちる（実 DB は 145/145 が参照されている）。失うのは将来の
+  法医学的追跡だけ（この列にはリポジトリ内で読み手が 0 件・9a の export にも出ない）。
+- **削除直前の再評価**（`collect_one_version`）。対象一覧を引いてから消すまでの間に
+  `build_lcir_for_attachment`（**排他フラグを 1 つも持たず、`DetailPanel` から直接呼べる**）が
+  新版を作って旧 completed を supersede すると、alt text をまだ刈られていない版が紛れる。
+  Vision バッチが課金直前に `still_latest` を再確認するのと同じ型。
+- **crop の回収は「削除対象版のパス − 生存版のパス」の集合差**。content_key から
+  ディレクトリ名を組むのは不可 ── ディレクトリのキーは `(attachment_id, content_key[..16])` で
+  版 id ではなく、UNIQUE 索引は起動時 best-effort なので**同一ディレクトリを superseded 版と
+  生存版が共有しうる**。`assets.document_version_id` は CASCADE なので**削除前にパスを控える**。
+- **node-FTS の孤児掃除**を最後に 1 回。`document_nodes_fts` は FK が無く削除経路が添付単位
+  しか無い。通常は孤児が出ないが、`mark_superseded_for_attachment` が tx 内・
+  `regenerate_node_fts_from_lcir` が tx 外で失敗しても `eprintln` だけ、という窓が実在する。
+  件数は生存確認のセンチネル（実 DB は 0 件）。
+- **debt-16**: `refresh_asset_file` が指紋を動かしたら `node_alt_texts.source_asset_sha256` も
+  同一 tx で付け替える。述語は**版スコープ + 旧指紋一致 + ノードリンクの 3 つ**
+  （実 DB に添付を跨ぐ sha が 3 件、同一版で同じ sha を共有する crop が最大 11 枚ある版がある）。
+  **tx はファイル 1 枚ごと**に張る（版全体で張ると att37 で 75 分ぶん書込ロックを保持する）。
+  `user_edited` も付け替える ── carry / prune は必ず除外するが、付け替えは削除でも上書きでもなく
+  「同じ絵を指し直す」だけなので、除外すると手編集行だけが存在しない指紋を指し続ける。
+- **UI**: 独立 Section（`lcir.enabled` で gate しない）+ インライン danger 確認
+  （`window.confirm` は WKWebView で素通りしうる）。既存 4 ボタンにも `|| gcRunning` を足した。
+
+#### 実データの効果（実 DB のコピーに本番の `run_gc` をそのまま流した）
+
+手書き SQL ではなく**本番のコードを呼ぶ** `#[ignore]` プローブ
+（`lcir_gc_on_a_copy_of_the_real_library`）。第 2 の実装を作らない。
+
+| | GC 前 | GC 後 |
+|---|---|---|
+| `document_versions`（superseded） | 145 | **0** |
+| `document_nodes` | 2,663,234 | **450,149** |
+| `source_fragments` | 2,659,223 | 448,241 |
+| `node_alt_texts` | 888 | **888（不変）** |
+| ファイル | 761,237,504 B | **761,241,600 B**（+1 ページ＝新しい索引） |
+| 使用中 | 761,237,504 B | 267,358,208 B |
+| 再利用可 | 0 | **493,883,392 B（471.0 MiB）** |
+
+- **所要 58.7 秒**（索引あり・降順チャンク）。最遅の版は 7.15 秒だが、それは
+  272,583 ノードの版が 6 チャンクに割れたときの**合計**で、
+  **1 tx あたりは実測 0.28〜0.63 秒**（`busy_timeout` 5 秒に対して 8 倍の余裕）。
+- **行を残した版 0 / skip 0 / 回収した crop 0 件**（superseded の `assets` は 0 行）。
+- **見積りと実削除が一致**（`nodes = 2,213,085`）。確認ダイアログの数字が嘘をつかないこと自体を
+  プローブで assert している。
+- **§7 の回収見込み「約 526MB」は 6.5% 過大**。実測 **493.9 MB**。free page になるのは
+  丸ごと空いたページだけで、生き残り行が 1 行でも載っているページは解放されない。
+- **§7 の「GC 後は圧縮 63〜70MB・1 世代あたり約 150MB・keep=14 で約 2.1GB」も過大**。
+  実測は GC 後の `VACUUM INTO` が raw 272.7MB、deflate 後 **110.5MB** ＝
+  **1 世代あたり約 110MB・keep=14 で約 1.5GB**。
+  なお **1 世代 831MB の最大成分は db.sqlite ではなく crop PNG（337.8MB）**で、
+  DB 側の GC はそこを 1 バイトも減らさない（削減は 1 世代の約 13%）。
+- **`dbstat` は「726MB で数十秒」ではなく 0.35〜2.4 秒**（bundled SQLite が
+  `-DSQLITE_ENABLE_DBSTAT_VTAB` 付き）。ただし**使っていない** ──
+  使用中 / 再利用可は `(page_count − freelist_count) × page_size` で `dbstat` と
+  1 バイトも違わない値がマイクロ秒で出る。`dbstat` が要るのは表ごとの内訳だけ。
+
+#### 予告は行数・事後はバイト
+
+GC 前に「何 MB 空きます」を出すには「表全体のバイト × 死行率」の按分推定しか作れず、
+実測で 6.5% 上振れした。だから**確認ダイアログには行数と安全述語**を出し、
+バイトは実行後に `freelist_count` の実測差分として報告する。
+`dbstat` はページを btree に帰属させるだけで、**行が superseded 版のものかを区別できない**。
+
+#### コミット後レビューで直したもの
+
+5 レンズ + 敵対的検証（35 指摘 / confirmed 7 / refuted 10 / **unverified 18** ──
+検証の途中で週次上限に当たったので、unverified は自分で仕分けた。
+[[feedback_workflow_zero_votes]] のとおり **unverified を refuted と同じ枝に落とさない**）。
+
+- **[high] チャンクが tx を分割していなかった**（上記）。
+- **[high] 確認ボックスが mount 時の古い見積りで同意を取る。** 同じタブに再構築ボタンが
+  並んでおり、押す直前に取り直すようにした。
+- **全件 skip されたときに「回収できる旧版はありませんでした」と嘘をつく**（skip 件数が
+  分岐ごと落ちていた）。
+- **確認ボックスが tombstone 版を「保護されます」と説明していた**（実際は中身を全部消す）。
+  crop が保存期間の無い待避領域へ行くことも書いていなかった ──
+  §2.16 の初出は「UI 文言もそう書いた」と主張していたが**実際には無かった**。
+- **`files_trashed` が実在しないファイルも数えていた。** `move_to_trash` は対象が無いとき
+  何もせず `Ok(())` を返すので、素直に数えると試行回数になる。#7 の後は
+  「`assets` 行はあるが実体は 8a の build 時 GC が回収済み」が多数派になるので、
+  `files_already_gone` と分けて数える（合算すると「1 枚も当たらない」異常が正常と同じ見た目）。
+- **alt text の保護述語をノード経由でも見る。** `node_alt_texts` は `node_id` と
+  `document_version_id` を独立に持ち、一致をスキーマが強制していない。version 列だけ見ると
+  「この版に alt text は無い」と判定するのに、ノードのカスケードで実際には消える。
+  今のデータでは no-op（[[feedback_refuted_is_not_no_action]]）。
+- **索引を GC 自身が保証する。** 所要時間はこの索引に全面的に依存しているのに、
+  起動時の best-effort（失敗しても `eprintln` だけ）に頼っていた。
+- **heal の tx 粒度の理由づけが実コードと違っていた。** 「版全体で張ると 75 分ロックする」は
+  誤りで、75 分かかる再レンダリングはループの**前**に完了している。正しい理由は
+  「途中失敗でそこまでの更新が残る」こと（まとめて張ると、ファイルは全部書き直したのに
+  DB は 1 行も追随していない状態になり、heal は二度と起動しないので恒久化する）。
+- 桁区切りが i18next の言語でなく実行環境ロケールだった / 排他が片方向だった
+  （backup・restore・全文索引側が `gcRunning` を見ていなかった）/
+  「次回の再構築で回収されます」が LCIR を切ったユーザーには成立しない。
+
+**残した指摘**（doc に記録して直さない）: プロセス横断の排他（`GuiLockState` は
+`AppState` に載っておらず `acquire_gui_lock` は再入不可 = debt-24 の残り）、
+`is_carry_source` と版行 DELETE が別 tx（窓は carry 行の挿入経路が build tx の中だけなので
+実際には踏めない）、`sweep_fts_orphans` がチャンク分割されていない（実 DB で孤児 0 件・
+FTS 129,706 行の 1 パス）。
+
+#### テストと変異
+
+テスト 1,078 → **1,117**（+39・`#[ignore]` のプローブ 1 本を含む）。
+**変異 18 通りは全部 killed**。ただし 3 件は**最初生き残り、テストの方を直した**:
+
+- **版スコープ（debt-16）** — ノードリンク条件だけで版が絞れてしまい冗長に見えた。
+  しかし `node_alt_texts.document_version_id` が「そのノードの版」と一致することを
+  **スキーマは強制していない**（揃えているのは挿入経路の作法だけ）。破れた行を 1 つ置く
+  テストを足して固定した。
+- **(iii) 生存版がある条件 / (i) alt text を守る条件** — 削除直前の再評価が同じ条件を見るので
+  「結果として消えていない」だけでは述語が効いているのか再評価が拾っているのか区別できない。
+  **対象一覧に入らないこと自体**（`gc_target_versions` が空・`versions_skipped == 0`）を
+  主張するテストに直した。
+- **チャンクの終了条件** — 罠が 2 段あった。①木の根から始まる素直な形だと 1 回の
+  カスケードで全部消えて差が出ない。②**行ごと消す版では最後の版削除がカスケードで
+  取りこぼしを片付けてしまう**。平坦ノードの後ろに親子の組を置き、かつ **tombstone される版**で
+  試して初めて killed になった。あわせて `delete_version_children` の返り値を
+  「消す前の数」から**実際に減った数**（before − after）に変えた ── 前者だと
+  ループが途中で抜けても報告値は満額のままで、取りこぼしが集計に出ない。
+
+`foreign_keys_are_on_in_the_test_database` を 1 本置いた。OFF だと CASCADE の主張が全部
+空振りする（sqlx 0.8 は既定 ON だが、既定が変わったら気づけるように固定する）。
+既存の `assets.rs::cascades_on_delete` は **JOIN 越しのアクセサで数えているので空振りする型**
+だったので、GC のテストは全部**素の `SELECT COUNT(*)`** で書いた。
+
+#### 残る限界
+
+- **`heal_missing_assets` は再抽出の領域数がずれると別の絵の指紋で上書きする。**
+  debt-16 の修正はその誤りを忠実に伝播させるだけで直せない（恒久解は debt-20）。
+- **`assets.metadata_json` の `render_target_width` は heal で更新されない**（debt-29 に新設）。
+- **GC 中に `build_lcir_for_attachment` が走るのは UI では塞げない**（`DetailPanel` の 2 経路に
+  排他フラグが無い・debt-24）。削除直前の再評価が最後の砦になっている。
+- **`.attachment-trash` に保持期間は無い**（`sweep_trash` は mtime を見ずに全消し）ので、
+  crop を trash に送った時点で実質不可逆。UI 文言もそう書いた。
+
+#### 実 DB の GC 実行（#7 の直前・§2.4 (c)）
+
+**まだ実行していない。** 手順と検算値は §2.4。上のプローブがコピーで完走しているので、
+期待値は **superseded 145 → 0 / `document_nodes` 2,663,234 → 450,149 / `node_alt_texts` 888 のまま**。
+実行前に配布版と `pnpm tauri dev` を**両方**終了すること（§2.3-7）。
+
+---
+
 ## 3. Phase 7（数式意味表現）— post-1.0
 
 **器は完成・中身はゼロ。** `math_expressions` の `ast_json` / `presentation_mathml` / `content_mathml` /
@@ -1642,6 +1848,8 @@ CASCADE でない FK は 3 本: `symbols.scope_node_id` = SET NULL（同版内�
 
 **GC が carry を壊さない条件（定式化）**: 版 v を削除して安全なのは
 「v に紐づく `node_alt_texts` 行が 0 件」かつ「v が他の行の `carried_from_version_id` から参照されていない」とき。
+**#6 では後者を「対象から外す」ではなく「子だけ消して版の行を残す」に変えた**（§2.16）──
+外すだけだと、#7 の再構築後は最初の生成版がすべて carry 元になるので 45 万ノードが二度と回収できない。
 前者が破れると (i) 課金済みで復旧不能な `llm_inference`（crop PNG は trash 済み・新版に page_crop が無いので
 `figures_missing_alt_text` の対象にも戻らない）と (ii) 人間が書いた `user_edited` が無音で消える。
 
@@ -1651,18 +1859,30 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 
 そのほかの実測:
 
-- 回収見込みは約 **526MB**（`document_nodes` 262.4MB + `source_fragments` 173.1MB + 索引 5 本で DB の 83.2% を占め、
-  そのうち 83% が superseded）。
+- 回収見込みは~~約 526MB~~ **493.9MB（471.0 MiB）**（2026-08-05 に実 DB のコピーで GC を完走させた実測・§2.16）。
+  初版の 526MB は「表 + 索引 633.3MB のうち 83%」の按分で **6.5% 過大**だった ──
+  free page になるのは丸ごと空いたページだけで、生き残り行が 1 行でも載っているページは解放されない。
 - **GC しても DB ファイルは縮まない**（free page になるだけ）。UI は「使用中 / 再利用可」を分けて出し、
   「次のバックアップと次の再構築で回収される」と明記する。live DB への VACUUM は p4 に入れない。
 - **バックアップは `VACUUM INTO` なので free page を運ばない** ＝ GC 後は live DB を VACUUM しなくても
-  バックアップだけ即座に縮む。実測: 直近 zip の db.sqlite は raw 737MB → 圧縮 220.6MB。
-  GC 後は圧縮 63〜70MB と見込め、1 世代あたり約 150MB・keep=14 で約 2.1GB の削減。
-- **cascade delete は 2.21M+2.21M 行で約 27 秒**（実測外挿）。main pool は `busy_timeout` を明示しておらず
-  sqlx 既定の 5 秒なので、単一 tx で保持すると別プロセスの書込が `SQLITE_BUSY` で落ちる。
-  **版単位の tx に割る**（145 回・1 回約 0.18 秒）。
+  バックアップだけ即座に縮む（SQL は `backup.rs` で確認済）。実測: 直近 zip の db.sqlite は raw 737MB → 圧縮 220.6MB。
+  GC 後は raw 272.7MB → **圧縮 110.5MB**（2026-08-05 実測）＝ **1 世代あたり約 110MB・keep=14 で約 1.5GB**。
+  ~~圧縮 63〜70MB・1 世代 150MB・2.1GB~~ は過大だった。
+  **なお 1 世代 831MB の最大成分は db.sqlite（220.6MB）ではなく crop PNG（337.8MB）**で、
+  DB 側の GC はそこを 1 バイトも減らさない ＝ 削減は 1 世代の約 13%。「世代サイズが半分になる」とは書かないこと。
+- ~~**cascade delete は 2.21M+2.21M 行で約 27 秒**（実測外挿）。**版単位の tx に割る**（145 回・1 回約 0.18 秒）。~~
+  **どちらも誤りだった**（2026-08-05 実測・§2.16）。実際は **125 秒 / 版あたり最大 16.7 秒**で
+  **6 版が `busy_timeout`（sqlx 既定 5 秒）を超える**。支配項は `symbols(scope_node_id)` の
+  **未索引**（`document_nodes` を参照する子キーで唯一）で、張ると 48 秒・最大 5.7 秒になる。
+  それでも 2 版が 5 秒を超えるので、**索引 + ノード数のチャンク（50,000）**の両方を入れた。
+  main pool が `busy_timeout` を明示していない（sqlx 既定 5 秒）という指摘自体は正しい。
 - 容量可視化の部品は既にある: `list_backups`（`BackupInfo{size_bytes}`）は Tauri に登録済みだが
-  **フロントに呼び手が 1 つも無い**ので流用できる。`dbstat` は本番 DB で使える（726MB で数十秒）。
+  **フロントに呼び手が 1 つも無い**（リポジトリ全体で 0 件・テストにも無い）ので流用できる。
+  ~~`dbstat` は本番 DB で使える（726MB で数十秒）~~ → **使えるが「数十秒」は 1〜2 桁の誤り**で、
+  実測 0.35〜2.4 秒（bundled SQLite が `-DSQLITE_ENABLE_DBSTAT_VTAB` 付き）。
+  **ただし #6 では使っていない** ── 使用中 / 再利用可は
+  `(page_count − freelist_count) × page_size` で `dbstat` と 1 バイトも違わない値が
+  マイクロ秒で出る（実測で恒等式を確認）。`dbstat` が要るのは表ごとの内訳だけ。
 - GC と stats は **`lcir.enabled` で gate しない**（切った人ほど消したい）。
 
 ---
@@ -1686,18 +1906,20 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | debt-13 | スキャン本 1 冊（att37）が figure の 43.7%・alt text の 58.9%・**crop 容量の 80%（444.5MB）**・**再構築時間の 94%（4,514 秒）**を占める | M | 8c/8a の費用対効果・p2 の最悪ケース |
 | ~~debt-14~~ | ~~図領域のクランプが CropBox 原点を無視~~ **解消**（2026-08-02・#2・§2.10）。クランプ範囲をページ境界 box へ、原点を `CropBox ∩ MediaBox` へ（後者は着手時の実測で見つかった 2 つ目の取り違え・392 頁 / 2 版）。実測は**新規に拾えた図 4 件 / bbox が動いた図 3 件 / 消えた図 0 件**、Vision 再課金は 1 件。「クランプ痕跡 10 図・alt text 6 件」は境界に接する図の数で、動く図の数ではなかった | S | 完了 |
 | ~~debt-15~~ | ~~`gc_stale_asset_dirs` に mtime 猶予が無い。dev と配布版が同一 app data dir を共有しているので、両方が build すると互いの content_key ディレクトリを trash に送り合う~~ **解消**（2026-08-02・#0・§2.8）。1 時間以上離れた build 同士は依然回収し合うので、恒久解は p4 の GC | S | 完了 |
-| **debt-16** | `heal_missing_assets` が `assets.sha256` を UPDATE しても `node_alt_texts.source_asset_sha256` が追随しない。crop が 1 枚欠けた添付を build した時点で無言の carry 破壊が仕込まれ、数週間後の再構築で「8d-2 のバグ」と誤診される | S（~40 行） | 再構築 1 回の前提 |
+| ~~**debt-16**~~ | ~~`heal_missing_assets` が `assets.sha256` を UPDATE しても `node_alt_texts.source_asset_sha256` が追随しない~~ **解消**（2026-08-05・#6・§2.16）。`refresh_asset_file` が同一 tx で付け替える。述語は**版スコープ + 旧指紋一致 + ノードリンクの 3 つ**（実 DB に添付を跨ぐ sha が 3 件・同一版で同じ sha を共有する crop が最大 11 枚の版がある）。**被害範囲は初版の記述より広かった** ── heal は欠けた 1 枚ではなく**その版の全ファイル**を描き直すので、壊れるのはその版の alt text 全件 | S | **完了** |
 | **debt-17** | 新規添付で `extract_and_index`（pdf_extract）の spawn と LCIR build が last-writer-wins レースになる。`index_attachment` は先頭で `DELETE FROM fulltext WHERE attachment_id=?` を無条件に打つので、pdf_extract が 0 字を返す個体（att93/att94）は **LCIR が正常でも検索から消える**。新規添付でしか起きないので既存 138 件の前後比較には現れない | M | **p1 の完了条件**（3 つの spawn を「足す」でなく「外す」） |
 | ~~**debt-18**~~ | ~~同じ座標系の取り違えが `in_margin` 判定にもある~~ **解消**（2026-08-03・#2.5・§2.11）。帯を `box_bottom + 高さ*0.90 / *0.10` に直した（`structure.rs` の `classify_block`）。実測は**帯の membership** が 誤 / 正 = vid 149: 1,179/272・183: 100/63・202: 24/13・223: 22/13（**頁ごとの**原点で判定）、**実際に反転したのは `unknown_block`→`paragraph` 107 件 / 6 版・`paragraph`→`unknown_block` 12 件 / 2 版**。予告どおり判定式だけでは終わらず、原点を `extract_document` へ引き上げて `ExtractedPage` に載せる必要があった | S | 完了 |
 | **debt-19** | **テキスト fragment 約 11,970 件（12 版・5 件以上に絞ると 9 版）がページ矩形をはみ出す**（y 方向最大 +116pt / x 方向最大 +464pt）。**発生源は `ingestion/mod.rs:547-559`** ── page ノードの fragment を「原点 `(0,0)` + box の寸法」で入れており、原点だけ絶対・寸法だけ box という debt-14 と同じ取り違えになっている（コメントの「ページ全面（MediaBox）」も実際と食い違う）。正しくは `box_left`/`box_bottom` を原点に置く。**debt-14 では直らない**（図 crop のクランプのみ） | M | 9b-4 の座標変換 |
 | **debt-20** | `content_key` の `config_hash` が全経路 `""` 固定で、`RENDER_TARGET_WIDTH` 等を変えても content_key が動かない。pdfium バイナリの tag（chromium/7934）も content_key にも `metadata_json` にも入っていない ＝ **pdfium を上げると全 crop の sha256 が変わり alt text 888 件が全滅しうるのに、それが版として表現されない** | S（metadata に tag を足すのは 1 行） | 再構築の再現性 |
-| **debt-21** | superseded 行が残る間、同一 content_key の再 build は UNIQUE 違反で必ず失敗する（`find_completed` が status で絞るので reuse に乗らない）。**古いバイナリで「旧版を再構築」を押すと全件失敗する**経路が実在する | S | p4 の GC が副作用で解消する |
+| **debt-21** | superseded 行が残る間、同一 content_key の再 build は UNIQUE 違反で必ず失敗する（`find_completed` が status で絞るので reuse に乗らない）。**古いバイナリで「旧版を再構築」を押すと全件失敗する**経路が実在する。**#6 の GC が行ごと消す版については解消する**（実 DB の 145 版は全部これ）。ただし **carry 元として行を残す版（tombstone）では解消しない** ── 行が残る限り `(attachment_id, content_key)` の UNIQUE は当たる。#7 の再構築後はこちらが主になる | S | p4 の GC が**部分的に**解消する（§2.16） |
 | ~~**debt-22**~~ | ~~page ノードの `plain_text` が `normalize_ws` を通らず C0 制御文字を含む~~ **解消**（2026-08-04・#5 の PR-b・§2.15）。保存点で `structure::clean_page_text` を通す（`\n` / `\t` 以外の C0 を除去 + `\r\n` / `\r` → `\n`）。**改行は潰さない**（`normalize_ws` 流用は `get_fulltext` の本文を 1 行の塊にする）。索引側（`regenerate_page_fts_from_lcir`）にも保険で同じクリーナーを掛けた ── #7 の再構築より前に p1 を回しても汚れが索引に入らないようにするため。実測は 4,570 → **0 ページ** | S | **完了** |
 | **debt-23** | 走り柱が caption と同一ブロックに融合する（「166 8 Staggered Model Fig. 8.3 …」）。`detect_caption` は先頭行しか見ないので caption にならない。素朴な緩和（先頭行以外にも当てる）は本文中の "Fig. 3" を誤認するので危険。**実測（2026-08-04）: 候補 164 ブロック / 終端記号を持つ caption 形 51 行 / 真の融合は目視で ~20-30 に対し、素朴修正の誤爆母集団は ~130-150 = 3〜6 倍**。誤 caption は 8d-2 のアンカーになり偽ベクター図 → 偽 crop → Vision 課金を生むので、**post-1.0 に確定**（§2.3-8） | M | **post-1.0** |
-| **debt-24** | 長時間 LCIR ジョブの排他が 3 つの独立フラグに分裂し、相互排他は `SettingsModal.tsx:1077` の `disabled` 属性 1 行だけ。alt text ボタンは `lcirBatch` を見ていない。**プロセス横断の側は #0 で解消**（`acquire_gui_lock` が `GuiLockState` を返す・§2.8）。残るのはプロセス内の 3 フラグ統合 | S〜M | **p2 の完了条件** |
+| **debt-24** | 長時間 LCIR ジョブの排他が 3 つの独立フラグに分裂している。**プロセス横断の側は #0 で解消**（`acquire_gui_lock` が `GuiLockState` を返す・§2.8）。**#6 で GC ボタンを既存 4 ボタンと相互排他にした**が、実態は初版の記述より悪い（2026-08-05 の実測）: ①フロントの gating 変数は 3 つでなく 4 つ（`busy` / `fetchTexRunning` / `lcirBatch` / `altTextRunning`）②`generate_vision_alt_texts` は `DetailPanel.tsx` からも呼べるので SettingsModal の `disabled` では塞げない ③**`build_lcir_for_attachment` にはフラグが 1 つも無い**（`DetailPanel` の 2 経路）。③は GC の「削除直前の再評価」が最後の砦になっている | S〜M | **p2 の完了条件** |
 | **debt-26** | （**2026-08-03・#4 で母集団が固まった**。8d-2 の後にコーパス全体で 1 回決める、という位置づけは不変で、対象は 1,248 → **1,628 領域**になった。8d-2 が回収したのは「ベクターで描かれていた図」なので、この項の「画像はあるのに図にならない」21 版のうち何版が残っているかは**再計測が要る**）**top-level に Image はあるのに図領域が 1 つも出ない版が 21 版ある**（未結合の図 caption 103 件・2026-08-03 の実測で 8d-8 / 8d-2 のどちらの担当でもないと判明・§4.1）。`MIN_DIM_PT`(16pt) / `MAX_PAGE_AREA_RATIO`(0.9) / クランプのいずれかで全部落ちている。極端な例は vid203/att61（796 枚）・vid250/att110（416 枚）・vid198/att56（262 枚）で、図がタイル画像に刻まれている疑いが濃い。逆端は vid149/att6 のように画像が 1 枚しか無い版（caption 41 件はベクター図＝ 8d-2 側）。**閾値をいじるとコーパス全体 1,248 領域の採否が動く**ので、8d-2 で図領域の母集団が固まってから 1 回で決めること | M（実測が主・調整は数行） | 8d-2 の後 |
 | **debt-27** | `assets.metadata_json` の `region_index` が `page.image_regions` の通し番号のままで、crop のファイル名の `fig-` / `vec-` 別採番と食い違う（8a では両者が一致していた不変量）。**リポジトリ内に読み手は 0 件**（書き込みとテスト固定値のみ）なので、読み手を名指しできない値を増やさない方針で直さずに記録する（2026-08-04・ゲート ②a・§2.14） | S | 読み手ができたとき |
 | **debt-28** | 同一ページ内の図の `ordinal` が視覚順にならない（`compose_figure_regions` が raster → vector の順に組むため、ページ上部のベクター図が下部のラスタ図より後ろになる）。直すとラスタ側の `ordinal` が動くので **#7 より前には入れられない** | S | post-1.0 |
+| **debt-29** | `heal_missing_assets` が `assets.metadata_json` を更新しない。中身は `{page, region_index, render_target_width}` で、`RENDER_TARGET_WIDTH` を変えても `config_hash` が `""` 固定なので content_key が動かず reuse 経路に乗る ＝ heal が新しい幅で描き直し、`width`/`height` は更新されるのに `metadata_json.render_target_width` は旧値のまま残る。**読み手を名指しできる**（`load_lcir_document` → `LcirAsset.metadata` → 9a の JSON export）ので debt-27（読み手 0 件）とは扱いが違う。`mime_type` も同様に更新しないが、今は両経路とも `"image/png"` 固定なので実害 0（2026-08-05・#6 で発見） | S | 9a の出力の正しさ |
+| **debt-30** | **実 DB の `fulltext` FTS5 の転置索引が壊れている**（`PRAGMA integrity_check` が `malformed inverted index for FTS5 table main.fulltext`）。検索は動くが取りこぼす（`'quantum'` が rebuild 前 2,065 → 後 2,079 件）。**`VACUUM INTO` は壊れたまま運ぶので全バックアップが同じ状態**で、`restore::validate_db_file` は `integrity_check != "ok"` を拒否する ＝ **現在のバックアップはアプリの復元経路で復元できない**。`INSERT INTO fulltext(fulltext) VALUES('rebuild')` で約 2 秒で直り、以後 `integrity_check` は `ok` になる（実 DB のコピーで確認）。#6 の作業中に偶然発見したもので LCIR とは無関係・**この PR では直していない** | S（起動時 self-heal か設定ボタン） | **バックアップの復元可能性** |
 | **debt-25** | 座標系の契約が原点の基準を言っていない。`CoordinateSpace::default()`（`document_ir/source.rs:36-45`）は `origin: "bottom_left"` としか宣言せず、**「MediaBox 絶対 user space であって box 相対ではない」が書かれていない**。debt-14 / debt-18 / debt-19 は同じ取り違えが 3 か所で独立に起きたもので、原因はこの契約の穴。しかもこの文字列は Phase 9a の LCIR JSON export でそのまま外部に出ている | S（doc か `origin` の値の明示） | 4 度目を防ぐ |
 
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
@@ -1864,7 +2086,7 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 | コード側の抽出器版 | pdfium **`0.14.0`**（#5 の PR-a で 0.13.0・PR-b で 0.14.0）/ tex `0.5.0` → **PDF 138/138 が outdated（実 DB は全件 0.6.0）・TeX は 0 件** |
 | `document_nodes` | 2,663,234 行（**superseded が 2,213,085 = 83%**） |
 | `source_fragments` | 2,659,223 行（fragment_type 別: line 309,992 / block 130,904 / page 7,345 は生存版のみ） |
-| DB ファイル | 761,237,504 B（726 MiB・freelist 0）。`document_nodes` 262.4MB + `source_fragments` 173.1MB + 索引 5 本で 83.2% |
+| DB ファイル | 761,237,504 B（726 MiB・freelist 0・`page_size` 4096 × `page_count` 185,849 がファイルサイズと**バイト単位で一致**・`auto_vacuum` 0）。`document_nodes` 262.4MB + `source_fragments` 173.1MB + 索引 5 本で 83.2%（`dbstat` で再確認） |
 | `assets` | 1,198 行 / 555,177,018 B（全て `image/png`・role は `page_crop` のみ）。実ファイル 531.8 MiB / content_key dir 69 個（stale 0） |
 | `node_alt_texts` | 888 行・全件 `llm_inference`・全件 completed 版・**`carried_from_version_id` は全件 NULL**（carry は本番で一度も発火していない） |
 | figure / figure_caption / caption_of / 未結合 caption | 1,198 / 904 / 262 / 642（うち Algorithm 10 件は対象外＝真の母数 632・556 件は「そのページに figure 0 件」）。**コード側（未再構築）では 8d-8 で 1,248 / 281、8d-2 で 1,628 / 661 になる**（§2.12・§2.13） |
@@ -1881,8 +2103,11 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 | 全ライブラリ再構築 | **4,797 秒（80 分）/ 138 PDF・7,345 ページ**。うち att37（527 ページのスキャン本）が 4,514 秒 = **94%**。残り 137 本は合計 ≒283 秒 |
 | Vision alt text | 888 件 / 6,312 秒 ≒ **7.1 秒/図**。model は全件 `claude-sonnet-5`。単価 ≒$0.0068/図（総額 ≒$6 はメモリ由来でリポジトリからは未検証） |
 | バックアップ | フル zip（`VACUUM INTO` + attachments 全体・差分も dedup も無し）・keep=14・24h 間隔。現在 5 本 × 831,617,064 B = 3.9 GiB。db.sqlite は raw 737MB → 圧縮 220.6MB |
+| p4 の GC（実 DB のコピーに本番の `run_gc` を流した実測・2026-08-05） | superseded **145 → 0** / `document_nodes` **2,663,234 → 450,149** / `source_fragments` 2,659,223 → 448,241 / `node_alt_texts` **888 のまま** / 再利用可 **0 → 493,883,392 B（471.0 MiB）** / ファイルは縮まない。**所要 58.7 秒**（`symbols(scope_node_id)` 索引あり + 50,000 ノードの**降順**チャンク）。最遅の版は 7.15 秒だがこれは 272,583 ノードが 6 チャンクに割れた合計で、**1 tx は実測 0.28〜0.63 秒**。**昇順で切ると木の根のカスケードで 1 版が 1 tx になり分割が無効化される**（実測: `changes()`=1・残り 0・7.95 秒）。索引なし・チャンクなしだと **125 秒 / 版あたり最大 16.7 秒**（5 秒超が 6 版） |
+| p4 後のバックアップ | GC 後の `VACUUM INTO` が raw 272,654,336 B → deflate **110,508,904 B**（GC 前は raw 737MB → 圧縮 220.6MB）＝ 1 世代あたり約 110MB の削減。**1 世代 831MB の最大成分は crop PNG（337.8MB）**で GC では減らない |
+| `fulltext` FTS5 の健全性 | **壊れている**（`malformed inverted index`）。検索は動くが取りこぼす（`'quantum'` が 2,065 → rebuild 後 2,079）。`VACUUM INTO` は壊れたまま運ぶので**全バックアップが同じ状態**＝ `restore::validate_db_file` に拒否される。rebuild は約 2 秒（debt-30・2026-08-05 発見） |
 | disk | 89 GB 空き（91% 使用） |
-| テスト本数 | **1,078**（#5 時点の `cargo test --lib` 実測。#0 で 977・#1 で +8・#2 で +12・#2.5 で +7・#3 で +15・#4 で +32・**#5 で +27**（PR-a +22 / PR-b +5））。**旧記載の 1,043 /「#4 で +24」は誤り** ── #4 の実測は 1,051 で増分は +32 だった（§10） |
+| テスト本数 | **1,117**（#6 時点の `cargo test --lib` 実測・keychain の 1 本を skip した数）。#0 で 977・#1 で +8・#2 で +12・#2.5 で +7・#3 で +15・#4 で +32・#5 で +27・**#6 で +39**（うち 10 本はコミット後レビューの指摘で追加） |
 
 **`figure_caption` の 904 / 954 の食い違いは決着した**（2026-08-02・集計条件の違い）:
 生存 pdfium 版 **904** / 生存 pdfium + tex **954** / superseded 込みの全版 **1,021**。
