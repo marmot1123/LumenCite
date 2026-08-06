@@ -143,12 +143,23 @@ async fn delete_version_children(
 
     loop {
         let mut tx = pool.begin().await?;
-        // `document_nodes.parent_id` は自己参照 CASCADE なので、親を消すと LIMIT の外の子も
-        // 一緒に消える。`rows_affected` はカスケードを数えないので**残数で終了を判定**する。
+        // **`ORDER BY id DESC` が本質。** `document_nodes.parent_id` は自己参照 CASCADE で、
+        // 木は根（`document`）→ `page` → `block` → `line` の順に挿入される ＝ **子の id は
+        // 親より大きい**。昇順で切ると 1 チャンク目に根が入り、その 1 行の削除が版の全ノードを
+        // カスケードで消してしまう ── **チャンクが丸ごと無効化される**。
+        // 実測（実 DB の版 34・272,583 ノード）: 昇順は `changes()` が **1** を返して
+        // 残り **0**（= 1 tx で全部消えた・7.95 秒）／降順は `changes()` 378 で
+        // ちょうど 50,000 減る。降順なら葉から剥がすので 1 tx が chunk 件に収まる。
+        //
+        // `rows_affected` はカスケードを数えない（降順でも 50,000 ではなく 378）ので、
+        // **終了判定は残数で行う**（件数で判定すると取りこぼす）。
         let n = sqlx::query(
             "DELETE FROM document_nodes
               WHERE id IN (
-                  SELECT id FROM document_nodes WHERE document_version_id = ? LIMIT ?
+                  SELECT id FROM document_nodes
+                   WHERE document_version_id = ?
+                   ORDER BY id DESC
+                   LIMIT ?
               )",
         )
         .bind(version_id)
@@ -304,14 +315,21 @@ pub async fn run_gc<F>(
 where
     F: Fn(i64, i64),
 {
-    run_gc_with_chunk(pool, app_data_dir, NODE_DELETE_CHUNK, progress).await
+    run_gc_with_chunk(pool, app_data_dir, NODE_DELETE_CHUNK, None, progress).await
 }
 
-/// [`run_gc`] の本体。`chunk` はテストが小さい値を入れてチャンク境界を踏むための引数。
+/// [`run_gc`] の本体。
+///
+/// `chunk` はテストが小さい値を入れてチャンク境界を踏むための引数。
+/// `targets` を `Some` にすると対象一覧の取得を差し替えられる ── **削除直前の再評価が
+/// 実際に効くのは「一覧が古くなったとき」だけ**で、それは単一スレッドのテストでは
+/// 作れない（対象述語は `still_collectable` の条件を包含するので、同一時点では
+/// 両者が食い違わない）。古い一覧を注入して初めて `versions_skipped` の経路を通せる。
 async fn run_gc_with_chunk<F>(
     pool: &SqlitePool,
     app_data_dir: &Path,
     chunk: i64,
+    targets: Option<Vec<i64>>,
     progress: F,
 ) -> Result<GcOutcome, String>
 where
@@ -321,9 +339,12 @@ where
         .await
         .map_err(|e| e.to_string())?;
 
-    let targets = storage_stats::gc_target_versions(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let targets = match targets {
+        Some(t) => t,
+        None => storage_stats::gc_target_versions(pool)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
     let total = targets.len() as i64;
     progress(0, total);
 
@@ -976,7 +997,7 @@ mod tests {
         assert_eq!(nodes_of(&pool, old).await, 22);
 
         let dir = std::env::temp_dir();
-        let out = run_gc_with_chunk(&pool, &dir, 3, noop).await.unwrap();
+        let out = run_gc_with_chunk(&pool, &dir, 3, None, noop).await.unwrap();
         assert_eq!(out.nodes_removed, 22, "報告値は削除前の実数");
         assert_eq!(nodes_of(&pool, old).await, 0);
         assert!(!version_exists(&pool, old).await);
@@ -1054,11 +1075,52 @@ mod tests {
         assert_eq!(nodes_of(&pool, old).await, 9);
 
         let dir = std::env::temp_dir();
-        let out = run_gc_with_chunk(&pool, &dir, 3, noop).await.unwrap();
+        let out = run_gc_with_chunk(&pool, &dir, 3, None, noop).await.unwrap();
         assert_eq!(out.versions_tombstoned, 1, "前提: 行を残す版として処理される");
         assert_eq!(out.nodes_removed, 9, "報告値は実際に減った数");
         assert_eq!(nodes_of(&pool, old).await, 0, "1 ノードも置き去りにしない");
         assert!(version_exists(&pool, old).await, "行は残る");
+    }
+
+    /// **チャンクが本当に tx を分割している**こと。
+    ///
+    /// これが `NODE_DELETE_CHUNK` の存在理由（1 tx を `busy_timeout` 5 秒より十分短く保つ）で、
+    /// 「全部消えたか」を見るテストでは**absolutely 検出できない** ── 昇順で切ると
+    /// 1 チャンク目に木の根が入り、その 1 行の削除が版の全ノードをカスケードで消すので、
+    /// 結果だけ見れば正しく全消えするからである（実 DB の 272,583 ノードの版が
+    /// `changes()` = 1 で残り 0 になることを実測した）。
+    /// だから**「1 回の DELETE で消える件数が chunk を超えないこと」を直接測る**。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn one_delete_chunk_never_removes_more_than_the_chunk_size(pool: SqlitePool) {
+        let att = setup_attachment(&pool, "P").await;
+        let vid = insert_ver(&pool, att, "ck", ExtractionStatus::Superseded, None).await;
+        // 本番と同じ形（根 → page → block）で 1 + 1 + 20 = 22 ノード。
+        insert_tree(&pool, vid, 20).await;
+
+        let before: i64 = nodes_of(&pool, vid).await;
+        assert_eq!(before, 22);
+
+        // 本番と同一の DELETE を 1 回だけ打つ。
+        sqlx::query(
+            "DELETE FROM document_nodes
+              WHERE id IN (
+                  SELECT id FROM document_nodes
+                   WHERE document_version_id = ?
+                   ORDER BY id DESC
+                   LIMIT ?
+              )",
+        )
+        .bind(vid)
+        .bind(5i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let removed = before - nodes_of(&pool, vid).await;
+        assert_eq!(
+            removed, 5,
+            "1 チャンクで消えるのはちょうど chunk 件（昇順だと根のカスケードで 22 件全部消える）"
+        );
     }
 
     /// 進捗は版単位で 0 から total まで流れる。
@@ -1075,6 +1137,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen.into_inner().unwrap(), vec![(0, 2), (1, 2), (2, 2)]);
+    }
+
+    /// **tombstone 経路でも版直下の行（`assets` / `symbols`）を回収する。**
+    ///
+    /// 行ごと消す版では最後の版削除がカスケードで片付けてしまうので、
+    /// `delete_version_children` の明示 DELETE を丸ごと消しても全テストが緑になる
+    /// （実際に変異させて確認した）。**その明示 DELETE が load-bearing なのは
+    /// tombstone 経路だけ**なので、ここで固定する。
+    ///
+    /// `node_relations` はここに書かない ── `from_node_id` / `to_node_id` が NOT NULL で
+    /// ノードを参照するので、ノード削除のカスケードで必ず先に消える。
+    /// 残りうるのは **`assets`（ノードを参照しない）**と
+    /// **`defined_at_node_id` が NULL の `symbols`** の 2 つ。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn gc_tombstone_also_reclaims_the_version_scoped_rows(pool: SqlitePool) {
+        let att = setup_attachment(&pool, "P").await;
+        let old = insert_ver(&pool, att, "ck1", ExtractionStatus::Superseded, None).await;
+        insert_tree(&pool, old, 1).await;
+        let live = insert_ver(&pool, att, "ck2", ExtractionStatus::Completed, Some(old)).await;
+        let live_page = insert_tree(&pool, live, 0).await;
+        crate::db::node_alt_texts::insert_alt_text(
+            &pool,
+            &crate::db::node_alt_texts::NewAltText {
+                node_id: live_page,
+                document_version_id: live,
+                source_asset_sha256: "sha",
+                text: "carry",
+                origin: Origin::LlmInference.as_str(),
+                confidence: None,
+                model: None,
+                carried_from_version_id: Some(old),
+            },
+        )
+        .await
+        .unwrap();
+
+        // ノードを参照しない版直下の行を 2 種類置く。
+        insert_asset(
+            &pool,
+            &NewAsset {
+                document_version_id: old,
+                sha256: "s",
+                mime_type: "image/png",
+                relative_path: "attachments/1/.lcir/1/aaaa/fig-p001-00.png",
+                width: Some(1),
+                height: Some(1),
+                size_bytes: Some(10),
+                metadata_json: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::db::symbols::insert_symbol(
+            &pool,
+            &crate::db::symbols::NewSymbol {
+                document_version_id: old,
+                surface_form: "U",
+                normalized_form: None,
+                description: None,
+                symbol_type: None,
+                defined_at_node_id: None, // ノードに紐づかない = カスケードで消えない
+                scope_node_id: None,
+                semantic_json: None,
+                confidence: None,
+                origin: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let dir = std::env::temp_dir();
+        let out = run_gc(&pool, &dir, noop).await.unwrap();
+        assert_eq!(out.versions_tombstoned, 1, "前提: 行を残す経路を通る");
+        assert!(version_exists(&pool, old).await);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM assets WHERE document_version_id = ?", old).await,
+            0,
+            "版直下の assets が残っている"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM symbols WHERE document_version_id = ?", old).await,
+            0,
+            "ノードに紐づかない symbols が残っている"
+        );
+        assert_eq!(out.asset_rows_removed, 1);
+    }
+
+    /// 対象一覧が古くなっていたら（別経路が alt text を挿した後）、
+    /// **`run_gc` の集計で `versions_skipped` に出る**。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_gc_reports_a_stale_target_as_skipped(pool: SqlitePool) {
+        let att = setup_attachment(&pool, "P").await;
+        let old = insert_ver(&pool, att, "ck-old", ExtractionStatus::Superseded, None).await;
+        let page = insert_tree(&pool, old, 2).await;
+        insert_ver(&pool, att, "ck-new", ExtractionStatus::Completed, Some(old)).await;
+        // 一覧を引いた「後」に alt text が挿さった状況を、古い一覧の注入で再現する。
+        let stale = storage_stats::gc_target_versions(&pool).await.unwrap();
+        assert_eq!(stale, vec![old], "前提: この時点では対象");
+        crate::db::node_alt_texts::insert_alt_text(
+            &pool,
+            &crate::db::node_alt_texts::NewAltText {
+                node_id: page,
+                document_version_id: old,
+                source_asset_sha256: "sha",
+                text: "課金済み",
+                origin: Origin::LlmInference.as_str(),
+                confidence: None,
+                model: None,
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let dir = std::env::temp_dir();
+        let out = run_gc_with_chunk(&pool, &dir, NODE_DELETE_CHUNK, Some(stale), noop)
+            .await
+            .unwrap();
+        assert_eq!(out.versions_skipped, 1);
+        assert_eq!(out.versions_removed, 0);
+        assert_eq!(out.nodes_removed, 0);
+        assert_eq!(nodes_of(&pool, old).await, 4, "1 行も消えていない");
+        assert!(version_exists(&pool, old).await);
+        assert!(out.db_size.is_some(), "実行後のファイル収支を返している");
+    }
+
+    /// チャンクの大きさを**リテラルで**固定する。
+    /// 定数シンボルで書いたテストは定数を変える変異と一緒に動くので守っていない。
+    #[test]
+    fn the_node_delete_chunk_is_fifty_thousand() {
+        assert_eq!(
+            NODE_DELETE_CHUNK, 50_000,
+            "1 tx を busy_timeout(5 秒)より十分短く保つ値。実測で 1 チャンク 0.28〜0.63 秒"
+        );
     }
 
     // ---- FS 側 ----
@@ -1389,6 +1585,16 @@ mod tests {
         // **GC ではファイルは縮まない**（free page になるだけ）。増える方向には動きうる ──
         // このプローブは `symbols(scope_node_id)` の索引を張るので、その 1 ページぶん。
         assert!(
+            out.freed_bytes > 400_000_000,
+            "実ライブラリでは 471 MiB 前後が再利用可になる（実測 493,899,776 B）。got {}",
+            out.freed_bytes
+        );
+        assert_eq!(
+            out.versions_removed + out.versions_tombstoned + out.versions_skipped,
+            preview.versions,
+            "対象件数の内訳が見積りと一致する"
+        );
+        assert!(
             after.file_bytes() >= before.file_bytes(),
             "GC でファイルが縮んではいけない（before={} after={}）",
             before.file_bytes(),
@@ -1504,5 +1710,46 @@ mod tests {
             .await
             .unwrap();
         assert!(!still_collectable(&pool, old).await.unwrap());
+
+        // superseded でなくなった（別経路が status を戻した）。
+        sqlx::query("UPDATE document_versions SET extraction_status = 'completed' WHERE id = ?")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let att2 = setup_attachment(&pool, "Q").await;
+        let sup = insert_ver(&pool, att2, "ck-s", ExtractionStatus::Superseded, None).await;
+        insert_ver(&pool, att2, "ck-l", ExtractionStatus::Completed, None).await;
+        assert!(still_collectable(&pool, sup).await.unwrap(), "前提: superseded なら対象");
+        sqlx::query("UPDATE document_versions SET extraction_status = 'completed' WHERE id = ?")
+            .bind(sup)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !still_collectable(&pool, sup).await.unwrap(),
+            "superseded でなくなったら対象外"
+        );
+    }
+
+    /// `symbols(scope_node_id)` の索引を張る（migration 0018 の抜け）。冪等であること。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scope_node_index_is_created_and_idempotent(pool: SqlitePool) {
+        let exists = || async {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'index' AND name = 'idx_symbols_scope_node'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            n
+        };
+        assert_eq!(exists().await, 0, "前提: migration では張られていない");
+        crate::db::symbols::try_create_scope_node_index(&pool).await.unwrap();
+        assert_eq!(exists().await, 1);
+        // 起動のたびに呼ばれるので冪等でなければならない。
+        crate::db::symbols::try_create_scope_node_index(&pool).await.unwrap();
+        assert_eq!(exists().await, 1);
     }
 }

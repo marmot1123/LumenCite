@@ -780,10 +780,16 @@ function DataTab() {
   const [confirmGc, setConfirmGc] = useState(false);
   // 実測 0.06 秒の COUNT だけで組んであるので mount で引いてよい
   // （表ごとの内訳を出す dbstat は数秒かかるので使っていない）。
-  const refreshStorage = () => {
-    invoke<StorageStats>("lcir_storage_stats").then(setStorage).catch(() => {});
+  const refreshStorage = async () => {
+    try {
+      setStorage(await invoke<StorageStats>("lcir_storage_stats"));
+    } catch {
+      /* 表示だけなので握りつぶす */
+    }
   };
-  useEffect(refreshStorage, []);
+  useEffect(() => {
+    void refreshStorage();
+  }, []);
   useEffect(() => {
     const un = listen<{ done: number; total: number }>("lcir-gc-progress", (e) =>
       setGcProgress(e.payload),
@@ -1052,7 +1058,9 @@ function DataTab() {
     setGcProgress(null);
     try {
       const r = await invoke<GcOutcome>("run_lcir_gc");
-      if (r.versions_removed === 0 && r.versions_tombstoned === 0) {
+      // **skip 件数を「何も無かった」に丸めない。** skip は「実行中に別経路が
+      // 書き込んだので対象から外した」という別の事実で、0 件回収とは意味が違う。
+      if (r.versions_removed === 0 && r.versions_tombstoned === 0 && r.versions_skipped === 0) {
         setMessage(t("settings.data.gcNone"));
       } else {
         setMessage(
@@ -1078,7 +1086,7 @@ function DataTab() {
     } finally {
       setGcRunning(false);
       setGcProgress(null);
-      refreshStorage();
+      void refreshStorage();
     }
   };
 
@@ -1262,7 +1270,10 @@ function DataTab() {
         )}
         <div style={{ marginTop: 8 }}>
           <SecondaryBtn
-            onClick={() => setConfirmGc(true)}
+            // **確認ボックスを開く直前に見積りを取り直す。** 同じタブに再構築ボタンが
+            // 並んでおり、mount 時の数字のまま非可逆な削除の同意を取ると
+            // 「145 件消します」と言って別の件数を消すことになる。
+            onClick={() => void refreshStorage().then(() => setConfirmGc(true))}
             disabled={
               gcRunning ||
               confirmGc ||
