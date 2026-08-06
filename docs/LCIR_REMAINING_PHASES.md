@@ -1419,6 +1419,15 @@ GC 前に「何 MB 空きます」を出すには「表全体のバイト × 死
   （backup・restore・全文索引側が `gcRunning` を見ていなかった）/
   「次回の再構築で回収されます」が LCIR を切ったユーザーには成立しない。
 
+**作業中に見つけて、測り直したら誤りだった件**: 実 DB の `fulltext` FTS5 を
+「壊れている・検索が取りこぼす・全バックアップが復元できない」と記録しかけた（debt-30 の初出）。
+**システムの `sqlite3` 3.51.0 で測った値を、アプリが同梱する SQLite 3.46.0 の挙動と
+取り違えていた**。同梱 SQLite で測り直すと `integrity_check` は `ok`、`'quantum'` の MATCH も
+rebuild 前後で 2,065 件のまま変わらず、`restore::validate_db_file` も同梱 SQLite で走るので
+拒否されない ＝ **実害 0**。3.46 で rebuild しても 3.51 は依然 malformed と言うので、
+修復可能な破損ではなく版ごとの挙動差だった。**外部ツールで測った値をアプリの挙動として
+報告しない**（アプリは自分の SQLite で動く）。
+
 **残した指摘**（doc に記録して直さない）: プロセス横断の排他（`GuiLockState` は
 `AppState` に載っておらず `acquire_gui_lock` は再入不可 = debt-24 の残り）、
 `is_carry_source` と版行 DELETE が別 tx（窓は carry 行の挿入経路が build tx の中だけなので
@@ -1919,7 +1928,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | **debt-27** | `assets.metadata_json` の `region_index` が `page.image_regions` の通し番号のままで、crop のファイル名の `fig-` / `vec-` 別採番と食い違う（8a では両者が一致していた不変量）。**リポジトリ内に読み手は 0 件**（書き込みとテスト固定値のみ）なので、読み手を名指しできない値を増やさない方針で直さずに記録する（2026-08-04・ゲート ②a・§2.14） | S | 読み手ができたとき |
 | **debt-28** | 同一ページ内の図の `ordinal` が視覚順にならない（`compose_figure_regions` が raster → vector の順に組むため、ページ上部のベクター図が下部のラスタ図より後ろになる）。直すとラスタ側の `ordinal` が動くので **#7 より前には入れられない** | S | post-1.0 |
 | **debt-29** | `heal_missing_assets` が `assets.metadata_json` を更新しない。中身は `{page, region_index, render_target_width}` で、`RENDER_TARGET_WIDTH` を変えても `config_hash` が `""` 固定なので content_key が動かず reuse 経路に乗る ＝ heal が新しい幅で描き直し、`width`/`height` は更新されるのに `metadata_json.render_target_width` は旧値のまま残る。**読み手を名指しできる**（`load_lcir_document` → `LcirAsset.metadata` → 9a の JSON export）ので debt-27（読み手 0 件）とは扱いが違う。`mime_type` も同様に更新しないが、今は両経路とも `"image/png"` 固定なので実害 0（2026-08-05・#6 で発見） | S | 9a の出力の正しさ |
-| **debt-30** | **実 DB の `fulltext` FTS5 の転置索引が壊れている**（`PRAGMA integrity_check` が `malformed inverted index for FTS5 table main.fulltext`）。検索は動くが取りこぼす（`'quantum'` が rebuild 前 2,065 → 後 2,079 件）。**`VACUUM INTO` は壊れたまま運ぶので全バックアップが同じ状態**で、`restore::validate_db_file` は `integrity_check != "ok"` を拒否する ＝ **現在のバックアップはアプリの復元経路で復元できない**。`INSERT INTO fulltext(fulltext) VALUES('rebuild')` で約 2 秒で直り、以後 `integrity_check` は `ok` になる（実 DB のコピーで確認）。#6 の作業中に偶然発見したもので LCIR とは無関係・**この PR では直していない** | S（起動時 self-heal か設定ボタン） | **バックアップの復元可能性** |
+| **debt-30** | **`fulltext` FTS5（trigram）の索引を、新しい SQLite が malformed と判定する。** システムの `sqlite3` 3.51.0 は `malformed inverted index for FTS5 table main.fulltext` を返すが、**アプリが同梱する SQLite 3.46.0 は `PRAGMA integrity_check` = `ok` を返す**。**現時点で実害は無い**（2026-08-06 に同梱 SQLite で実測 ── `'quantum'` の MATCH は rebuild 前後とも **2,065 件で同一**・`integrity_check` も前後とも `ok`）。初出（2026-08-05）で「検索が取りこぼす / 全バックアップが `restore::validate_db_file` に拒否される」と書いたのは**誤り**で、システム `sqlite3` 3.51 で測った値（2,065→2,079）を同梱 SQLite の挙動と取り違えていた。`validate_db_file` も同梱 SQLite で走るので拒否されない。**3.46 で rebuild しても 3.51 は依然 malformed と言う** ＝ 修復可能な破損ではなく**版ごとの挙動差**。同じ trigram の `entries_fts` / `document_nodes_fts` は 3.51 でも `ok` なので**内容依存**で、`fulltext` は制御文字を含む行が 525 件ある（debt-22 と同じ母集団）。**残るのは潜在リスクだけ**: 同梱 SQLite を上げた版では既存索引が malformed 扱いになりうるのに、`fulltext_fts` の self-heal は `settings.fts.fulltext_rebuilt` の**一度きりフラグ**で gate されており（実 DB では既に `1`）再発火しない。同梱 SQLite を上げるときに、フラグを版付きにして 1 回だけ rebuild させること | S | 同梱 SQLite を上げるとき |
 | **debt-25** | 座標系の契約が原点の基準を言っていない。`CoordinateSpace::default()`（`document_ir/source.rs:36-45`）は `origin: "bottom_left"` としか宣言せず、**「MediaBox 絶対 user space であって box 相対ではない」が書かれていない**。debt-14 / debt-18 / debt-19 は同じ取り違えが 3 か所で独立に起きたもので、原因はこの契約の穴。しかもこの文字列は Phase 9a の LCIR JSON export でそのまま外部に出ている | S（doc か `origin` の値の明示） | 4 度目を防ぐ |
 
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
@@ -2105,7 +2114,7 @@ LCIR_SMOKE_KEEP=1 : crop PNG を残して目視
 | バックアップ | フル zip（`VACUUM INTO` + attachments 全体・差分も dedup も無し）・keep=14・24h 間隔。現在 5 本 × 831,617,064 B = 3.9 GiB。db.sqlite は raw 737MB → 圧縮 220.6MB |
 | p4 の GC（実 DB のコピーに本番の `run_gc` を流した実測・2026-08-05） | superseded **145 → 0** / `document_nodes` **2,663,234 → 450,149** / `source_fragments` 2,659,223 → 448,241 / `node_alt_texts` **888 のまま** / 再利用可 **0 → 493,883,392 B（471.0 MiB）** / ファイルは縮まない。**所要 58.7 秒**（`symbols(scope_node_id)` 索引あり + 50,000 ノードの**降順**チャンク）。最遅の版は 7.15 秒だがこれは 272,583 ノードが 6 チャンクに割れた合計で、**1 tx は実測 0.28〜0.63 秒**。**昇順で切ると木の根のカスケードで 1 版が 1 tx になり分割が無効化される**（実測: `changes()`=1・残り 0・7.95 秒）。索引なし・チャンクなしだと **125 秒 / 版あたり最大 16.7 秒**（5 秒超が 6 版） |
 | p4 後のバックアップ | GC 後の `VACUUM INTO` が raw 272,654,336 B → deflate **110,508,904 B**（GC 前は raw 737MB → 圧縮 220.6MB）＝ 1 世代あたり約 110MB の削減。**1 世代 831MB の最大成分は crop PNG（337.8MB）**で GC では減らない |
-| `fulltext` FTS5 の健全性 | **壊れている**（`malformed inverted index`）。検索は動くが取りこぼす（`'quantum'` が 2,065 → rebuild 後 2,079）。`VACUUM INTO` は壊れたまま運ぶので**全バックアップが同じ状態**＝ `restore::validate_db_file` に拒否される。rebuild は約 2 秒（debt-30・2026-08-05 発見） |
+| `fulltext` FTS5 の健全性 | **同梱 SQLite 3.46.0 では `ok`・システム `sqlite3` 3.51.0 では `malformed inverted index`**（版ごとの挙動差。3.46 で rebuild しても 3.51 は malformed と言う）。**同梱 SQLite での実害は 0** ── `'quantum'` の MATCH は rebuild 前後とも 2,065 件で同一。同じ trigram の `entries_fts` / `document_nodes_fts` は 3.51 でも `ok`（内容依存・`fulltext` は制御文字を含む行が 525 件）。debt-30・**初出の「取りこぼす / 復元できない」は測定器の取り違えで誤り** |
 | disk | 89 GB 空き（91% 使用） |
 | テスト本数 | **1,117**（#6 時点の `cargo test --lib` 実測・keychain の 1 本を skip した数）。#0 で 977・#1 で +8・#2 で +12・#2.5 で +7・#3 で +15・#4 で +32・#5 で +27・**#6 で +39**（うち 10 本はコミット後レビューの指摘で追加） |
 
