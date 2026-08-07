@@ -486,7 +486,7 @@ type FulltextResult = {
 
 将来 `fulltext_search`（PDF ページ単位）を実装する際は、結果型を `Vec<SearchHit>` に拡張する形で `search_entries` 内に統合する想定。
 
-### LCIR（機械可読中間形式）— 実験 / `lcir.enabled`
+### LCIR（機械可読中間形式）— `lcir.enabled`（**v1.0.0-p3 で既定 ON**）
 
 論文全文を型付きノード木 + PDF 座標 + provenance で保存する中間表現。設計は `docs/LCIR_design_overview.md`、スキーマは `DATA_MODEL.md`「LCIR 関連テーブル」。settings `lcir.enabled = "1"` のときだけ動く追加の side-build（既存 `fulltext` 検索は不変）。
 
@@ -496,14 +496,15 @@ type FulltextResult = {
 | `get_lcir_document` | `attachment_id: i64` | `LcirDocument \| null` |
 | `build_missing_lcir` | — | `LcirBatchResult` — 多重起動ガード（`already_running`）+ `lcir-build-progress {done,total}` 進捗イベント |
 | `rebuild_outdated_lcir` | — | `LcirBatchResult` — 同上。**既存ライブラリに新フェーズの成果（定理・参照グラフ・記号・図・表）を行き渡らせる唯一の経路**。設定 → データのボタンから実行 |
-| `fetch_missing_arxiv_sources` | — | `{total, fetched, built, pdf_only, failed}` — ゴミ箱以外で arxiv_id を持ち gzip 添付が無いエントリの e-print を直列取得（3 秒スロットル）して LCIR 構築。多重起動ガード + `tex-fetch-progress {done,total}` 進捗イベント + 完了時 `entries-changed`。`lcir.enabled` OFF は全 0 |
+| `fetch_missing_arxiv_sources` | — | `{total, fetched, built, pdf_only, failed}` — ゴミ箱以外で arxiv_id を持ち gzip 添付が無いエントリの e-print を直列取得（3 秒スロットル）して LCIR 構築。多重起動ガード + `tex-fetch-progress {done,total}` 進捗イベント + 完了時 `entries-changed`。**同意面は `lcir.tex_autofetch.enabled`**（v1.0.0-p3 で `lcir.enabled` から分離）── ボタンだが押した瞬間に数百件ぶんを arXiv へ取りに行くので、取得そのものの同意を見る。OFF は全 0 |
 | `rederive_fulltext_from_lcir` | — | `FulltextDeriveResult = {total, derived, skipped_ocr, skipped_empty, skipped_existing, failed}` — **v1.0.0-p1**。既存ライブラリの全文索引を LCIR の page ノードから張り直す。pdfium を使わない純 SQL なので**実測 16〜20 秒 / 138 添付**（進捗イベントは出さない）。OCR 由来の索引（`skipped_ocr`）と、LCIR に本文が 1 ページも無い添付（`skipped_empty` = スキャン本）は触らない。`build_missing_lcir` と同じ排他を使う（2 本目は `already_running`）。**起動時にも 1 回だけ走るが、そちらは「索引がまだ無い添付を埋めるだけ」**（`AddMissingOnly`）── `fulltext.source.*` はこの版で初めて書かれるキーで、**この版より前に回した OCR には記録が無い**ので、記録の無い既存索引を自動で置き換えると課金して得た転写を消しうる。**置き換えはこのボタンだけ**。一度きりフラグは `settings.fts.fulltext_lcir_derived`（`lcir.enabled` が OFF / 対象 0 件 / 失敗ありのときは立てないので、後から ON にした・後から build した場合に走る） |
 | `lcir_storage_stats` | — | `{file_bytes, used_bytes, free_bytes, gc: GcPreview}` — **v1.0.0-p4**。DB ファイルのページ収支（`(page_count − freelist_count) × page_size`・実測でファイルサイズと 1 バイト一致）と superseded 版の回収見積り。`GcPreview = {versions, versions_removable, versions_tombstoned, nodes, asset_rows, asset_bytes, alt_texts_protected, carry_refs_protected, orphan_versions_skipped}`。**`lcir.enabled` で gate しない**（切った人ほど旧版を消したい）。読み取りのみで実測 0.06 秒 |
 | `run_lcir_gc` | — | `GcOutcome` — **v1.0.0-p4・非可逆**。superseded 版を回収する。`GcOutcome = {versions_removed, versions_tombstoned, versions_skipped, nodes_removed, asset_rows_removed, files_trashed, fts_orphans_removed, freed_bytes, db_size}`。`build_missing_lcir` と同じガードを使い（2 本目は `already_running`）、Vision / TeX 取得が走っていても `already_running`。`lcir-gc-progress {done,total}` を版単位で emit。**`freed_bytes` は `freelist` の実測差分**で按分推定ではない。**ファイルサイズは縮まない**（free page になるだけ・次のバックアップと次の再構築で回収される） |
 | `lcir_batch_status` | — | `{running: BatchKind[], progress: {[kind]: {done,total}}, last: {kind, finished_at, result, error} | null}` — **debt-32**。長時間バッチの実行状態・進捗・**直近に終わった 1 本の結果**を返す**読み取り専用**コマンド。`BatchKind = "build" | "rebuild" | "rederive" | "gc" | "vision_alt_text" | "tex_fetch"`。`running` が**配列**なのは全種別が排他ではないため（代替テキスト生成は `VISION_ALT_TEXT_RUNNING` しか見ない）。`last.result` は**そのコマンドの戻り値そのもの**で、文言整形は i18n を持つフロントの仕事。**読んでも `last` は消えない**（2 つ開いた画面のうち先に読んだ方だけが見られる状態を作らないため）ので、再掲の抑制は `finished_at` を見るフロント側の担当。**排他に弾かれた `already_running` は `last` に載らない**（バッチが走っていないので） |
 | `search_lcir_nodes` | `query, collection_id?, tag_id?, view?` | `NodeFtsHit[]` |
 | `get_lcir_node_region` | `node_id: i64` | `{node_id, attachment_id, source: "pdf"\|"tex", page: i64\|null, bbox: [f64;4]\|null} \| null` — **Phase 10b で拡張**（旧: `SourceFragment`）。ノードの代表領域に**所属添付**を添えて返すので、これ 1 本で `open_pdf_viewer` を呼べる。TeX 由来の版は座標を持たないので `page`/`bbox` は null（`attachment_id` も TeX ソース添付を指すためPDF ビューアには渡せない）。**`page` と `bbox` が揃うときだけ**ジャンプ可能と判断すること |
-| `get_lcir_enabled` / `set_lcir_enabled` | `—` / `enabled: bool` | `bool` / `()` |
+| `get_lcir_enabled` / `set_lcir_enabled` | `—` / `enabled: bool` | `bool` / `()` — **v1.0.0-p3 で既定 ON**。判定は「`"0"` でなければ ON」で、**「未設定」と「明示 OFF」を区別する**（未設定 = 一度も触っていない = ON）。この不変条件は `set_lcir_enabled` が `"0"`/`"1"` しか書かず、他に書く本番経路が無く、migration に seed も無いことに依存する |
+| `get_lcir_tex_autofetch_enabled` / `set_lcir_tex_autofetch_enabled` | `—` / `enabled: bool` | `bool` / `()` — **v1.0.0-p3**: settings `lcir.tex_autofetch.enabled`。arXiv から e-print を**自動で**取得してよいかの同意で、`lcir.enabled` とは独立（`lcir.vision_alt_text.enabled` と同型）。**未設定のときの既定は「この版より前に `lcir.enabled` を明示 ON にしていたか」** —— 既定 ON に反転した `lcir.enabled` で判定すると新規ユーザー全員に自動ダウンロードが付いてくるため、生の保存値が `"1"` かだけを見る。起動時に `backfill_tex_autofetch_consent` が 1 回だけ明示値（`"1"`/`"0"`）へ確定させる（**`"0"` でも書く** —— 未設定を残すと、後からユーザーが `lcir.enabled` を入れ直したときに同意していない取得が有効になる）。従うのは 4 経路: クリップ時の自動取得 / 重複クリップの欠落補完 / `fetch_missing_arxiv_sources` / AddSheet の arXiv 追加 |
 | `get_lcir_vision_alt_text_enabled` / `set_lcir_vision_alt_text_enabled` | `—` / `enabled: bool` | `bool` / `()` — **Phase 8c**: settings `lcir.vision_alt_text.enabled`（既定 off・`lcir.enabled` とは独立の同意面） |
 | `count_figures_missing_alt_text` | `entry_id?: i64, attachment_id?: i64` | `i64` — **Phase 8c**: 代替テキストがまだ無い図の件数（読み取り専用・フラグ非依存）。**課金の前に規模を見せる**ため設定画面と詳細パネルが引く。絞り込み・しきい値は生成バッチと同一述語 |
 | `generate_vision_alt_texts` | `entry_id?: i64, attachment_id?: i64` | `{enabled, total, generated, skipped, failed, aborted, abort_reason}` — **Phase 8c**: alt text の無い `figure` ノードの crop PNG を LLM Vision に説明させて `node_alt_texts` に保存する後追いバッチ。1 図ずつ best-effort（1 図の失敗で全体を捨てない）・リクエスト間 1 秒スロットル・多重起動ガード + `vision-alt-text-progress {done,total}` 進捗イベント。`lcir.enabled` / `lcir.vision_alt_text.enabled` のどちらかが OFF なら `enabled: false` で全 0（**課金する操作なので暗黙には走らせない**）。`skipped` = crop ファイル欠損・空応答・ループ中に版が古くなった図（Vision を呼ぶ前に最新 completed 版か再確認する）。対象は**ゴミ箱のエントリを除外**し、**短辺 200px 未満の crop（ロゴ・装飾等の小片）も除外**する（`DEFAULT_MIN_CROP_PX`。実蔵書では 1198 crop のうち 310 件が該当）。`entry_id`/`attachment_id` で範囲を絞れる（**まず 1 本で品質と費用を確かめてから広げる**ため。詳細パネルのボタンはエントリ単位で呼ぶ）。同一ラン内で crop 指紋が一致する図は API を呼ばず複製する。**打ち切り**は `aborted: true` + `abort_reason`: `"failures"`（1 件も生成できないまま連続 3 件失敗 = キー不正/レート制限/画像非対応モデル）/ `"consent_withdrawn"`（実行中に同意フラグが外された = 実質のキャンセル・毎図の先頭で再評価する）。未処理の図は対象のまま残り次回に拾える |
@@ -536,7 +537,7 @@ schema URI 等）は警告にしない — 狼少年にしないため。
 
 ```ts
 type LcirBuildResult = {
-  enabled: boolean;      // lcir.enabled が off なら false（何もしない）
+  enabled: boolean;      // lcir.enabled が off なら false（何もしない）※ v1.0.0-p3 で既定 ON
   built: boolean;        // 新規に構築したか
   reused: boolean;       // 同一 content_key の既存を再利用したか（冪等）
   version_id: number | null;
@@ -847,7 +848,7 @@ type CompleteResponse = {
 
 **サーバー側フロー:** `find_duplicate_entry`（DOI/arXiv/ISBN）→ 重複なら `duplicate` 応答（作成も PDF 添付もしない）→ 識別子があれば `metadata::fetch_by_doi/arxiv/isbn` でメタデータ解決 → `create_entry` → PDF URL（明示 or arXiv 導出）があれば**応答後に** `download_and_attach` を spawn（50MB 上限・30 秒タイムアウト・先頭チャンクの `%PDF-` マジック検証。失敗してもエントリは残る）。作成・添付の成功時は `.bib` 同期キック＋ `entries-changed` を発火。
 
-**TeX ソース自動取得（LCIR Phase 4 の自動化）:** arXiv クリップ（arxiv_id あり）で **`lcir.enabled` が ON のときだけ**、応答後に `spawn_tex_source_job` が `download_and_attach_arxiv_source` → `build_lcir_for_attachment` を best-effort 実行する（`clipper::derive_tex_source_job` がジョブ発行時にフラグを判定）。OFF のユーザーのクリップごとに e-print を落とすことはしない。失敗はログのみでクリップ成功は維持（PDF ジョブと同じ契約）。
+**TeX ソース自動取得（LCIR Phase 4 の自動化）:** arXiv クリップ（arxiv_id あり）で **`lcir.tex_autofetch.enabled` が ON のときだけ**（v1.0.0-p3 で `lcir.enabled` から分離 —— あちらは既定 ON なので、それで gate すると何も操作していないユーザー全員のクリップで外部ダウンロードが始まる）、応答後に `spawn_tex_source_job` が `download_and_attach_arxiv_source` → `build_lcir_for_attachment` を best-effort 実行する（`clipper::derive_tex_source_job` がジョブ発行時に同意を判定）。同意していないユーザーのクリップごとに e-print を落とすことはしない。失敗はログのみでクリップ成功は維持（PDF ジョブと同じ契約）。
 
 **重複クリップ時の欠落補完:** 重複エントリに PDF / TeX ソースが欠けていれば補完する。欠落は `plan_completion(pool, entry_id)` がエントリの `arxiv_id` を唯一の導出源に判定する（PDF 欠落 = mime `%pdf%` 添付なし ／ TeX 欠落 = mime `application/gzip` 添付なし **かつ** `lcir.enabled` ON ／ ゴミ箱は `deleted_at IS NULL` で対象外）。`clipper.complete_missing=="1"` なら重複応答で即 `completing` を返しジョブを spawn、未設定なら `confirm_missing` を返す（この時点では何もしない）。`POST /clipper/complete` はアプリ側で欠落を**再検証**してから `spawn_pdf_job` / `spawn_tex_source_job` を発行し、`remember` なら設定を保存する。PDF URL・arxiv_id はエントリの識別子から再導出する（`citation_pdf_url` 由来の補完は対象外 = arXiv 前提）。拡張の確認ポップアップは表示だけを担い、`/clipper/complete` 呼び出しと popup 状態管理は拡張の service worker が持つ（ポップアップは閉じても補完が中断しない設計）。
 

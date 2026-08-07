@@ -85,9 +85,29 @@ pub const FTS_FULLTEXT_REBUILT_KEY: &str = "fts.fulltext_rebuilt";
 /// 成功時にはこの値を更新する。未設定なら「未実施」＝次の自動実行で走る。
 pub const BACKUP_LAST_RUN_KEY: &str = "backup.last_run";
 
-/// LCIR（機械可読中間形式）の実験フラグ（"1" で有効・既定 off）。ON の間だけ pdfium 抽出で
-/// document_versions/nodes/source_fragments を追加構築する。OFF なら既存挙動は byte-for-byte 不変。
+/// LCIR（機械可読中間形式）を使うか。**v1.0.0-p3 で既定 ON に反転した**（それまでは実験フラグで既定 off）。
+///
+/// 判定は **「`"0"` でなければ ON」**（`ingestion::lcir_enabled`）。`"0"` = 明示的に切った /
+/// 未設定 = 一度も触っていない ＝ 既定 ON、を区別する。**書くのは `set_lcir_enabled` だけ**で
+/// `"0"`/`"1"` しか書かず、migration に seed も無い ── この不変条件が崩れると
+/// 「切ったのに戻る」か「新規ユーザーが OFF のまま」のどちらかになる。
+///
+/// このキーが許すのは①手動 build ②自動 build ③起動時バックフィル**まで**。
+/// **arXiv からの e-print 自動取得は含まない**（[`LCIR_TEX_AUTOFETCH_ENABLED_KEY`] へ分離）。
 pub const LCIR_ENABLED_KEY: &str = "lcir.enabled";
+
+/// v1.0.0-p3: arXiv から e-print（TeX ソース）を**自動で**取得することへの同意フラグ
+/// （"1" で有効）。`lcir.enabled` とは**独立の同意面**にする。
+///
+/// 分けた理由: `lcir.enabled` を既定 ON にすると、何も操作していないユーザーのクリップや
+/// 論文追加のたびに**数 MB の外部ダウンロードが黙って始まる**。手元で LCIR を組むことと、
+/// 外部サービスへ取りに行くこと（通信・相手への負荷）は同意の性質が違う
+/// （`clipper.enabled` / `lcir.vision_alt_text.enabled` と同型）。
+///
+/// 未設定のときの既定は **この版より前に `lcir.enabled` を明示 ON にしていたか**
+/// （`ingestion::tex_autofetch_default`）。既存ユーザーの挙動を無言で退行させないため。
+/// 起動時に 1 回 `ingestion::backfill_tex_autofetch_consent` が明示値へ確定させる。
+pub const LCIR_TEX_AUTOFETCH_ENABLED_KEY: &str = "lcir.tex_autofetch.enabled";
 
 /// LCIR Phase 8c: 図の代替テキストを LLM Vision で生成することへの同意フラグ（"1" で有効・
 /// 既定 off）。`lcir.enabled` とは**独立の同意面**にする — 画像 1 枚ごとに外部 API へ送信して

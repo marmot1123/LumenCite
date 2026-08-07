@@ -328,9 +328,12 @@ pub async fn handle_clip(pool: &SqlitePool, req: &ClipRequest) -> ClipOutcome {
 
 /// arXiv クリップに TeX ソース自動取得ジョブを出すかの判定（LCIR Phase 4 の自動化）。
 ///
-/// **`lcir.enabled` が ON のときだけ**出す: LCIR を使わないユーザーのクリップごとに
-/// 数 MB の e-print を黙って落とさない（OFF だと LCIR 構築も no-op で取得の意味が薄い）。
-/// ON なら「クリップ → PDF + TeX ソース + LCIR 構築」まで全自動になる。
+/// **e-print 自動取得の同意（`lcir.tex_autofetch.enabled`）が ON のときだけ**出す:
+/// クリップごとに数 MB の e-print を黙って落とさない。ON なら
+/// 「クリップ → PDF + TeX ソース + LCIR 構築」まで全自動になる。
+///
+/// ⚠ **`lcir.enabled` では判定しない**（v1.0.0-p3）。あちらは既定 ON になったので、
+/// それで gate すると**何も操作していないユーザー全員のクリップで外部ダウンロードが始まる**。
 async fn derive_tex_source_job(
     pool: &SqlitePool,
     req: &ClipRequest,
@@ -341,7 +344,7 @@ async fn derive_tex_source_job(
     if id.is_empty() {
         return None;
     }
-    if !crate::ingestion::lcir_enabled(pool).await {
+    if !crate::ingestion::tex_autofetch_enabled(pool).await {
         return None;
     }
     Some(TexSourceJob { entry_id, arxiv_id: id })
@@ -420,7 +423,8 @@ async fn plan_completion(pool: &SqlitePool, entry_id: i64) -> Result<CompletionP
     .await?;
 
     let pdf = !has_pdf;
-    let tex = !has_tex && crate::ingestion::lcir_enabled(pool).await;
+    // 欠落補完でも e-print 取得は同意面が別（v1.0.0-p3）。
+    let tex = !has_tex && crate::ingestion::tex_autofetch_enabled(pool).await;
     let pdf_job = pdf.then(|| PdfJob {
         entry_id,
         url: format!("https://arxiv.org/pdf/{arxiv_id}"),

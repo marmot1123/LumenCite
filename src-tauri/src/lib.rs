@@ -1452,18 +1452,40 @@ async fn get_lcir_node_region(
     }))
 }
 
-/// LCIR（実験）フラグ `lcir.enabled` の現在値。
+/// `lcir.enabled` の現在値（v1.0.0-p3 で既定 ON）。
 #[tauri::command]
 async fn get_lcir_enabled(state: State<'_, AppState>) -> Result<bool, String> {
     Ok(ingestion::lcir_enabled(&state.db).await)
 }
 
-/// LCIR（実験）フラグ `lcir.enabled` を設定する。
+/// `lcir.enabled` を設定する。**`"0"`/`"1"` しか書かない**（この不変条件の上に
+/// 「未設定 = 既定 ON」の判定が乗っている ── `db::settings::LCIR_ENABLED_KEY` 参照）。
 #[tauri::command]
 async fn set_lcir_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     db::settings::set_setting(
         &state.db,
         db::settings::LCIR_ENABLED_KEY,
+        if enabled { "1" } else { "0" },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// arXiv e-print 自動取得の同意 `lcir.tex_autofetch.enabled` の現在値（v1.0.0-p3）。
+#[tauri::command]
+async fn get_lcir_tex_autofetch_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(ingestion::tex_autofetch_enabled(&state.db).await)
+}
+
+/// arXiv e-print 自動取得の同意を設定する。
+#[tauri::command]
+async fn set_lcir_tex_autofetch_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    db::settings::set_setting(
+        &state.db,
+        db::settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY,
         if enabled { "1" } else { "0" },
     )
     .await
@@ -2016,15 +2038,18 @@ impl Drop for TexFetchGuard {
 
 /// 既存コーパスのバックフィル: ゴミ箱以外で arxiv_id を持ち TeX ソース添付が無い
 /// エントリを対象に、e-print を直列取得して LCIR を構築する。arXiv への礼儀として
-/// リクエスト間 3 秒スロットル。`lcir.enabled` OFF なら何もしない（全 0 を返す）。
+/// リクエスト間 3 秒スロットル。
 /// 進捗は `tex-fetch-progress` イベントで通知し、完了時に `entries-changed` を発火する。
+///
+/// **同意面は `lcir.tex_autofetch.enabled`**（v1.0.0-p3 で `lcir.enabled` から分離）。
+/// ユーザーが押すボタンだが、押した瞬間に**数百件ぶんの e-print を arXiv から取りに行く**
+/// 経路なので、「取得してよい」という同意そのものを見る。OFF なら全 0 を返す。
 #[tauri::command]
 async fn fetch_missing_arxiv_sources(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<FetchMissingArxivSourcesResult, String> {
-    // フラグ OFF では download しても build が no-op になるので、対象取得ごと落とさない。
-    if !ingestion::lcir_enabled(&state.db).await {
+    if !ingestion::tex_autofetch_enabled(&state.db).await {
         return Ok(FetchMissingArxivSourcesResult {
             total: 0,
             fetched: 0,
@@ -4150,6 +4175,15 @@ pub fn run() {
             let backfill_enabled = !cfg!(debug_assertions)
                 || matches!(std::env::var("LUMENCITE_LCIR_BACKFILL").as_deref(), Ok("1"));
             tauri::async_runtime::spawn(async move {
+                // v1.0.0-p3: e-print 自動取得の同意を**明示値に確定させる**。
+                // `lcir.enabled` を既定 ON へ反転したので、未設定のまま放置すると
+                // 「LCIR を入れ直したら自動取得も付いてきた」が起こりうる。
+                // **他の起動時処理より先に置く** ── クリッパー経由の取得より前に確定させたい。
+                match ingestion::backfill_tex_autofetch_consent(&fts_pool).await {
+                    Ok(true) => eprintln!("lcir: tex autofetch consent recorded (v1.0.0-p3)"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("lcir: tex autofetch consent backfill failed: {e}"),
+                }
                 match db::entries::rebuild_authors_fts_once(&fts_pool).await {
                     Ok(true) => eprintln!("entries_fts: rebuilt for v0.3.0 authors schema"),
                     Ok(false) => {}
@@ -4621,6 +4655,8 @@ pub fn run() {
             get_lcir_node_region,
             get_lcir_enabled,
             set_lcir_enabled,
+            get_lcir_tex_autofetch_enabled,
+            set_lcir_tex_autofetch_enabled,
             get_lcir_vision_alt_text_enabled,
             set_lcir_vision_alt_text_enabled,
             count_figures_missing_alt_text,
