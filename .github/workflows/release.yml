@@ -34,6 +34,9 @@ jobs:
           # ドラフトリリースへ手動添付する。手順は docs/RELEASE.md §2 を参照。
 
     runs-on: ${{ matrix.platform }}
+    # macOS は notarization 待ちが読めないぶん長め。ハングで 6 時間（GitHub 既定）を
+    # 燃やさないための上限であって、「遅いから落とす」ための値ではない。
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 

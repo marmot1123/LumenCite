@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     # プレリリースでは更新しない（workflow_dispatch は prerelease フィールドが無いので通す）
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false }}
+    # ダウンロードと sha256 の計算だけ。上限はハング対策（GitHub 既定は 6 時間）。
+    timeout-minutes: 20
     steps:
       - name: Resolve tag / version
         id: meta
