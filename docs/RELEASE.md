@@ -221,12 +221,24 @@ Tauri のリソース配置規則そのものは `tauri-utils` の `resource_dir
   **`--config` を忘れると署名設定も pdfium 同梱も両方落ちる**ので、生成物の中に `pdfium.dll` があることを
   インストーラ展開後に確認すること。
 
+- **Linux は同梱を CI が自動で検査する**（v1.0.0-p0）。同梱が落ちてもアプリは起動でき、
+  ユーザーが PDF を開いた瞬間に初めて「pdfium library not found」になるため、目視では捕まらない。
+  - `release.yml` の `Verify pdfium is bundled (Linux)` が **毎リリース** `.deb` / `.rpm` / `.AppImage` を
+    展開し、`libpdfium.so` が `bind_pdfium()` の探索候補にあることを確かめる
+    （`scripts/verify_linux_bundle.sh`）。⚠ tauri-action はバンドルとアップロードが 1 ステップなので、
+    この検査はアップロード**後**に走る。落ちてもドラフトには成果物が残るので、**公開せずに破棄すること**。
+  - `linux-bundle-verify.yml` は**実際に .deb をインストールし .AppImage を展開して、その中で
+    `bind_pdfium()` を呼ぶ**（`scripts/verify_linux_bundle_runtime.sh`）。手動実行と、
+    探索候補・同梱設定・pdfium 版に触る PR で走る。**タグを打つ前に確かめたいときはこちらを手動実行する。**
 - **ローカル開発で試す**: 各 OS 用アセットを展開し、上表の「置き場所」へ置く（`bind_pdfium` は
   カレントの `pdfium/` も探すので `src-tauri/` で `pnpm tauri dev` すれば拾う）。未配置でも OCR / LCIR 以外は動く。
 - `src-tauri/pdfium/` は gitignore 済み（バイナリは非コミット）。
-- **pdfium を更新するときは 3 OS 分をまとめて上げる**: `release.yml` の `PDFIUM_TAG` と 2 つの
-  `PDFIUM_SHA256`、および本節の Windows 用ハッシュを同じタグで揃える。
+- **pdfium の版と検証ハッシュの正本は `.github/pdfium.env` の 1 ファイル**（3 OS 分をまとめて持つ）。
+  `release.yml` と `linux-bundle-verify.yml` は両方これを `source` するので、**更新はこのファイルだけ**。
   値は `curl -fsSL <url> | shasum -a 256` で求める（GitHub API の asset digest とも一致する）。
+  上の PowerShell 例に出てくる期待値も同じファイルの `PDFIUM_SHA256_WINDOWS` と揃えること。
+  ⚠ 以前は同じ値がワークフロー 2 ファイルに複製されており、この手順が片方しか挙げていなかったため、
+  **pdfium を上げると検証ワークフローだけ古い版を掴んだまま緑になる**穴があった。複製を戻さないこと。
 
 ---
 
@@ -253,6 +265,18 @@ git push origin main --tags
 2. 各バイナリを署名 + macOS は notarize
 3. `latest.json` を生成して updater 用 ed25519 鍵で署名
 4. GitHub Release を作成し、すべてのアセットをアップロード
+5. **Linux ジョブが `Verify pdfium is bundled (Linux)` で成果物を展開し、`libpdfium.so` が
+   実行時の探索先に入っていることを確かめる**（v1.0.0-p0）
+
+⚠ **5 が赤いドラフトは公開しない。** tauri-action はバンドルとアップロードが 1 ステップなので、
+この検査はアップロード**後**にしか置けず、落ちても成果物はドラフトに残る。失敗すると
+ワークフローがドラフトのタイトルを `DO NOT PUBLISH — Linux pdfium verify failed …` に書き換えるので、
+**その印が付いたドラフトは破棄して原因を直してからタグを打ち直す**。
+
+⚠ この検査は「同梱されているか」までで、**実行時に `bind_pdfium()` が実際に掴むか**は見ていない。
+そちらは `linux-bundle-verify` ワークフロー（.deb を入れて中でプローブを走らせる）の担当で、
+タグでは自動起動しない。**探索候補・同梱設定・productName・pdfium の版に触ったリリースでは、
+タグを打つ前に手動実行しておくこと。**
 
 エラー時はワークフロー画面のログを確認。よくあるトラブル:
 
@@ -286,6 +310,8 @@ git push origin main --tags
 - [ ] **`tauri.conf.json` の `plugins.updater.pubkey` が本物の鍵**（`REPLACE_…` プレースホルダでない）— v0.1.0 はこれを取りこぼして updater が壊れた。`release.yml` のガードでも検証されるが、タグ前に目視確認
 - [ ] `CHANGELOG.md` に v0.1.0 エントリを追記
 - [ ] 試しに `v0.1.0-rc.1` タグでドライランしてワークフローを通す
+- [ ] **Linux ジョブの `Verify pdfium is bundled (Linux)` が緑**（赤ければドラフトを破棄。タイトルに `DO NOT PUBLISH` の印が付く）
+- [ ] pdfium の版・探索候補・同梱設定に触ったリリースなら、**タグ前に `linux-bundle-verify` を手動実行**（§4）
 - [ ] 各 OS でインストール検証（macOS: Gatekeeper 通過 / Windows: SmartScreen「詳細情報→実行」/ Linux: AppImage 起動）
 - [ ] ドラフトリリースの公開（GitHub UI から手動で「Publish release」）
 

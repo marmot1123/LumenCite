@@ -18,6 +18,13 @@ const PRODUCT_NAME: &str = "LumenCite";
 ///    AppImage は `$APPDIR/usr/bin` → `$APPDIR/usr/lib/<name>`）。
 ///    `<name>` が productName・crate 名・バイナリ名のどれになるかは配布形態と bundler 版に依存するため、
 ///    3 つとも見る（存在しないディレクトリは `bind_to_library` が失敗して次の候補へ進むだけ）。
+///
+///    **実測（2026-08-07・CI で実バンドルを検証）: 実行ファイルとリソース dir は名前が食い違う。**
+///    `.deb` / `.AppImage` のどちらも実行ファイルは `usr/bin/lumencite`（crate 名）なのに
+///    リソースは `usr/lib/LumenCite/`（productName）に置かれる ── つまり当たっているのは
+///    **productName の候補**で、実行ファイル名から組んだ候補では 1 つも当たらない。
+///    3 つ見るのは念のためではなく、**productName 候補が無ければ Linux では動かない**。
+///    検証は `.github/workflows/linux-bundle-verify.yml`（実バンドルの中で `bind_pdfium` を呼ぶ）。
 /// 4. `pdfium` / `.` — dev（`src-tauri/pdfium/`）とカレント
 fn library_search_dirs(exe: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
