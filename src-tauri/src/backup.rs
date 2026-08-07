@@ -352,13 +352,15 @@ mod tests {
     /// 観測しないと検出できない ＝ 単体テストで守れない。ロックを定義そのものにすれば、
     /// `run_backup` / `run_backup_if_due` が取る限り自動的に真になる。
     /// これを読むのは v1.0.0-p2 の LCIR バックフィル（zip 中は譲る）。
+    /// ⚠ **「走っていなければ false」は assert しない。** `BACKUP_LOCK` はプロセス全体で
+    /// 共有の static で、同じファイルの他のバックアップテストが並列に取りうる。false 側は
+    /// このテストの制御下に無く、assert すると CI で不定期に落ちる（実際に落とした）。
+    /// 自分が握っている間だけが、このテストが観測を保証できる唯一の状態。
     #[tokio::test]
     async fn is_running_reflects_the_backup_lock() {
-        assert!(!is_running(), "誰も走っていなければ false");
         let guard = BACKUP_LOCK.lock().await;
         assert!(is_running(), "ロックを握っている間は true");
         drop(guard);
-        assert!(!is_running(), "解放したら false に戻る");
     }
 
     /// zip アーカイブ内のエントリ名一覧を返すテストヘルパ。
