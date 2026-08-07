@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -86,6 +86,84 @@ interface GcOutcome {
   files_trashed: number;
   fts_orphans_removed: number;
   freed_bytes: number;
+}
+
+/**
+ * 長時間バッチの種別。Rust 側 `batch_status::BatchKind` の文字列と 1:1 の契約なので、
+ * **片方だけ変えない**（Rust 側にも同じ注意書きがある）。
+ */
+type BatchKind = "build" | "rebuild" | "rederive" | "gc" | "vision_alt_text" | "tex_fetch";
+
+/**
+ * `lcir_batch_status` の返り値（debt-32）。**バックエンドが正本**で、フロントはこれを引く。
+ *
+ * これが無いと、実行状態・進捗・対象件数がこのコンポーネントのローカル state にしか無く、
+ * モーダルを閉じるとアンマウントで消えていた。実害は 2 つ:
+ * ①閉じている間にバッチが終わると `failed` 件数を読む手段が消える
+ * ②課金操作の同意を古い件数で取る（2026-08-06 に約 4 倍の過少表示で実際に起きた）。
+ */
+interface BatchStatus {
+  /** 今走っている種別。**複数ありうる**（バックエンドは全種別を排他にしていない）。 */
+  running: BatchKind[];
+  /** 種別 → 直近の進捗。実行中でないものは載らない。 */
+  progress: Partial<Record<BatchKind, { done: number; total: number }>>;
+  /** 直近に終わったバッチ 1 本。閉じている間に終わった結果を後から読むためのもの。 */
+  last: {
+    kind: BatchKind;
+    /** RFC3339。同じ結果を開くたび再掲しないための識別に使う。 */
+    finished_at: string;
+    result: unknown;
+    error: string | null;
+  } | null;
+}
+
+/**
+ * **一度表示した「直近の結果」を覚えておく**（モジュールスコープ ＝ アンマウントで消えない）。
+ *
+ * `lcir_batch_status` は読み取り専用で、読んでも結果を消さない（2 つ開いた画面のうち
+ * 先に読んだ方だけが見られる、という状態を作らないため）。再掲の抑制はこちらの仕事。
+ */
+let lastShownBatchFinishedAt: string | null = null;
+
+/**
+ * 各バッチの戻り値。**Rust 側のコマンドの戻り値と 1:1** で、`lcir_batch_status` の
+ * `last.result` にもそのまま入る。
+ *
+ * ⚠ ここを `Record<string, ...>` の類で緩めないこと。以前 `number & boolean & string`
+ * （= `never`）にキャストしていたため、**フィールド名の綴り違いが型検査を素通りしていた**
+ * （`r.pdf_only` を `r.pdfOnly` と書いても通る）。i18n に渡す値が黙って undefined になる。
+ */
+interface LcirBatchResult {
+  enabled: boolean;
+  total: number;
+  built: number;
+  reused: number;
+  failed: number;
+  skipped: number;
+}
+interface FulltextDeriveResult {
+  total: number;
+  derived: number;
+  skipped_ocr: number;
+  skipped_empty: number;
+  skipped_existing: number;
+  failed: number;
+}
+interface VisionAltTextResult {
+  enabled: boolean;
+  total: number;
+  generated: number;
+  skipped: number;
+  failed: number;
+  aborted: boolean;
+  abort_reason: string | null;
+}
+interface FetchArxivSourcesResult {
+  total: number;
+  fetched: number;
+  built: number;
+  pdf_only: number;
+  failed: number;
 }
 
 /** バイト数を人が読める単位にする（1 KiB = 1024 B・小数 1 桁）。 */
@@ -763,6 +841,13 @@ function DataTab() {
   }, []);
   // 代替テキスト一括生成の進捗（図の数だけ Vision 呼び出しが走るので長時間になる）。
   const [altTextRunning, setAltTextRunning] = useState(false);
+  // 押す直前に取り直した件数が画面と食い違ったときの確認（debt-32）。GC と同じインライン方式
+  // （window.confirm は WKWebView で素通りすることがある）。
+  const [confirmAltText, setConfirmAltText] = useState(false);
+  // 件数の取り直し中。**この間もボタンを止める** ── 押してから件数が返るまでの窓で
+  // もう一度押せると、2 本目の invoke が already_running で弾かれ、その finally が
+  // 実行中表示を消して「課金中なのに待機状態」に見える。
+  const [altTextChecking, setAltTextChecking] = useState(false);
   const [altTextProgress, setAltTextProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
@@ -804,6 +889,243 @@ function DataTab() {
 
   const errMsg = (e: unknown) =>
     typeof e === "string" ? e : (e as Error)?.message ?? String(e);
+
+  // ── 長時間バッチの状態はバックエンドが正本（debt-32）─────────────────────
+  const [batchStatus, setBatchStatus] = useState<BatchStatus | null>(null);
+  // **まだ画面に居るか。** 「表示済み」の印を進めてよいのは実際に描画できたときだけで、
+  // アンマウント後の非同期継続で進めると**誰も見ていない結果を見せないまま捨てる**
+  // （debt-32 の実害①がそのまま残る）。
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  /**
+   * 終わったバッチ 1 本を文言にする。**実行時の `finally` と、開き直したときの復帰の
+   * 両方がここを通る** ── 2 か所で組み立てると、片方だけ直したときに
+   * 「モーダルを閉じていた場合だけ表現が違う」という直しにくいずれ方をする。
+   */
+  const formatBatchOutcome = (
+    kind: BatchKind,
+    result: unknown,
+    error: string | null,
+  ): { message: string | null; error: string | null } => {
+    if (error !== null) {
+      // 多重起動ガードに弾かれたケースは専用の案内にする。
+      // キーは i18n の型が literal を要求するので、組み立てずにそのまま書く。
+      const busy = error.includes("already_running");
+      const text = (() => {
+        switch (kind) {
+          case "build":
+          case "rebuild":
+            return busy
+              ? t("settings.data.lcirBatchRunning")
+              : t("settings.data.lcirError", { error });
+          case "rederive":
+            return busy
+              ? t("settings.data.lcirBatchRunning")
+              : t("settings.data.fulltextDeriveError", { error });
+          case "gc":
+            return busy ? t("settings.data.gcRunning") : t("settings.data.gcError", { error });
+          case "vision_alt_text":
+            return busy
+              ? t("settings.data.altTextRunning")
+              : t("settings.data.altTextError", { error });
+          case "tex_fetch":
+            return busy
+              ? t("settings.data.texFetchRunning")
+              : t("settings.data.texFetchError", { error });
+        }
+      })();
+      return { message: null, error: text };
+    }
+    switch (kind) {
+      case "build":
+      case "rebuild": {
+        const r = result as LcirBatchResult;
+        if (!r.enabled) return { message: t("settings.data.lcirDisabled"), error: null };
+        if (r.total === 0) {
+          return {
+            message: t(kind === "build" ? "settings.data.lcirNone" : "settings.data.lcirRebuildNone"),
+            error: null,
+          };
+        }
+        // サマリは常に出す。pdfium を読めない配布物では大半が「着手すらしていない」ので、
+        // その事実を**サマリを隠さずに**併記する（分岐を排他にすると built/failed が消える）。
+        return {
+          message: t(
+            kind === "build" ? "settings.data.lcirDone" : "settings.data.lcirRebuildDone",
+            { total: r.total, built: r.built, reused: r.reused, failed: r.failed },
+          ),
+          error:
+            r.skipped > 0
+              ? t("settings.data.lcirNoPdfium", { skipped: r.skipped, total: r.total })
+              : null,
+        };
+      }
+      case "rederive": {
+        const r = result as FulltextDeriveResult;
+        return {
+          message:
+            r.total === 0
+              ? t("settings.data.fulltextDeriveNone")
+              : t("settings.data.fulltextDeriveDone", {
+                  derived: r.derived,
+                  total: r.total,
+                  skippedOcr: r.skipped_ocr,
+                  skippedEmpty: r.skipped_empty,
+                  failed: r.failed,
+                }),
+          error: null,
+        };
+      }
+      case "vision_alt_text": {
+        const r = result as VisionAltTextResult;
+        if (!r.enabled) return { message: t("settings.data.altTextDisabled"), error: null };
+        if (r.total === 0) return { message: t("settings.data.altTextNone"), error: null };
+        const done = t("settings.data.altTextDone", {
+          total: r.total,
+          generated: r.generated,
+          skipped: r.skipped,
+          failed: r.failed,
+        });
+        // 打ち切られたときは理由を明示する（同意を外して止めた場合と、系統的失敗を区別）。
+        const reason = !r.aborted
+          ? null
+          : r.abort_reason === "consent_withdrawn"
+            ? t("settings.data.altTextStopped")
+            : t("settings.data.altTextAborted");
+        return { message: reason ? `${done} ${reason}` : done, error: null };
+      }
+      case "tex_fetch": {
+        const r = result as FetchArxivSourcesResult;
+        return {
+          message:
+            r.total === 0
+              ? t("settings.data.texFetchNone")
+              : t("settings.data.texFetchDone", {
+                  total: r.total,
+                  fetched: r.fetched,
+                  built: r.built,
+                  pdfOnly: r.pdf_only,
+                  failed: r.failed,
+                }),
+          error: null,
+        };
+      }
+      case "gc": {
+        const r = result as GcOutcome;
+        // **skip 件数を「何も無かった」に丸めない。** skip は「実行中に別経路が
+        // 書き込んだので対象から外した」という別の事実で、0 件回収とは意味が違う。
+        if (r.versions_removed === 0 && r.versions_tombstoned === 0 && r.versions_skipped === 0) {
+          return { message: t("settings.data.gcNone"), error: null };
+        }
+        return {
+          message:
+            t("settings.data.gcDone", {
+              removed: r.versions_removed,
+              tombstoned: r.versions_tombstoned,
+              nodes: num(r.nodes_removed),
+              freed: formatBytes(r.freed_bytes),
+            }) +
+            // 0 でないときだけ出す（0 が普通なので、常時表示すると重要な値が埋もれる）。
+            (r.versions_skipped > 0
+              ? ` ${t("settings.data.gcSkipped", { skipped: r.versions_skipped })}`
+              : ""),
+          error: null,
+        };
+      }
+    }
+  };
+
+  const showBatchOutcome = (kind: BatchKind, result: unknown, error: string | null) => {
+    const o = formatBatchOutcome(kind, result, error);
+    setMessage(o.message);
+    setError(o.error);
+  };
+
+  /**
+   * バックエンドの状態を引き直し、**まだ見せていない完了結果があればその場で出す**（debt-32）。
+   *
+   * 「直近の結果」を消費する経路をこの 1 本に絞ってある。マウント時・ポーリング・
+   * ハンドラの完了後がすべてここを通るので、
+   * - 開いたまま見届けた
+   * - 実行中に閉じて開き直した
+   * - このパネルではない場所（詳細パネル・起動時の自動処理）で終わった
+   * のどれでも同じ 1 か所が拾う。
+   *
+   * ⚠ **印を進めるのはマウント中だけ。** アンマウント後の非同期継続でも呼ばれうるが、
+   * そこで進めると描画されないまま「表示済み」になり、開き直しても二度と出ない
+   * （= debt-32 の実害①が主経路で残る。レビューで 4 レンズが独立に当てた）。
+   */
+  const refreshBatchStatus = async (): Promise<BatchStatus | null> => {
+    let s: BatchStatus;
+    try {
+      s = await invoke<BatchStatus>("lcir_batch_status");
+    } catch {
+      return null; // 表示のためだけなので握りつぶす
+    }
+    if (!mountedRef.current) return s;
+    setBatchStatus(s);
+    const last = s.last;
+    if (last && last.finished_at !== lastShownBatchFinishedAt) {
+      lastShownBatchFinishedAt = last.finished_at;
+      showBatchOutcome(last.kind, last.result, last.error);
+    }
+    return s;
+  };
+
+  // マウント時に 1 回だけ状態を引く。**リスナーの貼り直しだけでは足りない** ── 実ライブラリの
+  // att37（527 頁）は 1 添付に約 8 分かかり、その間 1 通もイベントが飛ばないので、
+  // 開き直した直後は「何も走っていない」ように見えてしまう。
+  // 閉じている間に終わっていた結果も、`refreshBatchStatus` の中でここから拾う。
+  useEffect(() => {
+    void refreshBatchStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 走っている間だけ軽く追う。理由は 2 つあり、**どちらも「マウント時に 1 回」では届かない**:
+  //   ① このパネルが起動していないバッチ（詳細パネル発の代替テキスト生成・起動時の再導出）は
+  //      invoke の解決が返って来ないので、実行中の表示がいつまでも消えない。
+  //   ② **完了結果もポーリングが拾う。** 開いたまま見届けた場合も、実行中に開き直した場合も、
+  //      マウント時の 1 回はまだ `last` が古いので拾えない。
+  // 読むのは Mutex 1 つなので安い。
+  useEffect(() => {
+    if (!batchStatus?.running.length) return;
+    const id = setInterval(() => void refreshBatchStatus(), 2000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batchStatus?.running.join(",")]);
+
+  // 表示に使う実行中フラグは「ローカルの楽観更新 ∪ バックエンドの正本」。
+  // ローカルだけだと他所で始まったバッチを取りこぼし、バックエンドだけだと
+  // 押してから最初のポーリングまでボタンが押せたままになる。
+  const backendRunning = batchStatus?.running ?? [];
+  const activeLcirBatch: "build" | "rebuild" | null =
+    lcirBatch ??
+    (backendRunning.includes("build")
+      ? "build"
+      : backendRunning.includes("rebuild")
+        ? "rebuild"
+        : null);
+  // 再導出（p1）と GC は同じ `LCIR_BATCH_RUNNING` を取るので、構築系ボタンも止める。
+  const anyLcirBatchRunning =
+    activeLcirBatch !== null ||
+    backendRunning.includes("rederive") ||
+    busy === "rederive_fulltext";
+  const activeGcRunning = gcRunning || backendRunning.includes("gc");
+  const activeAltTextRunning = altTextRunning || backendRunning.includes("vision_alt_text");
+  const activeFetchTexRunning = fetchTexRunning || backendRunning.includes("tex_fetch");
+  // 進捗は「今届いたイベント」を優先し、無ければバックエンドのスナップショット。
+  const backendProgress = batchStatus?.progress ?? {};
+  const activeLcirProgress =
+    lcirProgress ?? (activeLcirBatch ? backendProgress[activeLcirBatch] ?? null : null);
+  const activeAltTextProgress = altTextProgress ?? backendProgress.vision_alt_text ?? null;
+  const activeTexProgress = texProgress ?? backendProgress.tex_fetch ?? null;
+  const activeGcProgress = gcProgress ?? backendProgress.gc ?? null;
 
   const handleBackupNow = async () => {
     setBusy("backup");
@@ -910,34 +1232,10 @@ function DataTab() {
     setMessage(null);
     setError(null);
     try {
-      const r = await invoke<{
-        total: number;
-        derived: number;
-        skipped_ocr: number;
-        skipped_empty: number;
-        skipped_existing: number;
-        failed: number;
-      }>("rederive_fulltext_from_lcir");
-      if (r.total === 0) {
-        setMessage(t("settings.data.fulltextDeriveNone"));
-      } else {
-        setMessage(
-          t("settings.data.fulltextDeriveDone", {
-            derived: r.derived,
-            total: r.total,
-            skippedOcr: r.skipped_ocr,
-            skippedEmpty: r.skipped_empty,
-            failed: r.failed,
-          }),
-        );
-      }
+      await invoke<unknown>("rederive_fulltext_from_lcir");
+      await refreshBatchStatus();
     } catch (e) {
-      const s = errMsg(e);
-      setError(
-        s.includes("already_running")
-          ? t("settings.data.lcirBatchRunning")
-          : t("settings.data.fulltextDeriveError", { error: s }),
-      );
+      showBatchOutcome("rederive", null, errMsg(e));
     } finally {
       setBusy(null);
     }
@@ -961,42 +1259,11 @@ function DataTab() {
     setMessage(null);
     setError(null);
     try {
-      const r = await invoke<{
-        enabled: boolean;
-        total: number;
-        built: number;
-        reused: number;
-        failed: number;
-        skipped: number;
-      }>(kind === "build" ? "build_missing_lcir" : "rebuild_outdated_lcir");
-      if (!r.enabled) {
-        setMessage(t("settings.data.lcirDisabled"));
-      } else if (r.total === 0) {
-        setMessage(
-          kind === "build" ? t("settings.data.lcirNone") : t("settings.data.lcirRebuildNone"),
-        );
-      } else {
-        // サマリは常に出す。pdfium を読めない配布物では大半が「着手すらしていない」ので、
-        // その事実を**サマリを隠さずに**併記する（分岐を排他にすると built/failed が消える）。
-        setMessage(
-          t(kind === "build" ? "settings.data.lcirDone" : "settings.data.lcirRebuildDone", {
-            total: r.total,
-            built: r.built,
-            reused: r.reused,
-            failed: r.failed,
-          }),
-        );
-        if (r.skipped > 0) {
-          setError(t("settings.data.lcirNoPdfium", { skipped: r.skipped, total: r.total }));
-        }
-      }
+      await invoke<unknown>(kind === "build" ? "build_missing_lcir" : "rebuild_outdated_lcir");
+      // 表示は refreshBatchStatus が担当する（消費経路を 1 本に絞る）。
+      await refreshBatchStatus();
     } catch (e) {
-      const s = errMsg(e);
-      setError(
-        s.includes("already_running")
-          ? t("settings.data.lcirBatchRunning")
-          : t("settings.data.lcirError", { error: s }),
-      );
+      showBatchOutcome(kind, null, errMsg(e));
     } finally {
       setLcirBatch(null);
       setLcirProgress(null);
@@ -1014,47 +1281,76 @@ function DataTab() {
     }
   };
 
-  const handleGenerateAltTexts = async () => {
+  /**
+   * 代替テキスト生成のボタン。**押した瞬間に対象件数を取り直す**（debt-32）。
+   *
+   * 課金は「押したときに画面に出ていた件数」ではなく **バックエンドがその場で引き直した
+   * 件数**に対して発生する（`generate_vision_alt_texts` は `figures_missing_alt_text` を
+   * 自分で引く）。2026-08-06 の #7 では、再構築の途中でモーダルを開き直したために
+   * マウント時点の 89 件を表示し続け、実際の対象は 346 件だった ＝ **約 4 倍の過少表示のまま
+   * 非可逆・課金操作の同意を取る**状態になっていた。
+   *
+   * そこで、取り直した件数が画面の数と食い違ったら**走らせずに確認へ戻す**。
+   * 一致していれば同意は正しい件数に対して取れているので、そのまま実行する
+   * （毎回確認を挟むと、正しく見えている場合にも 1 クリック増えるだけになる）。
+   */
+  const handleAltTextRequest = () => proceedAltTextIfCountMatches(altTextPending);
+
+  /**
+   * 対象件数を取り直し、`expected` と一致していれば生成へ進む。食い違っていたら
+   * **走らせずに確認へ戻す**（新しい件数を見せて、もう一度押させる）。
+   *
+   * ⚠ **確認ボックスの「実行する」もここを通す。** 確認は「件数が動いていると分かった」
+   * ときにだけ出るので、そこで取り直さないと**動いていると分かっている経路だけが
+   * 再確認を素通りする**という逆立ちになる（レビューの high 指摘）。
+   * 件数が動き続けるなら押すたびに確認が出るが、動く対象に課金するよりはよい。
+   *
+   * ⚠ **`altTextChecking` はこの関数の中で立てる。** 呼び出し側に任せると、片方の入口
+   * （確認ボックスの「実行する」）だけ素通りして、件数を取り直している数百ミリ秒の間
+   * ボタンが押せたままになる。そこで二度押しすると 2 本目が `already_running` で弾かれ、
+   * **その `finally` が実行中表示を消して「課金中なのに待機状態」に見える。**
+   */
+  const proceedAltTextIfCountMatches = async (expected: number | null) => {
+    if (altTextChecking || altTextRunning) return;
+    setMessage(null);
+    setError(null);
+    setAltTextChecking(true);
+    try {
+      let fresh: number;
+      try {
+        fresh = await invoke<number>("count_figures_missing_alt_text");
+      } catch (e) {
+        setConfirmAltText(false);
+        setError(t("settings.data.altTextError", { error: errMsg(e) }));
+        return;
+      }
+      setAltTextPending(fresh);
+      if (fresh === 0) {
+        setConfirmAltText(false);
+        setMessage(t("settings.data.altTextNone"));
+        return;
+      }
+      if (expected !== fresh) {
+        setConfirmAltText(true);
+        return;
+      }
+      await runGenerateAltTexts();
+    } finally {
+      setAltTextChecking(false);
+    }
+  };
+
+  const runGenerateAltTexts = async () => {
+    setConfirmAltText(false);
     setAltTextRunning(true);
     setMessage(null);
     setError(null);
     setAltTextProgress(null);
     try {
-      const r = await invoke<{
-        enabled: boolean;
-        total: number;
-        generated: number;
-        skipped: number;
-        failed: number;
-        aborted: boolean;
-        abort_reason: string | null;
-      }>("generate_vision_alt_texts");
-      if (!r.enabled) {
-        setMessage(t("settings.data.altTextDisabled"));
-      } else if (r.total === 0) {
-        setMessage(t("settings.data.altTextNone"));
-      } else {
-        const done = t("settings.data.altTextDone", {
-          total: r.total,
-          generated: r.generated,
-          skipped: r.skipped,
-          failed: r.failed,
-        });
-        // 打ち切られたときは理由を明示する（同意を外して止めた場合と、系統的失敗を区別）。
-        const reason = !r.aborted
-          ? null
-          : r.abort_reason === "consent_withdrawn"
-            ? t("settings.data.altTextStopped")
-            : t("settings.data.altTextAborted");
-        setMessage(reason ? `${done} ${reason}` : done);
-      }
+      await invoke<unknown>("generate_vision_alt_texts");
+      await refreshBatchStatus();
     } catch (e) {
-      const s = errMsg(e);
-      setError(
-        s.includes("already_running")
-          ? t("settings.data.altTextRunning")
-          : t("settings.data.altTextError", { error: s }),
-      );
+      showBatchOutcome("vision_alt_text", null, errMsg(e));
     } finally {
       setAltTextRunning(false);
       setAltTextProgress(null);
@@ -1068,39 +1364,28 @@ function DataTab() {
     setError(null);
     setTexProgress(null);
     try {
-      const r = await invoke<{
-        total: number;
-        fetched: number;
-        built: number;
-        pdf_only: number;
-        failed: number;
-      }>("fetch_missing_arxiv_sources");
-      if (r.total === 0) {
-        setMessage(t("settings.data.texFetchNone"));
-      } else {
-        setMessage(
-          t("settings.data.texFetchDone", {
-            total: r.total,
-            fetched: r.fetched,
-            built: r.built,
-            pdfOnly: r.pdf_only,
-            failed: r.failed,
-          }),
-        );
-      }
+      await invoke<unknown>("fetch_missing_arxiv_sources");
+      await refreshBatchStatus();
     } catch (e) {
-      const s = errMsg(e);
-      // 多重起動ガードに弾かれたケースは専用の案内にする。
-      setError(
-        s.includes("already_running")
-          ? t("settings.data.texFetchRunning")
-          : t("settings.data.texFetchError", { error: s }),
-      );
+      // 多重起動ガードに弾かれたケースは専用の案内にする（formatBatchOutcome の担当）。
+      showBatchOutcome("tex_fetch", null, errMsg(e));
     } finally {
       setFetchTexRunning(false);
       setTexProgress(null);
       refreshAltTextPending();
     }
+  };
+
+  /**
+   * GC の確認を開く。**開く直前に見積りを取り直す**（debt-32）── 確認ボックスに出る
+   * 「回収できる版・ノード・バイト数」はマウント時に引いた値で、その後の構築・再構築・
+   * バックフィルで動く。非可逆な操作の同意を古い数字で取らないための取り直し。
+   */
+  const handleGcRequest = async () => {
+    setMessage(null);
+    setError(null);
+    await refreshStorage();
+    setConfirmGc(true);
   };
 
   const handleGcConfirmed = async () => {
@@ -1110,32 +1395,10 @@ function DataTab() {
     setError(null);
     setGcProgress(null);
     try {
-      const r = await invoke<GcOutcome>("run_lcir_gc");
-      // **skip 件数を「何も無かった」に丸めない。** skip は「実行中に別経路が
-      // 書き込んだので対象から外した」という別の事実で、0 件回収とは意味が違う。
-      if (r.versions_removed === 0 && r.versions_tombstoned === 0 && r.versions_skipped === 0) {
-        setMessage(t("settings.data.gcNone"));
-      } else {
-        setMessage(
-          t("settings.data.gcDone", {
-            removed: r.versions_removed,
-            tombstoned: r.versions_tombstoned,
-            nodes: num(r.nodes_removed),
-            freed: formatBytes(r.freed_bytes),
-          }) +
-            // 0 でないときだけ出す（0 が普通なので、常時表示すると重要な値が埋もれる）。
-            (r.versions_skipped > 0
-              ? ` ${t("settings.data.gcSkipped", { skipped: r.versions_skipped })}`
-              : ""),
-        );
-      }
+      await invoke<GcOutcome>("run_lcir_gc");
+      await refreshBatchStatus();
     } catch (e) {
-      const s = errMsg(e);
-      setError(
-        s.includes("already_running")
-          ? t("settings.data.gcRunning")
-          : t("settings.data.gcError", { error: s }),
-      );
+      showBatchOutcome("gc", null, errMsg(e));
     } finally {
       setGcRunning(false);
       setGcProgress(null);
@@ -1147,7 +1410,7 @@ function DataTab() {
     <>
       <Section title={t("settings.data.backup")} description={t("settings.data.backupDesc")}>
         <div style={{ display: "flex", gap: 6 }}>
-          <SecondaryBtn onClick={handleBackupNow} disabled={busy === "backup" || gcRunning}>
+          <SecondaryBtn onClick={handleBackupNow} disabled={busy === "backup" || activeGcRunning}>
             {busy === "backup" ? t("common.loading") : t("settings.data.backupNow")}
           </SecondaryBtn>
           <SecondaryBtn onClick={handleOpenFolder}>
@@ -1155,7 +1418,7 @@ function DataTab() {
           </SecondaryBtn>
           <SecondaryBtn
             onClick={() => setConfirmRestore(true)}
-            disabled={busy === "restore" || confirmRestore || gcRunning}
+            disabled={busy === "restore" || confirmRestore || activeGcRunning}
           >
             {busy === "restore" ? t("common.loading") : t("settings.data.restore")}
           </SecondaryBtn>
@@ -1198,7 +1461,7 @@ function DataTab() {
       </Section>
 
       <Section title={t("settings.data.fulltext")} description={t("settings.data.fulltextDesc")}>
-        <SecondaryBtn onClick={handleIndexMissing} disabled={busy === "index_missing" || gcRunning}>
+        <SecondaryBtn onClick={handleIndexMissing} disabled={busy === "index_missing" || activeGcRunning}>
           {busy === "index_missing" ? t("settings.data.indexMissingBusy") : t("settings.data.indexMissing")}
         </SecondaryBtn>
       </Section>
@@ -1211,39 +1474,39 @@ function DataTab() {
         <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
           <SecondaryBtn
             onClick={() => handleLcirBatch("build")}
-            disabled={!lcirEnabled || lcirBatch !== null || gcRunning}
+            disabled={!lcirEnabled || anyLcirBatchRunning || activeGcRunning}
           >
-            {lcirBatch === "build"
-              ? lcirProgress
+            {activeLcirBatch === "build"
+              ? activeLcirProgress
                 ? t("settings.data.lcirBusyProgress", {
-                    done: lcirProgress.done,
-                    total: lcirProgress.total,
+                    done: activeLcirProgress.done,
+                    total: activeLcirProgress.total,
                   })
                 : t("settings.data.lcirBusy")
               : t("settings.data.lcirBuild")}
           </SecondaryBtn>
           <SecondaryBtn
             onClick={() => handleLcirBatch("rebuild")}
-            disabled={!lcirEnabled || lcirBatch !== null || gcRunning}
+            disabled={!lcirEnabled || anyLcirBatchRunning || activeGcRunning}
           >
-            {lcirBatch === "rebuild"
-              ? lcirProgress
+            {activeLcirBatch === "rebuild"
+              ? activeLcirProgress
                 ? t("settings.data.lcirRebuildBusyProgress", {
-                    done: lcirProgress.done,
-                    total: lcirProgress.total,
+                    done: activeLcirProgress.done,
+                    total: activeLcirProgress.total,
                   })
                 : t("settings.data.lcirRebuildBusy")
               : t("settings.data.lcirRebuild")}
           </SecondaryBtn>
           <SecondaryBtn
             onClick={handleFetchTex}
-            disabled={!lcirEnabled || fetchTexRunning || lcirBatch !== null || gcRunning}
+            disabled={!lcirEnabled || activeFetchTexRunning || anyLcirBatchRunning || activeGcRunning}
           >
-            {fetchTexRunning
-              ? texProgress
+            {activeFetchTexRunning
+              ? activeTexProgress
                 ? t("settings.data.texFetchBusyProgress", {
-                    done: texProgress.done,
-                    total: texProgress.total,
+                    done: activeTexProgress.done,
+                    total: activeTexProgress.total,
                   })
                 : t("settings.data.texFetchBusy")
               : t("settings.data.texFetch")}
@@ -1268,19 +1531,50 @@ function DataTab() {
         </div>
         <div style={{ marginTop: 6 }}>
           <SecondaryBtn
-            onClick={handleGenerateAltTexts}
-            disabled={!lcirEnabled || !altTextEnabled || altTextRunning || gcRunning}
+            onClick={handleAltTextRequest}
+            disabled={
+              !lcirEnabled ||
+              !altTextEnabled ||
+              activeAltTextRunning ||
+              activeGcRunning ||
+              confirmAltText ||
+              altTextChecking
+            }
           >
-            {altTextRunning
-              ? altTextProgress
+            {activeAltTextRunning
+              ? activeAltTextProgress
                 ? t("settings.data.altTextBusyProgress", {
-                    done: altTextProgress.done,
-                    total: altTextProgress.total,
+                    done: activeAltTextProgress.done,
+                    total: activeAltTextProgress.total,
                   })
                 : t("settings.data.altTextBusy")
               : t("settings.data.altText")}
           </SecondaryBtn>
         </div>
+        {/* 押す直前に取り直した件数が画面と食い違ったときだけ確認を挟む（debt-32）。
+            課金は「表示していた件数」ではなく、バックエンドがその場で引き直した件数に
+            対して発生するので、ずれたまま同意を取らない。 */}
+        {confirmAltText && altTextPending !== null && (
+          <div style={{
+            padding: "10px 12px", borderRadius: 6, marginTop: 8,
+            background: "var(--danger-bg)", border: "1px solid var(--danger-border)",
+          }}>
+            <div style={{ fontSize: 12, color: "var(--text)", lineHeight: 1.55, marginBottom: 8 }}>
+              {t("settings.data.altTextCountChanged", { pending: altTextPending })}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <SecondaryBtn onClick={() => setConfirmAltText(false)}>
+                {t("common.cancel")}
+              </SecondaryBtn>
+              <SecondaryBtn
+                onClick={() => void proceedAltTextIfCountMatches(altTextPending)}
+                disabled={altTextChecking || activeAltTextRunning}
+              >
+                {t("settings.data.altTextProceed")}
+              </SecondaryBtn>
+            </div>
+          </div>
+        )}
         {/* 全文索引の再導出（v1.0.0-p1）。pdfium を使わない純 SQL なので秒オーダーで、
             進捗イベントは出さない。OCR 由来の索引と本文が空の添付は触らない。 */}
         <div style={{ fontSize: 11, color: "var(--text-mute)", marginTop: 10, lineHeight: 1.55 }}>
@@ -1292,10 +1586,10 @@ function DataTab() {
             disabled={
               !lcirEnabled ||
               busy !== null ||
-              lcirBatch !== null ||
-              fetchTexRunning ||
-              altTextRunning ||
-              gcRunning
+              anyLcirBatchRunning ||
+              activeFetchTexRunning ||
+              activeAltTextRunning ||
+              activeGcRunning
             }
           >
             {busy === "rederive_fulltext"
@@ -1348,25 +1642,25 @@ function DataTab() {
             // **確認ボックスを開く直前に見積りを取り直す。** 同じタブに再構築ボタンが
             // 並んでおり、mount 時の数字のまま非可逆な削除の同意を取ると
             // 「145 件消します」と言って別の件数を消すことになる。
-            onClick={() => void refreshStorage().then(() => setConfirmGc(true))}
+            onClick={handleGcRequest}
             disabled={
-              gcRunning ||
+              activeGcRunning ||
               confirmGc ||
               busy !== null ||
-              lcirBatch !== null ||
-              fetchTexRunning ||
-              altTextRunning ||
+              anyLcirBatchRunning ||
+              activeFetchTexRunning ||
+              activeAltTextRunning ||
               // 未取得（null）のうちも押させない。押しても確認ボックスは
               // `confirmGc && storage` で出ないので、無反応のボタンになるため。
               !storage ||
               storage.gc.versions === 0
             }
           >
-            {gcRunning
-              ? gcProgress
+            {activeGcRunning
+              ? activeGcProgress
                 ? t("settings.data.gcBusyProgress", {
-                    done: gcProgress.done,
-                    total: gcProgress.total,
+                    done: activeGcProgress.done,
+                    total: activeGcProgress.total,
                   })
                 : t("settings.data.gcBusy")
               : t("settings.data.gc")}

@@ -361,6 +361,13 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   }, [lcirEnabled, altTextEnabled, refreshAltTextPending, entry?.attachments?.length]);
 
   // このエントリの図だけに代替テキストを生成する（ライブラリ全体は設定 → データから）。
+  //
+  // **押す直前に件数を取り直し、ボタンに出ていた数と違ったら走らせない**（debt-32）。
+  // 課金はボタンの表示件数ではなく、バックエンドがその場で `figures_missing_alt_text` を
+  // 引き直した件数に対して発生する。ここの `altTextPending` はエントリ切替・添付増減・
+  // 生成後にしか更新されないので、**詳細パネルを開いたまま設定→データで再構築を回すと
+  // ずれる**（1 文献でも図は数百件ありうるので「スコープが小さいから安全」は成り立たない
+  // ── レビュー指摘）。ずれたときは新しい件数をボタンに出し、もう一度押させる。
   const handleGenerateAltTexts = async () => {
     if (!entry?.id || altTextBusy) return;
     const startedFor = entry.id;
@@ -368,6 +375,16 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setAltTextBusy(true);
     setIndexNote(null);
     try {
+      const shown = altTextPending;
+      const fresh = await invoke<number>("count_figures_missing_alt_text", {
+        entryId: startedFor,
+      });
+      if (!stillHere()) return;
+      if (fresh !== shown) {
+        setAltTextPending(fresh);
+        setIndexNote(t("detailPanel.altTextCountChanged", { pending: fresh }));
+        return;
+      }
       const r = await invoke<{
         enabled: boolean;
         total: number;
