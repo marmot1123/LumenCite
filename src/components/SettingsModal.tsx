@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -124,6 +124,47 @@ interface BatchStatus {
  * 先に読んだ方だけが見られる、という状態を作らないため）。再掲の抑制はこちらの仕事。
  */
 let lastShownBatchFinishedAt: string | null = null;
+
+/**
+ * 各バッチの戻り値。**Rust 側のコマンドの戻り値と 1:1** で、`lcir_batch_status` の
+ * `last.result` にもそのまま入る。
+ *
+ * ⚠ ここを `Record<string, ...>` の類で緩めないこと。以前 `number & boolean & string`
+ * （= `never`）にキャストしていたため、**フィールド名の綴り違いが型検査を素通りしていた**
+ * （`r.pdf_only` を `r.pdfOnly` と書いても通る）。i18n に渡す値が黙って undefined になる。
+ */
+interface LcirBatchResult {
+  enabled: boolean;
+  total: number;
+  built: number;
+  reused: number;
+  failed: number;
+  skipped: number;
+}
+interface FulltextDeriveResult {
+  total: number;
+  derived: number;
+  skipped_ocr: number;
+  skipped_empty: number;
+  skipped_existing: number;
+  failed: number;
+}
+interface VisionAltTextResult {
+  enabled: boolean;
+  total: number;
+  generated: number;
+  skipped: number;
+  failed: number;
+  aborted: boolean;
+  abort_reason: string | null;
+}
+interface FetchArxivSourcesResult {
+  total: number;
+  fetched: number;
+  built: number;
+  pdf_only: number;
+  failed: number;
+}
 
 /** バイト数を人が読める単位にする（1 KiB = 1024 B・小数 1 桁）。 */
 function formatBytes(n: number): string {
@@ -803,6 +844,10 @@ function DataTab() {
   // 押す直前に取り直した件数が画面と食い違ったときの確認（debt-32）。GC と同じインライン方式
   // （window.confirm は WKWebView で素通りすることがある）。
   const [confirmAltText, setConfirmAltText] = useState(false);
+  // 件数の取り直し中。**この間もボタンを止める** ── 押してから件数が返るまでの窓で
+  // もう一度押せると、2 本目の invoke が already_running で弾かれ、その finally が
+  // 実行中表示を消して「課金中なのに待機状態」に見える。
+  const [altTextChecking, setAltTextChecking] = useState(false);
   const [altTextProgress, setAltTextProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
@@ -847,15 +892,16 @@ function DataTab() {
 
   // ── 長時間バッチの状態はバックエンドが正本（debt-32）─────────────────────
   const [batchStatus, setBatchStatus] = useState<BatchStatus | null>(null);
-  const refreshBatchStatus = async (): Promise<BatchStatus | null> => {
-    try {
-      const s = await invoke<BatchStatus>("lcir_batch_status");
-      setBatchStatus(s);
-      return s;
-    } catch {
-      return null; // 表示のためだけなので握りつぶす
-    }
-  };
+  // **まだ画面に居るか。** 「表示済み」の印を進めてよいのは実際に描画できたときだけで、
+  // アンマウント後の非同期継続で進めると**誰も見ていない結果を見せないまま捨てる**
+  // （debt-32 の実害①がそのまま残る）。
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   /**
    * 終わったバッチ 1 本を文言にする。**実行時の `finally` と、開き直したときの復帰の
@@ -896,10 +942,10 @@ function DataTab() {
       })();
       return { message: null, error: text };
     }
-    const r = result as Record<string, number & boolean & string>;
     switch (kind) {
       case "build":
       case "rebuild": {
+        const r = result as LcirBatchResult;
         if (!r.enabled) return { message: t("settings.data.lcirDisabled"), error: null };
         if (r.total === 0) {
           return {
@@ -920,7 +966,8 @@ function DataTab() {
               : null,
         };
       }
-      case "rederive":
+      case "rederive": {
+        const r = result as FulltextDeriveResult;
         return {
           message:
             r.total === 0
@@ -934,7 +981,9 @@ function DataTab() {
                 }),
           error: null,
         };
+      }
       case "vision_alt_text": {
+        const r = result as VisionAltTextResult;
         if (!r.enabled) return { message: t("settings.data.altTextDisabled"), error: null };
         if (r.total === 0) return { message: t("settings.data.altTextNone"), error: null };
         const done = t("settings.data.altTextDone", {
@@ -951,7 +1000,8 @@ function DataTab() {
             : t("settings.data.altTextAborted");
         return { message: reason ? `${done} ${reason}` : done, error: null };
       }
-      case "tex_fetch":
+      case "tex_fetch": {
+        const r = result as FetchArxivSourcesResult;
         return {
           message:
             r.total === 0
@@ -965,7 +1015,9 @@ function DataTab() {
                 }),
           error: null,
         };
+      }
       case "gc": {
+        const r = result as GcOutcome;
         // **skip 件数を「何も無かった」に丸めない。** skip は「実行中に別経路が
         // 書き込んだので対象から外した」という別の事実で、0 件回収とは意味が違う。
         if (r.versions_removed === 0 && r.versions_tombstoned === 0 && r.versions_skipped === 0) {
@@ -996,37 +1048,51 @@ function DataTab() {
   };
 
   /**
-   * バッチが目の前で終わったときに呼ぶ。結果を画面に出したうえで、**同じものを
-   * 開き直したときに再掲しない**よう「表示済み」の印を進める。
+   * バックエンドの状態を引き直し、**まだ見せていない完了結果があればその場で出す**（debt-32）。
    *
-   * ⚠ 成功したときだけ呼ぶこと。`already_running` で弾かれた場合はバックエンドが
-   * 「直近の結果」を更新しないので、ここで印を進めると**まだ誰も見ていない前回の結果**を
-   * 見せないまま捨てることになる。
+   * 「直近の結果」を消費する経路をこの 1 本に絞ってある。マウント時・ポーリング・
+   * ハンドラの完了後がすべてここを通るので、
+   * - 開いたまま見届けた
+   * - 実行中に閉じて開き直した
+   * - このパネルではない場所（詳細パネル・起動時の自動処理）で終わった
+   * のどれでも同じ 1 か所が拾う。
+   *
+   * ⚠ **印を進めるのはマウント中だけ。** アンマウント後の非同期継続でも呼ばれうるが、
+   * そこで進めると描画されないまま「表示済み」になり、開き直しても二度と出ない
+   * （= debt-32 の実害①が主経路で残る。レビューで 4 レンズが独立に当てた）。
    */
-  const showAndAckBatchOutcome = async (kind: BatchKind, result: unknown) => {
-    showBatchOutcome(kind, result, null);
-    const s = await refreshBatchStatus();
-    if (s?.last) lastShownBatchFinishedAt = s.last.finished_at;
+  const refreshBatchStatus = async (): Promise<BatchStatus | null> => {
+    let s: BatchStatus;
+    try {
+      s = await invoke<BatchStatus>("lcir_batch_status");
+    } catch {
+      return null; // 表示のためだけなので握りつぶす
+    }
+    if (!mountedRef.current) return s;
+    setBatchStatus(s);
+    const last = s.last;
+    if (last && last.finished_at !== lastShownBatchFinishedAt) {
+      lastShownBatchFinishedAt = last.finished_at;
+      showBatchOutcome(last.kind, last.result, last.error);
+    }
+    return s;
   };
 
   // マウント時に 1 回だけ状態を引く。**リスナーの貼り直しだけでは足りない** ── 実ライブラリの
   // att37（527 頁）は 1 添付に約 8 分かかり、その間 1 通もイベントが飛ばないので、
   // 開き直した直後は「何も走っていない」ように見えてしまう。
-  // 閉じている間に終わっていた結果も、**まだ見せていないものだけ**ここで拾う。
+  // 閉じている間に終わっていた結果も、`refreshBatchStatus` の中でここから拾う。
   useEffect(() => {
-    void (async () => {
-      const s = await refreshBatchStatus();
-      const last = s?.last;
-      if (!last || last.finished_at === lastShownBatchFinishedAt) return;
-      lastShownBatchFinishedAt = last.finished_at;
-      showBatchOutcome(last.kind, last.result, last.error);
-    })();
+    void refreshBatchStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 走っている間だけ軽く追う。**このモーダルが起動していないバッチ**（詳細パネルから始めた
-  // 代替テキスト生成・起動時の再導出・別インスタンス由来）は invoke の解決が返って来ないので、
-  // ポーリングしないと実行中の表示が終わらない。読むのは Mutex 1 つなので安い。
+  // 走っている間だけ軽く追う。理由は 2 つあり、**どちらも「マウント時に 1 回」では届かない**:
+  //   ① このパネルが起動していないバッチ（詳細パネル発の代替テキスト生成・起動時の再導出）は
+  //      invoke の解決が返って来ないので、実行中の表示がいつまでも消えない。
+  //   ② **完了結果もポーリングが拾う。** 開いたまま見届けた場合も、実行中に開き直した場合も、
+  //      マウント時の 1 回はまだ `last` が古いので拾えない。
+  // 読むのは Mutex 1 つなので安い。
   useEffect(() => {
     if (!batchStatus?.running.length) return;
     const id = setInterval(() => void refreshBatchStatus(), 2000);
@@ -1166,8 +1232,8 @@ function DataTab() {
     setMessage(null);
     setError(null);
     try {
-      const r = await invoke<unknown>("rederive_fulltext_from_lcir");
-      await showAndAckBatchOutcome("rederive", r);
+      await invoke<unknown>("rederive_fulltext_from_lcir");
+      await refreshBatchStatus();
     } catch (e) {
       showBatchOutcome("rederive", null, errMsg(e));
     } finally {
@@ -1193,10 +1259,9 @@ function DataTab() {
     setMessage(null);
     setError(null);
     try {
-      const r = await invoke<unknown>(
-        kind === "build" ? "build_missing_lcir" : "rebuild_outdated_lcir",
-      );
-      await showAndAckBatchOutcome(kind, r);
+      await invoke<unknown>(kind === "build" ? "build_missing_lcir" : "rebuild_outdated_lcir");
+      // 表示は refreshBatchStatus が担当する（消費経路を 1 本に絞る）。
+      await refreshBatchStatus();
     } catch (e) {
       showBatchOutcome(kind, null, errMsg(e));
     } finally {
@@ -1232,20 +1297,39 @@ function DataTab() {
   const handleAltTextRequest = async () => {
     setMessage(null);
     setError(null);
+    setAltTextChecking(true);
+    try {
+      await proceedAltTextIfCountMatches(altTextPending);
+    } finally {
+      setAltTextChecking(false);
+    }
+  };
+
+  /**
+   * 対象件数を取り直し、`expected` と一致していれば生成へ進む。食い違っていたら
+   * **走らせずに確認へ戻す**（新しい件数を見せて、もう一度押させる）。
+   *
+   * ⚠ **確認ボックスの「実行する」もここを通す。** 確認は「件数が動いていると分かった」
+   * ときにだけ出るので、そこで取り直さないと**動いていると分かっている経路だけが
+   * 再確認を素通りする**という逆立ちになる（レビューの high 指摘）。
+   * 件数が動き続けるなら押すたびに確認が出るが、動く対象に課金するよりはよい。
+   */
+  const proceedAltTextIfCountMatches = async (expected: number | null) => {
     let fresh: number;
     try {
       fresh = await invoke<number>("count_figures_missing_alt_text");
     } catch (e) {
+      setConfirmAltText(false);
       setError(t("settings.data.altTextError", { error: errMsg(e) }));
       return;
     }
-    const shown = altTextPending;
     setAltTextPending(fresh);
     if (fresh === 0) {
+      setConfirmAltText(false);
       setMessage(t("settings.data.altTextNone"));
       return;
     }
-    if (shown !== fresh) {
+    if (expected !== fresh) {
       setConfirmAltText(true);
       return;
     }
@@ -1259,8 +1343,8 @@ function DataTab() {
     setError(null);
     setAltTextProgress(null);
     try {
-      const r = await invoke<unknown>("generate_vision_alt_texts");
-      await showAndAckBatchOutcome("vision_alt_text", r);
+      await invoke<unknown>("generate_vision_alt_texts");
+      await refreshBatchStatus();
     } catch (e) {
       showBatchOutcome("vision_alt_text", null, errMsg(e));
     } finally {
@@ -1276,8 +1360,8 @@ function DataTab() {
     setError(null);
     setTexProgress(null);
     try {
-      const r = await invoke<unknown>("fetch_missing_arxiv_sources");
-      await showAndAckBatchOutcome("tex_fetch", r);
+      await invoke<unknown>("fetch_missing_arxiv_sources");
+      await refreshBatchStatus();
     } catch (e) {
       // 多重起動ガードに弾かれたケースは専用の案内にする（formatBatchOutcome の担当）。
       showBatchOutcome("tex_fetch", null, errMsg(e));
@@ -1307,8 +1391,8 @@ function DataTab() {
     setError(null);
     setGcProgress(null);
     try {
-      const r = await invoke<GcOutcome>("run_lcir_gc");
-      await showAndAckBatchOutcome("gc", r);
+      await invoke<GcOutcome>("run_lcir_gc");
+      await refreshBatchStatus();
     } catch (e) {
       showBatchOutcome("gc", null, errMsg(e));
     } finally {
@@ -1449,7 +1533,8 @@ function DataTab() {
               !altTextEnabled ||
               activeAltTextRunning ||
               activeGcRunning ||
-              confirmAltText
+              confirmAltText ||
+              altTextChecking
             }
           >
             {activeAltTextRunning
@@ -1477,7 +1562,7 @@ function DataTab() {
               <SecondaryBtn onClick={() => setConfirmAltText(false)}>
                 {t("common.cancel")}
               </SecondaryBtn>
-              <SecondaryBtn onClick={() => void runGenerateAltTexts()}>
+              <SecondaryBtn onClick={() => void proceedAltTextIfCountMatches(altTextPending)}>
                 {t("settings.data.altTextProceed")}
               </SecondaryBtn>
             </div>

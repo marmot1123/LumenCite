@@ -4634,6 +4634,116 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+/// バッチ状態の**配線**のテスト（debt-32）。`batch_status.rs` 側は表を単体で守っているが、
+/// 「ガードが印を立てる / 結果を記録する / 排他に弾かれたら記録しない」という lib.rs 側の
+/// 結線には 1 本も無く、レビューの変異で 17 通り中 13 通りが生き残った。ここで塞ぐ。
+#[cfg(test)]
+mod batch_wiring_tests {
+    use super::*;
+
+    /// **プロセス共有の static（`LCIR_BATCH_RUNNING` と batch_status）を触るので直列化する。**
+    /// そのうえで各テストは自分が起こした遷移だけを assert する。
+    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn gate() -> std::sync::MutexGuard<'static, ()> {
+        GATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn begin_lcir_batch_marks_the_kind_it_was_given() {
+        let _g = gate();
+        let guard = begin_lcir_batch(batch_status::BatchKind::Rebuild).expect("1 本目は取れる");
+        let running = batch_status::snapshot().running;
+        assert!(
+            running.contains(&batch_status::BatchKind::Rebuild),
+            "渡した種別がそのまま印になる（表示はこれで分岐する）: {running:?}"
+        );
+        assert!(
+            !running.contains(&batch_status::BatchKind::Build),
+            "渡していない種別まで立てない"
+        );
+        drop(guard);
+        assert!(!batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::Rebuild));
+    }
+
+    #[test]
+    fn a_second_batch_is_rejected_and_leaves_the_first_mark_alone() {
+        let _g = gate();
+        let first = begin_lcir_batch(batch_status::BatchKind::Build).expect("1 本目は取れる");
+        let second = begin_lcir_batch(batch_status::BatchKind::Gc);
+        assert_eq!(second.err().as_deref(), Some("already_running"));
+        assert!(
+            batch_status::snapshot()
+                .running
+                .contains(&batch_status::BatchKind::Build),
+            "弾かれた 2 本目が 1 本目の印を壊さない"
+        );
+        assert!(
+            !batch_status::snapshot()
+                .running
+                .contains(&batch_status::BatchKind::Gc),
+            "取れなかった種別の印は立たない"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn record_batch_keeps_the_success_value_and_returns_it_unchanged() {
+        let _g = gate();
+        #[derive(serde::Serialize, PartialEq, Debug)]
+        struct R {
+            total: i64,
+            failed: i64,
+        }
+        let out = record_batch(
+            batch_status::BatchKind::Build,
+            Ok(R { total: 7, failed: 2 }),
+        );
+        assert_eq!(out.as_ref().unwrap(), &R { total: 7, failed: 2 }, "戻り値は素通し");
+        let last = batch_status::snapshot().last.expect("記録されている");
+        assert_eq!(last.kind, batch_status::BatchKind::Build);
+        // #7 の完了条件そのもの: 閉じている間に終わっても failed を読めること。
+        assert_eq!(last.result.as_ref().unwrap()["failed"], 2);
+    }
+
+    #[test]
+    fn record_batch_keeps_the_error_and_returns_it_unchanged() {
+        let _g = gate();
+        let out: Result<(), String> = record_batch(
+            batch_status::BatchKind::TexFetch,
+            Err("network is down".to_string()),
+        );
+        assert_eq!(out.unwrap_err(), "network is down", "エラーも素通し");
+        let last = batch_status::snapshot().last.expect("失敗も記録する");
+        assert_eq!(last.kind, batch_status::BatchKind::TexFetch);
+        assert_eq!(last.error.as_deref(), Some("network is down"));
+        assert!(last.result.is_none());
+    }
+
+    /// **排他に弾かれた呼び出しは「直近の結果」を上書きしない。**
+    /// 上書きすると、実際に走っている本物のバッチの結果が誰にも読めなくなる。
+    #[test]
+    fn a_rejected_start_does_not_overwrite_the_last_result() {
+        let _g = gate();
+        record_batch(batch_status::BatchKind::Build, Ok(serde_json::json!({ "total": 42 })))
+            .expect("記録用の 1 本");
+        let before = batch_status::snapshot().last.expect("記録済み");
+
+        let held = begin_lcir_batch(batch_status::BatchKind::Build).expect("1 本目");
+        let rejected = begin_lcir_batch(batch_status::BatchKind::Gc);
+        assert!(rejected.is_err());
+
+        let after = batch_status::snapshot().last.expect("まだ残っている");
+        assert_eq!(
+            after.finished_at, before.finished_at,
+            "弾かれた呼び出しは last を触らない"
+        );
+        assert_eq!(after.result.as_ref().unwrap()["total"], 42);
+        drop(held);
+    }
+}
+
 #[cfg(test)]
 mod gui_lock_tests {
     use super::*;

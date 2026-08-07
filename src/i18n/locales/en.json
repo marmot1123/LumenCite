@@ -526,6 +526,7 @@
     "texSourceBuildFailed": "TeX source attached, but LCIR build failed: {{error}}",
     "altText": "Generate figure alt text ({{pending}})",
     "altTextBusy": "Generating…",
+      "altTextCountChanged": "The number of pending figures changed to {{pending}}. Check the count on the button and press again.",
     "altTextTitle": "Describe this paper's figures with an LLM vision model (each image is sent to an external API and billed)",
     "altTextDone": "Generated {{generated}} of {{total}} ({{skipped}} skipped, {{failed}} failed).",
     "altTextNone": "No figures are missing alt text.",

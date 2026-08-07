@@ -81,7 +81,11 @@ pub struct FinishedBatch {
     /// 成功時は**コマンドの戻り値そのもの**を JSON にしたもの。文言整形は i18n を持つ
     /// フロントの仕事なので、ここでは組み立てない（同じ整形を 2 か所に置かない）。
     pub result: Option<serde_json::Value>,
-    /// 失敗時のエラー文字列（`already_running` を含む）。`result` とはどちらか一方。
+    /// 失敗時のエラー文字列。`result` とはどちらか一方。
+    ///
+    /// **`already_running` はここに載らない。** あれは「バッチが走らなかった」であって
+    /// 「バッチが終わった」ではないので、排他に弾かれた呼び出しは記録側（`record_batch`）へ
+    /// 到達する前に返る。載せると、実際に走っている本物のバッチの結果を上書きしてしまう。
     pub error: Option<String>,
 }
 
@@ -303,16 +307,62 @@ mod tests {
         assert_eq!(a.finished_at, b.finished_at);
     }
 
-    /// 新しく作った記録には「まだ 1 件も無い」初期状態がある（`feedback_new_provenance_has_no_past`）。
-    /// `last` が `None` のまま `running` が空でも、スナップショットは成立して返ること。
+    /// **終わったのは自分の種別だけ。** 1 本の Drop が他の実行中バッチの印まで消すと、
+    /// 走っているバッチが UI から消えてボタンが押せる状態に戻る（並走しうる設計なので実在する）。
     #[test]
-    fn empty_state_serializes_without_a_last_result() {
+    fn dropping_one_mark_leaves_the_other_kinds_running() {
         let _g = gate();
-        let s = BatchStatus::default();
-        let v = serde_json::to_value(&s).unwrap();
-        assert_eq!(v["running"], serde_json::json!([]));
-        assert_eq!(v["progress"], serde_json::json!({}));
-        assert_eq!(v["last"], serde_json::Value::Null);
+        let outer = RunningMark::new(BatchKind::Build);
+        {
+            let _inner = RunningMark::new(BatchKind::VisionAltText);
+            set_progress(BatchKind::Build, 1, 9);
+        }
+        let s = snapshot();
+        assert!(s.running.contains(&BatchKind::Build), "他人の Drop で消えない");
+        assert!(!s.running.contains(&BatchKind::VisionAltText));
+        assert_eq!(
+            s.progress.get("build").copied(),
+            Some(Progress { done: 1, total: 9 }),
+            "他人の Drop で進捗も消えない"
+        );
+        drop(outer);
+    }
+
+    /// 新しく作った記録には「まだ 1 件も無い」初期状態がある（`feedback_new_provenance_has_no_past`）。
+    /// **`BatchStatus::default()` ではなく実際の `snapshot()` を通す** ── 既定値を直列化しても
+    /// 「読み出し経路が初期状態で成立する」ことの証拠にはならない。
+    #[test]
+    fn a_snapshot_with_nothing_running_serializes_cleanly() {
+        let _g = gate();
+        let v = serde_json::to_value(snapshot()).unwrap();
+        assert_eq!(v["running"], serde_json::json!([]), "このテストの開始時は誰も走っていない");
+        assert!(v["progress"].is_object());
+        // `last` は他のテストが残しうるので**存在すること**だけを見る（自分が起こしていない
+        // 遷移は assert しない ── プロセス共有 static の作法）。
+        assert!(v.get("last").is_some());
+    }
+
+    /// **フロントとの契約は「実際に届く JSON」**。`as_str` だけを見ても、serde の属性を
+    /// 付け替えた瞬間に届く形が変わって気づけない（このテストが守るのは配線であって定数ではない）。
+    #[test]
+    fn the_json_the_frontend_receives_matches_the_agreed_shape() {
+        let _g = gate();
+        let mark = RunningMark::new(BatchKind::VisionAltText);
+        set_progress(BatchKind::VisionAltText, 2, 5);
+        record_success(BatchKind::VisionAltText, &serde_json::json!({ "total": 5 }));
+        let v = serde_json::to_value(snapshot()).unwrap();
+
+        // running は**文字列の配列**（フロントは includes() で引く）。
+        let running = v["running"].as_array().expect("running は配列");
+        assert!(running.contains(&serde_json::json!("vision_alt_text")));
+        // progress は**種別文字列をキーにしたオブジェクト**（フロントは progress[kind] で引く）。
+        assert_eq!(v["progress"]["vision_alt_text"], serde_json::json!({ "done": 2, "total": 5 }));
+        // last は kind / finished_at / result / error の 4 つ。
+        assert_eq!(v["last"]["kind"], serde_json::json!("vision_alt_text"));
+        assert_eq!(v["last"]["result"]["total"], 5);
+        assert!(v["last"]["error"].is_null());
+        assert!(v["last"]["finished_at"].as_str().is_some_and(|s| s.contains('T')));
+        drop(mark);
     }
 
     #[test]

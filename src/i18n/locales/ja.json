@@ -526,6 +526,7 @@
     "texSourceBuildFailed": "TeX ソースは添付済みですが、LCIR の構築に失敗しました: {{error}}",
     "altText": "図の代替テキストを生成（{{pending}} 件）",
     "altTextBusy": "生成中…",
+      "altTextCountChanged": "生成対象が {{pending}} 件に変わりました。ボタンの件数を確かめて、もう一度押してください。",
     "altTextTitle": "この文献の図を LLM Vision に説明させます（画像 1 枚ごとに外部 API へ送信・課金されます）",
     "altTextDone": "{{total}} 件中 {{generated}} 件を生成しました（スキップ {{skipped}} 件・失敗 {{failed}} 件）。",
     "altTextNone": "代替テキストが無い図はありません。",
