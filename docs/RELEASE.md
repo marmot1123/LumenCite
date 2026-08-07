@@ -221,6 +221,15 @@ Tauri のリソース配置規則そのものは `tauri-utils` の `resource_dir
   **`--config` を忘れると署名設定も pdfium 同梱も両方落ちる**ので、生成物の中に `pdfium.dll` があることを
   インストーラ展開後に確認すること。
 
+- **Linux は同梱を CI が自動で検査する**（v1.0.0-p0）。同梱が落ちてもアプリは起動でき、
+  ユーザーが PDF を開いた瞬間に初めて「pdfium library not found」になるため、目視では捕まらない。
+  - `release.yml` の `Verify pdfium is bundled (Linux)` が **毎リリース** `.deb` / `.rpm` / `.AppImage` を
+    展開し、`libpdfium.so` が `bind_pdfium()` の探索候補にあることを確かめる
+    （`scripts/verify_linux_bundle.sh`）。⚠ tauri-action はバンドルとアップロードが 1 ステップなので、
+    この検査はアップロード**後**に走る。落ちてもドラフトには成果物が残るので、**公開せずに破棄すること**。
+  - `linux-bundle-verify.yml` は**実際に .deb をインストールし .AppImage を展開して、その中で
+    `bind_pdfium()` を呼ぶ**（`scripts/verify_linux_bundle_runtime.sh`）。手動実行と、
+    探索候補・同梱設定・pdfium 版に触る PR で走る。**タグを打つ前に確かめたいときはこちらを手動実行する。**
 - **ローカル開発で試す**: 各 OS 用アセットを展開し、上表の「置き場所」へ置く（`bind_pdfium` は
   カレントの `pdfium/` も探すので `src-tauri/` で `pnpm tauri dev` すれば拾う）。未配置でも OCR / LCIR 以外は動く。
 - `src-tauri/pdfium/` は gitignore 済み（バイナリは非コミット）。

@@ -79,7 +79,9 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+          # libarchive-tools = bsdtar。成果物検査で .rpm の中身を読むのに使う
+          # （scripts/verify_linux_bundle.sh。無いと検査が「skip」ではなく失敗する）。
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libarchive-tools
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -177,6 +179,19 @@ jobs:
           # Windows は VM 手動署名のため CI 非対象。
           includeUpdaterJson: ${{ startsWith(matrix.platform, 'macos') }}
           args: ${{ matrix.args }}
+
+      # Linux 配布物に libpdfium.so が「実行時に探す場所」で入っているかを、成果物を展開して
+      # 検査する（v1.0.0-p0・docs/LCIR_REMAINING_PHASES.md §2.6-5 の (i)）。同梱が落ちても
+      # アプリは起動できてしまい、ユーザーが PDF を開いた瞬間に初めて壊れるので、
+      # ビルドの側で止めないと出荷まで気づけない。
+      #
+      # ⚠ tauri-action はバンドルとドラフトへのアップロードを 1 ステップで行うため、
+      # この検査はアップロードの**後**にしか置けない。落ちたときはジョブが赤くなるので
+      # ドラフトを公開する前に気づけるが、**成果物そのものはドラフトに残る**。
+      # タグを打つ前に確かめたいときは linux-bundle-verify ワークフローを手動実行する。
+      - name: Verify pdfium is bundled (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: ./scripts/verify_linux_bundle.sh src-tauri/target/release/bundle
 
       - name: Cleanup macOS keychain
         if: startsWith(matrix.platform, 'macos') && always()
