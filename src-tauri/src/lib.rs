@@ -1,5 +1,6 @@
 mod attachment_trash;
 mod backup;
+mod batch_status;
 mod bibtex;
 pub mod cli;
 pub mod context;
@@ -1174,7 +1175,13 @@ async fn get_lcir_document(
 static LCIR_BATCH_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// [`LCIR_BATCH_RUNNING`] を Drop で必ず解除する RAII ガード。
-struct LcirBatchGuard;
+///
+/// フィールドの [`batch_status::RunningMark`] は**裁定には関与しない** ── 多重起動を弾くのは
+/// 上の `compare_exchange` だけで、印はその結果を表示用に写しているだけ（debt-32）。
+struct LcirBatchGuard {
+    /// 実行中の印。**Drop で消えることだけが役目**なので直接は読まない。
+    _mark: batch_status::RunningMark,
+}
 impl Drop for LcirBatchGuard {
     fn drop(&mut self) {
         LCIR_BATCH_RUNNING.store(false, Ordering::SeqCst);
@@ -1182,24 +1189,61 @@ impl Drop for LcirBatchGuard {
 }
 
 /// 一括構築バッチの開始（多重起動なら `already_running`）。返り値のガードが Drop で解除する。
-fn begin_lcir_batch() -> Result<LcirBatchGuard, String> {
+///
+/// `kind` は**表示のためだけ**に受ける。`LCIR_BATCH_RUNNING` は 1 本しかないので、
+/// どの種別で来ても排他の効き方は同じ（GC もこれを流用している）。
+fn begin_lcir_batch(kind: batch_status::BatchKind) -> Result<LcirBatchGuard, String> {
     if LCIR_BATCH_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return Err("already_running".to_string());
     }
-    Ok(LcirBatchGuard)
+    Ok(LcirBatchGuard { _mark: batch_status::RunningMark::new(kind) })
 }
 
 /// 一括構築の進捗を `lcir-build-progress` イベントでフロントへ流すコールバック。
-fn lcir_progress_emitter(app: &tauri::AppHandle) -> impl Fn(i64, i64) + '_ {
+///
+/// **イベントと同時にバックエンドの状態も更新する**（debt-32）。イベントだけだと、
+/// 設定モーダルを閉じている間に飛んだぶんは誰も受け取らず、開き直したフロントは
+/// 次のイベントまで「何も走っていない」ように見える ── att37（527 頁）は 1 添付に
+/// 約 8 分かかり、その間 1 通も飛ばない。
+fn lcir_progress_emitter(
+    app: &tauri::AppHandle,
+    kind: batch_status::BatchKind,
+) -> impl Fn(i64, i64) + '_ {
     move |done, total| {
+        batch_status::set_progress(kind, done, total);
         let _ = app.emit(
             "lcir-build-progress",
             serde_json::json!({ "done": done, "total": total }),
         );
     }
+}
+
+/// バッチ 1 本の結果を「直近の結果」へ写してからそのまま返す（debt-32）。
+///
+/// **成功も失敗も必ず通す。** 片方だけ記録すると、モーダルを閉じている間に失敗したときだけ
+/// 何も残らない ── 一番読みたいのが失敗なのに、そこだけ穴になる。
+/// **排他に弾かれた `already_running` はここを通らない**（ガード取得前に `?` で返るため）。
+/// あれは「バッチが終わった」ではないので、直近の結果を上書きさせない。
+fn record_batch<T: serde::Serialize>(
+    kind: batch_status::BatchKind,
+    r: Result<T, String>,
+) -> Result<T, String> {
+    match &r {
+        Ok(v) => batch_status::record_success(kind, v),
+        Err(e) => batch_status::record_failure(kind, e),
+    }
+    r
+}
+
+/// 長時間バッチの実行状態と直近の結果（debt-32）。**読み取り専用**で、設定モーダルが
+/// マウント時に 1 回引く。イベントの貼り直しだけでは復帰できない穴を塞ぐためのもので、
+/// 理由と実害は [`batch_status`] のモジュールコメントに書いてある。
+#[tauri::command]
+async fn lcir_batch_status() -> Result<batch_status::BatchStatus, String> {
+    Ok(batch_status::snapshot())
 }
 
 /// LCIR（実験）: 完了 LCIR がまだ無い PDF 添付を一括構築する（過去分の後追い）。
@@ -1208,13 +1252,17 @@ async fn build_missing_lcir(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ingestion::LcirBatchResult, String> {
-    let _guard = begin_lcir_batch()?;
-    ingestion::build_missing_lcir(
-        &state.db,
-        &state.app_data_dir,
-        lcir_progress_emitter(&app),
+    let kind = batch_status::BatchKind::Build;
+    let _guard = begin_lcir_batch(kind)?;
+    record_batch(
+        kind,
+        ingestion::build_missing_lcir(
+            &state.db,
+            &state.app_data_dir,
+            lcir_progress_emitter(&app, kind),
+        )
+        .await,
     )
-    .await
 }
 
 /// LCIR（実験）: 旧い抽出器版で作られた LCIR を現行版へ再構築する（抽出ロジック更新後の後追い）。
@@ -1225,13 +1273,17 @@ async fn rebuild_outdated_lcir(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ingestion::LcirBatchResult, String> {
-    let _guard = begin_lcir_batch()?;
-    ingestion::rebuild_outdated_lcir(
-        &state.db,
-        &state.app_data_dir,
-        lcir_progress_emitter(&app),
+    let kind = batch_status::BatchKind::Rebuild;
+    let _guard = begin_lcir_batch(kind)?;
+    record_batch(
+        kind,
+        ingestion::rebuild_outdated_lcir(
+            &state.db,
+            &state.app_data_dir,
+            lcir_progress_emitter(&app, kind),
+        )
+        .await,
     )
-    .await
 }
 
 /// LCIR（v1.0.0-p1）: 既存の全文索引を LCIR の page ノードから張り直す。
@@ -1243,10 +1295,17 @@ async fn rebuild_outdated_lcir(
 async fn rederive_fulltext_from_lcir(
     state: State<'_, AppState>,
 ) -> Result<ingestion::FulltextDeriveResult, String> {
-    let _guard = begin_lcir_batch()?;
+    let kind = batch_status::BatchKind::Rederive;
+    let _guard = begin_lcir_batch(kind)?;
     // 明示操作なので置き換えまでやる（自動実行は「足すだけ」＝ `AddMissingOnly`）。
-    ingestion::derive_page_fts_from_lcir_batch(&state.db, ingestion::DeriveMode::ReplaceUnprotected)
-        .await
+    record_batch(
+        kind,
+        ingestion::derive_page_fts_from_lcir_batch(
+            &state.db,
+            ingestion::DeriveMode::ReplaceUnprotected,
+        )
+        .await,
+    )
 }
 
 /// ストレージの内訳（DB ファイルの使用中 / 再利用可 + LCIR の GC 見積り・v1.0.0-p4）。
@@ -1303,14 +1362,19 @@ async fn run_lcir_gc(
     else {
         return Err("already_running".to_string());
     };
-    let _guard = begin_lcir_batch()?;
-    ingestion::gc::run_gc(&state.db, &state.app_data_dir, move |done, total| {
-        let _ = app.emit(
-            "lcir-gc-progress",
-            serde_json::json!({ "done": done, "total": total }),
-        );
-    })
-    .await
+    let kind = batch_status::BatchKind::Gc;
+    let _guard = begin_lcir_batch(kind)?;
+    record_batch(
+        kind,
+        ingestion::gc::run_gc(&state.db, &state.app_data_dir, move |done, total| {
+            batch_status::set_progress(kind, done, total);
+            let _ = app.emit(
+                "lcir-gc-progress",
+                serde_json::json!({ "done": done, "total": total }),
+            );
+        })
+        .await,
+    )
 }
 
 /// LCIR（実験・Phase 2）: ノード単位（段落・見出し・caption 等）の全文検索。ヒットは
@@ -1458,7 +1522,11 @@ struct VisionAltTextResult {
 }
 
 /// [`VISION_ALT_TEXT_RUNNING`] を Drop で必ず解除する RAII ガード。
-struct VisionAltTextGuard;
+/// フィールドの印は表示用（debt-32）で、裁定は上の `compare_exchange` が持つ。
+struct VisionAltTextGuard {
+    /// 実行中の印。**Drop で消えることだけが役目**なので直接は読まない。
+    _mark: batch_status::RunningMark,
+}
 impl Drop for VisionAltTextGuard {
     fn drop(&mut self) {
         VISION_ALT_TEXT_RUNNING.store(false, Ordering::SeqCst);
@@ -1548,26 +1616,52 @@ async fn generate_vision_alt_texts(
     {
         return Err("already_running".to_string());
     }
-    let _guard = VisionAltTextGuard;
+    let batch_kind = batch_status::BatchKind::VisionAltText;
+    let _guard = VisionAltTextGuard { _mark: batch_status::RunningMark::new(batch_kind) };
 
-    // プロバイダ・モデル・API キーは OCR と同じ設定を共有する（Vision 用の設定面を増やさない）。
-    // キー未設定で全図ぶん叩かないよう、対象取得の前に一度だけ解決する。
-    let (provider, model) = llm::tools::ocr::resolve_ocr_provider(&state.db)
+    // 準備（プロバイダ・モデル・API キーの解決と対象取得）。プロバイダ設定は OCR と共有する
+    // （Vision 用の設定面を増やさない）。キー未設定で全図ぶん叩かないよう、対象取得の前に
+    // 一度だけ解決する。
+    //
+    // まとめて包んでいるのは、**ここで落ちた場合も「直近の結果」に残すため**（debt-32）。
+    // 失敗だけ記録から漏れると、モーダルを閉じている間に何が起きたかを読む手段が
+    // 失敗側にだけ無い状態になる。
+    let prepared = async {
+        let (provider, model) = llm::tools::ocr::resolve_ocr_provider(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        let account = keychain::account_for_api_key(&provider);
+        let api_key = keychain::get(&account)
+            .map_err(|e| e.to_string())?
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| format!("API key for {provider} is not configured"))?;
+        let targets = db::node_alt_texts::figures_missing_alt_text(
+            &state.db,
+            alt_text_filter(entry_id, attachment_id),
+        )
         .await
         .map_err(|e| e.to_string())?;
-    let account = keychain::account_for_api_key(&provider);
-    let api_key = keychain::get(&account)
-        .map_err(|e| e.to_string())?
-        .filter(|k| !k.trim().is_empty())
-        .ok_or_else(|| format!("API key for {provider} is not configured"))?;
-
-    let targets = db::node_alt_texts::figures_missing_alt_text(
-        &state.db,
-        alt_text_filter(entry_id, attachment_id),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+        Ok::<_, String>((provider, model, api_key, targets))
+    }
+    .await;
+    let (provider, model, api_key, targets) = match prepared {
+        Ok(v) => v,
+        Err(e) => {
+            batch_status::record_failure(batch_kind, &e);
+            return Err(e);
+        }
+    };
     let total = targets.len() as i64;
+    // 進捗はイベントとバックエンド状態の**両方**へ流す（debt-32）。ループの中に 3 つの
+    // 出口があるので必ずこの 1 本を通す ── 片方しか更新しない経路を残すと、
+    // モーダルを閉じている間に進んだぶんが開き直しても復帰しない。
+    let emit_progress = |done: i64| {
+        batch_status::set_progress(batch_kind, done, total);
+        let _ = app.emit(
+            "vision-alt-text-progress",
+            serde_json::json!({ "done": done, "total": total }),
+        );
+    };
     let (mut generated, mut skipped, mut failed) = (0i64, 0i64, 0i64);
     let mut consecutive_failures = 0u32;
     let mut abort_reason: Option<&'static str> = None;
@@ -1596,10 +1690,7 @@ async fn generate_vision_alt_texts(
         .unwrap_or(false);
         if !still_latest {
             skipped += 1;
-            let _ = app.emit(
-                "vision-alt-text-progress",
-                serde_json::json!({ "done": i as i64 + 1, "total": total }),
-            );
+            emit_progress(i as i64 + 1);
             continue;
         }
         // 同一ランで同じ画像を既に説明済みなら API を呼ばずに複製する（課金しない）。
@@ -1628,10 +1719,7 @@ async fn generate_vision_alt_texts(
                     failed += 1;
                 }
             }
-            let _ = app.emit(
-                "vision-alt-text-progress",
-                serde_json::json!({ "done": i as i64 + 1, "total": total }),
-            );
+            emit_progress(i as i64 + 1);
             continue;
         }
         // ここから先は実際に API を呼ぶ。2 回目以降はリクエスト前に 1 秒待つ
@@ -1706,10 +1794,7 @@ async fn generate_vision_alt_texts(
             _ => skipped += 1,
         }
         // 進捗をフロントへ（図の数だけ Vision 呼び出しが走るので長時間になる）。
-        let _ = app.emit(
-            "vision-alt-text-progress",
-            serde_json::json!({ "done": i as i64 + 1, "total": total }),
-        );
+        emit_progress(i as i64 + 1);
         // 系統的失敗（このランで 1 件も生成できないまま連続失敗）だけで打ち切る。
         if consecutive_failures >= VISION_ALT_TEXT_MAX_CONSECUTIVE_FAILURES && generated == 0 {
             eprintln!(
@@ -1721,7 +1806,7 @@ async fn generate_vision_alt_texts(
         }
     }
 
-    Ok(VisionAltTextResult {
+    let result = VisionAltTextResult {
         enabled: true,
         total,
         generated,
@@ -1729,7 +1814,10 @@ async fn generate_vision_alt_texts(
         failed,
         aborted: abort_reason.is_some(),
         abort_reason: abort_reason.map(|r| r.to_string()),
-    })
+    };
+    // 課金したぶんの内訳は、モーダルを閉じている間に終わっても読めなければならない（debt-32）。
+    batch_status::record_success(batch_kind, &result);
+    Ok(result)
 }
 
 /// LCIR（実験・Phase 9a）: エクスポート用にエントリの LCIR と書誌情報を読む。
@@ -1915,7 +2003,11 @@ struct FetchMissingArxivSourcesResult {
 static TEX_FETCH_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// [`TEX_FETCH_RUNNING`] を Drop で必ず解除する RAII ガード（途中エラー・panic でも解放）。
-struct TexFetchGuard;
+/// フィールドの印は表示用（debt-32）で、裁定は `compare_exchange` が持つ。
+struct TexFetchGuard {
+    /// 実行中の印。**Drop で消えることだけが役目**なので直接は読まない。
+    _mark: batch_status::RunningMark,
+}
 impl Drop for TexFetchGuard {
     fn drop(&mut self) {
         TEX_FETCH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1953,11 +2045,17 @@ async fn fetch_missing_arxiv_sources(
     {
         return Err("already_running".to_string());
     }
-    let _guard = TexFetchGuard;
+    let batch_kind = batch_status::BatchKind::TexFetch;
+    let _guard = TexFetchGuard { _mark: batch_status::RunningMark::new(batch_kind) };
 
-    let targets = db::entries::entries_missing_arxiv_source(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
+    let targets = match db::entries::entries_missing_arxiv_source(&state.db).await {
+        Ok(v) => v,
+        Err(e) => {
+            let e = e.to_string();
+            batch_status::record_failure(batch_kind, &e);
+            return Err(e);
+        }
+    };
     let total = targets.len() as i64;
     let (mut fetched, mut built, mut pdf_only, mut failed) = (0i64, 0i64, 0i64, 0i64);
     for (i, (entry_id, arxiv_id)) in targets.into_iter().enumerate() {
@@ -2001,6 +2099,8 @@ async fn fetch_missing_arxiv_sources(
             }
         }
         // 進捗をフロントへ（多分単位のバッチが「固まって見える」のを避ける）。
+        // バックエンド側にも書く理由は [`batch_status`]（閉じている間のぶんが復帰しない）。
+        batch_status::set_progress(batch_kind, i as i64 + 1, total);
         let _ = app.emit(
             "tex-fetch-progress",
             serde_json::json!({ "done": i as i64 + 1, "total": total }),
@@ -2010,7 +2110,9 @@ async fn fetch_missing_arxiv_sources(
     if fetched > 0 {
         let _ = app.emit("entries-changed", ());
     }
-    Ok(FetchMissingArxivSourcesResult { total, fetched, built, pdf_only, failed })
+    let result = FetchMissingArxivSourcesResult { total, fetched, built, pdf_only, failed };
+    batch_status::record_success(batch_kind, &result);
+    Ok(result)
 }
 
 // ── highlights ──────────────────────────────────────────────────────────────
@@ -4066,7 +4168,11 @@ pub fn run() {
                 // 置き換えは設定→データのボタン（明示操作）に任せる。
                 // LCIR が OFF の間はフラグを立てずに降りる（後で ON にしたら走る）。
                 // 他の LCIR バッチと同じ排他を取る（取れなければ次回起動に回す）。
-                match begin_lcir_batch() {
+                // 実行中の印は立てる（走っている間はボタンを押させない）が、**結果は
+                // 「直近の結果」に残さない**（debt-32）── あの枠はユーザーが押した操作の
+                // 結果を後から読むためのもので、起動時の自動処理を混ぜると、設定を開くたび
+                // 身に覚えのない完了メッセージが出る。
+                match begin_lcir_batch(batch_status::BatchKind::Rederive) {
                     Ok(_guard) => match ingestion::derive_page_fts_from_lcir_once(&fts_pool).await {
                         Ok(Some(r)) => eprintln!(
                             "fulltext: derived from LCIR for {}/{} attachment(s) \
@@ -4510,6 +4616,7 @@ pub fn run() {
             rederive_fulltext_from_lcir,
             lcir_storage_stats,
             run_lcir_gc,
+            lcir_batch_status,
             search_lcir_nodes,
             get_lcir_node_region,
             get_lcir_enabled,

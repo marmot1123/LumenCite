@@ -912,6 +912,8 @@
       "altTextEnable": "Allow generating figure alt text with an LLM vision model",
       "altTextConsent": "Each figure image is sent to an external LLM API and billed per image. Clearing this checkbox while a run is in progress stops it. Images whose shorter side is under 200px (logos, decorations) are excluded. Generated text is stored as an AI inference (origin=llm_inference); it never overwrites the paper's caption and is not added to full-text search. The provider and model are shared with the OCR settings.",
       "altTextPending": "{{pending}} figure(s) currently pending.",
+      "altTextCountChanged": "There are now {{pending}} figure(s) pending — different from the count shown. Proceeding bills for that many images.",
+      "altTextProceed": "Generate for this many",
       "altText": "Generate alt text for figures that have none",
       "altTextBusy": "Generating…",
       "altTextBusyProgress": "Generating… ({{done}}/{{total}})",
