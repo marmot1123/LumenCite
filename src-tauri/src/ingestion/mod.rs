@@ -1,6 +1,7 @@
 //! LCIR の取り込み（ingestion）。実験フラグ判定・添付ごとの LCIR 構築（pdfium）・
 //! 派生 FTS 再生成・read 面の組み立て。既存 `fulltext` 経路は触らず、LCIR は追加の side-build。
 
+pub mod backfill;
 pub mod figures;
 pub mod gc;
 pub mod graph;
@@ -45,14 +46,22 @@ pub async fn lcir_enabled(pool: &SqlitePool) -> bool {
 ///
 /// 逆にフラグを OFF に戻したときは、既に構築済みの版があっても隠す
 /// （ユーザーが「使わない」と言った以上、外部モデルへ渡す面からは下ろす）。
+///
+/// **ゴミ箱のエントリの版は数えない**（v1.0.0-p2）。一括バッチの対象クエリと同じ規約に揃える。
+/// p2 はこの関数を初めて日常的に true にする変更なので、ここを塞いでおかないと
+/// 「唯一の LCIR がゴミ箱行きのエントリ」という状態でチャットに 8 ツールの定義が毎ターン載り、
+/// モデルは `has_lcir:false` しか返さない呼び出しにコンテキストを使う。
 pub async fn lcir_readable(pool: &SqlitePool) -> bool {
     if !lcir_enabled(pool).await {
         return false;
     }
     sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS(
-            SELECT 1 FROM document_versions
-            WHERE extraction_status IN ('completed', 'completed_with_warnings')
+            SELECT 1 FROM document_versions v
+            JOIN attachments a ON a.id = v.attachment_id
+            JOIN entries e ON e.id = a.entry_id
+            WHERE e.deleted_at IS NULL
+              AND v.extraction_status IN ('completed', 'completed_with_warnings')
          )",
     )
     .fetch_one(pool)
@@ -74,14 +83,64 @@ pub struct LcirBuildResult {
 }
 
 /// `build_missing_lcir`（一括バックフィル）の結果サマリ。
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct LcirBatchResult {
     pub enabled: bool,
     pub total: i64,
     pub built: i64,
     pub reused: i64,
     pub failed: i64,
+    /// pdfium が使えないので着手すらしなかった PDF の件数（v1.0.0-p2）。
+    ///
+    /// これが無いと、pdfium を同梱し損ねた配布物で「138 件中 1 件 failed・残りは無カウント」＝
+    /// UI 上は「ほとんど最新だった」と読める表示になる。**「差分 0 件」と「1 本も実行して
+    /// いない」を同じ見た目にしない**（`run_build_batch` の `Ok(_) => {}` に落ちると
+    /// どのカウンタにも乗らない）。
+    pub skipped: i64,
 }
+
+/// LCIR build をプロセス全体で 1 本に直列化するロック（v1.0.0-p2・debt-24 ③）。
+///
+/// p2 より前は build の入口が「ユーザーがボタンを押したとき」だけだったので、UI の
+/// `disabled` 属性が事実上の排他になっていた。p2 は**添付のたび / 毎起動**に build を
+/// 起こすので、その防壁が無効になる。同じ添付ディレクトリへ 2 本が crop を書くと
+/// `gc_stale_asset_dirs`（「今回の content_key 以外」を trash へ送る）が互いの成果物を
+/// 消し合い、しかも `built`/`failed` の集計には一切現れない。
+///
+/// ## 取り方は入口で変える
+///
+/// - バックグラウンド（バッチ・添付時の自動 build）は [`lock_build`] で待つ。
+/// - **対話操作と GC は [`lock_build_within`] で待ち時間に上限を付ける。**
+///   ⚠ ここで `try_lock` を使ってはいけない ── tokio の Mutex は FIFO 公平で、`try_lock` は
+///   待ち行列に並ばず、解放された permit は待ち行列へ直接渡る。つまり背景で 1 本走って
+///   いる間、`try_lock` は確率的にではなく**決定的に失敗し続ける**（バックフィル中ずっと
+///   ボタンが押せない）。待ち行列に並べば最長 1 添付ぶんで順番が来る。
+///
+/// ## このロックが直列化しないもの
+///
+/// **OCR の pdfium セッションは含まない。** build と OCR は pdfium 側の
+/// `PDFIUM_THREAD_MARSHALL`（`FPDF_InitLibrary` で取り `FPDF_DestroyLibrary` で離す
+/// `std::sync::Mutex`）で安全に直列化されるが、それはこのロックとは別系統なので、
+/// [`lock_build_within`] のタイムアウトは「OCR が pdfium を握っている」を検出できない。
+/// 統合は post-1.0（debt-35）。
+static LCIR_BUILD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// build ロックを待って取る（バックグラウンド用）。
+pub async fn lock_build() -> tokio::sync::MutexGuard<'static, ()> {
+    LCIR_BUILD_LOCK.lock().await
+}
+
+/// build ロックを上限付きで取る（対話操作・GC 用）。取れなければ `None`。
+pub async fn lock_build_within(
+    wait: std::time::Duration,
+) -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    tokio::time::timeout(wait, LCIR_BUILD_LOCK.lock()).await.ok()
+}
+
+/// 対話操作が build ロックを待つ上限。tokio Mutex は FIFO 公平なので、待ち行列に入れば
+/// **走行中の 1 添付**が終われば順番が来る。実測の中央値（1 添付 8.5 秒）は十分に下回るが、
+/// att37 級（約 8 分）に当たった場合はここで諦めて `build_busy` を返す。
+pub const INTERACTIVE_BUILD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// 添付 1 件の LCIR を構築する。抽出器は添付の **mime だけ**で選ぶ（バッチ対象クエリと
 /// 同一述語・`docs/LCIR_design_overview.md` Phase 4）: `%pdf%` → pdfium / `application/gzip`
@@ -93,6 +152,36 @@ pub struct LcirBatchResult {
 /// `parent_version_id` で連結する（添付単位なので PDF 版と TeX 版が互いを supersede
 /// することはない）。フラグ OFF なら何もせず `enabled: false` を返す（DB に一切書かない）。
 pub async fn build_lcir_for_attachment(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    attachment_id: i64,
+) -> Result<LcirBuildResult, String> {
+    let _guard = lock_build().await;
+    build_lcir_unlocked(pool, app_data_dir, attachment_id).await
+}
+
+/// ユーザーが名指しで押した 1 件 build（詳細パネル / AddSheet）。
+///
+/// 背景の build が走っている間 [`lock_build`] で無条件に待つと、att37 級（約 8 分）の後ろで
+/// ボタンが返らなくなり、UI にはキャンセル手段が無い。上限付きで待ち、取れなければ
+/// `build_busy` を返してフロントに案内させる。
+pub async fn try_build_lcir_for_attachment(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    attachment_id: i64,
+) -> Result<LcirBuildResult, String> {
+    let Some(_guard) = lock_build_within(INTERACTIVE_BUILD_LOCK_WAIT).await else {
+        return Err("build_busy".to_string());
+    };
+    build_lcir_unlocked(pool, app_data_dir, attachment_id).await
+}
+
+/// [`build_lcir_for_attachment`] の本体（**ロックは呼び出し側が既に持っている**）。
+///
+/// ロックをこの関数の中に入れないのは、入口ごとに取り方を変える必要があるため
+/// （バックグラウンドは待つ / 対話は上限付き / バックフィルは残り予算をタイムアウトにする）。
+/// **この関数を直接呼んでよいのはロックを保持している呼び出し元だけ。**
+pub(crate) async fn build_lcir_unlocked(
     pool: &SqlitePool,
     app_data_dir: &Path,
     attachment_id: i64,
@@ -281,6 +370,11 @@ async fn build_pdf_version(pool: &SqlitePool, ctx: &PdfBuildCtx<'_>) -> Result<(
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&abs_asset_dir);
+            // panic は pdfium-render の `PDFIUM_THREAD_MARSHALL` を毒し、以後この
+            // プロセスの `Pdfium::new` は Err ではなく panic する（`thread_safe.rs:68-79`）。
+            // bind は成功し続けるので、ここで印を立てないと自動経路が残りの対象を
+            // 全部 panic で焼き切る。
+            pdf::pdfium::note_extraction_panic();
             return Err(format!("extraction task panicked: {e}"));
         }
     };
@@ -1370,7 +1464,14 @@ pub async fn build_missing_lcir<F: Fn(i64, i64)>(
     let targets = document_versions::attachments_without_completed_lcir(pool)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(run_build_batch(pool, app_data_dir, targets, on_progress).await)
+    Ok(run_build_batch(
+        pool,
+        app_data_dir,
+        targets,
+        !pdf::pdfium::bind_is_known_broken(),
+        on_progress,
+    )
+    .await)
 }
 
 /// 現行より古い抽出器版（例 Phase 1 の 0.1.0）で作られた LCIR を、現行版へ再構築する。
@@ -1405,32 +1506,44 @@ pub async fn rebuild_outdated_lcir<F: Fn(i64, i64)>(
         .await
         .map_err(|e| e.to_string())?,
     );
-    Ok(run_build_batch(pool, app_data_dir, targets, on_progress).await)
+    Ok(run_build_batch(
+        pool,
+        app_data_dir,
+        targets,
+        !pdf::pdfium::bind_is_known_broken(),
+        on_progress,
+    )
+    .await)
 }
 
 fn disabled_batch() -> LcirBatchResult {
-    LcirBatchResult {
-        enabled: false,
-        total: 0,
-        built: 0,
-        reused: 0,
-        failed: 0,
-    }
+    LcirBatchResult::default()
 }
 
 /// 対象添付を順に build して集計する。`build_missing_lcir` / `rebuild_outdated_lcir` が共有。
 /// `on_progress(done, total)` は 1 添付ぶん処理するたびに呼ぶ。**数十分かかりうる**バッチ
 /// （既存コーパスの再構築は PDF 1 本ごとに pdfium 抽出 + ページレンダ + crop 書き出し）なので、
 /// 呼び出し側が進捗イベントに変換して「固まって見える」のを避けられるようにする。
+/// `pdfium_available` は**引数で受ける**（グローバルな印を直接読まない）。読むとテストが
+/// 印を立てた瞬間に同一プロセスの他のテストへ波及し、実行順に依存して落ちるようになる。
+/// 本番の呼び出し元が `!pdf::pdfium::bind_is_known_broken()` を渡す。
 async fn run_build_batch<F: Fn(i64, i64)>(
     pool: &SqlitePool,
     app_data_dir: &Path,
     targets: Vec<(i64, String)>,
+    pdfium_available: bool,
     on_progress: F,
 ) -> LcirBatchResult {
     let total = targets.len() as i64;
-    let (mut built, mut reused, mut failed) = (0i64, 0i64, 0i64);
-    for (i, (att_id, _path)) in targets.into_iter().enumerate() {
+    let (mut built, mut reused, mut failed, mut skipped) = (0i64, 0i64, 0i64, 0i64);
+    for (i, (att_id, mime)) in targets.into_iter().enumerate() {
+        // pdfium が使えないと分かっている間は PDF に着手しない（v1.0.0-p2）。
+        // 判定は mime を見てから ＝ pdfium を要さない TeX の build は止めない。
+        if !pdfium_available && mime != TEX_SOURCE_MIME {
+            skipped += 1;
+            on_progress(i as i64 + 1, total);
+            continue;
+        }
         match build_lcir_for_attachment(pool, app_data_dir, att_id).await {
             Ok(r) if r.built => built += 1,
             Ok(r) if r.reused => reused += 1,
@@ -1442,12 +1555,19 @@ async fn run_build_batch<F: Fn(i64, i64)>(
         }
         on_progress(i as i64 + 1, total);
     }
+    if skipped > 0 {
+        eprintln!(
+            "LCIR: skipped {skipped} PDF attachment(s) because pdfium could not be loaded \
+             (restart after installing it)"
+        );
+    }
     LcirBatchResult {
         enabled: true,
         total,
         built,
         reused,
         failed,
+        skipped,
     }
 }
 
@@ -1591,6 +1711,107 @@ pub async fn index_fulltext_for_attachment(
         Err(e) => {
             eprintln!("p1: fulltext indexing failed for attachment {attachment_id}: {e}");
             FulltextIndexOutcome::Failed(e.to_string())
+        }
+    }
+}
+
+/// 新しく増えた PDF 添付を取り込む（v1.0.0-p2）。**添付が増える 3 経路が共有する唯一の入口**
+/// （`add_attachment` / `download_arxiv_pdf` / クリッパーの `spawn_pdf_job`）。
+///
+/// ## なぜ決定点の中に build を入れないのか
+///
+/// `index_fulltext_for_attachment` は添付経路以外からも呼ばれる（詳細パネルの再索引ボタンと
+/// 「未索引の PDF を一括索引」バッチ）。あちらに build を配ると、**秒オーダーで終わるはずの
+/// 一括索引ボタンが pdfium 全件バッチに化ける**。決定点はソース選択専用のまま残す。
+///
+/// ## なぜ索引が先で build が後なのか
+///
+/// build を先にすると、テキスト層の無いスキャン本で**全文索引が最長 8 分遅れる**（その間
+/// 検索に出ない）。索引を先にしても収束先は同じ ── build の中の
+/// `regenerate_page_fts_from_lcir` が pdf_extract 由来を LCIR 由来へ置き換える
+/// （逆向きは起きない。`index_attachment_from_pdf_extract` は自動経路では LCIR に譲る）。
+/// build が固まってもプロセスが落ちても、全文検索だけは生き残る。
+///
+/// `on_busy(true/false)` は取り込みの開始と終了を呼び出し側へ伝える（UI の索引インジケータ）。
+/// **終了側は必ず呼ばれる**（早期 return もエラーも通る）。
+/// **両方の段の結果を返す。** 返さないと「索引を呼んだか」「build を呼んだか」が外から
+/// 観測できず、どちらの配線を外しても全テストが通ってしまう（p1 で同型の配線が変異を
+/// 生き延びた）。呼び出し側はログにも使う。
+pub async fn ingest_new_pdf_attachment<F>(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    abs_path: std::path::PathBuf,
+    attachment_id: i64,
+    on_busy: F,
+) -> (FulltextIndexOutcome, AutoBuildOutcome)
+where
+    F: Fn(bool),
+{
+    on_busy(true);
+    // 1. 全文索引（自動経路なので `replace_existing` は必ず false）。
+    let indexed = index_fulltext_for_attachment(pool, abs_path, attachment_id, false).await;
+    // 2. LCIR を build する（best-effort）。フラグ OFF なら内部で即 return する。
+    let built = auto_build_lcir(
+        pool,
+        app_data_dir,
+        attachment_id,
+        !pdf::pdfium::bind_is_known_broken(),
+    )
+    .await;
+    on_busy(false);
+    (indexed, built)
+}
+
+/// 自動 build の結果（`ingest_new_pdf_attachment` の戻りの片方）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoBuildOutcome {
+    /// `lcir.enabled` が OFF。
+    Disabled,
+    /// このプロセスで pdfium が使えないと分かっている。
+    SkippedNoPdfium,
+    /// 新しい版を作った。
+    Built,
+    /// 既存の版を再利用した。
+    Reused,
+    /// build がエラーを返した（添付そのものは成功している）。
+    Failed(String),
+}
+
+/// 自動経路の LCIR build（best-effort）。失敗はログだけ ── 添付そのものは既に成功している。
+///
+/// **pdfium が壊れていると分かっているプロセスでは着手しない。** 印を読むのは
+/// この自動経路だけで、ユーザーが名指しで押した 1 件 build は必ず実際に bind を試みる。
+/// `pdfium_available` を**引数で受ける**のは、グローバルな印を直接読むとテストが印を
+/// 立てた瞬間に同一プロセスの他のテストへ波及して実行順に依存するため。
+async fn auto_build_lcir(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    attachment_id: i64,
+    pdfium_available: bool,
+) -> AutoBuildOutcome {
+    if !lcir_enabled(pool).await {
+        return AutoBuildOutcome::Disabled;
+    }
+    if !pdfium_available {
+        eprintln!(
+            "LCIR: skipping automatic build for attachment {attachment_id} \
+             (pdfium is unavailable in this process)"
+        );
+        return AutoBuildOutcome::SkippedNoPdfium;
+    }
+    match build_lcir_for_attachment(pool, app_data_dir, attachment_id).await {
+        Ok(r) if r.built => {
+            eprintln!(
+                "LCIR: built automatically for attachment {attachment_id} ({} page(s))",
+                r.page_count
+            );
+            AutoBuildOutcome::Built
+        }
+        Ok(_) => AutoBuildOutcome::Reused,
+        Err(e) => {
+            eprintln!("LCIR: automatic build failed for attachment {attachment_id}: {e}");
+            AutoBuildOutcome::Failed(e)
         }
     }
 }
@@ -2141,17 +2362,55 @@ mod tests {
         let res = run_build_batch(
             &pool,
             Path::new("/nonexistent"),
-            vec![(9001, "a.pdf".to_string()), (9002, "b.pdf".to_string())],
+            vec![
+                (9001, "application/pdf".to_string()),
+                (9002, "application/pdf".to_string()),
+            ],
+            true,
             |done, total| seen.lock().unwrap().push((done, total)),
         )
         .await;
         assert_eq!(res.total, 2);
         assert_eq!(res.failed, 2, "存在しない添付は失敗として数える");
         assert_eq!(res.built, 0);
+        assert_eq!(res.skipped, 0);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![(1, 2), (2, 2)],
             "1 添付ごとに (done, total) が通知される"
+        );
+    }
+
+    /// pdfium が使えないバッチは **PDF に着手せず `skipped` に数える**。
+    ///
+    /// これが無いと、pdfium を同梱し損ねた配布物で 138 件が `Ok(_) => {}` に落ちて
+    /// どのカウンタにも乗らず、UI は「total 138 / built 0 / failed 0」＝「もう最新だった」に
+    /// 見える（「差分 0 件」と「1 本も実行していない」を同じ見た目にしない）。
+    /// TeX は pdfium を要さないので着手する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn batch_without_pdfium_skips_pdf_and_counts_it(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let seen = std::sync::Mutex::new(Vec::<(i64, i64)>::new());
+        let res = run_build_batch(
+            &pool,
+            Path::new("/nonexistent"),
+            vec![
+                (9001, "application/pdf".to_string()),
+                (9002, TEX_SOURCE_MIME.to_string()),
+            ],
+            false,
+            |done, total| seen.lock().unwrap().push((done, total)),
+        )
+        .await;
+        assert_eq!(res.total, 2);
+        assert_eq!(res.skipped, 1, "PDF は着手せず skipped に数える");
+        assert_eq!(res.failed, 1, "TeX は着手する（添付が無いので失敗する）");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(1, 2), (2, 2)],
+            "skip した添付でも進捗は前進させる"
         );
     }
 
@@ -2170,6 +2429,181 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0, "flag OFF は LCIR 表に一切書かない");
+    }
+
+    /// 添付の取り込みは **索引 → build** の順で、`on_busy` は開始と終了で必ず 1 回ずつ。
+    /// build を先にすると、テキスト層の無いスキャン本で全文索引が最長 8 分遅れる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ingest_reports_busy_around_the_whole_run(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let seen = std::sync::Mutex::new(Vec::<bool>::new());
+        let (indexed, built) = ingest_new_pdf_attachment(
+            &pool,
+            Path::new("/nonexistent"),
+            PathBuf::from("/nonexistent.pdf"),
+            att,
+            |b| seen.lock().unwrap().push(b),
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![true, false],
+            "取り込みの開始と終了を 1 回ずつ通知する（失敗しても終了は通知する）"
+        );
+        // **索引の段を実際に通ったことを assert する。** 戻り値で見ないと、索引の呼び出しを
+        // 丸ごと外す変異がどのテストでも落ちない。
+        assert!(
+            matches!(indexed, FulltextIndexOutcome::Failed(_)),
+            "存在しない PDF なので索引は Failed を返す（段を通った証跡）: {indexed:?}"
+        );
+        assert_eq!(built, AutoBuildOutcome::Disabled, "フラグ OFF なので build しない");
+    }
+
+    /// pdfium が使えないプロセスでは自動 build に着手しない。
+    /// **印は引数で渡す**（グローバルを立てると同一プロセスの他テストへ波及する）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn auto_build_stands_down_when_pdfium_is_broken(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        assert_eq!(
+            auto_build_lcir(&pool, Path::new("/nonexistent"), att, false).await,
+            AutoBuildOutcome::SkippedNoPdfium,
+        );
+        // 印が無ければ実際に着手する（ファイルが無いので失敗する = 着手した証跡）。
+        assert!(
+            matches!(
+                auto_build_lcir(&pool, Path::new("/nonexistent"), att, true).await,
+                AutoBuildOutcome::Failed(_)
+            ),
+            "印が無ければ着手する"
+        );
+    }
+
+    /// **取り込みが実際に LCIR を build することを固定する**（p2 の主目的）。
+    ///
+    /// PDF 経路は CI に pdfium が無いので殺せない。TeX（gzip）添付なら pdfium を要さずに
+    /// 同じ配線を通せるので、`ingest_new_pdf_attachment` から `auto_build_lcir` を外す変異が
+    /// ここで落ちる ── p1 では同型の「build 経路への配線」がどのテストでも殺せず survive した。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ingest_actually_builds_lcir(pool: SqlitePool) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "T".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let file_name = "arxiv-2401.00001-source.gz";
+        let rel = format!("attachments/{}/{file_name}", entry.id);
+        let att = add_attachment(&pool, entry.id, &rel, file_name, TEX_SOURCE_MIME)
+            .await
+            .unwrap()
+            .id;
+
+        let root = std::env::temp_dir().join(format!("p2-ingest-{}-{att}", std::process::id()));
+        let dir = root.join("attachments").join(entry.id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let tex = "\\documentclass{article}\\begin{document}\n\
+                   \\section{Intro}\nBody text here.\n\\end{document}";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(tex.as_bytes()).unwrap();
+        std::fs::write(dir.join(file_name), enc.finish().unwrap()).unwrap();
+
+        let (_, built) = ingest_new_pdf_attachment(&pool, &root, dir.join(file_name), att, |_| {}).await;
+        assert_eq!(built, AutoBuildOutcome::Built, "取り込みは実際に build する");
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM document_versions
+             WHERE attachment_id = ? AND extraction_status IN ('completed','completed_with_warnings')",
+        )
+        .bind(att)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(n, 1, "取り込みは LCIR を build する（配線が外れたらここが落ちる）");
+    }
+
+    /// LCIR が OFF なら取り込みは build を起こさない（DB に版が 1 行も増えない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn ingest_does_not_build_when_the_flag_is_off(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let (_, built) = ingest_new_pdf_attachment(
+            &pool,
+            Path::new("/nonexistent"),
+            PathBuf::from("/nonexistent.pdf"),
+            att,
+            |_| {},
+        )
+        .await;
+        assert_eq!(built, AutoBuildOutcome::Disabled);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM document_versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "フラグ OFF では版を作らない");
+    }
+
+    /// `lcir_readable` は**ゴミ箱のエントリの版を数えない**。
+    /// 数えると、唯一の LCIR がゴミ箱行きでもチャットに 8 ツールの定義が毎ターン載る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn readable_ignores_versions_under_trashed_entries(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "T".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let att = add_attachment(
+            &pool,
+            entry.id,
+            "attachments/1/t.pdf",
+            "t.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        sqlx::query(
+            "INSERT INTO document_versions
+               (attachment_id, content_key, schema_version, source_sha256, source_mime_type,
+                extractor_name, extractor_version, extraction_status)
+             VALUES (?, 'ck', '0.1.0', 'sha', 'application/pdf', 'lumencite-pdfium', '0.1.0', 'completed')",
+        )
+        .bind(att)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(lcir_readable(&pool).await, "生きているエントリの版は数える");
+
+        sqlx::query("UPDATE entries SET deleted_at = datetime('now') WHERE id = ?")
+            .bind(entry.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !lcir_readable(&pool).await,
+            "ゴミ箱のエントリしか版を持たないなら readable ではない"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -153,14 +153,19 @@ pub async fn try_create_content_key_unique_index(pool: &SqlitePool) -> Result<bo
     Ok(true)
 }
 
-/// 完了 LCIR がまだ無い LCIR 対象添付（PDF と arXiv TeX ソース）を `(id, file_path)` で返す
-/// （ゴミ箱のエントリは除外）。「未構築の添付を一括 LCIR 化」バッチが対象を集める。
+/// 完了 LCIR がまだ無い LCIR 対象添付（PDF と arXiv TeX ソース）を **`(id, mime_type)`** で返す
+/// （ゴミ箱のエントリは除外）。「未構築の添付を一括 LCIR 化」バッチと v1.0.0-p2 の
+/// 起動時バックフィルが対象を集める。
 /// mime 述語は `build_lcir_for_attachment` のディスパッチと同一（`%pdf%` / `application/gzip`）。
+///
+/// **2 要素目は `file_path` ではなく `mime_type`**（v1.0.0-p2 で変えた）。`build_lcir_for_attachment`
+/// は添付 id から自分でパスを引き直すので path を読む呼び出し元は 1 つも無かった一方、
+/// バックフィルは pdfium が使えないときに **PDF だけ落として TeX は続ける**判断に mime が要る。
 pub async fn attachments_without_completed_lcir(
     pool: &SqlitePool,
 ) -> Result<Vec<(i64, String)>, sqlx::Error> {
     sqlx::query_as::<_, (i64, String)>(
-        "SELECT a.id, a.file_path
+        "SELECT a.id, a.mime_type
          FROM attachments a
          JOIN entries e ON e.id = a.entry_id
          WHERE e.deleted_at IS NULL
@@ -178,7 +183,8 @@ pub async fn attachments_without_completed_lcir(
 }
 
 /// 完了 LCIR は在るが、現在の抽出器（`extractor_name`/`extractor_version`）では作られていない
-/// 添付を `(id, file_path)` で返す。抽出ロジックを上げた後（例 Phase 2 で 0.1.0→0.2.0）、既存
+/// 添付を **`(id, mime_type)`** で返す（2 要素目は v1.0.0-p2 で `file_path` から変えた ──
+/// `run_build_batch` が pdfium 不在時に PDF だけ落とす判断に使う）。抽出ロジックを上げた後（例 Phase 2 で 0.1.0→0.2.0）、既存
 /// コーパスを新版へ再構築するバッチ `rebuild_outdated_lcir` の対象集め。`build_lcir_for_attachment`
 /// は新 content_key で新版を作り旧 completed を supersede するので、これで漏れなく上げられる。
 ///
@@ -193,7 +199,7 @@ pub async fn attachments_with_outdated_lcir(
     mime_pattern: &str,
 ) -> Result<Vec<(i64, String)>, sqlx::Error> {
     sqlx::query_as::<_, (i64, String)>(
-        "SELECT a.id, a.file_path
+        "SELECT a.id, a.mime_type
          FROM attachments a
          JOIN entries e ON e.id = a.entry_id
          WHERE e.deleted_at IS NULL
@@ -392,7 +398,12 @@ mod tests {
         assert!(ids.contains(&unbuilt));
         assert!(ids.contains(&pend));
         assert!(!ids.contains(&built));
-        assert!(targets.iter().any(|(_, p)| p.ends_with("/p.pdf")));
+        // 2 要素目は **mime_type**（v1.0.0-p2 で file_path から変えた）。バックフィルは
+        // pdfium が使えないときに PDF だけ落として TeX を続ける判断にこれを使う。
+        assert!(
+            targets.iter().all(|(_, m)| m == "application/pdf"),
+            "2 要素目は mime_type: {targets:?}"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

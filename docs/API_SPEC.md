@@ -439,11 +439,17 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 
 索引の出どころは **`settings` の添付単位キー `fulltext.source.<attachment_id>`**（値 `lcir` / `ocr`・キーが無ければ `pdf-extract` 由来か未索引）に記録する。`fulltext` は FTS5 仮想表なので provenance 列を足せず（`virtual tables may not be altered`）、側表を足すと migration が要るため。索引や添付を消すときは同じトランザクションでこの記録も消す。
 
-**添付後の自動索引（CR-027）:** 手動添付（`add_attachment`）・arXiv 取得（`download_arxiv_pdf`）・Web クリッパー（MCP `spawn_pdf_job`）のいずれの経路も、添付成功後に上記の決定点でバックグラウンド索引する（best-effort・スキャン PDF は OCR へ誘導）。以前はリーダーからの手動添付とクリッパー経路が索引されなかった。
+**添付後の自動取り込み（CR-027 / v1.0.0-p2）:** 手動添付（`add_attachment`）・arXiv 取得（`download_arxiv_pdf`）・Web クリッパー（MCP `spawn_pdf_job`）のいずれの経路も、添付成功後に共有ヘルパ `ingestion::ingest_new_pdf_attachment` を 1 回呼ぶ（best-effort・スキャン PDF は OCR へ誘導）。ヘルパは **①上記の決定点で全文索引 → ②`lcir.enabled` が ON なら LCIR を自動 build** の順に走る。
+
+**順序が「索引 → build」である理由**: build を先にすると、テキスト層の無いスキャン本で全文索引が最長 8 分（実測 att37）遅れ、その間その論文は検索に出ない。索引を先にしても収束先は同じで、build の中の `regenerate_page_fts_from_lcir` が pdf-extract 由来を LCIR 由来へ置き換える（逆向きは起きない — 自動経路の `index_attachment_from_pdf_extract` は LCIR 由来に譲る）。build が固まってもプロセスが落ちても全文検索だけは生き残る。
+
+**build を決定点の中に入れない理由**: 決定点は添付経路以外からも呼ばれる（`index_attachment` と `index_missing_attachments`）。そちらにも build が配られると、秒オーダーで終わるはずの「未索引の PDF を一括索引」ボタンが pdfium の全件バッチに化ける。
+
+自動取り込みは開始と終了に `attachment-ingest` イベント（`{ attachment_id, busy }`）を発火する。フロントはこれで索引インジケータ（`StatusBar`）を出す。**以前はフロントが添付成功後に `index_attachment` を invoke して自前で数えていたが、あれは `replace_existing = true`（＝名指しの再索引）を自動経路から呼ぶ形で、自動 build が張った LCIR 由来の索引を pdf-extract で上書きし返す競合になるため v1.0.0-p2 で削除した。**
 
 `download_arxiv_pdf` は、arXiv からメタデータ取得してエントリを作成した直後に「PDF も一括で取得する」ためのコマンド（AddSheet の arXiv タブのチェックボックス。デフォルト ON）。`arxiv_id` を正規化して `https://arxiv.org/pdf/<id>` を `download::download_and_attach`（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き）でダウンロードし添付、成功後はバックグラウンドで `pdf-extract` → 全文索引を試みる（索引失敗は無視）。ペイウォールやネットワーク障害で失敗しても呼び出し側はエントリ作成を成功扱いにする（フロントは警告ログのみで詳細パネルからの手動添付に誘導）。
 
-`download_arxiv_source`（LCIR Phase 4）は、同じ正規化 ID で `https://arxiv.org/e-print/<id>` から **TeX ソース**（gzip された tar または単一 .tex）をダウンロードし、`arxiv-<id>-source.gz`・mime `application/gzip` として添付する。同じ SSRF ガード/リダイレクト検証/50MB 上限を共有する。応答検証は `%PDF-`（PDF-only submission = TeX 未公開の明示エラー）と HTML（エラーページ）を弾き、それ以外は受理して形式判定（gzip/tar/単一 .tex）は LCIR ビルド側の内容スニッフィングに委ねる。**再取得は既存の TeX ソース添付を上書きする**（別添付を積まない — 中身が変われば sha256 → content_key が変わり、次のビルドが新版を作って旧版を supersede する）。**全文索引は行わない**（PDF ではないため）。LCIR ビルド（`build_lcir_for_attachment`）は呼び出し側が添付成功後に実行する — 経路は 3 つ: 詳細パネルのボタン（明示・await）／AddSheet の arXiv 追加（`lcir.enabled` ON のとき自動・fire-and-forget）／Web クリッパー（`lcir.enabled` ON のとき自動・`spawn_tex_source_job`）。
+`download_arxiv_source`（LCIR Phase 4）は、同じ正規化 ID で `https://arxiv.org/e-print/<id>` から **TeX ソース**（gzip された tar または単一 .tex）をダウンロードし、`arxiv-<id>-source.gz`・mime `application/gzip` として添付する。同じ SSRF ガード/リダイレクト検証/50MB 上限を共有する。応答検証は `%PDF-`（PDF-only submission = TeX 未公開の明示エラー）と HTML（エラーページ）を弾き、それ以外は受理して形式判定（gzip/tar/単一 .tex）は LCIR ビルド側の内容スニッフィングに委ねる。**再取得は既存の TeX ソース添付を上書きする**（別添付を積まない — 中身が変われば sha256 → content_key が変わり、次のビルドが新版を作って旧版を supersede する）。**全文索引は行わない**（PDF ではないため）。LCIR ビルド（`build_lcir_for_attachment`）は呼び出し側が添付成功後に実行する — 経路は **4 つ**: 詳細パネルのボタン（明示・await）／AddSheet の arXiv 追加（`lcir.enabled` ON のとき自動・fire-and-forget）／Web クリッパー（`lcir.enabled` ON のとき自動・`spawn_tex_source_job`）／設定→データの「TeX ソースを一括取得」（`fetch_missing_arxiv_sources`）。
 
 ```ts
 type IndexMissingResult = {

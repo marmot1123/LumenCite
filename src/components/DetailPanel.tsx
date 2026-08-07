@@ -471,7 +471,12 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
       }
     } catch (e: any) {
       if (stillHere()) {
-        setIndexNote(t("detailPanel.lcirBuildFailed", { error: e?.message ?? String(e) }));
+        const msg = e?.message ?? String(e);
+        setIndexNote(
+          String(msg).includes("build_busy")
+            ? t("detailPanel.lcirBuildBusy")
+            : t("detailPanel.lcirBuildFailed", { error: msg }),
+        );
       }
     } finally {
       setLcirBuildBusy(b => ({ ...b, [attId]: false }));

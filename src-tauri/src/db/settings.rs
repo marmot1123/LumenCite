@@ -112,6 +112,15 @@ pub const FULLTEXT_SOURCE_KEY_PREFIX: &str = "fulltext.source.";
 /// 既存 138 添付に派生索引が永久に届かない。値は "1" のみ。
 pub const FTS_FULLTEXT_LCIR_DERIVED_KEY: &str = "fts.fulltext_lcir_derived";
 
+/// v1.0.0-p2: 起動時 LCIR バックフィルが**最後に 1 件以上着手した**時刻（RFC3339）。
+///
+/// `BACKUP_LAST_RUN_KEY` と同型の間引きキーで、`FTS_FULLTEXT_LCIR_DERIVED_KEY` のような
+/// boolean の一度きりフラグにはしない ── バックフィルは 1 ランの予算で途中打ち切りするうえ、
+/// 壊れた PDF が 1 本あるだけで「完了」条件を満たさなくなるので、boolean だとフラグが永久に
+/// 立たないか、逆に残件があるのに「完了」で立つ。**「やり切ったか」は残件数 0 で毎回判定する**
+/// （状態を二重に持たない）。**対象 0 件の回と LCIR OFF の回は書かない。**
+pub const LCIR_BACKFILL_LAST_RUN_KEY: &str = "lcir.backfill.last_run";
+
 #[cfg(test)]
 mod tests {
     use super::*;

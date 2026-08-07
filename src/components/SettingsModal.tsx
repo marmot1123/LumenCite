@@ -967,6 +967,7 @@ function DataTab() {
         built: number;
         reused: number;
         failed: number;
+        skipped: number;
       }>(kind === "build" ? "build_missing_lcir" : "rebuild_outdated_lcir");
       if (!r.enabled) {
         setMessage(t("settings.data.lcirDisabled"));
@@ -974,6 +975,10 @@ function DataTab() {
         setMessage(
           kind === "build" ? t("settings.data.lcirNone") : t("settings.data.lcirRebuildNone"),
         );
+      } else if (r.skipped > 0) {
+        // pdfium を読めない配布物では大半が「着手すらしていない」。それを
+        // built 0 / failed 0 として出すと「もう最新だった」と読めてしまう。
+        setError(t("settings.data.lcirNoPdfium", { skipped: r.skipped, total: r.total }));
       } else {
         setMessage(
           t(kind === "build" ? "settings.data.lcirDone" : "settings.data.lcirRebuildDone", {

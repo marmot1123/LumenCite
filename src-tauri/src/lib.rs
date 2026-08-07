@@ -775,14 +775,20 @@ async fn add_attachment(
 
     match result {
         Ok(att) => {
-            // 添付成功後にバックグラウンドで全文索引する（SPEC: 添付後に自動索引・CR-027）。
+            // 添付成功後にバックグラウンドで取り込む（SPEC: 添付後に自動索引・CR-027）。
             // リーダーからの手動添付もこの経路を通るので、以前は索引されなかった。
             // 索引ソースの選択は `index_fulltext_for_attachment` に一本化してある（p1・debt-17）。
+            // v1.0.0-p2: 索引に続けて LCIR も自動 build する（共有ヘルパ）。
             let pool = state.db.clone();
             let att_id = att.id;
             let abs = dest.clone();
+            let dir = state.app_data_dir.clone();
+            let app2 = app.clone();
             tauri::async_runtime::spawn(async move {
-                ingestion::index_fulltext_for_attachment(&pool, abs, att_id, false).await;
+                ingestion::ingest_new_pdf_attachment(&pool, &dir, abs, att_id, |busy| {
+                    emit_attachment_ingest(&app2, att_id, busy)
+                })
+                .await;
             });
             Ok(att)
         }
@@ -826,15 +832,20 @@ async fn download_arxiv_pdf(
     )
     .await?;
 
-    // 添付済み PDF をバックグラウンドで全文索引する（best-effort・共有ヘルパ・CR-027）。
+    // 添付済み PDF をバックグラウンドで取り込む（索引 → LCIR build・best-effort・共有ヘルパ）。
     let pool = state.db.clone();
     let att_id = att.id;
     let abs = app_data_dir
         .join("attachments")
         .join(entry_id.to_string())
         .join(&att.file_name);
+    let dir = app_data_dir.clone();
+    let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
-        ingestion::index_fulltext_for_attachment(&pool, abs, att_id, false).await;
+        ingestion::ingest_new_pdf_attachment(&pool, &dir, abs, att_id, |busy| {
+            emit_attachment_ingest(&app2, att_id, busy)
+        })
+        .await;
     });
 
     Ok(att)
@@ -1118,14 +1129,33 @@ async fn fulltext_search(
         .map_err(|e| e.to_string())
 }
 
+/// 添付の取り込み（全文索引 + LCIR 自動 build）の開始/終了をフロントへ伝える（v1.0.0-p2）。
+///
+/// 読み手は `App.tsx` の索引インジケータ（`StatusBar` の `indexingCount`）。以前はフロントが
+/// 添付成功後に `index_attachment` を invoke して自前で数えていたが、あれは
+/// **`replace_existing = true`（＝名指しの再索引）を自動経路から呼ぶ**形で、p1 の契約
+/// 「自動経路は必ず false」を破っていた。p2 で自動 build が入ると、その呼び出しが
+/// **自動 build の張った LCIR 由来の索引を pdf_extract で上書きし返す**競合になる
+/// （`index_attachment_from_pdf_extract` は `replace_existing = true` に対して LCIR を守らない）。
+/// フロントの invoke を消し、代わりにバックエンドが実際の取り込みを通知する。
+fn emit_attachment_ingest(app: &tauri::AppHandle, attachment_id: i64, busy: bool) {
+    let _ = app.emit(
+        "attachment-ingest",
+        serde_json::json!({ "attachment_id": attachment_id, "busy": busy }),
+    );
+}
+
 /// LCIR（実験・機械可読中間形式）: 添付 1 件を pdfium 抽出して document_versions/nodes/
 /// source_fragments を構築する。フラグ `lcir.enabled` が OFF なら何もしない。
+///
+/// **ユーザーが名指しで押す経路**なので上限付きでロックを待つ（`try_build_lcir_for_attachment`）。
+/// 背景の build が走っていて順番が来なければ `build_busy` を返し、フロントが案内文言に変える。
 #[tauri::command]
 async fn build_lcir_for_attachment(
     state: State<'_, AppState>,
     attachment_id: i64,
 ) -> Result<ingestion::LcirBuildResult, String> {
-    ingestion::build_lcir_for_attachment(&state.db, &state.app_data_dir, attachment_id).await
+    ingestion::try_build_lcir_for_attachment(&state.db, &state.app_data_dir, attachment_id).await
 }
 
 /// LCIR（実験）: 添付の最新 LCIR を木 + PDF 座標付きの JSON 派生ビューで返す（read 面）。
@@ -1255,8 +1285,11 @@ struct StorageStats {
 /// alt text と TeX 取得を別に見るのは、**どちらも SettingsModal の外から呼べる**ため
 /// （`DetailPanel` の 3 箇所）で、UI の `disabled` では塞げない。
 ///
-/// なお `build_lcir_for_attachment` にはフラグが 1 つも無く UI からも塞げないので、
-/// そこは `run_gc` 側の「削除直前の再評価」が最後の砦になる（debt-24）。
+/// **v1.0.0-p2: build ロックも取る。** p2 で build は「ユーザーがボタンを押したとき」だけの
+/// 操作ではなくなった（添付のたび / 毎起動）ので、`run_gc` の「削除直前の再評価」
+/// （`still_collectable`）を最後の砦にしておけない ── バックフィルが直前に作った新版によって
+/// superseded になった版を GC が消すと、`node_alt_texts.carried_from_version_id` が SET NULL に
+/// なり、carry 行が「NULL = この版で生成」というスキーマの契約を偽る。
 #[tauri::command]
 async fn run_lcir_gc(
     app: tauri::AppHandle,
@@ -1265,6 +1298,11 @@ async fn run_lcir_gc(
     if VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst) || TEX_FETCH_RUNNING.load(Ordering::SeqCst) {
         return Err("already_running".to_string());
     }
+    let Some(_build_guard) = ingestion::lock_build_within(ingestion::INTERACTIVE_BUILD_LOCK_WAIT)
+        .await
+    else {
+        return Err("already_running".to_string());
+    };
     let _guard = begin_lcir_batch()?;
     ingestion::gc::run_gc(&state.db, &state.app_data_dir, move |done, total| {
         let _ = app.emit(
@@ -3953,10 +3991,18 @@ pub fn run() {
                 );
             }
 
+            // `busy_timeout` は v1.0.0-p2 で明示した（それまでは sqlx 既定の 5 秒）。
+            // LCIR の版挿入は 1 添付ぶんを**チャンクなしの単一 tx**で書き、大きい版では
+            // 5 秒を超える（`gc.rs` は削除側で同じ実測をして 50,000 ノードのチャンクを入れた）。
+            // p2 より前はそれが「ユーザーがボタンを押して待っている間」にしか起きなかったが、
+            // p2 は**添付のたび / 毎起動**に build を走らせるので、そのままだとバックフィル中に
+            // タグを付ける・メモを保存するだけで `SQLITE_BUSY` で落ちる。
+            // 値は既存の探索用プール（`llm/ocr.rs` ほか）と揃える。
             let options = SqliteConnectOptions::new()
                 .filename(data_dir.join("lumencite.db"))
                 .create_if_missing(true)
                 .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_secs(30))
                 .foreign_keys(true);
 
             // DB 接続 + マイグレーション。失敗は `?` で setup 外に投げず、ここで握って
@@ -3994,6 +4040,13 @@ pub fn run() {
             // (name + name_original + reading_*) で 1 回だけ作り直す。フラグ既設なら no-op。
             // 失敗してもアプリ起動は止めず、log だけ残してリトライさせる（次回起動で再試行）。
             let fts_pool = pool.clone();
+            let backfill_dir = data_dir.clone();
+            let another_instance_live = gui_lock.another_instance_is_live();
+            // dev ビルドは既定オフ（バックアップと同型）。`pnpm tauri dev` は再ビルドのたびに
+            // プロセスが再起動し、配布版と**同じ app data dir・同じ実 DB**を共有しているので、
+            // その都度 pdfium 抽出と crop 書き出しが実データに走ると互いの crop を消し合う。
+            let backfill_enabled = !cfg!(debug_assertions)
+                || matches!(std::env::var("LUMENCITE_LCIR_BACKFILL").as_deref(), Ok("1"));
             tauri::async_runtime::spawn(async move {
                 match db::entries::rebuild_authors_fts_once(&fts_pool).await {
                     Ok(true) => eprintln!("entries_fts: rebuilt for v0.3.0 authors schema"),
@@ -4025,6 +4078,55 @@ pub fn run() {
                         Err(e) => eprintln!("fulltext derivation from LCIR failed: {e}"),
                     },
                     Err(_) => eprintln!("fulltext derivation from LCIR skipped: batch running"),
+                }
+
+                // v1.0.0-p2: 既存ライブラリへの LCIR バックフィル。
+                //
+                // **新しい spawn を作らず、この同じタスクの末尾に置く。** 別タスクにすると、
+                // 上の `derive_page_fts_from_lcir_once` と `begin_lcir_batch()` を奪い合い、
+                // 負けた側が eprintln 1 行で静かに降りる（「0 件処理」と正常が同じ見た目になる）。
+                // ここなら順序が固定される。
+                //
+                // ゲートは setup で 1 回だけ取った `gui_lock` の値（Copy）。
+                // ⚠ ここで `acquire_gui_lock` を呼び直してはいけない ── OnceLock で再入不可なので
+                // 握っている当のインスタンスが自分を `HeldByOther` と誤認し、バックフィルが
+                // どのマシンでも永久に走らなくなる。`Unavailable` は「別インスタンスあり」ではない。
+                if !backfill_enabled {
+                    eprintln!(
+                        "LCIR backfill: disabled in dev build \
+                         (set LUMENCITE_LCIR_BACKFILL=1 to enable)"
+                    );
+                    return;
+                }
+                if another_instance_live {
+                    eprintln!("LCIR backfill: skipped (another LumenCite instance is live)");
+                    return;
+                }
+                tokio::time::sleep(ingestion::backfill::STARTUP_DELAY).await;
+                let state = ingestion::backfill::BackfillState::default();
+                let mut interval = tokio::time::interval(Duration::from_secs(
+                    ingestion::backfill::AUTO_INTERVAL_SECS as u64,
+                ));
+                loop {
+                    ingestion::backfill::run_backfill_if_due(
+                        &fts_pool,
+                        &backfill_dir,
+                        ingestion::backfill::BackfillLimits::default(),
+                        ingestion::backfill::AUTO_INTERVAL_SECS,
+                        &state,
+                        !ingestion::pdf::pdfium::bind_is_known_broken(),
+                        || {
+                            // 手動バッチ / Vision / TeX 取得 / バックアップのどれかが動いて
+                            // いたら添付境界で譲る。**バックフィル自身は外側フラグを握らない**
+                            // ので、ユーザーのボタンが `already_running` で弾かれない。
+                            LCIR_BATCH_RUNNING.load(Ordering::SeqCst)
+                                || VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst)
+                                || TEX_FETCH_RUNNING.load(Ordering::SeqCst)
+                                || backup::is_running()
+                        },
+                    )
+                    .await;
+                    interval.tick().await;
                 }
             });
 

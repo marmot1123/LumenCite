@@ -998,12 +998,29 @@ fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
         {
             Ok(att) => {
                 eprintln!("clipper: attached {} to entry {}", att.file_name, job.entry_id);
-                // 添付後に全文索引する（クリッパー経路も自動索引・CR-027）。
+                // 添付後に取り込む（索引 → LCIR build・クリッパー経路も自動・CR-027 / v1.0.0-p2）。
+                // 既にこの spawn の中で await しているので、新しいタスクは増えない。
                 let abs = app_data_dir
                     .join("attachments")
                     .join(job.entry_id.to_string())
                     .join(&att.file_name);
-                crate::ingestion::index_fulltext_for_attachment(&pool, abs, att.id, false).await;
+                let att_id = att.id;
+                let emit_app = app.clone();
+                crate::ingestion::ingest_new_pdf_attachment(
+                    &pool,
+                    &app_data_dir,
+                    abs,
+                    att_id,
+                    |busy| {
+                        if let Some(app) = &emit_app {
+                            let _ = app.emit(
+                                "attachment-ingest",
+                                serde_json::json!({ "attachment_id": att_id, "busy": busy }),
+                            );
+                        }
+                    },
+                )
+                .await;
                 if let Some(app) = &app {
                     let _ = app.emit("entries-changed", ());
                 }

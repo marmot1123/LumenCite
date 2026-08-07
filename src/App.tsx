@@ -133,7 +133,9 @@ export default function App() {
   // 一覧の複合フィルタ（v0.6.0）。ビュー切替をまたいで保持し、明示クリアするまで持続する。
   const [filter, setFilter] = useState<EntryFilter>(EMPTY_FILTER);
   const [fulltextHits, setFulltextHits] = useState<FulltextHit[]>([]);
-  const [indexingCount, setIndexingCount] = useState(0);
+  // 取り込み中の添付 id（バックエンドの `attachment-ingest` イベントが正本）。
+  const [ingestingIds, setIngestingIds] = useState<Set<number>>(new Set());
+  const indexingCount = ingestingIds.size;
   const [viewMode, setViewMode] = useState<ViewMode>("table");
   const [showAdd, setShowAdd] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
@@ -174,6 +176,24 @@ export default function App() {
           setBibtexLastError(null);
           setBibtexLastSynced(e.payload.synced_at);
         }
+      },
+    );
+    return () => { unlistenPromise.then(u => u()); };
+  }, []);
+
+  // 添付の取り込み（全文索引 + LCIR 自動 build）の実行中件数。バックエンドが正本。
+  // 件数はカウンタでなく id の集合で持つ ── 同じ添付の開始イベントが 2 度届いても
+  // 二重に数えず、終了イベントが 1 通落ちても他の添付の表示を巻き込まない。
+  useEffect(() => {
+    const unlistenPromise = listen<{ attachment_id: number; busy: boolean }>(
+      "attachment-ingest",
+      (e) => {
+        setIngestingIds(prev => {
+          const next = new Set(prev);
+          if (e.payload.busy) next.add(e.payload.attachment_id);
+          else next.delete(e.payload.attachment_id);
+          return next;
+        });
       },
     );
     return () => { unlistenPromise.then(u => u()); };
@@ -1050,12 +1070,11 @@ export default function App() {
             if (selectedId != null) reloadDetail(selectedId);
             loadEntries();
           }}
-          onAttachmentAdded={(attachmentId) => {
-            setIndexingCount(c => c + 1);
-            invoke("index_attachment", { id: attachmentId })
-              .catch(console.error)
-              .finally(() => setIndexingCount(c => Math.max(0, c - 1)));
-          }}
+          /* 索引はバックエンドが添付成功時に自分で走らせる（CR-027）。ここで
+             `index_attachment` を invoke し直していたが、あれは replace_existing=true
+             ＝「名指しの再索引」を自動経路から呼ぶ形で、v1.0.0-p2 の自動 LCIR build が
+             張った LCIR 由来の索引を pdf_extract で上書きし返す競合になる。
+             進捗は `attachment-ingest` イベントで受ける。 */
           onUpdateField={handleUpdateField}
           onSelectEntry={selectSingle}
           onSummarize={detail ? () => setShowSummary(true) : undefined}
