@@ -388,7 +388,8 @@ pub struct CompletionPlan {
 /// エントリの `arxiv_id` を唯一の導出源に、PDF / TeX ソースの欠落と対応ジョブを計算する。
 ///
 /// - PDF 欠落 = mime `%pdf%` の添付なし（URL は arxiv_id から導出）。
-/// - TeX 欠落 = mime `application/gzip` の添付なし **かつ** `lcir.enabled` ON。
+/// - TeX 欠落 = mime `application/gzip` の添付なし **かつ** e-print 自動取得が有効
+///   （`ingestion::tex_autofetch_enabled` = 同意あり かつ LCIR ON・v1.0.0-p3）。
 ///
 /// `citation_pdf_url` 由来の補完は対象外（arXiv 前提）。エントリが無い / ゴミ箱 /
 /// arxiv_id 無しなら空プラン。全経路（クリップ重複 / `/clipper/complete`）で共有する。
@@ -706,25 +707,36 @@ mod tests {
         assert_eq!(outcome2.response["status"], "created");
     }
 
-    /// LCIR Phase 4 自動化: TeX ソースジョブは「arxiv_id あり + `lcir.enabled` ON」の
+    /// LCIR Phase 4 自動化: TeX ソースジョブは「arxiv_id あり + e-print 自動取得が有効」の
     /// ときだけ発行される（OFF のユーザーのクリップごとに e-print を落とさない）。
+    /// **同意キー（`lcir.tex_autofetch.enabled`）を直に動かして固定する**（v1.0.0-p3）。
+    /// `lcir.enabled` を立てるだけだと旧同意の引き継ぎで true になり、
+    /// **判定を `lcir.enabled` に差し戻す退行が緑のまま通ってしまう**。
     #[sqlx::test(migrations = "./migrations")]
-    async fn tex_source_job_requires_arxiv_id_and_lcir_flag(pool: SqlitePool) {
+    async fn tex_source_job_requires_arxiv_id_and_the_fetch_consent(pool: SqlitePool) {
+        let set = |k: &'static str, v: &'static str| {
+            let pool = pool.clone();
+            async move { crate::db::settings::set_setting(&pool, k, v).await.unwrap() }
+        };
         let mut req = clip_req("https://arxiv.org/abs/2301.00001");
         req.arxiv_id = Some("arXiv:2301.00001v2".to_string());
 
-        // フラグ OFF → 出ない。
+        // LCIR は既定 ON でも、同意が無ければ出ない（p3 の分離の核心）。
+        set(crate::db::settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "0").await;
         assert!(derive_tex_source_job(&pool, &req, 1).await.is_none());
 
-        // フラグ ON → 正規化済み ID（プレフィックス・版サフィックス除去）でジョブが出る。
-        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1")
-            .await
-            .unwrap();
+        // 同意あり → 正規化済み ID（プレフィックス・版サフィックス除去）でジョブが出る。
+        set(crate::db::settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "1").await;
         let job = derive_tex_source_job(&pool, &req, 1).await.expect("job");
         assert_eq!(job.entry_id, 1);
         assert_eq!(job.arxiv_id, "2301.00001");
 
-        // arxiv_id なし → フラグ ON でも出ない。
+        // 同意があっても LCIR を切ったら出ない（取ってきても build が no-op になる）。
+        set(crate::db::settings::LCIR_ENABLED_KEY, "0").await;
+        assert!(derive_tex_source_job(&pool, &req, 1).await.is_none());
+        set(crate::db::settings::LCIR_ENABLED_KEY, "1").await;
+
+        // arxiv_id なし → 同意があっても出ない。
         let plain = clip_req("https://example.com");
         assert!(derive_tex_source_job(&pool, &plain, 1).await.is_none());
     }
@@ -755,27 +767,34 @@ mod tests {
         .unwrap();
     }
 
+    /// 欠落補完でも e-print は**同意キー**で決まる（v1.0.0-p3）。ここも `lcir.enabled` では固定しない。
     #[sqlx::test(migrations = "./migrations")]
-    async fn plan_completion_detects_missing_gated_by_lcir(pool: SqlitePool) {
+    async fn plan_completion_gates_the_tex_job_on_the_fetch_consent(pool: SqlitePool) {
         let id = arxiv_entry(&pool, "arXiv:2301.00001v2").await;
 
-        // 添付なし + LCIR OFF → PDF だけ欠落（tex は lcir.enabled が要る）。URL は正規化 ID。
+        // 同意なし → PDF だけ欠落。URL は正規化 ID。
+        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "0").await.unwrap();
         let plan = plan_completion(&pool, id).await.unwrap();
         assert_eq!(plan.missing, MissingSet { pdf: true, tex: false });
         assert_eq!(plan.pdf_job.as_ref().unwrap().url, "https://arxiv.org/pdf/2301.00001");
         assert!(plan.tex_source_job.is_none());
 
-        // LCIR ON → tex も欠落に（正規化済み arxiv_id でジョブ）。
-        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1").await.unwrap();
+        // 同意あり → tex も欠落に（正規化済み arxiv_id でジョブ）。
+        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "1").await.unwrap();
         let plan = plan_completion(&pool, id).await.unwrap();
         assert_eq!(plan.missing, MissingSet { pdf: true, tex: true });
         assert_eq!(plan.tex_source_job.unwrap().arxiv_id, "2301.00001");
+
+        // 同意があっても LCIR を切れば出ない。
+        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "0").await.unwrap();
+        let plan = plan_completion(&pool, id).await.unwrap();
+        assert_eq!(plan.missing, MissingSet { pdf: true, tex: false });
     }
 
     #[sqlx::test(migrations = "./migrations")]
     async fn plan_completion_skips_present_attachments(pool: SqlitePool) {
         let id = arxiv_entry(&pool, "2301.00002").await;
-        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_ENABLED_KEY, "1").await.unwrap();
+        crate::db::settings::set_setting(&pool, crate::db::settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "1").await.unwrap();
         add_att(&pool, id, "p.pdf", "application/pdf").await;
         add_att(&pool, id, "s.gz", "application/gzip").await;
         let plan = plan_completion(&pool, id).await.unwrap();

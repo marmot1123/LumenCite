@@ -164,6 +164,8 @@ interface FetchArxivSourcesResult {
   built: number;
   pdf_only: number;
   failed: number;
+  /** 実行中に同意が外されて打ち切ったか（v1.0.0-p3）。未処理の対象は次回そのまま拾える。 */
+  aborted: boolean;
 }
 
 /** バイト数を人が読める単位にする（1 KiB = 1024 B・小数 1 桁）。 */
@@ -1006,17 +1008,17 @@ function DataTab() {
       }
       case "tex_fetch": {
         const r = result as FetchArxivSourcesResult;
+        if (r.total === 0) return { message: t("settings.data.texFetchNone"), error: null };
+        const done = t("settings.data.texFetchDone", {
+          total: r.total,
+          fetched: r.fetched,
+          built: r.built,
+          pdfOnly: r.pdf_only,
+          failed: r.failed,
+        });
+        // 途中で同意を外したときは、それが理由だと明示する（黙って件数が減ると失敗に見える）。
         return {
-          message:
-            r.total === 0
-              ? t("settings.data.texFetchNone")
-              : t("settings.data.texFetchDone", {
-                  total: r.total,
-                  fetched: r.fetched,
-                  built: r.built,
-                  pdfOnly: r.pdf_only,
-                  failed: r.failed,
-                }),
+          message: r.aborted ? `${done} ${t("settings.data.texFetchStopped")}` : done,
           error: null,
         };
       }

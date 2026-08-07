@@ -1034,7 +1034,8 @@ fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
 
 /// クリップ後の arXiv TeX ソース自動取得 + LCIR 構築（LCIR Phase 4 の自動化・best-effort）。
 ///
-/// ジョブは `lcir.enabled` ON のときだけ発行される（`clipper::derive_tex_source_job`）。
+/// ジョブは e-print 自動取得が有効なときだけ発行される（`clipper::derive_tex_source_job` が
+/// `ingestion::tex_autofetch_enabled` = 同意あり かつ LCIR ON を判定・v1.0.0-p3）。
 /// 失敗はログのみでクリップ自体は成功扱い（PDF ジョブと同じ契約）。ビルドは内部でも
 /// フラグを再確認するので、発行後に OFF へ切り替わっても DB には書かない。
 fn spawn_tex_source_job(deps: &ServerDeps, job: clipper::TexSourceJob) {

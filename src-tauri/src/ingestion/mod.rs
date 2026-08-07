@@ -62,7 +62,8 @@ async fn raw_lcir_enabled(pool: &SqlitePool) -> Option<String> {
         .flatten()
 }
 
-/// arXiv から e-print（TeX ソース）を**自動で**取得してよいか（v1.0.0-p3 で `lcir.enabled` から分離）。
+/// arXiv から e-print（TeX ソース）を自動取得することへの**同意そのもの**
+/// （v1.0.0-p3 で `lcir.enabled` から分離）。
 ///
 /// 分けた理由: `lcir.enabled` を既定 ON にすると、**何も操作していないユーザーのクリップや
 /// 論文追加のたびに数 MB の外部ダウンロードが黙って始まる**。LCIR を作ること（手元の計算）と、
@@ -71,10 +72,13 @@ async fn raw_lcir_enabled(pool: &SqlitePool) -> Option<String> {
 ///
 /// | 保存値 | 結果 |
 /// |---|---|
-/// | `Some("1")` | ON |
-/// | `Some(_)` | OFF |
+/// | `Some("1")` | 同意あり |
+/// | `Some(_)` | 同意なし |
 /// | `None` | [`tex_autofetch_default`]（＝この版より前に LCIR を明示 ON にしていたか） |
-pub async fn tex_autofetch_enabled(pool: &SqlitePool) -> bool {
+///
+/// ⚠ **取りに行ってよいかは [`tex_autofetch_enabled`] で判定すること。** これは
+/// 「同意しているか」だけで、LCIR 自体が切られているかは見ていない（設定 UI の表示用）。
+pub async fn tex_autofetch_consent(pool: &SqlitePool) -> bool {
     match settings::get_setting(pool, settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY)
         .await
         .ok()
@@ -85,6 +89,25 @@ pub async fn tex_autofetch_enabled(pool: &SqlitePool) -> bool {
         Some(_) => false,
         None => tex_autofetch_default(pool).await,
     }
+}
+
+/// **e-print を実際に取りに行ってよいか。取得 4 経路が呼ぶ唯一の決定点。**
+///
+/// 同意（[`tex_autofetch_consent`]）に加えて **LCIR 自体が有効であること**も要る。
+/// これは `lcir.vision_alt_text.enabled` と**まったく同型**（`generate_vision_alt_texts` は
+/// `lcir_enabled && vision_alt_text_enabled` を要求する）。
+///
+/// LCIR を要求する理由は 2 つ:
+///
+/// 1. **取ってきても使えない。** LCIR が OFF なら直後の `build_lcir_for_attachment` は
+///    `enabled: false` の no-op なので、数 MB の通信が LCIR に 1 行も化けない。
+///    分離前の実装が `lcir.enabled` で gate していたのはこの理由だった。
+/// 2. **同意を撤回できなくなる。** 設定 UI のチェックボックスは（Vision と同じく）
+///    `disabled={!lcirEnabled}` なので、LCIR を切ると同意を下ろせない。ここで AND を
+///    取らないと「操作できない灰色のチェックが生きたまま外部通信が続く」状態が作れる
+///    （レビューで 2 レンズが独立に当てた）。
+pub async fn tex_autofetch_enabled(pool: &SqlitePool) -> bool {
+    lcir_enabled(pool).await && tex_autofetch_consent(pool).await
 }
 
 /// 未設定のときの既定値。**この版より前に `lcir.enabled` を明示 ON にしていた人は、
@@ -2782,6 +2805,55 @@ mod tests {
         assert!(lcir_enabled(&pool).await, "明示 ON");
     }
 
+    /// **既定 ON が「実際に build を起こす」ところまで確かめる。**
+    /// 判定関数のテストだけだと、経路が別の理由（配線漏れ）で動いていなくても気づけない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_brand_new_library_does_attempt_a_build(pool: SqlitePool) {
+        // 設定を 1 つも書かない = p3 の既定。
+        let att = setup_attachment(&pool).await;
+        let (_, built) = ingest_new_pdf_attachment(
+            &pool,
+            Path::new("/nonexistent"),
+            PathBuf::from("/nonexistent.pdf"),
+            att,
+            |_| {},
+        )
+        .await;
+        assert_ne!(
+            built,
+            AutoBuildOutcome::Disabled,
+            "未設定は既定 ON なので、build は「フラグ OFF」で降りない: {built:?}"
+        );
+    }
+
+    /// 反転の判定は **`set_lcir_enabled` が `"0"`/`"1"` しか書かない**ことに乗っている。
+    /// 書き手と読み手の契約を 1 本で固定する（片方だけ変えたら落ちる）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_writer_and_the_reader_agree_on_the_two_values(pool: SqlitePool) {
+        for (enabled, expected_value) in [(true, "1"), (false, "0")] {
+            settings::set_setting(
+                &pool,
+                settings::LCIR_ENABLED_KEY,
+                crate::lcir_enabled_value(enabled),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                settings::get_setting(&pool, settings::LCIR_ENABLED_KEY)
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(expected_value),
+                "書き手は \"0\"/\"1\" 以外を書かない"
+            );
+            assert_eq!(
+                lcir_enabled(&pool).await,
+                enabled,
+                "読み手が同じ意味に戻す"
+            );
+        }
+    }
+
     /// e-print 自動取得は `lcir.enabled` とは**別の同意面**。既定 ON の LCIR に
     /// 引きずられて外部ダウンロードが始まらないことを固定する（p3 の分離の核心）。
     #[sqlx::test(migrations = "./migrations")]
@@ -2813,6 +2885,48 @@ mod tests {
         settings::set_setting(&pool, settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "0")
             .await
             .unwrap();
+        assert!(!tex_autofetch_enabled(&pool).await);
+    }
+
+    /// **LCIR を切ったら取得も止まる。** 同意は保存値として残る（UI のチェックは映したまま）が、
+    /// 取りに行く判定は false になる。ここを AND にしないと、設定 UI が
+    /// `disabled={!lcirEnabled}` で同意を下ろせないまま外部通信だけが続く
+    /// （`lcir.vision_alt_text.enabled` は最初からこの形。TeX 側だけ非対称だった）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn turning_lcir_off_stops_fetching_but_keeps_the_consent(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        assert!(tex_autofetch_enabled(&pool).await, "LCIR が ON なら取りに行く");
+
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        assert!(
+            !tex_autofetch_enabled(&pool).await,
+            "LCIR を切ったら取りに行かない（取ってきても build が no-op で無駄になる）"
+        );
+        assert!(
+            tex_autofetch_consent(&pool).await,
+            "同意そのものは残す ── 勝手に外すと UI のチェックが独りでに消えたように見える"
+        );
+
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        assert!(tex_autofetch_enabled(&pool).await, "戻せば元どおり");
+    }
+
+    /// 逆向き: LCIR が ON でも同意が無ければ取りに行かない（分離の主目的）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn lcir_on_without_consent_does_not_fetch(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        settings::set_setting(&pool, settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        assert!(lcir_enabled(&pool).await);
         assert!(!tex_autofetch_enabled(&pool).await);
     }
 
