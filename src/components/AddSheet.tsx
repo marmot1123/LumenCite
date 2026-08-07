@@ -124,9 +124,12 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
         // 欠落判定は返ってきた entry.attachments が権威（新規/既存とも二重添付しない）。
         const hasPdf = entry.attachments.some((a) => a.mime_type.toLowerCase().includes("pdf"));
         const hasTex = entry.attachments.some((a) => a.mime_type === "application/gzip");
-        const lcir = await invoke<boolean>("get_lcir_enabled").catch(() => false);
+        // e-print（TeX ソース）の取得は **`lcir.enabled` ではなく専用の同意面**で決める
+        // （v1.0.0-p3）。LCIR は既定 ON になったので、それで判定すると論文を足すたびに
+        // 数 MB の外部ダウンロードが黙って始まる。
+        const texConsent = await invoke<boolean>("get_lcir_tex_autofetch_enabled").catch(() => false);
         const wantPdf = downloadPdf && !hasPdf;
-        const wantTex = lcir && !hasTex;
+        const wantTex = texConsent && !hasTex;
 
         // 既存エントリで欠落がある場合は clipper.complete_missing に従う（未設定=確認 / "1"=自動）。
         // 新規エントリはチェックボックスが同意なので確認しない。
@@ -156,7 +159,7 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
             console.warn("arXiv PDF download failed:", e);
           }
         }
-        // TeX ソースも欠落時のみ（LCIR 有効時）。シートを待たせない fire-and-forget。
+        // TeX ソースも欠落時のみ（自動取得に同意しているときだけ）。待たせない fire-and-forget。
         if (wantTex) {
           const entryId = entry.id;
           void (async () => {

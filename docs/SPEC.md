@@ -202,8 +202,8 @@ Claude Desktop / Claude Code などの MCP クライアントから LumenCite �
 - **識別子ベース抽出**: ページの meta タグ（`citation_doi` / `citation_arxiv_id` / `citation_isbn` / `citation_pdf_url` / `DC.Identifier`）と URL パターン（`arxiv.org/abs|pdf/...`、`doi.org/10.*` canonical）から DOI / arXiv ID / ISBN を抽出。メタデータの解決・重複判定・エントリ作成は**すべてアプリ側**（既存 `metadata.rs` / `find_duplicate_entry` / `create_entry` を再利用）で行い、拡張は「識別子を抜いて POST するだけ」の薄い実装
 - **フォールバック**: 識別子が無いページは `webpage` エントリ（title + URL + OG タグの日付/サイト名）として保存
 - **PDF 自動添付**: `citation_pdf_url` または arXiv ID から導出した PDF URL をアプリ側でダウンロードして添付（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き。ペイウォール等で失敗してもエントリ作成は成功扱い）
-- **TeX ソース自動取得（LCIR Phase 4 の自動化）**: arXiv クリップで **`lcir.enabled` が ON のときだけ**、e-print も取得して LCIR（構造 + 生 LaTeX 数式）を自動構築する。OFF なら取得しない。重複クリップでは再取得しない（詳細パネルのボタンで明示再取得可）
-- **PDF の LCIR 自動 build（v1.0.0-p2）**: **`lcir.enabled` が ON のときだけ**、PDF 添付が増える 3 経路（手動添付 / arXiv 取得 / クリッパー）で**全文索引に続けて** LCIR を構築する。加えて既存ライブラリには**起動時バックフィル**が少しずつ行き渡らせる（1 ランの時間予算あり・添付境界で判定 / 手動バッチ・Vision 生成・TeX 一括取得・バックアップのいずれかが動いていれば譲る / 別インスタンス起動中は走らない / dev ビルドは既定オフ）。**抽出器版を上げただけでは自動再構築しない**（旧版更新は明示ボタンのまま）。pdfium を読み込めない環境では PDF を飛ばして件数に数え、TeX ソースの構築は続ける
+- **TeX ソース自動取得（LCIR Phase 4 の自動化）**: arXiv クリップで **`lcir.tex_autofetch.enabled`（e-print 自動取得の同意）と `lcir.enabled` の**両方** ON のときだけ**、e-print も取得して LCIR（構造 + 生 LaTeX 数式）を自動構築する。どちらかが OFF なら取得しない（v1.0.0-p3 で同意面を分離）。重複クリップでは再取得しない（詳細パネルのボタンで明示再取得可）
+- **PDF の LCIR 自動 build（v1.0.0-p2）**: **`lcir.enabled` が ON のときだけ**（v1.0.0-p3 で**既定 ON**に反転）、PDF 添付が増える 3 経路（手動添付 / arXiv 取得 / クリッパー）で**全文索引に続けて** LCIR を構築する。加えて既存ライブラリには**起動時バックフィル**が少しずつ行き渡らせる（1 ランの時間予算あり・添付境界で判定 / 手動バッチ・Vision 生成・TeX 一括取得・バックアップのいずれかが動いていれば譲る / 別インスタンス起動中は走らない / dev ビルドは既定オフ）。**抽出器版を上げただけでは自動再構築しない**（旧版更新は明示ボタンのまま）。pdfium を読み込めない環境では PDF を飛ばして件数に数え、TeX ソースの構築は続ける
 - **重複**: 既存エントリ（DOI/arXiv/ISBN 一致）があれば作成せず duplicate 応答 → 拡張はバッジで通知
 - **対象ブラウザ**: Chrome（Manifest V3）。WebExtension 標準準拠で実装し Firefox は将来の小差分。配布は v1 では load-unpacked + GitHub Releases の zip（Chrome Web Store は後日）
 
@@ -219,7 +219,7 @@ Claude Desktop / Claude Code などの MCP クライアントから LumenCite �
 重複クリップ（エントリが既に在る）でエントリに PDF/TeX が欠けていれば補完する。「欠落分だけ補完する。ただし**初回は確認**を取り、以後は確認なしを選べる」設計。**確認 UI はツールバーボタン直下の拡張ポップアップ**（ユーザー要望・2026-07-19）— クリックした場所で確認が完結し、ブラウザ→アプリをまたぐ非同期 UX を持ち込まない。
 
 - **新設定 `clipper.complete_missing`（アプリ側・全取込経路で共有）**: 未設定 = 初回確認 ／ `"1"` = 確認なしで自動補完。**判断は常にアプリ側**で行い、拡張は応答に従うだけの stateless 設計（AddSheet とも設定を共有するため）。
-- **欠落検出**（duplicate 判定直後・エントリ単位）: PDF 欠落 = mime `%pdf%` の添付なし かつ クリップから PDF URL が導出できる ／ TeX 欠落 = mime `application/gzip` の添付なし かつ arxiv_id あり かつ **`lcir.enabled` ON**（既存の TeX 自動取得と同一ゲート）。TeX は上書き契約（LCIR Phase 4）なので「欠落」= 添付行の有無のみ（在れば対象外）。
+- **欠落検出**（duplicate 判定直後・エントリ単位）: PDF 欠落 = mime `%pdf%` の添付なし かつ クリップから PDF URL が導出できる ／ TeX 欠落 = mime `application/gzip` の添付なし かつ arxiv_id あり かつ **e-print 自動取得が有効**（`lcir.tex_autofetch.enabled` と `lcir.enabled` の両方 ON・既存の TeX 自動取得と同一ゲート）。TeX は上書き契約（LCIR Phase 4）なので「欠落」= 添付行の有無のみ（在れば対象外）。
 - **duplicate 応答を拡張**: 設定 `"1"` なら即補完し `completing: ["pdf","tex"]` を返す（バッジで「補完中」を表現可能）。未設定かつ欠落ありなら `confirm_missing: ["pdf","tex"]` を返す（この時点では何もしない）。
 - **拡張ポップアップ（ボタン直下の確認）**: service worker は `confirm_missing` を受けたら pending payload（entry_id/title/missing）を `chrome.storage.session` に置き、`chrome.action.setPopup({popup:"confirm.html"})` → **`chrome.action.openPopup()`**（Chrome 127+。使えない環境ではバッジ `?` を出し、次のボタンクリックがポップアップを開くフォールバック）。ポップアップの選択肢は「補完する」／「今回はしない」／「**次回以降は確認せず補完する**」。選択後は payload を消して `setPopup({popup:""})` で通常動作に戻す。
 - **新エンドポイント `POST /clipper/complete`**: `{entry_id, remember?: bool}`（同一 Bearer 認証・`clipper.enabled` ゲート）。アプリ側で欠落を**再検証**してから既存の `spawn_pdf_job` / `spawn_tex_source_job` を発行し、`remember` なら `clipper.complete_missing="1"` を保存。PDF URL・arxiv_id はクリップ時の値をアプリ側で保持せず、エントリの識別子から再導出する（arXiv 導出 PDF / e-print。`citation_pdf_url` 由来の補完はこの版では対象外 = arXiv 前提で十分。ゴミ箱のエントリは `deleted_at IS NULL` で弾き、confirm 後に trash された TOCTOU も空プランにする）。
@@ -230,7 +230,7 @@ Claude Desktop / Claude Code などの MCP クライアントから LumenCite �
 
 既存コーパスのバックフィル用。クリッパーの欠落補完は「再遭遇した論文を拾う」増分向けで、手持ちの arXiv エントリ全部に TeX を揃えるにはこちらが本命。
 
-- **設定 → データ**に「arXiv の TeX ソースを一括取得」ボタン（`lcir.enabled` ON のときのみ活性。既存の「未構築 PDF を一括 LCIR 化」ボタンの隣・同じ busy/結果表示パターン）。
+- **設定 → データ**に「arXiv の TeX ソースを一括取得」ボタン（e-print 自動取得の同意が ON のときのみ活性。**実行中に同意を外すと添付境界で打ち切る**（v1.0.0-p3）。既存の「未構築 PDF を一括 LCIR 化」ボタンの隣・同じ busy/結果表示パターン）。
 - **対象**: ゴミ箱以外で `arxiv_id` があり、mime `application/gzip` の添付が**無い**エントリ。
 - 各対象に `download_and_attach_arxiv_source` → `build_lcir_for_attachment` を**直列**実行。**arXiv への礼儀としてリクエスト間 3 秒スロットル**（export.arxiv.org の慣行に合わせバーストしない）。
 - PDF-only 投稿（TeX 未公開）は `failed` と分けて `pdf_only` としてカウント（`fetch_arxiv_source` は先頭 5 バイトの `%PDF-` で即打ち切るので再実行のコストは軽微。永続マーカーは持たず、手動バッチの再実行で再判定される割り切り）。
@@ -325,7 +325,7 @@ LumenCite ライブラリを **ターミナルから直接読める** CLI を実
 
 - 添付成功後は**バックグラウンドで全文索引**（`pdf-extract` → `fulltext`）まで自動で行い、直後から PDF 全文検索の対象になる（索引失敗＝スキャン PDF 等は無視し、後追いの手動索引に委ねる）。
 - ダウンロード失敗（ペイウォール・ネットワーク障害・ID 不正）でも**エントリ作成は成功扱い**。フロントは警告をログに残すのみで、詳細パネルからの手動添付に誘導する。
-- **TeX ソース自動取得（LCIR Phase 4 の自動化）**: **`lcir.enabled` が ON のときだけ**、追加直後に fire-and-forget で `download_arxiv_source` → `build_lcir_for_attachment` も実行する（PDF チェックボックスとは独立・Web クリッパーと同じゲートと best-effort 契約。失敗はログのみ・詳細パネルのボタンで再取得可）。
+- **TeX ソース自動取得（LCIR Phase 4 の自動化）**: **`lcir.tex_autofetch.enabled`（e-print 自動取得の同意）と `lcir.enabled` の**両方** ON のときだけ**、追加直後に fire-and-forget で `download_arxiv_source` → `build_lcir_for_attachment` も実行する（PDF チェックボックスとは独立・Web クリッパーと同じゲートと best-effort 契約。失敗はログのみ・詳細パネルのボタンで再取得可）。
 - 対象は arXiv タブのみ（DOI / ISBN は出版社側の PDF 配布が不定のため対象外）。詳細は `API_SPEC.md` の `download_arxiv_pdf` を参照。
 
 ### 将来検討事項（lumencite-bib Skill の駆動方式）
@@ -347,7 +347,7 @@ CLI（読取＋書込）が揃ったので、LaTeX 執筆支援の `lumencite-bi
 - **入るもの**: 1エントリ複数 PDF 添付（下記）／v0.7.0 以降の信頼性・レビュー修正（バックアップ自動リストア + FTS self-heal・BibTeX エスケープ 等）／LCIR Phase 0-4（`lcir.enabled` 既定 OFF の実験機能）／**取得整備**（クリッパー欠落補完 + TeX 一括取得バッチ + AddSheet quirk 修正 — 拡張 zip の更新を伴うため、配布の都合でリリースと同期させる）。**LCIR Phase 5 に入る前に出す。**
 - **理由**: LCIR はフラグ既定 OFF でリリースを止める理由にならない／main に既にユーザー価値（特に信頼性修正）が溜まっている／拡張 zip は GitHub Release 添付でしか配布できない。
 - **以後のリリース間引き**: LCIR フェーズはフラグ付きで main に積み、リリースは **2〜3 フェーズごと**（例: v0.9.0 = Phase 5+6）。署名・notarize 等のリリース作業コストと配信頻度のバランスを取る。
-- **v1.0.0 の看板 = LCIR 完成**: Phase 9/10 到達 + `lcir.enabled` 既定 ON 化のタイミングで「機械可読文献基盤の完成」として 1.0 を名乗る。
+- **v1.0.0 の看板 = LCIR 完成**: Phase 9/10 到達 + `lcir.enabled` 既定 ON 化（**v1.0.0-p3 で実施済み**。外部通信を伴う e-print 自動取得は `lcir.tex_autofetch.enabled` へ分離）のタイミングで「機械可読文献基盤の完成」として 1.0 を名乗る。
 - **フェーズ順序の変更と Phase 9 の分割（2026-07-23 決定）**: Phase 6 完了後の実装順は **9a → 8 → 7 → 9b/10**。Phase 9 を **9a（エクスポート第一段 = LCIR JSON + Markdown 書き出し・v0.10.0 予定）**と **9b（JATS/TEI/HTML+MathML — Presentation MathML を出す Phase 7 が本質的前提）**に分割する。9a を前倒しする理由: ①中身（`LcirDocument` 派生ビュー・validation・`get_lcir_document`）は Phase 6b 時点で実質完成しており、残作業はファイル書き出しと Markdown レンダラのみ（migration 不要・依存追加なし・ヒューリスティックなし＝「誤検出より欠損」を構造的に満たす）。②フラグ OFF で main に積んできた Phase 4〜6b の成果（原文 LaTeX 数式・定理番号・cite key）を初めて目に見えるユーザー価値（Obsidian 論文ノート直行の Markdown）に変換できる。③Phase 9 のうち Phase 7 に本質依存するのは 9b だけなので、分割すれば二度手間は生じない。**v1.0.0 の「Phase 9 到達」は 9a を指し、9b は post-1.0 でもよい。**
 
 ### LCIR エクスポート（Phase 9a・v0.10.0 予定）

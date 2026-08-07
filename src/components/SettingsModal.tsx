@@ -164,6 +164,8 @@ interface FetchArxivSourcesResult {
   built: number;
   pdf_only: number;
   failed: number;
+  /** 実行中に同意が外されて打ち切ったか（v1.0.0-p3）。未処理の対象は次回そのまま拾える。 */
+  aborted: boolean;
 }
 
 /** バイト数を人が読める単位にする（1 KiB = 1024 B・小数 1 桁）。 */
@@ -801,6 +803,9 @@ function DataTab() {
   // 描画されず素通りすることがあるため）。
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [lcirEnabled, setLcirEnabled] = useState(false);
+  // arXiv から e-print を**自動で**取りに行ってよいか（v1.0.0-p3）。
+  // `lcir.enabled` は既定 ON になったので、外部通信の同意はそこから切り離してある。
+  const [texAutofetchEnabled, setTexAutofetchEnabled] = useState(false);
   // 図の代替テキスト生成（Phase 8c）は画像 1 枚ごとに課金されるので、LCIR とは別の同意フラグ。
   const [altTextEnabled, setAltTextEnabled] = useState(false);
   // 代替テキスト未生成の図の件数（課金される前に規模を見せる）。
@@ -810,6 +815,7 @@ function DataTab() {
   };
   useEffect(() => {
     invoke<boolean>("get_lcir_enabled").then(setLcirEnabled).catch(() => {});
+    invoke<boolean>("get_lcir_tex_autofetch_enabled").then(setTexAutofetchEnabled).catch(() => {});
     invoke<boolean>("get_lcir_vision_alt_text_enabled").then(setAltTextEnabled).catch(() => {});
     refreshAltTextPending();
   }, []);
@@ -1002,17 +1008,17 @@ function DataTab() {
       }
       case "tex_fetch": {
         const r = result as FetchArxivSourcesResult;
+        if (r.total === 0) return { message: t("settings.data.texFetchNone"), error: null };
+        const done = t("settings.data.texFetchDone", {
+          total: r.total,
+          fetched: r.fetched,
+          built: r.built,
+          pdfOnly: r.pdf_only,
+          failed: r.failed,
+        });
+        // 途中で同意を外したときは、それが理由だと明示する（黙って件数が減ると失敗に見える）。
         return {
-          message:
-            r.total === 0
-              ? t("settings.data.texFetchNone")
-              : t("settings.data.texFetchDone", {
-                  total: r.total,
-                  fetched: r.fetched,
-                  built: r.built,
-                  pdfOnly: r.pdf_only,
-                  failed: r.failed,
-                }),
+          message: r.aborted ? `${done} ${t("settings.data.texFetchStopped")}` : done,
           error: null,
         };
       }
@@ -1238,6 +1244,15 @@ function DataTab() {
       showBatchOutcome("rederive", null, errMsg(e));
     } finally {
       setBusy(null);
+    }
+  };
+
+  const toggleTexAutofetch = async (next: boolean) => {
+    try {
+      await invoke("set_lcir_tex_autofetch_enabled", { enabled: next });
+      setTexAutofetchEnabled(next);
+    } catch (e) {
+      setError(errMsg(e));
     }
   };
 
@@ -1471,6 +1486,20 @@ function DataTab() {
           <input type="checkbox" checked={lcirEnabled} onChange={(e) => void toggleLcir(e.target.checked)} />
           <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.data.lcirEnable")}</span>
         </label>
+        {/* e-print 自動取得は独立の同意面（v1.0.0-p3）。LCIR は手元の計算だが、こちらは
+            相手のサーバへ数 MB を取りに行くので、既定 ON にした LCIR に含めない。 */}
+        <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={texAutofetchEnabled}
+            disabled={!lcirEnabled}
+            onChange={(e) => void toggleTexAutofetch(e.target.checked)}
+          />
+          <span style={{ fontSize: 12.5, color: "var(--text)" }}>{t("settings.data.texAutofetchEnable")}</span>
+        </label>
+        <div style={{ fontSize: 11, color: "var(--text-mute)", marginTop: 4, lineHeight: 1.55 }}>
+          {t("settings.data.texAutofetchDesc")}
+        </div>
         <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
           <SecondaryBtn
             onClick={() => handleLcirBatch("build")}
@@ -1500,7 +1529,7 @@ function DataTab() {
           </SecondaryBtn>
           <SecondaryBtn
             onClick={handleFetchTex}
-            disabled={!lcirEnabled || activeFetchTexRunning || anyLcirBatchRunning || activeGcRunning}
+            disabled={!texAutofetchEnabled || activeFetchTexRunning || anyLcirBatchRunning || activeGcRunning}
           >
             {activeFetchTexRunning
               ? activeTexProgress

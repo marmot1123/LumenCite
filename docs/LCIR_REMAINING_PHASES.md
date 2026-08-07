@@ -138,7 +138,7 @@ migration 20 本すべてに当たって確認した。0 件なら v1.0.0 のロ
 | 7 | ~~（PR なし）**唯一の再構築 80 分 + Vision 1 回**~~ **完了**（2026-08-06・§2.17） | — | — | なし | **実行済** | 版を 5 回上げても実データは動いていなかった。**実測は再構築 20 分（見積り 80 分の 1/4）・Vision 346 件 30 分 ≈$0.80（見積り $2.19 の 1/2.7）**。138/138 completed・`failed` 0・carry 887/888（失敗 1 件は debt-14 の予告どおり）。**DB ファイルは 1 バイトも増えなかった**（#6 の GC が作った free page で吸収） |
 | 8 | ~~`feat(LCIR): 全文検索の索引源を LCIR 優先にする（p1）`~~ **完了**（§2.18・**PR #88**・`88d1fc0`） | p1 | M / 900–1,250 → **実績 1,990 追加 / 214 削除**（テスト込み） | なし | 否 | 再構築の**後**。p1 の再導出は pdfium 不要の純 SQL（秒オーダー）なので再構築に相乗りさせる利得がほぼ無い一方、debt-17 / debt-22 の解消を含むので独立してレビューしたい。OCR 保護を settings に置く決定（§2.6-1）により **migration は不要**になり、配布版 v0.10.0 との併用も壊れない |
 | 9 | ~~`feat(LCIR): LCIR の自動 build（p2）`~~ **完了**（§2.19） | p2 | L / 420–620 | なし | 否 | p1 の後。p1 が build 経路（reuse / 新版の両方）に page-FTS を配線済みなので p2 は索引を意識しなくてよい。逆順だと p2 が pdf_extract 前提の配線を書き p1 で剥がす。**着手前調査で doc の数字が 8 箇所腐っていた**（§10）ほか、**設計への敵対的検証が「p2 が新しく作る危険」を 3 件出した**（前景書き込みの `SQLITE_BUSY` / pdfium marshall の毒 / フロントの二重索引） |
-| 10 | `feat(LCIR): lcir.enabled 既定 ON + TeX 自動取得の同意分離（p3）` | p3 | M / 300–360 | なし | 否 | p2 の後でないと機能的 no-op（`lcir_readable` が false のままでチャットの LCIR ツールが出ない）。**分離と反転は同一 PR 必須**（分けると中間コミットで全 arXiv エントリに無言の e-print DL が走る）。**p0 の Linux 実バンドル検証はこの前に済ませる**（§2.6-5） |
+| 10 | ~~`feat(LCIR): lcir.enabled 既定 ON + TeX 自動取得の同意分離（p3）`~~ **完了**（§2.22） | p3 | M / 300–360 → **実績 557 追加 / 56 削除**（コードのみ・テスト込み。doc 込みで 658/73） | なし | 否 | p2 の後でないと機能的 no-op（`lcir_readable` が false のままでチャットの LCIR ツールが出ない）。**分離と反転は同一 PR 必須**（分けると中間コミットで全 arXiv エントリに無言の e-print DL が走る）。**p0 の Linux 実バンドル検証はこの前に済ませる**（§2.6-5） |
 | 11 | （PR なし）**ゲート ②b — リポジトリ全体レビュー** + 指摘修正 PR | — | — | なし | 否 | 抽出器は ②a で通過済みなので p1/p2/p3/p4 と横断関心事に絞れる。**抽出出力を変える指摘が出たら既定で v1.0.1 送り**（再構築 1 回を守る） |
 | 12 | `release: v1.0.0` | — | — | アプリ 0.10.0→1.0.0 | 否 | 実データ・実 UI を見てからタグ（§9） |
 
@@ -2004,6 +2004,130 @@ unverified 0。** 最重要は **3 レンズが独立に同じ根に当てた 1 
   「バッチ中にモーダルを閉じ→開く」「開いたまま完了を見る」「代替テキストの件数がずれたときに
   確認が出る」「確認から実行する間にまたずれたら再確認になる」の 4 つ。
 
+### 2.22 #10（p3・既定 ON + 同意分離）の実装記録（2026-08-07・完了）
+
+v1.0.0 の看板「`lcir.enabled` 既定 ON」。**反転と分離は同一 PR**（分けると中間コミットで
+全 arXiv エントリに無言の e-print ダウンロードが走る・§2.2 の #10 行）。
+
+#### 反転は「`"0"` でなければ ON」
+
+| 保存値 | 意味 | 結果 |
+|---|---|---|
+| `Some("0")` | ユーザーが明示的に切った | **OFF** |
+| `None` | 一度も触っていない | **ON**（p3 の既定） |
+| `Some("1")` | 明示的に入れた | ON |
+| それ以外 | 想定外 | ON |
+
+**「明示 OFF」と「未設定」を区別できることが反転の前提。** `set_lcir_enabled` は `"0"`/`"1"` しか
+書かず、他に書く本番経路が無く、migration に seed も無いので「保存値が無い＝意思表示していない」と
+読んでよい。逆に `== Some("1")` のままだと**切った人も含めて全員 OFF に固定される**。
+想定外の値を ON と読むのは暗黙の不変条件なので、3 状態 + 想定外 5 種を単体テストで固定した。
+
+#### 分離したのは「外部へ取りに行く同意」だけ
+
+`lcir.enabled` が許していた 4 つ（①手動 build ②自動 build ③起動時バックフィル ④e-print 自動取得）の
+うち、**④だけ**を `lcir.tex_autofetch.enabled` へ出した。手元で LCIR を組むこと（計算）と、
+arXiv へ数 MB を取りに行くこと（通信・相手への負荷）は同意の性質が違う。
+従う 4 経路: クリップ時の自動取得 / 重複クリップの欠落補完 / `fetch_missing_arxiv_sources` /
+AddSheet の arXiv 追加。**`fetch_missing_arxiv_sources` はボタンだが同意面に従わせた** ──
+押した瞬間に数百件ぶんを取りに行く経路なので、「取得してよいか」そのものを見るのが正しい。
+
+#### 既定値の設計で 2 つ間違えかけた
+
+1. **`lcir_enabled()` で既定を決めてはいけない。** 反転後は未設定でも true になるので、
+   それで「旧ユーザーか」を判定すると**新規ユーザー全員に自動取得が付いてくる**（分離が無意味になる）。
+   見るのは**生の保存値が `"1"` か**（`raw_lcir_enabled`）。
+2. **バックフィルは `false` でも書く。** 「同意していないから書かない」にすると未設定が残り、
+   後からユーザーが `lcir.enabled` を切って入れ直したときに既定判定が再び走って
+   **同意していない自動取得が有効になる**。`"0"` を明示的に置いて曖昧さを消す。
+
+判定（`tex_autofetch_default`）とバックフィルが**同じ 1 か所**を通るので、
+バックフィルがまだ走っていない起動直後の窓でも答えが変わらない（テストで固定した）。
+
+#### 既定 OFF 前提のテストは 7 本だった
+
+doc の予告「8 本」も中間メモの「10 本」も外れ、**実測 7 本**（`ingestion/mod.rs` 6 +
+`ingestion/backfill.rs` 1）。**`clipper.rs` は 0 本**で、「分離を先にやれば無改造で通る」という
+予測だけは当たった（clipper のテストは `lcir.enabled` を明示 `"1"` にするので、
+`tex_autofetch_default` が旧同意を引き継いで同じ結果になる）。
+7 本はいずれも「OFF なら何もしない」を主張するテストで、**未設定＝OFF に暗黙に依存していた**ため、
+明示 `"0"` を置いて意図を保った（主張は 1 つも変えていない）。
+
+#### 変異
+
+8 通り当てて **8/8 killed**。**件数ではなくテスト名で記録する**（件数だけだと監査できず、
+実際 1 回目の集計は `grep` が `failures:` の一覧行まで数えて 6 行が +1 ずれていた）。
+
+| 変異 | 置換 | 落ちたテスト |
+|---|---|---|
+| 既定を OFF に戻す（反転の取り消し） | 1 | `a_brand_new_library_does_not_fetch_eprints` / `lcir_is_on_unless_explicitly_turned_off` / `plan_completion_gates_the_tex_job_on_the_fetch_consent` / `tex_source_job_requires_arxiv_id_and_the_fetch_consent` / `turning_lcir_off_stops_fetching_but_keeps_the_consent` / `unexpected_values_are_read_as_on` |
+| 未設定の既定を「常に取得してよい」に | 1 | `a_brand_new_library_does_not_fetch_eprints` / `duplicate_outcome_confirm_then_completing` / `duplicate_outcome_no_missing_is_side_effect_free` / `handle_complete_verifies_and_remembers` |
+| 旧ユーザーの引き継ぎをやめる | 1 | `an_existing_opt_in_keeps_fetching_eprints` / `the_answer_is_the_same_before_and_after_the_backfill` / `the_backfill_carries_an_existing_opt_in_and_is_idempotent` |
+| 既定判定を `lcir_enabled` にすり替える（分離の無効化） | 1 | 上記 + `the_backfill_pins_the_answer_so_a_later_opt_in_cannot_grant_it` |
+| **取得判定から LCIR の AND を外す** | 1 | `plan_completion_gates_the_tex_job_on_the_fetch_consent` / `tex_source_job_requires_arxiv_id_and_the_fetch_consent` / `turning_lcir_off_stops_fetching_but_keeps_the_consent` |
+| バックフィルが `false` を書かない | 1 | `the_backfill_pins_the_answer_so_a_later_opt_in_cannot_grant_it` |
+| バックフィルが既存値を上書きする | 1 | `the_backfill_carries_an_existing_opt_in_and_is_idempotent` |
+| クリップの取得を `lcir.enabled` 判定に戻す | 2 | `plan_completion_gates_the_tex_job_on_the_fetch_consent` / `tex_source_job_requires_arxiv_id_and_the_fetch_consent` ほか 3 |
+
+#### コミット後レビューで直したもの（confirmed 17 件 / 31 件中）
+
+5 レンズ 31 件のうち 14 件は敵対的検証で反証。残る 17 件を反映した。
+
+- **最重要（2 レンズが独立に検出）: 同意面の設計が `lcir.vision_alt_text.enabled` と
+  「同型」を名乗りながら非対称だった。** Vision は消費点で
+  `lcir_enabled && vision_alt_text_enabled` を要求するのに、TeX 側は UI の
+  `disabled={!lcirEnabled}` だけ真似てバックエンドの AND を落としていた。結果
+  **「LCIR OFF + 同意 ON」が到達可能**になり、その状態では (a) e-print を落とし続けるのに
+  直後の build が `enabled:false` の no-op で通信が 1 バイトも LCIR に化けず、
+  (b) 設定 UI のチェックが灰色で**同意を下ろせない**。
+  `tex_autofetch_enabled` を `lcir_enabled && tex_autofetch_consent` にして Vision と揃えた
+  （同意そのものは `tex_autofetch_consent` として残し、UI のチェックは保存値を映す ──
+  LCIR を切った間だけ外れて見えると「勝手に消えた」と読める）。
+- **一括取得が同意を最初の 1 回しか読んでいなかった。** 数百件 × 3 秒スロットルで数十分走る
+  経路なので、「設定で切ったのに arXiv を叩き続ける」が実際に踏める。Vision バッチと同じく
+  ループ先頭で読み直し、`aborted` を返して UI に理由を出す。
+- **`docs/SPEC.md` の TeX ゲート 4 箇所**と src-tauri のコメント 3 箇所が
+  `lcir.enabled` のまま腐っていた（この PR が直し漏らした）。
+- **変異表の件数が 6 行で +1 ずれていた。** `grep -c "^test .* FAILED"` が `failures:` の
+  一覧行まで数えていた。**件数ではなくテスト名で記録する**形に変えた（監査できるので）。
+- `#10` 行の「実績 約 620 追加」も実測と合っていなかった（正: 557/56）。
+- 取得 2 経路のテストが**新しい同意キーを 1 度も通していなかった**（`lcir.enabled` を立てる
+  だけで旧同意の引き継ぎにより true になるので、**判定を差し戻す退行が緑のまま通る**）。
+  同意キーを直に動かす形に書き換え、LCIR を切ったら出ないことも足した。
+- テストを 4 本追加（AND の両方向 / 既定 ON で実際に build に着手する /
+  書き手と読み手の 2 値契約）。
+
+#### 直さずに債務として残したもの（検算した結果）
+
+レビューは「起動時の自動処理は未索引の添付を埋めるだけで、置き換えはこのボタンだけです」
+（`fulltextDeriveDesc`）が既定 ON で偽になる、と指摘した。**正しい。** p2 の build 経路は
+`regenerate_page_fts_from_lcir` を通り、`index_attachment_from_lcir` は
+**OCR と記録された添付しか避けない**ので、記録の無い既存索引は上書きされる。
+
+**ただし「自動経路では記録の無い索引を触らない」ガードは入れられなかった。**
+`index_attachment_from_pdf_extract` は書き込み時に出どころキーを **DELETE** するので、
+「記録なし + 索引あり」は
+
+- この版より前に OCR した添付（守りたい）
+- **たった今 pdf_extract で索引したばかりの新規添付**（守ると p1 が無効化される）
+
+を区別できない。ガードを入れると**新規添付が永久に pdf_extract のまま**になる。
+そこで文言を実態に合わせるに留め、**新しい債務 debt-37** とした（下表）。
+実害の窓は「テキスト層が部分的に壊れていて、それでも OCR した PDF」だけ ──
+純粋なスキャン本は LCIR のページ本文が空なので既存索引がそのまま残る。
+
+#### 残る限界
+
+- **実 UI・実 DB での確認はしていない**（`cargo test` 1,195 + `pnpm build` まで）。
+  実機で見るなら「新規プロファイルで LCIR が ON・TeX 取得が OFF」「既存 DB で両方 ON のまま」
+  「設定で TeX 取得を切ると一括取得ボタンが無効化される」「一括取得の実行中に同意を外すと止まる」の 4 つ。
+- **`lcir.enabled` を切ってもチャットのツールは `lcir_readable` 経由で隠れるだけ**で、
+  既に構築済みの版は残る（p3 の担当外・仕様どおり）。
+- 起動時バックフィルはクリッパー受信より前に確定させたいが、**厳密な順序は保証していない**
+  （同じ spawn の先頭に置いただけ）。判定側が同じ既定を返すので**答えは変わらない**が、
+  「バックフィルが走る前にクリップが来る」窓自体は残る。
+- **debt-37**（下記）── 自動 build が、記録の無い既存索引を LCIR で置き換えうる。
+
 ---
 
 ## 3. Phase 7（数式意味表現）— post-1.0
@@ -2405,12 +2529,18 @@ mtime 猶予のパターンは `sweep_backup_workdir` の `WORK_FILE_STALE_SECS 
 ＝添付境界でしか止められない。⚠ **予算判定の後にロック待ちで実時間が進むと上限が崩れる**ので、
 ロックはバックフィル側で残り予算をタイムアウトにして取り、**取れた直後に再評価する**（§2.19）。
 
-### v1.0.0-p3 — 既定 ON + 同意分離
+### v1.0.0-p3 — 既定 ON + 同意分離 ── **実装済み**（2026-08-07・#10・§2.22）
+
+**以下は着手前の調査記録**（実装で覆った点は §2.22 に照合表がある）。**行番号は関数名で grep し直すこと。**
 
 - 判定式は `ingestion/mod.rs:29-36`。反転の本体は `== Some("1")`（:35）1 行だが、直上の doc コメントと
   `db/settings.rs:88-90` のキー説明も嘘になる。
-- 既定 OFF 前提のテストは **8 本**（初版の「10 箇所程度」より少ない）。うち clipper.rs の 3 本は
-  **tex_autofetch 分離を先にやれば無改造で通る**ので、要修正は 5 本に減る。
+- ~~既定 OFF 前提のテストは **8 本**（初版の「10 箇所程度」より少ない）。うち clipper.rs の 3 本は
+  **tex_autofetch 分離を先にやれば無改造で通る**ので、要修正は 5 本に減る。~~
+  **実測は 7 本**（`ingestion/mod.rs` 6 + `ingestion/backfill.rs` 1）。**clipper.rs は 0 本**で、
+  「分離を先にやれば無改造で通る」という予測は当たった（clipper のテストは `lcir.enabled` を明示 `"1"` に
+  するので、`tex_autofetch_default` が旧同意を引き継いで同じ結果になる）。
+  ⚠ 初版「8 本」も中間メモの「10 本」も外れていた。**着手時に落として数えるのが唯一確実**。
 - **外部通信は 11 系統**あり、`lcir.enabled` に従うのは TeX 自動取得の 4 経路のみ
   （`clipper.rs:344` / `clipper.rs:423` / `lib.rs:1773` / `AddSheet.tsx:127`）。
   GitHub リリース確認は自動起動しない（設定→更新のボタンのみ）。
@@ -2520,6 +2650,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 
 | **debt-35** | **build ロックと OCR の pdfium セッションが別系統。** #9 の `LCIR_BUILD_LOCK` が直列化するのは *LCIR build 同士*だけで、OCR のラスタライズ（`llm/tools/ocr.rs` の `rasterize`）は含まない。両者は pdfium-render 側の `PDFIUM_THREAD_MARSHALL` で**安全には**直列化される（`thread_safe` は default feature。ただし直列化の単位は FFI 呼び出しではなく **`Pdfium` インスタンスの生存期間** ── `FPDF_InitLibrary` で `std::sync::Mutex` を取り `FPDF_DestroyLibrary` で離す）。したがってデータ競合は無いが、**`lock_build_within` のタイムアウトは「OCR が pdfium を握っている」を検出できない**ので、`build_busy` / `already_running` は真実の全部を語らない。統合するなら「pdfium を使う区間」を 1 つのロックにまとめる（`rasterize` も同じロックを通す）| S〜M | post-1.0 |
 | **debt-36** | **LCIR の版挿入がチャンクなしの単一トランザクション。** `insert_pdf_version_tx` は 1 添付ぶんの version 行・全ノード・fragment・assets・辺・記号を 1 tx で書く（実 DB の最大版は 272,583 ノード）。GC は削除側で同じ問題を実測して `NODE_DELETE_CHUNK = 50,000` を入れたが、挿入側は無分割のまま。#9 は本体プールの `busy_timeout` を **sqlx 既定 5 秒 → 30 秒**に上げて当座を凌いだが、最大級の版では 30 秒も超えうる。**1 添付 = 1 tx は supersede と carry の前提**（途中まで挿入された版が見えると `find_completed` / `latest_completed_for_attachment` が壊れる）なので、チャンク化するなら「未完了の版は completed にしない」状態設計とセットで | M | post-1.0 |
+| **debt-37** | **自動 build が、出どころの記録が無い既存の全文索引を LCIR で置き換えうる。** p1 は「記録の無い既存索引を自動で置き換えると課金して得た OCR 転写を消しうる」として、起動時の再導出バッチ（`AddMissingOnly`）にはガードを入れた。しかし **p2 の build 経路**は`regenerate_page_fts_from_lcir` を通り、`index_attachment_from_lcir` は **OCR と記録された添付しか避けない**。p3 で `lcir.enabled` が既定 ON になったため、起動時バックフィルが全ユーザーで走り、この経路が日常的に効くようになった。**同じガードを build 経路へ入れることはできない** ── `index_attachment_from_pdf_extract` は書き込み時に出どころキーを DELETE するので、「記録なし + 索引あり」が 『この版より前の OCR』なのか『たった今 pdf_extract で張った新規添付』なのか区別できず、ガードを入れると新規添付が永久に pdf_extract のままになる（p1 が無効化される）。**直すなら `index_attachment_from_pdf_extract` に `pdf_extract` を記録させる**（出どころが常に埋まれば「記録なし = この版より前」が一意に決まる）。実害の窓は「テキスト層が部分的に壊れていて、それでも OCR した PDF」だけで、純粋なスキャン本は LCIR のページ本文が空なので既存索引が残る | S〜M | post-1.0 |
 
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
 `ListItem` / `Footnote` / `Citation` / `InlineMath` / `EquationGroup` / `TextBlock` はどちらも生成しない。

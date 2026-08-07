@@ -354,7 +354,7 @@ OS キーチェーン側のサービス名: `com.lumencite.app`、アカウン�
 
 ### LCIR 関連テーブル（機械可読中間形式 / migration 0014）
 
-論文全文を「型付きノード木 + PDF 座標 + provenance + 信頼度」で保存する中間表現 **LCIR**（LumenCite Document Intermediate Representation）の基盤。設計全体は `docs/LCIR_design_overview.md`。**実験段階**で、settings `lcir.enabled` が `"1"` のときだけ構築する追加の side-build（既存 `fulltext` は不変）。抽出器は 2 系統: PDF 添付は pdfium（`lumencite-pdfium`）、arXiv TeX ソース添付（Phase 4・mime `application/gzip`）は TeX パーサ（`lumencite-tex`）。同一エントリに PDF 版と TeX 版の `document_version` が**別添付として併存**する（ADR #8）。第一段は下記 3 表のみ（math/assets/relations/symbols は後続フェーズの別 migration）。
+論文全文を「型付きノード木 + PDF 座標 + provenance + 信頼度」で保存する中間表現 **LCIR**（LumenCite Document Intermediate Representation）の基盤。設計全体は `docs/LCIR_design_overview.md`。settings `lcir.enabled` が ON のとき構築する（**v1.0.0-p3 で既定 ON**・判定は「`"0"` でなければ ON」）。抽出器は 2 系統: PDF 添付は pdfium（`lumencite-pdfium`）、arXiv TeX ソース添付（Phase 4・mime `application/gzip`）は TeX パーサ（`lumencite-tex`）。同一エントリに PDF 版と TeX 版の `document_version` が**別添付として併存**する（ADR #8）。第一段は下記 3 表のみ（math/assets/relations/symbols は後続フェーズの別 migration）。
 
 #### `document_versions` — 添付ごとの抽出結果 1 回分（provenance の正本）
 
@@ -413,7 +413,8 @@ OS キーチェーン側のサービス名: `com.lumencite.app`、アカウン�
 | `reading_order` | INTEGER | 読み順（任意） |
 | `fragment_type` | TEXT | `page` / `text_block` / `line` |
 
-設定キー `lcir.enabled`（`"1"` で有効・既定 off）は `db/settings.rs::LCIR_ENABLED_KEY`。OFF なら上記 3 表は空のまま、既存挙動は byte-for-byte 不変。
+設定キー `lcir.enabled` は `db/settings.rs::LCIR_ENABLED_KEY`。**v1.0.0-p3 で既定 ON に反転**し、判定は「`"0"` でなければ ON」（未設定 = 一度も触っていない = ON / 明示 `"0"` = 切った）。OFF なら上記 3 表は空のまま。
+**arXiv からの e-print 自動取得はこのキーに含まれない** —— 外部通信の同意は `lcir.tex_autofetch.enabled` へ分離した（既定は「この版より前に `lcir.enabled` を明示 ON にしていたか」で、起動時に 1 回明示値へ確定させる）。
 
 #### `document_nodes_fts` — ノード単位 FTS（Phase 2 / migration 0015）
 

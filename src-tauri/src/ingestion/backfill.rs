@@ -570,6 +570,11 @@ mod tests {
     /// 書くと p3 で既定 ON になった既存ユーザーにバックフィルが永久に届かない。
     #[sqlx::test(migrations = "./migrations")]
     async fn disabled_does_nothing_and_writes_no_key(pool: SqlitePool) {
+        // v1.0.0-p3 で `lcir.enabled` の既定が ON に反転したので、**明示的に切る**。
+        // 以前はこの行が無くても未設定 = OFF だった。
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
         let _serial = BUILD_LOCK_TESTS.lock().await;
         entry_with_pdf(&pool, "a", "application/pdf").await;
         let st = BackfillState::default();
