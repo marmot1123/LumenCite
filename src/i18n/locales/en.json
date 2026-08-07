@@ -598,7 +598,8 @@
     "identifiersLabel": "Identifiers",
     "attachmentsLabel": "Attachments",
     "removeAttachment": "Remove attachment",
-    "removeAttachmentConfirm": "Remove this PDF?"
+    "removeAttachmentConfirm": "Remove this PDF?",
+    "lcirBuildBusy": "Another LCIR build is running. Try again once it finishes."
   },
   "pdfViewer": {
     "loading": "Loading…",
@@ -944,7 +945,8 @@
       "gcNone": "There were no superseded versions to reclaim.",
       "gcRunning": "Another LCIR job is running. Please try again once it finishes.",
       "gcError": "Failed to reclaim old versions: {{error}}",
-      "gcConfirmCrops": "{{crops}} cropped figure image(s) ({{size}}) will be deleted as well."
+      "gcConfirmCrops": "{{crops}} cropped figure image(s) ({{size}}) will be deleted as well.",
+      "lcirNoPdfium": "Skipped {{skipped}} of {{total}} attachments because the PDF library (pdfium) could not be loaded."
     },
     "about": {
       "appTitle": "LumenCite",

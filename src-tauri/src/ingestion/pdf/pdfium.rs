@@ -45,8 +45,38 @@ fn library_search_dirs(exe: Option<&Path>) -> Vec<PathBuf> {
     dirs
 }
 
+/// **このプロセスで pdfium が壊れていると分かった**印（v1.0.0-p2）。
+///
+/// 立つのは 2 つの生成点だけで、判定を文字列一致に頼らない（エラー文言が変われば無言で
+/// 効かなくなり、それを守るテストも無い）:
+///
+/// 1. [`bind_pdfium`] がライブラリを見つけられなかった ── Windows / Linux で同梱に失敗した配布物。
+/// 2. **pdfium 抽出タスクが panic した**（[`note_extraction_panic`]）── pdfium-render の
+///    `PDFIUM_THREAD_MARSHALL` は panic すると毒され、以後 `PdfiumThreadMarshall::lock()` は
+///    `Err` を返さず **panic する**（`thread_safe.rs:68-79`）。この状態では bind は成功し
+///    続けるので、1. だけでは印が永久に立たず、残りの対象を全部 panic で焼き切る。
+///
+/// **読むのは自動経路だけ**（起動時バックフィル・一括バッチ・添付時の自動 build）。
+/// ユーザーが名指しで押した 1 件 build は必ず実際に bind を試みて生のエラーを返す ──
+/// 印はプロセス寿命なので、自動経路と同じように黙らせると pdfium を入れ直しても
+/// 「押しても何も起きない」状態から再起動なしには抜けられなくなる。
+static PDFIUM_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// このプロセスで pdfium が使えないと分かっているか（自動経路だけが読む）。
+pub fn bind_is_known_broken() -> bool {
+    PDFIUM_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// pdfium 抽出タスクが panic したことを記録する（生成点 2）。
+pub fn note_extraction_panic() {
+    PDFIUM_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// pdfium 動的ライブラリを複数の候補から探してバインドする。
 /// 候補は [`library_search_dirs`] を参照。見つからなければ最後にシステムライブラリ。
+///
+/// 失敗したら [`PDFIUM_BROKEN`] を立てる（生成点 1）。**印は自動経路だけが読む**ので、
+/// ここで立てても名指しの 1 件 build は次回も実際に bind を試みる。
 pub fn bind_pdfium() -> Result<Box<dyn PdfiumLibraryBindings>, String> {
     let exe = std::env::current_exe().ok();
     for dir in library_search_dirs(exe.as_deref()) {
@@ -55,7 +85,10 @@ pub fn bind_pdfium() -> Result<Box<dyn PdfiumLibraryBindings>, String> {
             return Ok(b);
         }
     }
-    Pdfium::bind_to_system_library().map_err(|e| format!("pdfium library not found: {e}"))
+    Pdfium::bind_to_system_library().map_err(|e| {
+        PDFIUM_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        format!("pdfium library not found: {e}")
+    })
 }
 
 #[cfg(test)]

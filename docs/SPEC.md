@@ -203,6 +203,7 @@ Claude Desktop / Claude Code などの MCP クライアントから LumenCite �
 - **フォールバック**: 識別子が無いページは `webpage` エントリ（title + URL + OG タグの日付/サイト名）として保存
 - **PDF 自動添付**: `citation_pdf_url` または arXiv ID から導出した PDF URL をアプリ側でダウンロードして添付（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き。ペイウォール等で失敗してもエントリ作成は成功扱い）
 - **TeX ソース自動取得（LCIR Phase 4 の自動化）**: arXiv クリップで **`lcir.enabled` が ON のときだけ**、e-print も取得して LCIR（構造 + 生 LaTeX 数式）を自動構築する。OFF なら取得しない。重複クリップでは再取得しない（詳細パネルのボタンで明示再取得可）
+- **PDF の LCIR 自動 build（v1.0.0-p2）**: **`lcir.enabled` が ON のときだけ**、PDF 添付が増える 3 経路（手動添付 / arXiv 取得 / クリッパー）で**全文索引に続けて** LCIR を構築する。加えて既存ライブラリには**起動時バックフィル**が少しずつ行き渡らせる（1 ランの時間予算あり・添付境界で判定 / 手動バッチ・Vision 生成・TeX 一括取得・バックアップのいずれかが動いていれば譲る / 別インスタンス起動中は走らない / dev ビルドは既定オフ）。**抽出器版を上げただけでは自動再構築しない**（旧版更新は明示ボタンのまま）。pdfium を読み込めない環境では PDF を飛ばして件数に数え、TeX ソースの構築は続ける
 - **重複**: 既存エントリ（DOI/arXiv/ISBN 一致）があれば作成せず duplicate 応答 → 拡張はバッジで通知
 - **対象ブラウザ**: Chrome（Manifest V3）。WebExtension 標準準拠で実装し Firefox は将来の小差分。配布は v1 では load-unpacked + GitHub Releases の zip（Chrome Web Store は後日）
 

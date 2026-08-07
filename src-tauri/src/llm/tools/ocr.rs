@@ -132,8 +132,24 @@ pub async fn run_ocr(
         .filter(|k| !k.trim().is_empty())
         .ok_or_else(|| ToolError::Execution(format!("API key for {provider} is not configured")))?;
 
-    // 3. ラスタライズ（pdfium・同期）
-    let images = rasterize(&abs_path, pages.as_deref())?;
+    // 3. ラスタライズ（pdfium・同期）。**必ず `spawn_blocking` の下で回す**（v1.0.0-p2）──
+    //    pdfium-render の `thread_safe` は `FPDF_InitLibrary` から `FPDF_DestroyLibrary` まで
+    //    `std::sync::Mutex` を握り続けるので、async fn の中で直接呼ぶと 1 冊ぶんのレンダリングが
+    //    終わるまで tokio のワーカースレッドを 1 本占有する。p2 で LCIR の自動 build が
+    //    常時走るようになると、その 1 本がランタイム全体を巻き添えにする。
+    let rasterize_path = abs_path.clone();
+    let rasterize_pages = pages.clone();
+    let images = tokio::task::spawn_blocking(move || {
+        rasterize(&rasterize_path, rasterize_pages.as_deref())
+    })
+    .await
+    .map_err(|e| {
+        // OCR のラスタライズも pdfium を触るので、panic すると marshall が毒され、以後
+        // このプロセスの `Pdfium::new` は Err ではなく panic する。自動経路（LCIR の
+        // 自動 build / バックフィル）が残りを焼き切らないよう、ここでも印を立てる。
+        crate::ingestion::pdf::pdfium::note_extraction_panic();
+        ToolError::Execution(format!("rasterize task panicked: {e}"))
+    })??;
     if images.is_empty() {
         return Err(ToolError::Execution("no pages to OCR".into()));
     }

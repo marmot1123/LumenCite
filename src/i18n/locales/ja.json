@@ -598,7 +598,8 @@
     "identifiersLabel": "識別子",
     "attachmentsLabel": "添付ファイル",
     "removeAttachment": "添付を削除",
-    "removeAttachmentConfirm": "この PDF を削除しますか？"
+    "removeAttachmentConfirm": "この PDF を削除しますか？",
+    "lcirBuildBusy": "別の LCIR 構築が実行中です。完了後にもう一度お試しください。"
   },
   "pdfViewer": {
     "loading": "読み込み中…",
@@ -944,7 +945,8 @@
       "gcNone": "回収できる旧版はありませんでした。",
       "gcRunning": "他の LCIR 処理が実行中です。完了してからもう一度お試しください。",
       "gcError": "旧版の回収に失敗しました: {{error}}",
-      "gcConfirmCrops": "図の切り出し画像 {{crops}} 枚（{{size}}）も削除されます。"
+      "gcConfirmCrops": "図の切り出し画像 {{crops}} 枚（{{size}}）も削除されます。",
+      "lcirNoPdfium": "PDF を読み取るライブラリ (pdfium) を読み込めないため、{{total}} 件中 {{skipped}} 件は構築していません。"
     },
     "about": {
       "appTitle": "LumenCite",

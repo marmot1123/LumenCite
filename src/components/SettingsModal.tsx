@@ -967,6 +967,7 @@ function DataTab() {
         built: number;
         reused: number;
         failed: number;
+        skipped: number;
       }>(kind === "build" ? "build_missing_lcir" : "rebuild_outdated_lcir");
       if (!r.enabled) {
         setMessage(t("settings.data.lcirDisabled"));
@@ -975,6 +976,8 @@ function DataTab() {
           kind === "build" ? t("settings.data.lcirNone") : t("settings.data.lcirRebuildNone"),
         );
       } else {
+        // サマリは常に出す。pdfium を読めない配布物では大半が「着手すらしていない」ので、
+        // その事実を**サマリを隠さずに**併記する（分岐を排他にすると built/failed が消える）。
         setMessage(
           t(kind === "build" ? "settings.data.lcirDone" : "settings.data.lcirRebuildDone", {
             total: r.total,
@@ -983,6 +986,9 @@ function DataTab() {
             failed: r.failed,
           }),
         );
+        if (r.skipped > 0) {
+          setError(t("settings.data.lcirNoPdfium", { skipped: r.skipped, total: r.total }));
+        }
       }
     } catch (e) {
       const s = errMsg(e);

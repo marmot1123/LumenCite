@@ -63,6 +63,21 @@ pub struct BackupInfo {
 /// DB は 1 つなのでモジュール static で足りる。
 static BACKUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// バックアップが今走っているか（v1.0.0-p2 の LCIR バックフィルが読む）。
+///
+/// フル zip は `attachments/` を丸ごと束ねて実測 9 分かかる。その最中に LCIR build が完了して
+/// `gc_stale_asset_dirs` が旧 content_key ディレクトリを trash へ送ると、**アーカイブは
+/// 「`assets` 行はあるがファイルが無い」状態で固まる** ── 復元すると `heal_missing_assets` が
+/// 全ページ再抽出に化け、crop の sha256 が動いて**課金済み alt text の carry が無言で外れる**。
+///
+/// **状態を二重に持たない。** 実行中フラグを別に立てると「立て忘れ」という壊し方が生まれ、
+/// しかもそれを単体テストで検出できない（実行中の一瞬を外から観測する必要があるため）。
+/// [`BACKUP_LOCK`] を握っていること**が**実行中の定義なので、そのまま覗く。
+/// `try_lock` は待ち行列に並ばないので、待っている実行から permit を奪うことはない。
+pub fn is_running() -> bool {
+    BACKUP_LOCK.try_lock().is_err()
+}
+
 /// バックアップを実行する（手動実行 = 常に走る）。
 pub async fn run_backup(
     pool: &SqlitePool,
@@ -330,6 +345,23 @@ fn prune_old_backups(backups_dir: &Path, keep: usize) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// `is_running` は**バックアップのロックそのもの**を見る（別フラグを持たない）。
+    ///
+    /// フラグを二重に持つと「立て忘れ」という壊し方が生まれ、しかも実行中の一瞬を外から
+    /// 観測しないと検出できない ＝ 単体テストで守れない。ロックを定義そのものにすれば、
+    /// `run_backup` / `run_backup_if_due` が取る限り自動的に真になる。
+    /// これを読むのは v1.0.0-p2 の LCIR バックフィル（zip 中は譲る）。
+    /// ⚠ **「走っていなければ false」は assert しない。** `BACKUP_LOCK` はプロセス全体で
+    /// 共有の static で、同じファイルの他のバックアップテストが並列に取りうる。false 側は
+    /// このテストの制御下に無く、assert すると CI で不定期に落ちる（実際に落とした）。
+    /// 自分が握っている間だけが、このテストが観測を保証できる唯一の状態。
+    #[tokio::test]
+    async fn is_running_reflects_the_backup_lock() {
+        let guard = BACKUP_LOCK.lock().await;
+        assert!(is_running(), "ロックを握っている間は true");
+        drop(guard);
+    }
 
     /// zip アーカイブ内のエントリ名一覧を返すテストヘルパ。
     fn archive_names(path: &Path) -> Vec<String> {
