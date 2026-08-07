@@ -94,6 +94,24 @@ pub const LCIR_ENABLED_KEY: &str = "lcir.enabled";
 /// 課金が発生するため、LCIR の実験フラグ ON だけで暗黙に許可しない（`clipper.enabled` と同型）。
 pub const LCIR_VISION_ALT_TEXT_ENABLED_KEY: &str = "lcir.vision_alt_text.enabled";
 
+/// v1.0.0-p1: 添付ごとの「全文索引の出どころ」を記録するキーの接頭辞
+/// （`fulltext.source.<attachment_id>` = `"lcir"` / `"ocr"`）。
+///
+/// `fulltext` は FTS5 仮想表なので provenance 列を持てず（`virtual tables may not be altered`）、
+/// 側表を足すと dev 起動の瞬間に共有実 DB へ migration が適用されて配布版が起動不能になる
+/// （`NewerSchema`）。そこで **DDL を伴わない settings KV** に置く。
+/// 記録が無い = pdf_extract 由来 or 未索引（既定なので書かない）。
+pub const FULLTEXT_SOURCE_KEY_PREFIX: &str = "fulltext.source.";
+
+/// v1.0.0-p1: 既存ライブラリの `fulltext` を LCIR の page ノードから 1 回だけ再導出したか
+/// （`FTS_FULLTEXT_REBUILT_KEY` と同型の一度きりフラグ）。
+///
+/// build 経路に派生を配線しても、既に完了版がある添付には二度と build が走らないので
+/// （`attachments_without_completed_lcir` は完了版のある添付を除外し、
+/// `attachments_with_outdated_lcir` は版 bump 無しでは 0 件）、この経路が無いと
+/// 既存 138 添付に派生索引が永久に届かない。値は "1" のみ。
+pub const FTS_FULLTEXT_LCIR_DERIVED_KEY: &str = "fts.fulltext_lcir_derived";
+
 #[cfg(test)]
 mod tests {
     use super::*;

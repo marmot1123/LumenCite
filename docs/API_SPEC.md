@@ -426,16 +426,20 @@ v0.3.0 で本格的な編集 API を追加。`Author` 型・`AuthorInput` / `Aut
 | `download_arxiv_source` | `entry_id: i64, arxiv_id: String` | `Result<Attachment>` — arXiv TeX ソース（e-print）を DL して添付（LCIR Phase 4） |
 | `delete_attachment` | `id: i64` | `Result<()>` |
 | `open_attachment` | `id: i64` | `Result<()>` |
-| `index_attachment` | `id: i64` | `Result<i64>` — 索引した非空ページ数 |
+| `index_attachment` | `id: i64` | `Result<{pages, outcome}>` — `pages` = 実行後の索引済みページ数 / `outcome` = `lcir` \| `pdf_extract` \| `skipped_ocr` \| `skipped_lcir`（v1.0.0-p1。守って何もしなかった場合を UI が区別できるようにするため） |
 | `is_attachment_indexed` | `id: i64` | `Result<bool>` — fulltext 行が 1 件以上あるか |
 | `unindex_attachment` | `id: i64` | `Result<()>` |
 | `index_missing_attachments` | — | `Result<IndexMissingResult>` — 未索引 PDF を一括索引（v0.7.0） |
 
-`index_attachment` はPDFからテキストを抽出してFTS5インデックスに登録する（冪等：既存行を削除して再登録）。`add_attachment` 後に自動で呼ばれるほか、詳細パネルの索引/再索引ボタンからも任意タイミングで呼べる。
+`index_attachment` はその添付の全文索引を張り直す（冪等）。`add_attachment` 後に自動で呼ばれるほか、詳細パネルの索引/再索引ボタンからも任意タイミングで呼べる。**v1.0.0-p1 以降、テキストの出どころは 1 つの決定点が選ぶ**（下記）。
 
-`index_missing_attachments` は、まだ全文索引の無い PDF 添付（ゴミ箱を除く）を `db::fulltext::attachments_without_fulltext` で洗い出し、順に `pdf-extract` で抽出して索引する。過去に添付済み・自動索引を逃したエントリの後追い用（設定 → データの「未索引の PDF を一括索引」）。
+`index_missing_attachments` は、まだ全文索引の無い PDF 添付（ゴミ箱を除く）を `db::fulltext::attachments_without_fulltext` で洗い出し、順に索引する。過去に添付済み・自動索引を逃したエントリの後追い用（設定 → データの「未索引の PDF を一括索引」）。`IndexMissingResult = {total, indexed, needs_ocr, failed, skipped}`（`skipped` = 既存の索引を守って触らなかった添付数・v1.0.0-p1）。
 
-**添付後の自動索引（CR-027）:** 手動添付（`add_attachment`）・arXiv 取得（`download_arxiv_pdf`）・Web クリッパー（MCP `spawn_pdf_job`）のいずれの経路も、添付成功後に共有ヘルパ `db::fulltext::extract_and_index` でバックグラウンド索引する（best-effort・スキャン PDF は OCR へ誘導）。以前はリーダーからの手動添付とクリッパー経路が索引されなかった。
+**索引ソースの決定点（v1.0.0-p1）:** **pdf_extract を使う本番経路 5 つ**（添付 3 経路 + `index_attachment` + `index_missing_attachments`）はすべて `ingestion::index_fulltext_for_attachment` を通る。OCR の保存（`llm::tools::ocr::save_ocr_pages`）と LCIR からの再導出バッチは別の writer で、そちらの保護は `index_attachment_from_lcir` / `index_attachment_from_pdf_extract` の**トランザクション内の判定**が担う。判断は 3 段で、①この添付の索引が **OCR 由来**として記録されていれば触らない → ②`lcir.enabled` かつ LCIR の page ノードに本文があれば **LCIR から派生**（`regenerate_page_fts_from_lcir`）→ ③どちらでもなければ従来どおり `pdf-extract`。③は判定と書き込みを同一トランザクションで行い、**LCIR / OCR 由来の索引には譲る**（添付直後に spawn した `pdf-extract` は数十秒かかるので、後から書き戻すと LCIR 由来の索引を壊す = debt-17）。
+
+索引の出どころは **`settings` の添付単位キー `fulltext.source.<attachment_id>`**（値 `lcir` / `ocr`・キーが無ければ `pdf-extract` 由来か未索引）に記録する。`fulltext` は FTS5 仮想表なので provenance 列を足せず（`virtual tables may not be altered`）、側表を足すと migration が要るため。索引や添付を消すときは同じトランザクションでこの記録も消す。
+
+**添付後の自動索引（CR-027）:** 手動添付（`add_attachment`）・arXiv 取得（`download_arxiv_pdf`）・Web クリッパー（MCP `spawn_pdf_job`）のいずれの経路も、添付成功後に上記の決定点でバックグラウンド索引する（best-effort・スキャン PDF は OCR へ誘導）。以前はリーダーからの手動添付とクリッパー経路が索引されなかった。
 
 `download_arxiv_pdf` は、arXiv からメタデータ取得してエントリを作成した直後に「PDF も一括で取得する」ためのコマンド（AddSheet の arXiv タブのチェックボックス。デフォルト ON）。`arxiv_id` を正規化して `https://arxiv.org/pdf/<id>` を `download::download_and_attach`（50MB 上限・`%PDF-` マジックバイト検証・タイムアウト付き）でダウンロードし添付、成功後はバックグラウンドで `pdf-extract` → 全文索引を試みる（索引失敗は無視）。ペイウォールやネットワーク障害で失敗しても呼び出し側はエントリ作成を成功扱いにする（フロントは警告ログのみで詳細パネルからの手動添付に誘導）。
 
@@ -447,6 +451,7 @@ type IndexMissingResult = {
   indexed: number;   // テキストを抽出して索引できた数
   needs_ocr: number; // 0 ページ＝テキストレイヤー無し（OCR 候補）
   failed: number;    // 読み込み/抽出に失敗した数
+  skipped: number;   // 既存の索引（OCR / LCIR 由来）を守って触らなかった数（v1.0.0-p1）
 };
 ```
 
@@ -486,6 +491,7 @@ type FulltextResult = {
 | `build_missing_lcir` | — | `LcirBatchResult` — 多重起動ガード（`already_running`）+ `lcir-build-progress {done,total}` 進捗イベント |
 | `rebuild_outdated_lcir` | — | `LcirBatchResult` — 同上。**既存ライブラリに新フェーズの成果（定理・参照グラフ・記号・図・表）を行き渡らせる唯一の経路**。設定 → データのボタンから実行 |
 | `fetch_missing_arxiv_sources` | — | `{total, fetched, built, pdf_only, failed}` — ゴミ箱以外で arxiv_id を持ち gzip 添付が無いエントリの e-print を直列取得（3 秒スロットル）して LCIR 構築。多重起動ガード + `tex-fetch-progress {done,total}` 進捗イベント + 完了時 `entries-changed`。`lcir.enabled` OFF は全 0 |
+| `rederive_fulltext_from_lcir` | — | `FulltextDeriveResult = {total, derived, skipped_ocr, skipped_empty, skipped_existing, failed}` — **v1.0.0-p1**。既存ライブラリの全文索引を LCIR の page ノードから張り直す。pdfium を使わない純 SQL なので**実測 16〜20 秒 / 138 添付**（進捗イベントは出さない）。OCR 由来の索引（`skipped_ocr`）と、LCIR に本文が 1 ページも無い添付（`skipped_empty` = スキャン本）は触らない。`build_missing_lcir` と同じ排他を使う（2 本目は `already_running`）。**起動時にも 1 回だけ走るが、そちらは「索引がまだ無い添付を埋めるだけ」**（`AddMissingOnly`）── `fulltext.source.*` はこの版で初めて書かれるキーで、**この版より前に回した OCR には記録が無い**ので、記録の無い既存索引を自動で置き換えると課金して得た転写を消しうる。**置き換えはこのボタンだけ**。一度きりフラグは `settings.fts.fulltext_lcir_derived`（`lcir.enabled` が OFF / 対象 0 件 / 失敗ありのときは立てないので、後から ON にした・後から build した場合に走る） |
 | `lcir_storage_stats` | — | `{file_bytes, used_bytes, free_bytes, gc: GcPreview}` — **v1.0.0-p4**。DB ファイルのページ収支（`(page_count − freelist_count) × page_size`・実測でファイルサイズと 1 バイト一致）と superseded 版の回収見積り。`GcPreview = {versions, versions_removable, versions_tombstoned, nodes, asset_rows, asset_bytes, alt_texts_protected, carry_refs_protected, orphan_versions_skipped}`。**`lcir.enabled` で gate しない**（切った人ほど旧版を消したい）。読み取りのみで実測 0.06 秒 |
 | `run_lcir_gc` | — | `GcOutcome` — **v1.0.0-p4・非可逆**。superseded 版を回収する。`GcOutcome = {versions_removed, versions_tombstoned, versions_skipped, nodes_removed, asset_rows_removed, files_trashed, fts_orphans_removed, freed_bytes, db_size}`。`build_missing_lcir` と同じガードを使い（2 本目は `already_running`）、Vision / TeX 取得が走っていても `already_running`。`lcir-gc-progress {done,total}` を版単位で emit。**`freed_bytes` は `freelist` の実測差分**で按分推定ではない。**ファイルサイズは縮まない**（free page になるだけ・次のバックアップと次の再構築で回収される） |
 | `search_lcir_nodes` | `query, collection_id?, tag_id?, view?` | `NodeFtsHit[]` |

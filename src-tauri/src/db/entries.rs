@@ -1023,6 +1023,8 @@ async fn purge_one(
     .bind(id)
     .execute(&mut **tx)
     .await?;
+    // 索引の出どころの記録（settings KV・p1）も同じ tx で消す。
+    crate::db::fulltext::clear_fulltext_sources_for_entry_tx(&mut *tx, id).await?;
     sqlx::query("DELETE FROM entries WHERE id = ?")
         .bind(id)
         .execute(&mut **tx)
@@ -1411,6 +1413,8 @@ pub async fn delete_entry(pool: &SqlitePool, id: i64) -> Result<(), sqlx::Error>
     .bind(id)
     .execute(&mut *tx)
     .await?;
+    // 索引の出どころの記録（settings KV・p1）も同じ tx で消す。
+    crate::db::fulltext::clear_fulltext_sources_for_entry_tx(&mut tx, id).await?;
 
     let rows_affected = sqlx::query("DELETE FROM entries WHERE id = ?")
         .bind(id)

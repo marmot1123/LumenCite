@@ -424,12 +424,15 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setIndexNote(null);
     setIndexStatus(s => ({ ...s, [attId]: "indexing" }));
     try {
-      const pages = await invoke<number>("index_attachment", { id: attId });
-      setIndexStatus(s => ({ ...s, [attId]: pages > 0 ? "indexed" : "none" }));
+      const r = await invoke<{ pages: number; outcome: string }>("index_attachment", { id: attId });
+      setIndexStatus(s => ({ ...s, [attId]: r.pages > 0 ? "indexed" : "none" }));
       setIndexNote(
-        pages > 0
-          ? t("detailPanel.indexDonePages", { count: pages })
-          : t("detailPanel.indexNoText"),
+        // 守って何もしなかった場合は「索引しました」と言わない（OCR の転写は上書きしない）。
+        r.outcome === "skipped_ocr"
+          ? t("detailPanel.indexKeptOcr", { count: r.pages })
+          : r.pages > 0
+            ? t("detailPanel.indexDonePages", { count: r.pages })
+            : t("detailPanel.indexNoText"),
       );
     } catch (e: any) {
       setIndexStatus(s => ({ ...s, [attId]: "none" }));

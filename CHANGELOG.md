@@ -15,7 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`get_document_blocks` and `search_document_nodes` now return each block's `node_id`** — the stable handle you pass to `get_node_context` and `get_node_relations`. (`get_document_blocks`' existing `index` only numbers blocks within one response and was never a block id.)
 - **Storage view and reclamation of superseded LCIR versions** — Settings → Data now shows how much of the database file is in use and how much is reusable, and can reclaim the old LCIR versions left behind by rebuilds. In a real library those old versions held **83% of all document nodes**. Reclaiming is offered even when LCIR is disabled, since that is exactly when the old versions are pure overhead. Versions that hold generated or hand-written figure descriptions are protected, and versions that carried-over descriptions point back to keep their record while their contents are freed. The database file itself does not shrink — the space becomes reusable and is reclaimed by the next backup and the next rebuild. No migration.
 
+### Changed
+
+- **Full-text search now reads its text from LCIR when a paper has been built** (experimental; requires LCIR enabled). The page text pdfium extracted for LCIR replaces the older extractor's output as the source of the search index — for newly attached papers, for every paper you build LCIR for, and, for an existing library, on demand from Settings → Data. In a real 138-paper library, converting the whole library added **112 pages**, of which **57 came from two papers that had no searchable text at all**, and removed the control characters that were splitting words inside the index — **729 index rows contained them, now none do**. Measured on twelve frequent terms, every term matched more pages than before (512 pages started matching that had not, against 216 that stopped — the new text is not a superset of the old one). Pages whose LCIR has no text keep their existing rows, so nothing is lost where pdfium reads nothing; papers you OCR from this version on are left untouched entirely. No migration; the conversion takes seconds and does not re-parse any PDF.
+
+  ⚠ **Text you OCR'd before this version is not recorded as OCR-derived**, so the manual conversion can replace it with the LCIR text. The automatic pass on launch therefore only fills attachments that have no index at all; replacing an existing index is the Settings → Data button only.
+
 ### Fixed
+
+- **A newly attached PDF can no longer lose its LCIR-derived index to the slower extractor finishing later** — the two writers are now one decision made in a single transaction. Previously, a paper whose text the older extractor could not read at all would disappear from search even though LumenCite had read it correctly.
 
 - **Regenerating a missing figure crop no longer loses its description** — when the app re-renders a crop that has gone missing and the new image differs byte-for-byte, the stored description now follows the new image. Previously the link broke silently, and the next rebuild would discard the paid-for description and bill for it again.
 

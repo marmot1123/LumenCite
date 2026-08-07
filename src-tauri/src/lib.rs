@@ -777,11 +777,12 @@ async fn add_attachment(
         Ok(att) => {
             // 添付成功後にバックグラウンドで全文索引する（SPEC: 添付後に自動索引・CR-027）。
             // リーダーからの手動添付もこの経路を通るので、以前は索引されなかった。
+            // 索引ソースの選択は `index_fulltext_for_attachment` に一本化してある（p1・debt-17）。
             let pool = state.db.clone();
             let att_id = att.id;
             let abs = dest.clone();
             tauri::async_runtime::spawn(async move {
-                db::fulltext::extract_and_index(&pool, abs, att_id).await;
+                ingestion::index_fulltext_for_attachment(&pool, abs, att_id, false).await;
             });
             Ok(att)
         }
@@ -833,7 +834,7 @@ async fn download_arxiv_pdf(
         .join(entry_id.to_string())
         .join(&att.file_name);
     tauri::async_runtime::spawn(async move {
-        db::fulltext::extract_and_index(&pool, abs, att_id).await;
+        ingestion::index_fulltext_for_attachment(&pool, abs, att_id, false).await;
     });
 
     Ok(att)
@@ -976,7 +977,7 @@ async fn index_attachment(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: i64,
-) -> Result<i64, String> {
+) -> Result<IndexAttachmentResult, String> {
     let att = db::attachments::get_attachment_with_path(&state.db, id)
         .await
         .map_err(|e| e.to_string())?;
@@ -984,25 +985,45 @@ async fn index_attachment(
     let root = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let abs = root.join(&att.file_path);
 
-    // pdf-extract は同期で重い CPU 処理なので blocking スレッドへ逃がす
-    let pages_text = tauri::async_runtime::spawn_blocking(move || {
-        pdf_extract::extract_text_by_pages(&abs).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    let pages: Vec<(i64, String)> = pages_text
-        .into_iter()
-        .enumerate()
-        .map(|(i, t)| ((i + 1) as i64, t))
-        .collect();
-    let indexed_pages = pages.iter().filter(|(_, t)| !t.trim().is_empty()).count() as i64;
-
-    db::fulltext::index_attachment(&state.db, id, &pages)
+    // ソースの選択（LCIR / OCR 保護 / pdf_extract）は単一の決定点に任せる（p1）。
+    // pdf-extract は同期で重い CPU 処理なので、その中で blocking スレッドへ逃がしている。
+    // 名指しの再索引なので、LCIR 由来の記録は退けて張り直してよい（OCR 由来は守る）。
+    // **何が起きたかを返す** ── ページ数だけ返すと、OCR を守って何もしなかったのに
+    // UI が「N ページを索引しました」と報告してしまう。
+    let (pages, outcome) = match ingestion::index_fulltext_for_attachment(&state.db, abs, id, true)
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        ingestion::FulltextIndexOutcome::Lcir(n) => (n, "lcir"),
+        ingestion::FulltextIndexOutcome::PdfExtract(n) => (n, "pdf_extract"),
+        // 既存の索引を守ったときは「今入っているページ数」を返す。0 を返すと UI が
+        // 「テキストが無い」と表示してしまい、守ったことが消えたように見える。
+        ingestion::FulltextIndexOutcome::SkippedOcr => (
+            db::fulltext::indexed_page_count(&state.db, id)
+                .await
+                .map_err(|e| e.to_string())?,
+            "skipped_ocr",
+        ),
+        ingestion::FulltextIndexOutcome::SkippedLcirIndexed => (
+            db::fulltext::indexed_page_count(&state.db, id)
+                .await
+                .map_err(|e| e.to_string())?,
+            "skipped_lcir",
+        ),
+        ingestion::FulltextIndexOutcome::Failed(e) => return Err(e),
+    };
+    Ok(IndexAttachmentResult {
+        pages,
+        outcome: outcome.to_string(),
+    })
+}
 
-    Ok(indexed_pages)
+/// `index_attachment` の戻り。`outcome` は `lcir` / `pdf_extract` / `skipped_ocr` / `skipped_lcir`。
+#[derive(serde::Serialize)]
+struct IndexAttachmentResult {
+    /// 実行後にこの添付が持つ索引済みページ数。
+    pages: i64,
+    /// 何をしたか（守って何もしなかった場合を UI が区別できるようにする）。
+    outcome: String,
 }
 
 /// 「未索引の PDF を一括索引」の結果サマリ。
@@ -1016,6 +1037,8 @@ struct IndexMissingResult {
     needs_ocr: i64,
     /// ファイル読み込み / 抽出に失敗した添付数。
     failed: i64,
+    /// 既存の索引（OCR / LCIR 由来）を守って触らなかった添付数（p1）。
+    skipped: i64,
 }
 
 /// まだ全文索引が無い PDF 添付を洗い出し、順にテキスト抽出して索引する。
@@ -1034,44 +1057,25 @@ async fn index_missing_attachments(
     let mut indexed = 0i64;
     let mut needs_ocr = 0i64;
     let mut failed = 0i64;
+    let mut skipped = 0i64;
 
     for (att_id, file_path) in targets {
         let abs = root.join(&file_path);
-        // pdf-extract は重い同期処理なので 1 件ずつ blocking スレッドへ逃がす。
-        let extracted = tauri::async_runtime::spawn_blocking(move || {
-            pdf_extract::extract_text_by_pages(&abs).map_err(|e| e.to_string())
-        })
-        .await;
-
-        let pages_text = match extracted {
-            Ok(Ok(p)) => p,
-            // spawn の join 失敗・抽出失敗どちらも「失敗」扱いで次へ。
-            _ => {
-                failed += 1;
-                continue;
+        // ソースの選択は単一の決定点に任せる（p1）。pdf_extract に落ちる場合も
+        // その中で blocking スレッドへ逃がしている。
+        match ingestion::index_fulltext_for_attachment(&state.db, abs, att_id, false).await {
+            ingestion::FulltextIndexOutcome::Lcir(_) => indexed += 1,
+            ingestion::FulltextIndexOutcome::PdfExtract(n) => {
+                if n > 0 {
+                    indexed += 1;
+                } else {
+                    // テキストレイヤーが無い（スキャン PDF 等）。OCR で拾う候補。
+                    needs_ocr += 1;
+                }
             }
-        };
-
-        let pages: Vec<(i64, String)> = pages_text
-            .into_iter()
-            .enumerate()
-            .map(|(i, t)| ((i + 1) as i64, t))
-            .collect();
-        let non_empty = pages.iter().filter(|(_, t)| !t.trim().is_empty()).count();
-
-        if db::fulltext::index_attachment(&state.db, att_id, &pages)
-            .await
-            .is_err()
-        {
-            failed += 1;
-            continue;
-        }
-
-        if non_empty > 0 {
-            indexed += 1;
-        } else {
-            // テキストレイヤーが無い（スキャン PDF 等）。OCR で拾う候補。
-            needs_ocr += 1;
+            ingestion::FulltextIndexOutcome::SkippedOcr
+            | ingestion::FulltextIndexOutcome::SkippedLcirIndexed => skipped += 1,
+            ingestion::FulltextIndexOutcome::Failed(_) => failed += 1,
         }
     }
 
@@ -1080,6 +1084,7 @@ async fn index_missing_attachments(
         indexed,
         needs_ocr,
         failed,
+        skipped,
     })
 }
 
@@ -1197,6 +1202,21 @@ async fn rebuild_outdated_lcir(
         lcir_progress_emitter(&app),
     )
     .await
+}
+
+/// LCIR（v1.0.0-p1）: 既存の全文索引を LCIR の page ノードから張り直す。
+///
+/// pdfium は使わず純 SQL なので秒オーダー（構築バッチと違って進捗イベントは出さない）。
+/// それでも同じ添付の `fulltext` を触るので、構築バッチとは相互排他にする。
+/// OCR 由来の索引と、LCIR に本文が無い添付（スキャン本）は触らない。
+#[tauri::command]
+async fn rederive_fulltext_from_lcir(
+    state: State<'_, AppState>,
+) -> Result<ingestion::FulltextDeriveResult, String> {
+    let _guard = begin_lcir_batch()?;
+    // 明示操作なので置き換えまでやる（自動実行は「足すだけ」＝ `AddMissingOnly`）。
+    ingestion::derive_page_fts_from_lcir_batch(&state.db, ingestion::DeriveMode::ReplaceUnprotected)
+        .await
 }
 
 /// ストレージの内訳（DB ファイルの使用中 / 再利用可 + LCIR の GC 見積り・v1.0.0-p4）。
@@ -3987,6 +4007,25 @@ pub fn run() {
                     Ok(false) => {}
                     Err(e) => eprintln!("fulltext_fts rebuild failed: {e}"),
                 }
+                // v1.0.0-p1: 既に完了 LCIR がある添付には build が二度と走らないので、
+                // 起動時に 1 回だけ page ノードから全文索引を埋める（純 SQL・秒オーダー）。
+                // **索引がまだ無い添付だけ**を対象にする（`AddMissingOnly`）。既存索引の
+                // 置き換えは設定→データのボタン（明示操作）に任せる。
+                // LCIR が OFF の間はフラグを立てずに降りる（後で ON にしたら走る）。
+                // 他の LCIR バッチと同じ排他を取る（取れなければ次回起動に回す）。
+                match begin_lcir_batch() {
+                    Ok(_guard) => match ingestion::derive_page_fts_from_lcir_once(&fts_pool).await {
+                        Ok(Some(r)) => eprintln!(
+                            "fulltext: derived from LCIR for {}/{} attachment(s) \
+                             (skipped: ocr {} / empty {} / existing {}, failed {})",
+                            r.derived, r.total, r.skipped_ocr, r.skipped_empty,
+                            r.skipped_existing, r.failed
+                        ),
+                        Ok(None) => {}
+                        Err(e) => eprintln!("fulltext derivation from LCIR failed: {e}"),
+                    },
+                    Err(_) => eprintln!("fulltext derivation from LCIR skipped: batch running"),
+                }
             });
 
             // CR-019: 既存行の識別子 canonical 列を埋め（migration 0013 の後段）、重複が
@@ -4361,6 +4400,7 @@ pub fn run() {
             get_lcir_document,
             build_missing_lcir,
             rebuild_outdated_lcir,
+            rederive_fulltext_from_lcir,
             lcir_storage_stats,
             run_lcir_gc,
             search_lcir_nodes,
