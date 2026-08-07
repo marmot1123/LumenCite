@@ -45,6 +45,8 @@ jobs:
   verify:
     name: Build Linux bundles and bind pdfium inside them
     runs-on: ubuntu-22.04
+    # 実測 約 12 分（rust-cache 冷）/ 約 7 分（温）。上限はハング対策。
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 

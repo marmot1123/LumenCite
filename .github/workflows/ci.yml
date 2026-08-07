@@ -24,6 +24,9 @@ jobs:
   frontend:
     name: Frontend build + extension tests
     runs-on: ubuntu-22.04
+    # 実測 3 分前後。ハングしたときに GitHub 既定の 360 分（6 時間）を燃やさないための上限で、
+    # 「遅いから落とす」ための値ではないので実測の 5 倍ほど余裕を取る。
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -45,6 +48,10 @@ jobs:
   rust:
     name: Rust test + clippy
     runs-on: ubuntu-22.04
+    # 実測 3〜4 分（apt 25 秒 + cargo test 95〜135 秒 + clippy 30〜37 秒）。
+    # **2026-08-07 に `Install Linux dependencies` が 20 分以上返らない実行が出た**
+    # （apt ミラーの一過性の不調・GitHub 側の障害報告は無し）。上限が無いと 6 時間走る。
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
