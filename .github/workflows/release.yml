@@ -92,36 +92,30 @@ jobs:
       #   macOS   → bundle.macOS.frameworks（.app/Contents/Frameworks/・codesign 対象）
       #   Linux   → bundle.resources（/usr/lib/LumenCite/・AppImage は $APPDIR/usr/lib/LumenCite/）
       #   Windows → bundle.resources（exe と同じディレクトリ）。CI 非対象なので手順は docs/RELEASE.md §4
-      # サプライチェーン対策（CR-004）: `latest` ではなく **リリースを固定**し、展開前に
-      # SHA-256 を検証する。upstream が侵害・差し替えされても、第三者バイナリが署名・
-      # notarization を受けて配布されることを防ぐ。
-      # 更新手順: PDFIUM_TAG を上げ、`curl -fsSL <url> | shasum -a 256` で各アセットの新しい値を
-      # 求めて差し替える（GitHub API の asset digest とも一致する）。**3 OS 分をまとめて上げること**
-      # （docs/RELEASE.md §4 に Windows 用の値も同じタグで記載している）。
+      # **版とハッシュの正本は `.github/pdfium.env`**（サプライチェーン対策 CR-004 の説明も
+      # そこに書いてある）。以前はここに直書きしていたが、linux-bundle-verify.yml が同じ値を
+      # 複製して持っており、RELEASE.md の更新手順が片方しか挙げていなかったため、
+      # pdfium を上げると検証ワークフローだけ古い版を掴んで緑になる穴があった。
       - name: Download and verify pdfium (macOS)
         if: startsWith(matrix.platform, 'macos')
-        env:
-          PDFIUM_TAG: chromium/7934
-          PDFIUM_SHA256: c3eaf0e4722398f64a9b806976efab378b9cb553743e7b9e27b594a4336c25e7
         run: |
+          . .github/pdfium.env
           mkdir -p src-tauri/pdfium tmp-pdfium
           curl -fL -o tmp-pdfium/pdfium.tgz \
             "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/pdfium-mac-univ.tgz"
-          echo "${PDFIUM_SHA256}  tmp-pdfium/pdfium.tgz" | shasum -a 256 -c -
+          echo "${PDFIUM_SHA256_MACOS}  tmp-pdfium/pdfium.tgz" | shasum -a 256 -c -
           tar -xzf tmp-pdfium/pdfium.tgz -C tmp-pdfium
           cp tmp-pdfium/lib/libpdfium.dylib src-tauri/pdfium/libpdfium.dylib
           rm -rf tmp-pdfium
 
       - name: Download and verify pdfium (Linux)
         if: matrix.platform == 'ubuntu-22.04'
-        env:
-          PDFIUM_TAG: chromium/7934
-          PDFIUM_SHA256: 60975aea26c0c6e2f0e0ca3e3c55d184085362f78ac689e4cba2d7d7997920bb
         run: |
+          . .github/pdfium.env
           mkdir -p src-tauri/pdfium tmp-pdfium
           curl -fL -o tmp-pdfium/pdfium.tgz \
             "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/pdfium-linux-x64.tgz"
-          echo "${PDFIUM_SHA256}  tmp-pdfium/pdfium.tgz" | sha256sum -c -
+          echo "${PDFIUM_SHA256_LINUX}  tmp-pdfium/pdfium.tgz" | sha256sum -c -
           tar -xzf tmp-pdfium/pdfium.tgz -C tmp-pdfium
           cp tmp-pdfium/lib/libpdfium.so src-tauri/pdfium/libpdfium.so
           rm -rf tmp-pdfium
@@ -192,6 +186,17 @@ jobs:
       - name: Verify pdfium is bundled (Linux)
         if: matrix.platform == 'ubuntu-22.04'
         run: ./scripts/verify_linux_bundle.sh src-tauri/target/release/bundle
+
+      # 検査が落ちたドラフトを**機械的に**止める。目視の運用だけに頼ると、
+      # 赤いジョブに気づかないまま公開する経路が残る（成果物はもうドラフトに載っている）。
+      - name: Mark the draft as unpublishable (Linux verify failed)
+        if: failure() && matrix.platform == 'ubuntu-22.04' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.ref_name }}" \
+            --title "DO NOT PUBLISH — Linux pdfium verify failed (${{ github.ref_name }})" \
+            || echo "::warning::ドラフトに印を付けられなかった。手動で破棄すること"
 
       - name: Cleanup macOS keychain
         if: startsWith(matrix.platform, 'macos') && always()

@@ -8,21 +8,23 @@ name: Linux bundle verify
 # （deb は /usr/lib/<name>/、AppImage は $APPDIR/usr/lib/<name>/）。ここでは .deb を実際に
 # インストールし、.AppImage を自己展開して、その中で `bind_pdfium()` を回す。
 #
-# 手動実行と、**同梱の前提に触る PR** で走る。フル Tauri ビルドで 20 分前後かかるので
-# paths を絞り、通常の PR では回さない（普段の PR は ci.yml だけ）。
+# 手動実行と、**同梱の前提に触る PR** で走る。1 回あたり約 12 分（rust-cache 冷）/ 約 7 分（温）
+# ── 2026-08-07 実測 ── かかるので paths を絞り、通常の PR では回さない（普段の PR は ci.yml だけ）。
 # **リリースは作らない**（成果物はアップロードもしない）。
 #
 # paths に挙げているのは「この検査の答えを変えうるファイル」:
 #   pdfium.rs                     探索候補そのもの（library_search_dirs）
 #   tauri.release-linux.conf.json 同梱先（bundle.resources）
 #   tauri.conf.json               productName ＝ 実行時のリソースディレクトリ名
-#   release.yml                   pdfium の取得先とバージョン
+#   .github/pdfium.env            pdfium の版と検証ハッシュ（正本）
+#   release.yml                   取得ステップそのもの
 # 片方だけ変えると検査が通ったまま実機で落ちるので、対で見直せるようにここに並べる。
 
 on:
   workflow_dispatch:
   pull_request:
     paths:
+      - ".github/pdfium.env"
       - "src-tauri/src/ingestion/pdf/pdfium.rs"
       - "src-tauri/tauri.conf.json"
       - "src-tauri/tauri.release-linux.conf.json"
@@ -69,17 +71,16 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # release.yml の Linux ジョブと同じ取得手順（タグ固定 + SHA-256 検証）。
-      # **値は release.yml と揃えること** — ずれると「検証した配置」と「出荷する配置」が別物になる。
+      # release.yml の Linux ジョブと**同じ正本**（.github/pdfium.env）から取る。
+      # 以前はここに値を複製しており、pdfium を上げたとき検証側だけ古い版を掴んで
+      # 緑になる穴があった（PR #92 のレビュー指摘）。
       - name: Download and verify pdfium (Linux)
-        env:
-          PDFIUM_TAG: chromium/7934
-          PDFIUM_SHA256: 60975aea26c0c6e2f0e0ca3e3c55d184085362f78ac689e4cba2d7d7997920bb
         run: |
+          . .github/pdfium.env
           mkdir -p src-tauri/pdfium tmp-pdfium
           curl -fL -o tmp-pdfium/pdfium.tgz \
             "https://github.com/bblanchon/pdfium-binaries/releases/download/${PDFIUM_TAG}/pdfium-linux-x64.tgz"
-          echo "${PDFIUM_SHA256}  tmp-pdfium/pdfium.tgz" | sha256sum -c -
+          echo "${PDFIUM_SHA256_LINUX}  tmp-pdfium/pdfium.tgz" | sha256sum -c -
           tar -xzf tmp-pdfium/pdfium.tgz -C tmp-pdfium
           cp tmp-pdfium/lib/libpdfium.so src-tauri/pdfium/libpdfium.so
           rm -rf tmp-pdfium
@@ -88,8 +89,8 @@ jobs:
       # .rpm は作らない（実行時検証の対象は .deb と .AppImage の 2 つ・§2.6-5）。
       #
       # 2 枚目の --config で updater 成果物を切る。**署名鍵をこのジョブに渡さないため**で、
-      # Linux の updater 成果物は .AppImage.tar.gz + .sig ＝ 検証対象の .deb / .AppImage
-      # そのものには 1 バイトも影響しない。--config は「後勝ちで順にマージ」される。
+      # updater 成果物は各バンドルの隣に並ぶ .sig（.AppImage.sig / .deb.sig / .rpm.sig）＝
+      # バンドル本体のバイト列は変わらない。--config は「後勝ちで順にマージ」される。
       - name: Build Linux bundles
         run: |
           pnpm tauri build \
