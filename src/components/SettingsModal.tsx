@@ -1294,16 +1294,7 @@ function DataTab() {
    * 一致していれば同意は正しい件数に対して取れているので、そのまま実行する
    * （毎回確認を挟むと、正しく見えている場合にも 1 クリック増えるだけになる）。
    */
-  const handleAltTextRequest = async () => {
-    setMessage(null);
-    setError(null);
-    setAltTextChecking(true);
-    try {
-      await proceedAltTextIfCountMatches(altTextPending);
-    } finally {
-      setAltTextChecking(false);
-    }
-  };
+  const handleAltTextRequest = () => proceedAltTextIfCountMatches(altTextPending);
 
   /**
    * 対象件数を取り直し、`expected` と一致していれば生成へ進む。食い違っていたら
@@ -1313,27 +1304,40 @@ function DataTab() {
    * ときにだけ出るので、そこで取り直さないと**動いていると分かっている経路だけが
    * 再確認を素通りする**という逆立ちになる（レビューの high 指摘）。
    * 件数が動き続けるなら押すたびに確認が出るが、動く対象に課金するよりはよい。
+   *
+   * ⚠ **`altTextChecking` はこの関数の中で立てる。** 呼び出し側に任せると、片方の入口
+   * （確認ボックスの「実行する」）だけ素通りして、件数を取り直している数百ミリ秒の間
+   * ボタンが押せたままになる。そこで二度押しすると 2 本目が `already_running` で弾かれ、
+   * **その `finally` が実行中表示を消して「課金中なのに待機状態」に見える。**
    */
   const proceedAltTextIfCountMatches = async (expected: number | null) => {
-    let fresh: number;
+    if (altTextChecking || altTextRunning) return;
+    setMessage(null);
+    setError(null);
+    setAltTextChecking(true);
     try {
-      fresh = await invoke<number>("count_figures_missing_alt_text");
-    } catch (e) {
-      setConfirmAltText(false);
-      setError(t("settings.data.altTextError", { error: errMsg(e) }));
-      return;
+      let fresh: number;
+      try {
+        fresh = await invoke<number>("count_figures_missing_alt_text");
+      } catch (e) {
+        setConfirmAltText(false);
+        setError(t("settings.data.altTextError", { error: errMsg(e) }));
+        return;
+      }
+      setAltTextPending(fresh);
+      if (fresh === 0) {
+        setConfirmAltText(false);
+        setMessage(t("settings.data.altTextNone"));
+        return;
+      }
+      if (expected !== fresh) {
+        setConfirmAltText(true);
+        return;
+      }
+      await runGenerateAltTexts();
+    } finally {
+      setAltTextChecking(false);
     }
-    setAltTextPending(fresh);
-    if (fresh === 0) {
-      setConfirmAltText(false);
-      setMessage(t("settings.data.altTextNone"));
-      return;
-    }
-    if (expected !== fresh) {
-      setConfirmAltText(true);
-      return;
-    }
-    await runGenerateAltTexts();
   };
 
   const runGenerateAltTexts = async () => {
@@ -1562,7 +1566,10 @@ function DataTab() {
               <SecondaryBtn onClick={() => setConfirmAltText(false)}>
                 {t("common.cancel")}
               </SecondaryBtn>
-              <SecondaryBtn onClick={() => void proceedAltTextIfCountMatches(altTextPending)}>
+              <SecondaryBtn
+                onClick={() => void proceedAltTextIfCountMatches(altTextPending)}
+                disabled={altTextChecking || activeAltTextRunning}
+              >
                 {t("settings.data.altTextProceed")}
               </SecondaryBtn>
             </div>

@@ -1959,6 +1959,12 @@ unverified 0。** 最重要は **3 レンズが独立に同じ根に当てた 1 
   `altTextPending` は更新されない。同じ取り直しを入れ、i18n キー `detailPanel.altTextCountChanged` を追加。
 - **件数を取り直している間ボタンが有効のまま**で、二度押しすると 2 本目が `already_running` で
   弾かれ、その `finally` が実行中表示を消す（**課金中なのに待機状態に見える**）。`altTextChecking` で塞いだ。
+  ⚠ **これは「未検証」で返ってきた 1 件**（検証エージェントが API エラーで落ちた）。
+  **未検証を反証と同じ扱いにせず自分で確かめたら、確認ボックス側で実在していた** ──
+  最初の修正はガードを呼び出し側に置いており、確認ボックスの「実行する」だけが素通りしていた。
+  ガードを `proceedAltTextIfCountMatches` の中へ畳んで両方の入口を覆った
+  （「票 0 件＝未検証」を refuted の枝に落とすと、確定 0 件に見えるだけでなく
+  実在する欠陥を取り逃がす）。
 - **`never` へのキャストで型検査が丸ごと消えていた**（medium）。`result as Record<string,
   number & boolean & string>` は交差型が `never` になるため、**フィールド名の綴り違いが
   素通りする**（`r.pdf_only` を `r.pdfOnly` と書いても通り、i18n に渡る値が黙って undefined になる）。
