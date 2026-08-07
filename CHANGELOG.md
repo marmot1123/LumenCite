@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A newly attached PDF no longer has its LCIR-derived index overwritten by a redundant re-index** — the app used to re-index every attachment a second time from the front end, as if you had asked for it explicitly. With automatic LCIR building that second pass could undo the first, and which one won depended on timing. The redundant pass is gone; the "indexing" indicator now follows the work the backend is actually doing.
 
-- **Saving while a paper is being processed in the background no longer fails with "database is locked"** — the database now waits up to 30 seconds for a writer instead of 5. Building a large paper writes its whole structure in one transaction, which can exceed five seconds; that only used to happen while you watched a batch run, and now happens on its own.
+- **Saving in the app while a paper is being processed in the background no longer fails with "database is locked"** — the app's database connection now waits up to 30 seconds for a writer instead of 5 (the `lumencite` CLI's direct-write path is unchanged). Building a large paper writes its whole structure in one transaction, which can exceed five seconds; that only used to happen while you watched a batch run, and now happens on its own.
 
 - **A newly attached PDF can no longer lose its LCIR-derived index to the slower extractor finishing later** — the two writers are now one decision made in a single transaction. Previously, a paper whose text the older extractor could not read at all would disappear from search even though LumenCite had read it correctly.
 

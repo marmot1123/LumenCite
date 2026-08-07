@@ -40,6 +40,15 @@ pub const DEFAULT_RUN_BUDGET: Duration = Duration::from_secs(5 * 60);
 /// 初期描画を巻き添えにしないための猶予。
 pub const STARTUP_DELAY: Duration = Duration::from_secs(60);
 
+/// 起動後、「走ってよいか」を叩きに行く周期。
+///
+/// **`AUTO_INTERVAL_SECS` と同値にしてはいけない。** tick の起点はラン**開始**時刻なのに
+/// 間引きの記録はラン**終了**時刻なので、同値だと経過が常に「間隔 − 所要」になって
+/// 隔回で必ず間引かれ、実効周期が 2 倍になる（1 時間のつもりが 2 時間）。
+/// 十分短い周期で叩き、走ってよいかの判断は `lcir.backfill.last_run` に一本化する
+/// （間引かれる回は SELECT 2 本で終わるので安い）。
+pub const POLL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 /// build ロックを待つ上限を「残り予算」にするときの下限（残り予算が 0 でも一瞬は試す）。
 const MIN_LOCK_WAIT: Duration = Duration::from_millis(50);
 
@@ -137,17 +146,18 @@ pub(crate) fn is_due_from_record(
 
 /// 前回から `min_interval_secs` 以上経っているときだけバックフィルする。
 /// 間引かれた場合は `None`。
-pub async fn run_backfill_if_due<F>(
+pub async fn run_backfill_if_due<F, P>(
     pool: &SqlitePool,
     app_data_dir: &Path,
     limits: BackfillLimits,
     min_interval_secs: i64,
     state: &BackfillState,
-    pdfium_available: bool,
+    pdfium_ok: P,
     should_stop: F,
 ) -> Option<BackfillOutcome>
 where
     F: Fn() -> bool,
+    P: Fn() -> bool,
 {
     // LCIR OFF なら**キーを書かずに**降りる。書くと p3 で既定 ON になった既存ユーザーに
     // バックフィルが永久に届かない（`derive_page_fts_from_lcir_once` と同じ規約）。
@@ -167,7 +177,7 @@ where
         app_data_dir,
         limits,
         state,
-        pdfium_available,
+        pdfium_ok,
         should_stop,
     )
     .await;
@@ -189,16 +199,17 @@ where
 /// の内側で取ると、予算判定を通った後にロック待ちで実時間が進み、「予算 + 最長 1 添付」という
 /// 上限が崩れる（GC が 125 秒握っていれば、起きたときには予算をとうに過ぎている）。
 /// **取れた直後に `should_stop` と残り予算をもう一度評価する。**
-pub async fn run_backfill<F>(
+pub async fn run_backfill<F, P>(
     pool: &SqlitePool,
     app_data_dir: &Path,
     limits: BackfillLimits,
     state: &BackfillState,
-    pdfium_available: bool,
+    pdfium_ok: P,
     should_stop: F,
 ) -> BackfillOutcome
 where
     F: Fn() -> bool,
+    P: Fn() -> bool,
 {
     let started = Instant::now();
     let targets = match targets(pool).await {
@@ -219,7 +230,10 @@ where
 
         // pdfium が使えないなら PDF は飛ばす。**判定は mime を見てから** ── 入口で切ると
         // pdfium を要さない TeX の build まで道連れになる。
-        if !pdfium_available && !is_tex {
+        // ⚠ **毎周評価する。** ラン開始時の 1 回だけ見る形にすると、1 件目の失敗で印が立っても
+        // そのランでは誰も読まず、138 件すべてに着手してしまう（印が最も必要な初回ランで
+        // 短絡が効かない）。
+        if !pdfium_ok() && !is_tex {
             out.skipped_no_pdfium += 1;
             continue;
         }
@@ -303,6 +317,14 @@ mod tests {
     use crate::db::entries::create_entry;
     use crate::models::EntryInput;
     use crate::document_ir;
+
+    /// **build ロックに触るテストを直列化する。**
+    ///
+    /// `LCIR_BUILD_LOCK` はプロセス全体で共有の static なので、`run_backfill` を呼ぶテストと
+    /// ロックを保持するテストが並列に走ると、前者が `LockBusy` を掴んで期待と違う結果になる。
+    /// 「グローバル状態を持つテストは、自分が支配している遷移だけを見る」の実践 ──
+    /// ここでは支配できるようにゲートで囲う（CI で 1 度落としてから入れた）。
+    static BUILD_LOCK_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn entry_with_pdf(pool: &SqlitePool, title: &str, mime: &str) -> i64 {
         let entry = create_entry(
@@ -388,6 +410,7 @@ mod tests {
     /// 予算 0 なら 1 件も着手せずに `Budget` で降りる（対象は在る）。
     #[sqlx::test(migrations = "./migrations")]
     async fn zero_budget_attempts_nothing(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         enable_lcir(&pool).await;
         entry_with_pdf(&pool, "a", "application/pdf").await;
         let st = BackfillState::default();
@@ -398,7 +421,7 @@ mod tests {
                 budget: Duration::ZERO,
             },
             &st,
-            true,
+            || true,
             || false,
         )
         .await;
@@ -410,6 +433,7 @@ mod tests {
     /// `should_stop` が最初から真なら 1 件も着手せず `Yielded` で降りる。
     #[sqlx::test(migrations = "./migrations")]
     async fn yields_before_touching_anything(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         enable_lcir(&pool).await;
         entry_with_pdf(&pool, "a", "application/pdf").await;
         let st = BackfillState::default();
@@ -418,12 +442,67 @@ mod tests {
             Path::new("/nonexistent"),
             BackfillLimits::default(),
             &st,
-            true,
+            || true,
             || true,
         )
         .await;
         assert_eq!(r.attempted, 0);
         assert_eq!(r.stopped, Some(StopReason::Yielded));
+    }
+
+    /// **判定は「添付境界ごと」であって「ラン開始時に 1 回」ではない。**
+    ///
+    /// ガードをループの外へ持ち出す変異はこのテストでしか落ちない（1 件目は着手し、
+    /// 2 件目の境界で初めて真になる `should_stop` を使う）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn yields_at_the_attachment_boundary_not_only_at_the_start(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
+        enable_lcir(&pool).await;
+        entry_with_pdf(&pool, "a", "application/pdf").await;
+        entry_with_pdf(&pool, "b", "application/pdf").await;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let st = BackfillState::default();
+        let r = run_backfill(
+            &pool,
+            Path::new("/nonexistent"),
+            BackfillLimits::default(),
+            &st,
+            || true,
+            // 1 件目の境界では false・2 件目の境界で true。
+            || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1,
+        )
+        .await;
+        assert_eq!(r.total, 2);
+        assert_eq!(r.attempted, 1, "1 件目は着手し、2 件目の境界で降りる");
+        assert_eq!(r.stopped, Some(StopReason::Yielded));
+    }
+
+    /// **pdfium の印もラン中に立ちうるので、毎周評価する。**
+    ///
+    /// ラン開始時の 1 回だけ読む形にすると、1 件目の失敗で印が立っても残り全件に着手して
+    /// しまう（`§2.6-5` が要求した短絡が、それが最も必要な初回ランで効かない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_latch_raised_mid_run_stops_the_remaining_pdfs(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
+        enable_lcir(&pool).await;
+        entry_with_pdf(&pool, "a", "application/pdf").await;
+        entry_with_pdf(&pool, "b", "application/pdf").await;
+        entry_with_pdf(&pool, "c", "application/pdf").await;
+        let broken = std::sync::atomic::AtomicBool::new(false);
+        let st = BackfillState::default();
+        let r = run_backfill(
+            &pool,
+            Path::new("/nonexistent"),
+            BackfillLimits::default(),
+            &st,
+            // 1 件目だけ使える。以後は「壊れている」＝ 実際の bind 失敗と同じ形。
+            || !broken.swap(true, std::sync::atomic::Ordering::SeqCst),
+            || false,
+        )
+        .await;
+        assert_eq!(r.total, 3);
+        assert_eq!(r.attempted, 1, "印が立った後は着手しない");
+        assert_eq!(r.skipped_no_pdfium, 2, "残りは skip として数える（failed ではない）");
     }
 
     // ---- pdfium latch ---------------------------------------------------
@@ -432,6 +511,7 @@ mod tests {
     /// 入口（mime 判定より前）で切ると pdfium が要らない TeX まで止まる。
     #[sqlx::test(migrations = "./migrations")]
     async fn without_pdfium_skips_pdf_but_still_tries_tex(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         enable_lcir(&pool).await;
         entry_with_pdf(&pool, "a", "application/pdf").await;
         entry_with_pdf(&pool, "b", crate::ingestion::TEX_SOURCE_MIME).await;
@@ -441,7 +521,7 @@ mod tests {
             Path::new("/nonexistent"),
             BackfillLimits::default(),
             &st,
-            false,
+            || false,
             || false,
         )
         .await;
@@ -456,6 +536,7 @@ mod tests {
     /// 同じプロセスで失敗した添付は次のランで飛ばす（毎ラン同じ先頭に予算を食われない）。
     #[sqlx::test(migrations = "./migrations")]
     async fn a_failure_is_not_retried_in_the_same_process(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         enable_lcir(&pool).await;
         entry_with_pdf(&pool, "a", "application/pdf").await;
         let st = BackfillState::default();
@@ -464,7 +545,7 @@ mod tests {
             Path::new("/nonexistent"),
             BackfillLimits::default(),
             &st,
-            true,
+            || true,
             || false,
         )
         .await;
@@ -475,7 +556,7 @@ mod tests {
             Path::new("/nonexistent"),
             BackfillLimits::default(),
             &st,
-            true,
+            || true,
             || false,
         )
         .await;
@@ -489,6 +570,7 @@ mod tests {
     /// 書くと p3 で既定 ON になった既存ユーザーにバックフィルが永久に届かない。
     #[sqlx::test(migrations = "./migrations")]
     async fn disabled_does_nothing_and_writes_no_key(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         entry_with_pdf(&pool, "a", "application/pdf").await;
         let st = BackfillState::default();
         let r = run_backfill_if_due(
@@ -497,7 +579,7 @@ mod tests {
             BackfillLimits::default(),
             AUTO_INTERVAL_SECS,
             &st,
-            true,
+            || true,
             || false,
         )
         .await;
@@ -514,6 +596,7 @@ mod tests {
     /// 対象 0 件の回はキーを書かない（次に添付が増えたらすぐ拾えるように）。
     #[sqlx::test(migrations = "./migrations")]
     async fn an_empty_run_writes_no_key(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         enable_lcir(&pool).await;
         let st = BackfillState::default();
         let r = run_backfill_if_due(
@@ -522,7 +605,7 @@ mod tests {
             BackfillLimits::default(),
             AUTO_INTERVAL_SECS,
             &st,
-            true,
+            || true,
             || false,
         )
         .await;
@@ -539,6 +622,7 @@ mod tests {
     /// 1 件以上着手した回はキーを書き、次のランは間引かれる。
     #[sqlx::test(migrations = "./migrations")]
     async fn an_attempted_run_records_and_then_throttles(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         enable_lcir(&pool).await;
         entry_with_pdf(&pool, "a", "application/pdf").await;
         let st = BackfillState::default();
@@ -548,7 +632,7 @@ mod tests {
             BackfillLimits::default(),
             AUTO_INTERVAL_SECS,
             &st,
-            true,
+            || true,
             || false,
         )
         .await;
@@ -567,7 +651,7 @@ mod tests {
             BackfillLimits::default(),
             AUTO_INTERVAL_SECS,
             &st,
-            true,
+            || true,
             || false,
         )
         .await;
@@ -619,6 +703,7 @@ mod tests {
     /// **決定的に**失敗し続け、バックフィル中ずっとボタンが押せなくなる。
     #[tokio::test]
     async fn the_interactive_build_lock_queues_instead_of_failing_fast() {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         let guard = super::super::lock_build().await;
         // 保持中は上限付き取得が失敗する。
         assert!(
@@ -642,6 +727,7 @@ mod tests {
     /// （記録すると、たまたま GC とぶつかった 1 回で 1 時間動けなくなる）。
     #[sqlx::test(migrations = "./migrations")]
     async fn a_held_build_lock_stops_the_run_without_recording(pool: SqlitePool) {
+        let _serial = BUILD_LOCK_TESTS.lock().await;
         enable_lcir(&pool).await;
         entry_with_pdf(&pool, "a", "application/pdf").await;
         let held = super::super::lock_build().await;
@@ -654,7 +740,7 @@ mod tests {
             },
             AUTO_INTERVAL_SECS,
             &st,
-            true,
+            || true,
             || false,
         )
         .await;

@@ -4104,9 +4104,14 @@ pub fn run() {
                 }
                 tokio::time::sleep(ingestion::backfill::STARTUP_DELAY).await;
                 let state = ingestion::backfill::BackfillState::default();
-                let mut interval = tokio::time::interval(Duration::from_secs(
-                    ingestion::backfill::AUTO_INTERVAL_SECS as u64,
-                ));
+                // **tick 周期は間引き間隔より十分短くする。** 同値にすると、tick の起点が
+                // ラン**開始**時刻なのに間引きの記録はラン**終了**時刻なので、経過が常に
+                // 「間隔 − 所要」となって隔回で必ず間引かれ、実効周期が 2 倍になる。
+                // 短い周期で叩いて、走ってよいかの判断は `run_backfill_if_due`（=
+                // `lcir.backfill.last_run`）に一本化する。間引かれる回は SELECT 2 本で終わる。
+                let mut interval =
+                    tokio::time::interval(ingestion::backfill::POLL_INTERVAL);
+                interval.tick().await; // 起動直後の重複 tick を消費（バックアップと同型）
                 loop {
                     ingestion::backfill::run_backfill_if_due(
                         &fts_pool,
@@ -4114,7 +4119,7 @@ pub fn run() {
                         ingestion::backfill::BackfillLimits::default(),
                         ingestion::backfill::AUTO_INTERVAL_SECS,
                         &state,
-                        !ingestion::pdf::pdfium::bind_is_known_broken(),
+                        || !ingestion::pdf::pdfium::bind_is_known_broken(),
                         || {
                             // 手動バッチ / Vision / TeX 取得 / バックアップのどれかが動いて
                             // いたら添付境界で譲る。**バックフィル自身は外側フラグを握らない**

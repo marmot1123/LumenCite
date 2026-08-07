@@ -265,6 +265,13 @@ const panelStyle = (width: number): React.CSSProperties => ({
   overflow: "hidden",
 });
 
+/** 背景の LCIR 構築が走っていてロックが取れなかったか（`build_lcir_for_attachment` の
+ *  `build_busy`）。**失敗ではない** ── 順番が来れば構築されるし、起動時バックフィルの
+ *  対象にもなる。build を invoke する全経路で同じ判定を使う。 */
+function isBuildBusy(e: any): boolean {
+  return String(e?.message ?? e).includes("build_busy");
+}
+
 export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore, onToggleStar, allCollections, onAddToCollection, onRemoveFromCollection, allTags, onAddTag, onRemoveTag, onAttachmentsChanged, onAttachmentAdded, onUpdateField, onSelectEntry, onSummarize, onOpenDetail, onAuthorEdited }: DetailPanelProps) {
   const { t } = useTranslation();
   const [tab, setTab] = useState<TabId>("info");
@@ -473,7 +480,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
       if (stillHere()) {
         const msg = e?.message ?? String(e);
         setIndexNote(
-          String(msg).includes("build_busy")
+          isBuildBusy(e)
             ? t("detailPanel.lcirBuildBusy")
             : t("detailPanel.lcirBuildFailed", { error: msg }),
         );
@@ -579,7 +586,13 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         }
       } catch (e: any) {
         if (stillHere()) {
-          setAttachError(t("detailPanel.texSourceBuildFailed", { error: e?.message ?? String(e) }));
+          // 背景の構築が走っていて順番が来なかっただけなら失敗ではない
+          // （起動時バックフィルの対象クエリは gzip も拾うので、いずれ構築される）。
+          if (isBuildBusy(e)) {
+            setIndexNote(t("detailPanel.lcirBuildBusy"));
+          } else {
+            setAttachError(t("detailPanel.texSourceBuildFailed", { error: e?.message ?? String(e) }));
+          }
         }
       }
     } finally {

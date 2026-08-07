@@ -975,11 +975,9 @@ function DataTab() {
         setMessage(
           kind === "build" ? t("settings.data.lcirNone") : t("settings.data.lcirRebuildNone"),
         );
-      } else if (r.skipped > 0) {
-        // pdfium を読めない配布物では大半が「着手すらしていない」。それを
-        // built 0 / failed 0 として出すと「もう最新だった」と読めてしまう。
-        setError(t("settings.data.lcirNoPdfium", { skipped: r.skipped, total: r.total }));
       } else {
+        // サマリは常に出す。pdfium を読めない配布物では大半が「着手すらしていない」ので、
+        // その事実を**サマリを隠さずに**併記する（分岐を排他にすると built/failed が消える）。
         setMessage(
           t(kind === "build" ? "settings.data.lcirDone" : "settings.data.lcirRebuildDone", {
             total: r.total,
@@ -988,6 +986,9 @@ function DataTab() {
             failed: r.failed,
           }),
         );
+        if (r.skipped > 0) {
+          setError(t("settings.data.lcirNoPdfium", { skipped: r.skipped, total: r.total }));
+        }
       }
     } catch (e) {
       const s = errMsg(e);

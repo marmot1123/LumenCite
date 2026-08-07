@@ -436,7 +436,11 @@ async fn heal_missing_assets(
     let dir2 = app_data_dir.join(&rel_dir);
     let extracted = tokio::task::spawn_blocking(move || pdf::extract_document(&abs2, Some(&dir2)))
         .await
-        .map_err(|e| format!("asset heal task panicked: {e}"))?
+        .map_err(|e| {
+            // heal も pdfium を触るので、ここで panic すると marshall が毒される（生成点 3）。
+            pdf::pdfium::note_extraction_panic();
+            format!("asset heal task panicked: {e}")
+        })?
         .map_err(|e| format!("asset heal extraction failed: {e}"))?;
     let mut refreshed = 0u64;
     let mut retargeted = 0u64;
@@ -1066,7 +1070,10 @@ async fn build_tex_version(
     let doc = match extracted {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return Err(e),
-        Err(e) => return Err(format!("extraction task panicked: {e}")),
+        Err(e) => {
+            pdf::pdfium::note_extraction_panic();
+            return Err(format!("extraction task panicked: {e}"));
+        }
     };
 
     // TeX には座標が無いので coordinate_space は記録しない。
@@ -1468,7 +1475,7 @@ pub async fn build_missing_lcir<F: Fn(i64, i64)>(
         pool,
         app_data_dir,
         targets,
-        !pdf::pdfium::bind_is_known_broken(),
+        || !pdf::pdfium::bind_is_known_broken(),
         on_progress,
     )
     .await)
@@ -1510,7 +1517,7 @@ pub async fn rebuild_outdated_lcir<F: Fn(i64, i64)>(
         pool,
         app_data_dir,
         targets,
-        !pdf::pdfium::bind_is_known_broken(),
+        || !pdf::pdfium::bind_is_known_broken(),
         on_progress,
     )
     .await)
@@ -1524,14 +1531,18 @@ fn disabled_batch() -> LcirBatchResult {
 /// `on_progress(done, total)` は 1 添付ぶん処理するたびに呼ぶ。**数十分かかりうる**バッチ
 /// （既存コーパスの再構築は PDF 1 本ごとに pdfium 抽出 + ページレンダ + crop 書き出し）なので、
 /// 呼び出し側が進捗イベントに変換して「固まって見える」のを避けられるようにする。
-/// `pdfium_available` は**引数で受ける**（グローバルな印を直接読まない）。読むとテストが
-/// 印を立てた瞬間に同一プロセスの他のテストへ波及し、実行順に依存して落ちるようになる。
-/// 本番の呼び出し元が `!pdf::pdfium::bind_is_known_broken()` を渡す。
-async fn run_build_batch<F: Fn(i64, i64)>(
+/// `pdfium_ok` は**クロージャで受ける**（グローバルな印を直接読まない）。直接読むとテストが
+/// 印を立てた瞬間に同一プロセスの他のテストへ波及し、実行順に依存して落ちる。
+/// ⚠ **`bool` ではなくクロージャなのが要点** ── 値で受けるとループ突入前の 1 回しか評価されず、
+/// **1 件目の失敗で印が立ってもそのランでは誰も読まない**。pdfium を同梱し損ねた配布物では
+/// 138 件すべてに着手してエラーログを 138 行吐くことになり、`§2.6-5` が p2 に要求した
+/// 「bind 失敗を 1 回検出したら諦める」が、それが最も必要な初回ランで機能しなくなる。
+/// 本番の呼び出し元は `|| !pdf::pdfium::bind_is_known_broken()` を渡す。
+async fn run_build_batch<F: Fn(i64, i64), P: Fn() -> bool>(
     pool: &SqlitePool,
     app_data_dir: &Path,
     targets: Vec<(i64, String)>,
-    pdfium_available: bool,
+    pdfium_ok: P,
     on_progress: F,
 ) -> LcirBatchResult {
     let total = targets.len() as i64;
@@ -1539,7 +1550,7 @@ async fn run_build_batch<F: Fn(i64, i64)>(
     for (i, (att_id, mime)) in targets.into_iter().enumerate() {
         // pdfium が使えないと分かっている間は PDF に着手しない（v1.0.0-p2）。
         // 判定は mime を見てから ＝ pdfium を要さない TeX の build は止めない。
-        if !pdfium_available && mime != TEX_SOURCE_MIME {
+        if !pdfium_ok() && mime != TEX_SOURCE_MIME {
             skipped += 1;
             on_progress(i as i64 + 1, total);
             continue;
@@ -2366,7 +2377,7 @@ mod tests {
                 (9001, "application/pdf".to_string()),
                 (9002, "application/pdf".to_string()),
             ],
-            true,
+            || true,
             |done, total| seen.lock().unwrap().push((done, total)),
         )
         .await;
@@ -2400,7 +2411,7 @@ mod tests {
                 (9001, "application/pdf".to_string()),
                 (9002, TEX_SOURCE_MIME.to_string()),
             ],
-            false,
+            || false,
             |done, total| seen.lock().unwrap().push((done, total)),
         )
         .await;

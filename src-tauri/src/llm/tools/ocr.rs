@@ -143,7 +143,13 @@ pub async fn run_ocr(
         rasterize(&rasterize_path, rasterize_pages.as_deref())
     })
     .await
-    .map_err(|e| ToolError::Execution(format!("rasterize task panicked: {e}")))??;
+    .map_err(|e| {
+        // OCR のラスタライズも pdfium を触るので、panic すると marshall が毒され、以後
+        // このプロセスの `Pdfium::new` は Err ではなく panic する。自動経路（LCIR の
+        // 自動 build / バックフィル）が残りを焼き切らないよう、ここでも印を立てる。
+        crate::ingestion::pdf::pdfium::note_extraction_panic();
+        ToolError::Execution(format!("rasterize task panicked: {e}"))
+    })??;
     if images.is_empty() {
         return Err(ToolError::Execution("no pages to OCR".into()));
     }
