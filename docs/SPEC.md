@@ -230,7 +230,7 @@ Claude Desktop / Claude Code などの MCP クライアントから LumenCite �
 
 既存コーパスのバックフィル用。クリッパーの欠落補完は「再遭遇した論文を拾う」増分向けで、手持ちの arXiv エントリ全部に TeX を揃えるにはこちらが本命。
 
-- **設定 → データ**に「arXiv の TeX ソースを一括取得」ボタン（e-print 自動取得の同意が ON のときのみ活性。**実行中に同意を外すと添付境界で打ち切る**（v1.0.0-p3）。既存の「未構築 PDF を一括 LCIR 化」ボタンの隣・同じ busy/結果表示パターン）。
+- **設定 → データ**に「arXiv の TeX ソースを一括取得」ボタン（**LCIR が有効かつ** e-print 自動取得の同意が ON のときのみ活性（v1.0.0 で `lcir.enabled` を条件に追加 ── 無いと「押せるのに何も起きないボタン」になる）。**実行中に同意を外すと添付境界で打ち切る**（v1.0.0-p3）。既存の「未構築 PDF を一括 LCIR 化」ボタンの隣・同じ busy/結果表示パターン）。
 - **対象**: ゴミ箱以外で `arxiv_id` があり、mime `application/gzip` の添付が**無い**エントリ。
 - 各対象に `download_and_attach_arxiv_source` → `build_lcir_for_attachment` を**直列**実行。**arXiv への礼儀としてリクエスト間 3 秒スロットル**（export.arxiv.org の慣行に合わせバーストしない）。
 - PDF-only 投稿（TeX 未公開）は `failed` と分けて `pdf_only` としてカウント（`fetch_arxiv_source` は先頭 5 バイトの `%PDF-` で即打ち切るので再実行のコストは軽微。永続マーカーは持たず、手動バッチの再実行で再判定される割り切り）。

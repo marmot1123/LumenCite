@@ -852,19 +852,42 @@ async fn download_arxiv_pdf(
     Ok(att)
 }
 
+/// 自動経路の e-print 取得が同意面で止められたことを表すエラー文字列。
+///
+/// フロントは**これを失敗として見せない**（ユーザーは何も頼んでいないので、
+/// 「取得に失敗しました」は嘘になる）。`already_running` と同じく、機械が読む印。
+pub(crate) const TEX_AUTOFETCH_DISABLED: &str = "tex_autofetch_disabled";
+
 /// arXiv ID から TeX ソース（e-print）をダウンロードして添付する（LCIR Phase 4）。
 ///
 /// `https://arxiv.org/e-print/<id>` は gzip（tar か単一 .tex）を返す。`arxiv-<id>-source.gz`・
 /// mime `application/gzip` として保存し、**全文索引は行わない**（PDF ではない）。LCIR ビルドは
 /// 呼び出し側（詳細パネル）が添付成功後に `build_lcir_for_attachment` を明示実行する。
 /// PDF-only 投稿（TeX 未公開）は明示エラーになる。SSRF ガード・50MB 上限は PDF 取得と共有。
+///
+/// ## `automatic` は「誰が決めたか」を表す（v1.0.0・ゲート ②b の W2-1）
+///
+/// - `false` = **ユーザーがそのボタンを押した**（詳細パネルの「TeX ソース取得」）。
+///   同意面は問わない ── 明示操作そのものが同意なので、`lcir.enabled` が OFF でも取りに行く。
+/// - `true` = **アプリが自動で決めた**（追加シートの arXiv 取得のように、ユーザーが
+///   「取ってこい」と言っていない経路）。この場合は [`ingestion::tex_autofetch_enabled`]
+///   （＝同意 AND `lcir.enabled`）を要求し、false なら**通信する前に**返す。
+///
+/// **判定をフロントに任せない。** p3 までここは無ゲートで、呼び出し側の
+/// `AddSheet.tsx` が同意だけを見ていたため、**LCIR を明示 OFF にしたユーザーの
+/// arXiv 追加で毎回数 MB のダウンロードが走っていた**（しかも直後の build は no-op）。
+/// 同意チェックは `disabled={!lcirEnabled}` で下ろせないので撤回もできなかった。
 #[tauri::command]
 async fn download_arxiv_source(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     entry_id: i64,
     arxiv_id: String,
+    automatic: bool,
 ) -> Result<Attachment, String> {
+    if !ingestion::may_fetch_eprint(&state.db, automatic).await {
+        return Err(TEX_AUTOFETCH_DISABLED.to_string());
+    }
     let id = metadata::normalize_arxiv_id(&arxiv_id);
     if id.is_empty() {
         return Err("arXiv ID が空です".to_string());
@@ -1349,12 +1372,16 @@ struct StorageStats {
 /// （`still_collectable`）を最後の砦にしておけない ── バックフィルが直前に作った新版によって
 /// superseded になった版を GC が消すと、`node_alt_texts.carried_from_version_id` が SET NULL に
 /// なり、carry 行が「NULL = この版で生成」というスキーマの契約を偽る。
+///
+/// 排他の判定そのものは [`gc_is_blocked_by_a_writing_batch`] に出してある ──
+/// `#[tauri::command]` の本体は `State<AppState>` を作れず単体テストできないので、
+/// **判定を関数の外に出さないと変異が素通りする**（ゲート ②b の M7）。
 #[tauri::command]
 async fn run_lcir_gc(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ingestion::gc::GcOutcome, String> {
-    if VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst) || TEX_FETCH_RUNNING.load(Ordering::SeqCst) {
+    if gc_is_blocked_by_a_writing_batch() {
         return Err("already_running".to_string());
     }
     let Some(_build_guard) = ingestion::lock_build_within(ingestion::INTERACTIVE_BUILD_LOCK_WAIT)
@@ -1375,6 +1402,19 @@ async fn run_lcir_gc(
         })
         .await,
     )
+}
+
+/// GC を始めてはいけない状態か ── **書き込む長時間バッチがどれか 1 つでも走っていたら真**。
+///
+/// `LCIR_BATCH_RUNNING` はここでは見ない（[`begin_lcir_batch`] が直後に取るので二重になる）。
+/// 見るのは **SettingsModal の外からも起動できる 2 つ**（`DetailPanel` 発の代替テキスト生成と
+/// TeX 取得）で、UI の `disabled` では塞げない。
+///
+/// ⚠ **`||` であって `&&` ではない。** `&&` にすると「2 本とも走っているときだけ止める」
+/// になり、片方だけ走っている実際の競合を通してしまう。この関数が独立しているのは、
+/// その変異を捕まえるテストを書けるようにするため（ゲート ②b の M7）。
+fn gc_is_blocked_by_a_writing_batch() -> bool {
+    VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst) || TEX_FETCH_RUNNING.load(Ordering::SeqCst)
 }
 
 /// LCIR（実験・Phase 2）: ノード単位（段落・見出し・caption 等）の全文検索。ヒットは
@@ -1491,7 +1531,19 @@ async fn set_lcir_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(
 /// 「勝手に外れた」ように読める。実際に取りに行ってよいかは `tex_autofetch_enabled`。
 #[tauri::command]
 async fn get_lcir_tex_autofetch_enabled(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(ingestion::tex_autofetch_consent(&state.db).await)
+    Ok(ingestion::tex_autofetch_consent(&state.db).await.0)
+}
+
+/// **実際に取りに行ってよいか**（同意 AND `lcir.enabled`）＝ [`ingestion::tex_autofetch_enabled`]。
+///
+/// 自動取得を「するかどうか」をフロントが先に判断する場所（追加シートの arXiv タブ）が使う。
+/// **チェックボックスの表示には使わない**（そちらは上の同意値）。
+///
+/// この 2 本を分けているのは、片方しか無いと必ず取り違えるため ── ゲート ②b の W2-1 は
+/// まさにそれで、`AddSheet.tsx` が同意だけを見て `lcir.enabled` が OFF でも取りに行っていた。
+#[tauri::command]
+async fn get_lcir_tex_autofetch_effective(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(ingestion::tex_autofetch_enabled(&state.db).await)
 }
 
 /// arXiv e-print 自動取得の同意を設定する。
@@ -1512,7 +1564,11 @@ async fn set_lcir_tex_autofetch_enabled(
 /// LCIR Phase 8c フラグ `lcir.vision_alt_text.enabled` の現在値。
 #[tauri::command]
 async fn get_lcir_vision_alt_text_enabled(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(vision_alt_text_enabled(&state.db).await)
+    // **`vision_alt_text_consent` を返す**（`vision_alt_text_allowed` ではない）── チェック
+    // ボックスは同意の保存値を映すもので、LCIR を切った瞬間に外れて見えると
+    // 「勝手に外れた」と読める。実際に課金してよいかは `vision_alt_text_allowed`。
+    // `get_lcir_tex_autofetch_enabled` と同型。
+    Ok(ingestion::vision_alt_text_consent(&state.db).await.0)
 }
 
 /// LCIR Phase 8c フラグ `lcir.vision_alt_text.enabled` を設定する。
@@ -1530,15 +1586,10 @@ async fn set_lcir_vision_alt_text_enabled(
     .map_err(|e| e.to_string())
 }
 
-/// 図の代替テキスト生成への同意フラグ（既定 off）。`lcir.enabled` とは独立に評価する。
-async fn vision_alt_text_enabled(pool: &SqlitePool) -> bool {
-    db::settings::get_setting(pool, db::settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY)
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("1")
-}
+// 同意フラグの読み出しは `ingestion::vision_alt_text_consent` /
+// 課金してよいかの判定は `ingestion::vision_alt_text_allowed` に一本化した（ゲート ②b の W1-4）。
+// **ここに同意だけを返す私設ヘルパを再び置かないこと** ── 消費点がそれを呼べるようになると、
+// 入口とループで別の述語を読む形（W1-4 そのもの）が再発する。
 
 /// `generate_vision_alt_texts`（図の代替テキスト一括生成）の結果サマリ。
 /// `enabled` は `lcir.enabled` と `lcir.vision_alt_text.enabled` の**両方** ON のときだけ true。
@@ -1645,10 +1696,6 @@ async fn generate_vision_alt_texts(
         aborted: false,
         abort_reason: None,
     };
-    // 課金する操作なので、LCIR 実験フラグと Vision 同意フラグの両方を要求する。
-    if !ingestion::lcir_enabled(&state.db).await || !vision_alt_text_enabled(&state.db).await {
-        return Ok(disabled);
-    }
     if VISION_ALT_TEXT_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -1657,6 +1704,18 @@ async fn generate_vision_alt_texts(
     }
     let batch_kind = batch_status::BatchKind::VisionAltText;
     let _guard = VisionAltTextGuard { _mark: batch_status::RunningMark::new(batch_kind) };
+
+    // 課金する操作なので、LCIR フラグと Vision 同意の両方を要求する（決定点は 1 つ）。
+    //
+    // **判定はガードを取った後に置く**（`build_missing_lcir` と同型）。前に置くと
+    // `RunningMark` も `record_success` も通らないまま返るので、`batch_status.last` に
+    // 載らず、**設定モーダルは戻り値を捨てて `last` だけを見るため完全に無反応**になる
+    // （ゲート ②b の W1-9・F-1 と同型）。`already_running` だけは「走らなかった」ので
+    // 記録しない ── これは `record_batch` の doc が定めた契約。
+    if !ingestion::vision_alt_text_allowed(&state.db).await {
+        batch_status::record_success(batch_kind, &disabled);
+        return Ok(disabled);
+    }
 
     // 準備（プロバイダ・モデル・API キーの解決と対象取得）。プロバイダ設定は OCR と共有する
     // （Vision 用の設定面を増やさない）。キー未設定で全図ぶん叩かないよう、対象取得の前に
@@ -1713,8 +1772,15 @@ async fn generate_vision_alt_texts(
     for (i, target) in targets.into_iter().enumerate() {
         // 実行中に同意を外したら止まる（cancel UI は非目標だが、ユーザーに見える唯一の
         // 「止めそうに見える操作」が黙って無効なのは不誠実なので、毎回の再評価で実現する）。
-        if !vision_alt_text_enabled(&state.db).await {
-            abort_reason = Some("consent_withdrawn");
+        //
+        // ⚠ **入口と同じ述語を読むこと。** 初版はここだけ同意を読んでおり、**LCIR を
+        // 切っても止まらなかった** ── しかも設定 UI は `disabled={!lcirEnabled}` で同意
+        // チェックを固めるので、ユーザーに見える停止操作が両方とも効かないまま課金が
+        // 最後まで走った（ゲート ②b の W1-4）。
+        // **どちらの面で止まったかを保つ。** 両方を consent_withdrawn に丸めると、
+        // LCIR を切って止めた人に「同意チェックが外されました」という嘘の説明が出る。
+        if let Some(reason) = ingestion::vision_alt_text_gate(&state.db).await.abort_reason() {
+            abort_reason = Some(reason);
             break;
         }
         // その版がまだ当該添付の最新 completed か確認する（**Vision を呼ぶ前**に）。
@@ -2029,6 +2095,13 @@ async fn set_clipper_complete_missing(
 /// 失敗した場合は `fetched` にだけ計上し `failed` は増やさない（取得は成功のため）。
 #[derive(serde::Serialize)]
 struct FetchMissingArxivSourcesResult {
+    /// 同意面（`lcir.tex_autofetch.enabled` AND `lcir.enabled`）が開いていたか。
+    ///
+    /// **`false` と「対象 0 件」を混ぜない**（v1.0.0・ゲート ②b の F-1）。両方とも
+    /// `total: 0` になるが、前者は「取りに行っていない」、後者は「取りに行く相手が
+    /// 居なかった」で、ユーザーに見せるべき文言が違う。`VisionAltTextResult.enabled`
+    /// と同型。
+    enabled: bool,
     total: i64,
     fetched: i64,
     built: i64,
@@ -2063,22 +2136,12 @@ impl Drop for TexFetchGuard {
 ///
 /// **同意面は `lcir.tex_autofetch.enabled`**（v1.0.0-p3 で `lcir.enabled` から分離）。
 /// ユーザーが押すボタンだが、押した瞬間に**数百件ぶんの e-print を arXiv から取りに行く**
-/// 経路なので、「取得してよい」という同意そのものを見る。OFF なら全 0 を返す。
+/// 経路なので、[`ingestion::tex_autofetch_enabled`]（同意 AND `lcir.enabled`）を要求する。
 #[tauri::command]
 async fn fetch_missing_arxiv_sources(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<FetchMissingArxivSourcesResult, String> {
-    if !ingestion::tex_autofetch_enabled(&state.db).await {
-        return Ok(FetchMissingArxivSourcesResult {
-            total: 0,
-            fetched: 0,
-            built: 0,
-            pdf_only: 0,
-            failed: 0,
-            aborted: false,
-        });
-    }
     // 既に実行中なら弾く（多重起動ガード）。フロントは `already_running` を案内文言に変換する。
     if TEX_FETCH_RUNNING
         .compare_exchange(
@@ -2093,6 +2156,25 @@ async fn fetch_missing_arxiv_sources(
     }
     let batch_kind = batch_status::BatchKind::TexFetch;
     let _guard = TexFetchGuard { _mark: batch_status::RunningMark::new(batch_kind) };
+
+    // **判定はガードを取った後に置く**（`build_missing_lcir` と同型）。前に置くと
+    // `record_success` を通らないまま返るので `batch_status.last` に載らず、
+    // 設定モーダルは戻り値を捨てて `last` だけを見るため**押しても完全に無反応**になる
+    // （ゲート ②b の F-1・実機で確認済み）。`already_running` だけは「走らなかった」ので
+    // 記録しない ── これは `record_batch` の doc が定めた契約。
+    if !ingestion::tex_autofetch_enabled(&state.db).await {
+        let disabled = FetchMissingArxivSourcesResult {
+            enabled: false,
+            total: 0,
+            fetched: 0,
+            built: 0,
+            pdf_only: 0,
+            failed: 0,
+            aborted: false,
+        };
+        batch_status::record_success(batch_kind, &disabled);
+        return Ok(disabled);
+    }
 
     let targets = match db::entries::entries_missing_arxiv_source(&state.db).await {
         Ok(v) => v,
@@ -2165,7 +2247,15 @@ async fn fetch_missing_arxiv_sources(
     if fetched > 0 {
         let _ = app.emit("entries-changed", ());
     }
-    let result = FetchMissingArxivSourcesResult { total, fetched, built, pdf_only, failed, aborted };
+    let result = FetchMissingArxivSourcesResult {
+        enabled: true,
+        total,
+        fetched,
+        built,
+        pdf_only,
+        failed,
+        aborted,
+    };
     batch_status::record_success(batch_kind, &result);
     Ok(result)
 }
@@ -4686,6 +4776,7 @@ pub fn run() {
             get_lcir_enabled,
             set_lcir_enabled,
             get_lcir_tex_autofetch_enabled,
+            get_lcir_tex_autofetch_effective,
             set_lcir_tex_autofetch_enabled,
             get_lcir_vision_alt_text_enabled,
             set_lcir_vision_alt_text_enabled,
@@ -4712,6 +4803,41 @@ mod batch_wiring_tests {
     static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn gate() -> std::sync::MutexGuard<'static, ()> {
         GATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// **GC の排他は「どれか 1 つでも走っていたら止める」**（ゲート ②b の M7）。
+    ///
+    /// `||` を `&&` に変えると「2 本とも走っているときだけ止める」になり、片方だけ
+    /// 走っている実際の競合を通す。判定が `#[tauri::command]` の本体に埋まっていた頃は
+    /// その変異が 1 本もテストを落とさなかった。
+    ///
+    /// **自分が立てた印だけを倒す**（プロセス共有の static なので、他人の遷移は assert しない）。
+    #[test]
+    fn gc_is_blocked_by_either_writing_batch_not_only_by_both() {
+        let _g = gate();
+        assert!(
+            !gc_is_blocked_by_a_writing_batch(),
+            "前提: このテストの開始時はどちらも走っていない"
+        );
+
+        VISION_ALT_TEXT_RUNNING.store(true, Ordering::SeqCst);
+        assert!(
+            gc_is_blocked_by_a_writing_batch(),
+            "代替テキスト生成だけでも GC は止まる（課金済みの行を消しうる）"
+        );
+        VISION_ALT_TEXT_RUNNING.store(false, Ordering::SeqCst);
+
+        TEX_FETCH_RUNNING.store(true, Ordering::SeqCst);
+        assert!(
+            gc_is_blocked_by_a_writing_batch(),
+            "TeX 一括取得だけでも GC は止まる（build が新版を作る）"
+        );
+        TEX_FETCH_RUNNING.store(false, Ordering::SeqCst);
+
+        assert!(
+            !gc_is_blocked_by_a_writing_batch(),
+            "両方下ろしたら通る（印を倒し忘れていない）"
+        );
     }
 
     #[test]

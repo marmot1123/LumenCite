@@ -159,6 +159,12 @@ interface VisionAltTextResult {
   abort_reason: string | null;
 }
 interface FetchArxivSourcesResult {
+  /**
+   * 同意面（自動取得の同意 AND `lcir.enabled`）が開いていたか。
+   * **`false` と「対象 0 件」を混ぜない** ── どちらも `total: 0` だが、
+   * 前者は「取りに行っていない」、後者は「相手が居なかった」で見せる文言が違う。
+   */
+  enabled: boolean;
   total: number;
   fetched: number;
   built: number;
@@ -1003,11 +1009,19 @@ function DataTab() {
           ? null
           : r.abort_reason === "consent_withdrawn"
             ? t("settings.data.altTextStopped")
-            : t("settings.data.altTextAborted");
+            // **どちらの面で止まったかを区別する。** LCIR を切って止めた人に
+            // 「同意チェックが外された」と言うと嘘になる（同意は ON のまま）。
+            : r.abort_reason === "lcir_disabled"
+              ? t("settings.data.altTextStoppedLcir")
+              : t("settings.data.altTextAborted");
         return { message: reason ? `${done} ${reason}` : done, error: null };
       }
       case "tex_fetch": {
         const r = result as FetchArxivSourcesResult;
+        // 代替テキスト側（`!r.enabled` → altTextDisabled）と同型。**この分岐を
+        // `total === 0` より前に置くこと** ── 後ろに置くと同意 OFF が
+        // 「未取得の arXiv エントリはありません」という偽の説明になる。
+        if (!r.enabled) return { message: t("settings.data.texFetchDisabled"), error: null };
         if (r.total === 0) return { message: t("settings.data.texFetchNone"), error: null };
         const done = t("settings.data.texFetchDone", {
           total: r.total,
@@ -1529,7 +1543,17 @@ function DataTab() {
           </SecondaryBtn>
           <SecondaryBtn
             onClick={handleFetchTex}
-            disabled={!texAutofetchEnabled || activeFetchTexRunning || anyLcirBatchRunning || activeGcRunning}
+            // **`!lcirEnabled` を落とさないこと**（ゲート ②b の F-1）。同意チェックは
+            // `disabled={!lcirEnabled}` で固まるので、LCIR を切ると「同意 ON のまま
+            // 押せるボタン」だけが残る。バックエンドは AND で弾くので通信は起きないが、
+            // 押しても何も起きないボタンになる。代替テキスト側と同型にする。
+            disabled={
+              !lcirEnabled ||
+              !texAutofetchEnabled ||
+              activeFetchTexRunning ||
+              anyLcirBatchRunning ||
+              activeGcRunning
+            }
           >
             {activeFetchTexRunning
               ? activeTexProgress
