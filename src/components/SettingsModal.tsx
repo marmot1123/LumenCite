@@ -92,7 +92,7 @@ interface GcOutcome {
  * 長時間バッチの種別。Rust 側 `batch_status::BatchKind` の文字列と 1:1 の契約なので、
  * **片方だけ変えない**（Rust 側にも同じ注意書きがある）。
  */
-type BatchKind = "build" | "rebuild" | "rederive" | "gc" | "vision_alt_text" | "tex_fetch";
+type BatchKind = "build" | "rebuild" | "rederive" | "gc" | "vision_alt_text" | "tex_fetch" | "ocr";
 
 /**
  * `lcir_batch_status` の返り値（debt-32）。**バックエンドが正本**で、フロントはこれを引く。
@@ -158,6 +158,15 @@ interface VisionAltTextResult {
   aborted: boolean;
   abort_reason: string | null;
 }
+/** `run_ocr` の結果（`batch_status.last` 経由で読む）。Rust 側 `OcrOutcome` と 1:1。 */
+interface OcrResult {
+  saved: number;
+  planned: number;
+  stopped: boolean;
+  failure: string | null;
+  partial: boolean;
+}
+
 interface FetchArxivSourcesResult {
   /**
    * 同意面（自動取得の同意 AND `lcir.enabled`）が開いていたか。
@@ -950,6 +959,8 @@ function DataTab() {
             return busy
               ? t("settings.data.texFetchRunning")
               : t("settings.data.texFetchError", { error });
+          case "ocr":
+            return busy ? t("settings.data.ocrBusy") : t("settings.data.ocrError", { error });
         }
       })();
       return { message: null, error: text };
@@ -1033,6 +1044,21 @@ function DataTab() {
         // 途中で同意を外したときは、それが理由だと明示する（黙って件数が減ると失敗に見える）。
         return {
           message: r.aborted ? `${done} ${t("settings.data.texFetchStopped")}` : done,
+          error: null,
+        };
+      }
+      case "ocr": {
+        const r = result as OcrResult;
+        if (r.failure) {
+          return {
+            message: t("settings.data.ocrDoneFailed", { saved: r.saved, error: r.failure }),
+            error: null,
+          };
+        }
+        return {
+          message: r.stopped
+            ? t("settings.data.ocrDoneStopped", { saved: r.saved, planned: r.planned })
+            : t("settings.data.ocrDone", { saved: r.saved }),
           error: null,
         };
       }
@@ -1494,6 +1520,27 @@ function DataTab() {
           {busy === "index_missing" ? t("settings.data.indexMissingBusy") : t("settings.data.indexMissing")}
         </SecondaryBtn>
       </Section>
+
+      {/* **OCR は起動口がこの画面の外（リーダー／チャット）にしかない。**
+          それでもここに出すのは、走っていることと止める手段を**画面をまたいで**
+          持たせるため ── リーダーを離れると停止できなくなっていた（PR-1b のレビュー指摘）。 */}
+      {batchStatus?.running.includes("ocr") && (
+        <Section title={t("settings.data.ocrRunningTitle")} description={t("settings.data.ocrRunningDesc")}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 12.5 }}>
+              {batchStatus.progress.ocr
+                ? t("settings.data.ocrRunningProgress", {
+                    done: batchStatus.progress.ocr.done,
+                    total: batchStatus.progress.ocr.total,
+                  })
+                : t("settings.data.ocrRunningNoProgress")}
+            </span>
+            <SecondaryBtn onClick={() => { void invoke("cancel_ocr"); }}>
+              {t("settings.data.ocrStop")}
+            </SecondaryBtn>
+          </div>
+        </Section>
+      )}
 
       <Section title={t("settings.data.lcir")} description={t("settings.data.lcirDesc")}>
         <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", cursor: "pointer" }}>

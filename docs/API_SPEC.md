@@ -889,7 +889,8 @@ type ClipperStatusInfo = {
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
-| `ocr_pdf` | `entry_id: i64, attachment_id?: i64, pages?: Vec<i64>` | `Result<()>` — `attachment_id` 省略時は先頭 PDF、指定時はその添付を OCR（複数 PDF 対応・CR-027）。`pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック |
+| `cancel_ocr` | — | `()` — **v1.0.0**。実行中の OCR を**次のページ境界で**止める。1 ページ = 1 回の課金 API 呼び出しで、ページ数は押す前に分からない（ラスタライズして初めて確定する）ため、**実行中に規模を見て降りられること**が唯一の歯止め。処理済みのページは保存される。**再開は無い** ── もう一度実行すると最初からやり直しで全ページ課金し直しになる（結果文言もそう明言する） |
+| `ocr_pdf` | `entry_id: i64, attachment_id?: i64, pages?: Vec<i64>` | `Result<String>` — `attachment_id` 省略時は先頭 PDF、指定時はその添付を OCR（複数 PDF 対応・CR-027）。`pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック。**v1.0.0 で以下が入った**: (a) **1 ページ = 1 課金**なのでループが毎ページ中断要求（`cancel_ocr` のプロセス内フラグ + チャットの停止 `ToolContext::should_stop`）を見る。2 本目は `Err("already_running")`（排他は `run_ocr` の中 ── 起動口が 2 つあるため）(b) `batch_status` の `BatchKind::Ocr` に実行中・進捗・直近結果が載る（**リーダーを離れても設定 → データに停止手段が残る**）。`ocr-progress {done,total}` イベントは UI 起動のランのみ (c) **中断・失敗でも課金済みページは保存**し、届かなかったページがあるなら**部分差し替え**（添付ごと置き換えは完走時だけ）(d) **`fulltext.source = Ocr` の封印は完走時だけ**（中断・失敗で封印すると、pdf_extract 由来の壊れた既存索引ごと恒久保護してしまう） |
 
 ---
 

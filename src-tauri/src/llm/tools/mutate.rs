@@ -672,7 +672,7 @@ mod tests {
     }
 
     fn make_ctx(pool: &SqlitePool) -> ToolContext<'_> {
-        ToolContext {
+        ToolContext { should_stop: None,
             pool,
             session_id: 1,
             scope_mode: "all",
@@ -745,7 +745,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.pdf"), b"pdf").unwrap();
 
-        let ctx = ToolContext { app_data_dir: &base, ..make_ctx(&pool) };
+        let ctx = ToolContext { should_stop: None, app_data_dir: &base, ..make_ctx(&pool) };
         let c = call("delete_entry", json!({"entry_id": entry_id}));
         try_execute(&ctx, &c).await.unwrap().unwrap();
 
@@ -849,7 +849,7 @@ mod tests {
         let in_scope = make_entry(&pool, "In scope").await;
         let out_scope = make_entry(&pool, "Out of scope").await;
         let scope = [in_scope];
-        let ctx = ToolContext {
+        let ctx = ToolContext { should_stop: None,
             scope_mode: "entries",
             scope_entry_ids: &scope,
             ..make_ctx(&pool)

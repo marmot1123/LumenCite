@@ -3069,18 +3069,47 @@ async fn remove_mcp_server(state: State<'_, AppState>, id: String) -> Result<(),
 
 // ── OCR ──────────────────────────────────────────────────────────────────────
 
+/// 実行中の OCR を次のページ境界で止める（v1.0.0）。
+///
+/// **1 ページ = 1 回の課金 API 呼び出し**で、実ライブラリには 527 ページの本がある。
+/// 押す前にはページ数が分からない（ラスタライズして初めて確定する）ので、
+/// **実行中に規模を見て降りられること**が唯一の歯止めになる。
+/// 処理済みのページは保存されるが、**再開は無い** ── もう一度実行すると最初から
+/// やり直しで全ページ課金し直しになる（文言もそう出す）。
+///
+/// 排他とフラグは `llm::tools::ocr` が持つ（起動口が 2 つあるため）。
+#[tauri::command]
+fn cancel_ocr() {
+    llm::tools::ocr::request_cancel();
+}
+
 /// 詳細ビューの「OCR を実行」ボタン用。ユーザー操作なので承認は不要（クリック＝同意）。
-/// LLM ツール `ocr_pdf` と内部実装（run_ocr）を共有する。
+/// LLM ツール `ocr_pdf` と内部実装（`run_ocr`）を共有する。
+///
+/// **排他・中断フラグ・`batch_status` への登録と進捗は `run_ocr` 側**（起動口が 2 つあるので、
+/// ここに置くとチャット経路が素通りする）。ここで配線するのはリーダー画面向けの
+/// `ocr-progress` イベントだけ。
 #[tauri::command]
 async fn ocr_pdf(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     entry_id: i64,
     attachment_id: Option<i64>,
     pages: Option<Vec<i64>>,
 ) -> Result<String, String> {
-    llm::tools::ocr::run_ocr(&state.db, &state.app_data_dir, entry_id, attachment_id, pages)
-        .await
-        .map_err(|e| e.to_string())
+    let on_progress = move |done: i64, total: i64| {
+        let _ = app.emit("ocr-progress", serde_json::json!({ "done": done, "total": total }));
+    };
+    llm::tools::ocr::run_ocr(
+        &state.db,
+        &state.app_data_dir,
+        entry_id,
+        attachment_id,
+        pages,
+        llm::tools::ocr::OcrHooks { should_stop: &|| false, on_progress: &on_progress },
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// ツール結果テキストから根拠参照を取り出す（Phase 10b）。
@@ -3198,6 +3227,8 @@ async fn chat_send_message(
             return Err(msg);
         }
     };
+    // **`cancel` を host へ move する前に**チャットの停止フラグを取り分ける。
+    let ocr_cancel = cancel.clone();
     let mut host = ChannelHost {
         channel: channel.clone(),
         runtime: state.chat.clone(),
@@ -3206,7 +3237,13 @@ async fn chat_send_message(
         sync_tx: state.sync_tx.clone(),
     };
 
+    // チャットの停止ボタンを**長いツールの中まで**届かせる（v1.0.0）。
+    // `run_chat_loop` は `is_cancelled()` をツール呼び出しの**前**でしか見ておらず、
+    // `execute_tool(..).await` は完了まで待つ ── OCR は 1 ページ 1 課金なので、
+    // 527 ページの本を承認すると停止を押しても最後まで課金され続けていた。
+    let should_stop = move || ocr_cancel.load(Ordering::SeqCst);
     let ctx = llm::tools::ToolContext {
+        should_stop: Some(&should_stop),
         pool: &pool,
         session_id,
         scope_mode: &session.scope_mode,
@@ -4756,6 +4793,7 @@ pub fn run() {
             get_clipper_complete_missing,
             set_clipper_complete_missing,
             ocr_pdf,
+            cancel_ocr,
             run_backup_now,
             list_backups,
             open_backup_folder,

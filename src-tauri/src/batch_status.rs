@@ -44,6 +44,12 @@ pub enum BatchKind {
     VisionAltText,
     /// arXiv e-print の一括取得（`fetch_missing_arxiv_sources`）
     TexFetch,
+    /// スキャン PDF の OCR（`run_ocr`）。**1 ページごとに課金される。**
+    ///
+    /// 他の 6 種と違い、起動口が 2 つある（リーダーのボタン / チャットの `ocr_pdf` ツール）。
+    /// **どちらから始めても必ずここに載せる** ── 載せないと、リーダーを離れた瞬間に
+    /// 「走っていることも、止める手段も」画面から消える（PR-1b のレビューで実際に出た）。
+    Ocr,
 }
 
 impl BatchKind {
@@ -55,6 +61,7 @@ impl BatchKind {
             BatchKind::Gc => "gc",
             BatchKind::VisionAltText => "vision_alt_text",
             BatchKind::TexFetch => "tex_fetch",
+            BatchKind::Ocr => "ocr",
         }
     }
 }
@@ -374,5 +381,6 @@ mod tests {
         assert_eq!(BatchKind::Gc.as_str(), "gc");
         assert_eq!(BatchKind::VisionAltText.as_str(), "vision_alt_text");
         assert_eq!(BatchKind::TexFetch.as_str(), "tex_fetch");
+        assert_eq!(BatchKind::Ocr.as_str(), "ocr");
     }
 }

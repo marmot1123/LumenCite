@@ -438,7 +438,7 @@ mod tests {
         host: &mut RecordingHost,
         first_user: &str,
     ) {
-        let ctx = ToolContext {
+        let ctx = ToolContext { should_stop: None,
             pool,
             session_id,
             scope_mode: "all",
@@ -706,7 +706,7 @@ mod tests {
         // 常に list_tags を呼び続けるモック → max_turns で止まるべき
         let provider = MockProvider::looping(tool_turn("c", "list_tags", serde_json::json!({})));
         let mut host = RecordingHost::default();
-        let ctx = ToolContext {
+        let ctx = ToolContext { should_stop: None,
             pool: &pool,
             session_id: sid,
             scope_mode: "all",

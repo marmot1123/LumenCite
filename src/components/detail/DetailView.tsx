@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import * as pdfjsLib from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import PdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
@@ -75,6 +76,9 @@ export function DetailView({
   const [scrollTick, setScrollTick] = useState(0);
   const [ocrBusy, setOcrBusy] = useState(false);
   const [ocrMsg, setOcrMsg] = useState<string | null>(null);
+  /** OCR の進捗。**押す前にはページ数が分からない**（ラスタライズして初めて確定する）ので、
+   *  規模を知って降りる判断ができるのは実行中だけ。 */
+  const [ocrProgress, setOcrProgress] = useState<{ done: number; total: number } | null>(null);
 
   // 複数添付の切替。null のときは先頭（primary）を表示する。
   const [selectedAttachmentId, setSelectedAttachmentId] = useState<number | null>(null);
@@ -170,6 +174,7 @@ export function DetailView({
   // OCR（スキャン PDF を Vision で文字起こしして全文検索に取り込む）
   const handleOcr = useCallback(async () => {
     setOcrBusy(true);
+    setOcrProgress(null);
     setOcrMsg(t("detail.header.ocrRunning"));
     try {
       // 選択中の添付を OCR する（複数 PDF で常に先頭を対象にしない・CR-027）。
@@ -180,11 +185,31 @@ export function DetailView({
       setOcrMsg(t("detail.header.ocrDone", { summary }));
     } catch (e) {
       const msg = typeof e === "string" ? e : (e as Error)?.message ?? String(e);
-      setOcrMsg(t("detail.header.ocrError", { error: msg }));
+      // 多重起動ガードに弾かれたケースは「失敗」ではないので専用の案内にする
+      // （生のまま出すと「OCR 失敗: already_running」になる）。
+      setOcrMsg(
+        msg.includes("already_running")
+          ? t("detail.header.ocrAlreadyRunning")
+          : t("detail.header.ocrError", { error: msg }),
+      );
     } finally {
+      // `ocrBusy` は自分の invoke の解決で必ず false に戻る（片道にならない）。
+      // 画面をまたいだ停止手段は設定 → データが担う（進捗に添付の識別子が無いので、
+      // ここでバックエンドから復帰すると**別の文献の OCR をこの文献のものとして表示しうる**）。
       setOcrBusy(false);
+      setOcrProgress(null);
     }
-  }, [entry.id, t]);
+  }, [entry.id, activeAttachment?.id, t]);
+
+  // 1 ページ = 1 回の課金なので、進捗はページ単位で出す。
+  useEffect(() => {
+    const un = listen<{ done: number; total: number }>("ocr-progress", (e) => {
+      setOcrProgress(e.payload);
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
   useEffect(() => {
     if (!activeAttachment) {
       setDoc(null);
@@ -355,10 +380,24 @@ export function DetailView({
       />
       {ocrMsg && (
         <div
-          onClick={() => setOcrMsg(null)}
-          style={{ flexShrink: 0, padding: "6px 14px", fontSize: 12, cursor: "pointer", background: "var(--surface-2)", borderBottom: "1px solid var(--border)", color: "var(--text-mute)" }}
+          style={{ flexShrink: 0, padding: "6px 14px", fontSize: 12, background: "var(--surface-2)", borderBottom: "1px solid var(--border)", color: "var(--text-mute)", display: "flex", alignItems: "center", gap: 10 }}
         >
-          {ocrMsg}
+          <span onClick={() => { if (!ocrBusy) setOcrMsg(null); }} style={{ cursor: ocrBusy ? "default" : "pointer" }}>
+            {ocrBusy && ocrProgress
+              ? t("detail.header.ocrProgress", { done: ocrProgress.done, total: ocrProgress.total })
+              : ocrMsg}
+          </span>
+          {/* **実行中は必ず降りられるようにする。** ページ数は押す前に分からず、
+              1 ページごとに課金される。押した時点までの結果は保存される（ただし
+              再開は無い ── もう一度実行すると最初からやり直しで全ページ課金し直し）。 */}
+          {ocrBusy && (
+            <button
+              onClick={() => { void invoke("cancel_ocr"); }}
+              style={{ fontSize: 11, padding: "2px 8px", cursor: "pointer" }}
+            >
+              {t("detail.header.ocrStop")}
+            </button>
+          )}
         </div>
       )}
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>

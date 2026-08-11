@@ -300,7 +300,7 @@ fn tool_content(text: String, is_error: bool) -> Value {
 
 fn mcp_ctx<'a>(pool: &'a SqlitePool, app_data_dir: &'a Path) -> ToolContext<'a> {
     // MCP サーバーは scope を持たないため "all" 固定。外部 mcp_* ツールも使わない。
-    ToolContext {
+    ToolContext { should_stop: None,
         pool,
         session_id: 0,
         scope_mode: "all",
@@ -3145,7 +3145,7 @@ mod tests {
 
                 // ── Phase 10b: チャット経路で同じものが引けること + 根拠参照 ──
                 // MCP と同じ定義・同じ実行を共有しているかを実データで確かめる。
-                let chat_ctx = crate::llm::tools::ToolContext {
+                let chat_ctx = crate::llm::tools::ToolContext { should_stop: None,
                     pool: &pool,
                     session_id: 0,
                     scope_mode: "all",
