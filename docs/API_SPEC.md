@@ -681,6 +681,10 @@ type BackupInfo = { path: string; file_name: string; created_at: string; size_by
 
 **完全バックアップ（CR-018）**: `run_backup_now` は `<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.zip` を作る。アーカイブ内レイアウトは `db.sqlite`（DB 全体＝highlights/chat/settings/fulltext 込み）＋ `attachments/<entry_id>/<file_name>`（添付本体）。deflate 圧縮。14 世代保持。自動バックアップは Rust 側で起動時 + 24h 間隔のタイマーから呼ばれ、前回成功（`settings.backup.last_run`）から 24h 未満なら間引かれる（`run_backup_if_due`）。`run_backup_now` は間引かず常に実行する。アーカイブは `<stem>.zip.partial` に書いてから `<stem>.zip` へ rename するため、途中終了しても中身の欠けたアーカイブが一覧・世代管理に混ざらない。
 
+**走査中に消えたエントリ（②b W2-5）**: DB スナップショット（`VACUUM INTO`）は先頭で固まるのに `attachments/` の走査は実測 7〜9 分かかるので、その間の削除・trash 送りでファイルが消えるのは**通常のレース**。消えたエントリ（`NotFound`）は**飛ばして続行**し、一覧を `SKIPPED.txt`（先頭 200 件）としてアーカイブに同梱する（stderr にも総数と先頭 5 件を出す）。`SKIPPED.txt` は復元の allowlist（`db.sqlite` / `attachments/` 配下のみ）に当たらないので展開時は無視される ── **自動で読むものは無い**（復元時に警告を出すのは debt-45）。**`NotFound` 以外（容量不足・権限）はこれまでどおりバックアップ全体を失敗させる** ── 中身の欠けたアーカイブを「成功」として並べないため。
+
+⚠ **記録できるのは「その親ディレクトリを `read_dir` で列挙した後に消えた」ものだけ**（列挙は各ディレクトリに到達した時点で 1 回）。したがって窓の長さは階層で桁違いに違い、**エントリ丸ごと削除は走査のほぼ全域が窓**なのに対し、添付 1 件の削除や crop の回収は**そのディレクトリを詰める一瞬だけ**。`SKIPPED.txt` があれば確実に欠けているが、**無いことは完全性の証明にならない**（完成後に DB と突き合わせる検算は debt-45）。なお `write_atomic` の作業ファイル（`<name>.tmp`）が消えた場合は正常動作なので記録しない（狼少年にしないため）。
+
 - **復元（CR-018）**: `restore_from_archive(path)` はライブ DB を握ったまま差し替える危険を避けるため **2 フェーズ**で動く。①稼働中に `.zip` を検証（`db.sqlite` 存在・`PRAGMA integrity_check`・スキーマ版がアプリ以下か）し、**復元前に現行状態を自動フルバックアップ**したうえで `<app_data_dir>/pending-restore/` へ展開＋マーカー設置。②次回起動時、pool を開く前に現行 DB（＋ `-wal`/`-shm`）と `attachments/` を `<app_data_dir>/pre-restore/` へ退避し、staged を所定位置へ移す（失敗時は退避物から自動ロールバックし、旧 DB のまま起動継続）。フロントは `restore_from_archive` 成功後に `@tauri-apps/plugin-process` の `relaunch()` で再起動する。
 - `export_database_json` / `export_database_markdown` は再インポート不可の**メタデータ書き出し**（PDF・ハイライト・チャット・設定は含まない）。
 
