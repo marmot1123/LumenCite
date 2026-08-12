@@ -1044,6 +1044,13 @@ async fn index_attachment(
                 .map_err(|e| e.to_string())?,
             "skipped_lcir",
         ),
+        // 抽出が空だったので既存索引を残した（②b の W1-1）。同じく「今入っているページ数」を返す。
+        ingestion::FulltextIndexOutcome::SkippedEmptyExtract => (
+            db::fulltext::indexed_page_count(&state.db, id)
+                .await
+                .map_err(|e| e.to_string())?,
+            "skipped_empty_extract",
+        ),
         ingestion::FulltextIndexOutcome::Failed(e) => return Err(e),
     };
     Ok(IndexAttachmentResult {
@@ -1052,7 +1059,8 @@ async fn index_attachment(
     })
 }
 
-/// `index_attachment` の戻り。`outcome` は `lcir` / `pdf_extract` / `skipped_ocr` / `skipped_lcir`。
+/// `index_attachment` の戻り。`outcome` は `lcir` / `pdf_extract` / `skipped_ocr` /
+/// `skipped_lcir` / `skipped_empty_extract`。
 #[derive(serde::Serialize)]
 struct IndexAttachmentResult {
     /// 実行後にこの添付が持つ索引済みページ数。
@@ -1108,8 +1116,11 @@ async fn index_missing_attachments(
                     needs_ocr += 1;
                 }
             }
+            // 空抽出で守った添付も `skipped`。`needs_ocr` に入れると、対象クエリが
+            // 「索引が無い添付」だけなのに未索引として二重に数えることになる。
             ingestion::FulltextIndexOutcome::SkippedOcr
-            | ingestion::FulltextIndexOutcome::SkippedLcirIndexed => skipped += 1,
+            | ingestion::FulltextIndexOutcome::SkippedLcirIndexed
+            | ingestion::FulltextIndexOutcome::SkippedEmptyExtract => skipped += 1,
             ingestion::FulltextIndexOutcome::Failed(_) => failed += 1,
         }
     }
@@ -1320,15 +1331,8 @@ async fn rederive_fulltext_from_lcir(
 ) -> Result<ingestion::FulltextDeriveResult, String> {
     let kind = batch_status::BatchKind::Rederive;
     let _guard = begin_lcir_batch(kind)?;
-    // 明示操作なので置き換えまでやる（自動実行は「足すだけ」＝ `AddMissingOnly`）。
-    record_batch(
-        kind,
-        ingestion::derive_page_fts_from_lcir_batch(
-            &state.db,
-            ingestion::DeriveMode::ReplaceUnprotected,
-        )
-        .await,
-    )
+    // 強さの選択は `ingestion::rederive_fulltext` が持つ（ここに書くと変異が素通りする・②b の M6）。
+    record_batch(kind, ingestion::rederive_fulltext(&state.db).await)
 }
 
 /// ストレージの内訳（DB ファイルの使用中 / 再利用可 + LCIR の GC 見積り・v1.0.0-p4）。

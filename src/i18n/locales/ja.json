@@ -520,6 +520,11 @@
     "indexDonePages": "{{count}} ページを索引しました",
     "indexNoText": "テキストレイヤーが見つかりません（スキャンPDFは詳細ビューのOCRをお試しください）",
     "indexKeptOcr": "OCR で取り込んだ本文（{{count}} ページ）をそのまま残しました。取り直すには OCR を再実行してください",
+    "indexKeptLcir": "既存の索引（{{count}} ページ）をそのまま残しました",
+    "indexKeptNoText": "テキストが取れなかったので、既存の索引（{{count}} ページ）を残しました。消したい場合は「索引を削除」から",
+    "unindexTitle": "索引を削除",
+    "unindexConfirm": "この添付の全文検索インデックス（ページ本文）を削除します。PDF ファイルと LCIR の解析結果は消えません。よろしいですか？",
+    "unindexDone": "索引を削除しました",
     "texSource": "TeX ソース取得",
     "texSourceBusy": "TeX ソース取得中…",
     "texSourceTitle": "arXiv から TeX ソース（e-print）を取得し、LCIR（構造・生 LaTeX 数式）を構築します",
@@ -529,7 +534,7 @@
     "texSourceBuildFailed": "TeX ソースは添付済みですが、LCIR の構築に失敗しました: {{error}}",
     "altText": "図の代替テキストを生成（{{pending}} 件）",
     "altTextBusy": "生成中…",
-      "altTextCountChanged": "生成対象が {{pending}} 件に変わりました。ボタンの件数を確かめて、もう一度押してください。",
+    "altTextCountChanged": "生成対象が {{pending}} 件に変わりました。ボタンの件数を確かめて、もう一度押してください。",
     "altTextTitle": "この文献の図を LLM Vision に説明させます（画像 1 枚ごとに外部 API へ送信・課金されます）",
     "altTextDone": "{{total}} 件中 {{generated}} 件を生成しました（スキップ {{skipped}} 件・失敗 {{failed}} 件）。",
     "altTextNone": "代替テキストが無い図はありません。",
@@ -603,7 +608,8 @@
     "attachmentsLabel": "添付ファイル",
     "removeAttachment": "添付を削除",
     "removeAttachmentConfirm": "この PDF を削除しますか？",
-    "lcirBuildBusy": "別の LCIR 構築が実行中です。完了後にもう一度お試しください。"
+    "lcirBuildBusy": "別の LCIR 構築が実行中です。完了後にもう一度お試しください。",
+    "unindexConfirmYes": "索引を削除する"
   },
   "pdfViewer": {
     "loading": "読み込み中…",

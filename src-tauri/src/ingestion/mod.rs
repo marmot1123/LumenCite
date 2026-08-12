@@ -481,7 +481,7 @@ pub(crate) async fn build_lcir_unlocked(
         }
         // ページ FTS も同じ扱い（p1）。ここを配線しないと、**この版より後に追加・build した
         // 添付は pdf_extract の索引のまま**になる（起動時 1 回の再導出はもう走らない）。
-        if let Err(e) = regenerate_page_fts_from_lcir(pool, attachment_id).await {
+        if let Err(e) = regenerate_page_fts_from_lcir(pool, attachment_id, false).await {
             eprintln!("LCIR: page-FTS regeneration failed for attachment {attachment_id}: {e}");
         }
         // アセットファイルの self-heal（Phase 8a・best-effort）: DB 行が指すファイルが消えて
@@ -549,7 +549,7 @@ pub(crate) async fn build_lcir_unlocked(
         eprintln!("LCIR: node-FTS regeneration failed for attachment {attachment_id}: {e}");
     }
     // ページ FTS も同じ扱い（p1）。OCR 保護と「LCIR が空なら触らない」は seam 側が持つ。
-    if let Err(e) = regenerate_page_fts_from_lcir(pool, attachment_id).await {
+    if let Err(e) = regenerate_page_fts_from_lcir(pool, attachment_id, false).await {
         eprintln!("LCIR: page-FTS regeneration failed for attachment {attachment_id}: {e}");
     }
 
@@ -1811,12 +1811,35 @@ async fn run_build_batch<F: Fn(i64, i64), P: Fn() -> bool>(
     }
 }
 
+/// [`regenerate_page_fts_from_lcir`] が何をしたか。
+///
+/// **「0 ページ」を理由ごとに分ける。** 呼び出し側の一括バッチは結果を種類ごとに数えて
+/// ユーザーに出すので、`Ok(0)` に潰すと「LCIR に本文が無かった」と「既存索引を守った」が
+/// 同じ数字に混ざる（粗い記録で細かい判断をしないこと）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LcirDeriveOutcome {
+    /// LCIR から索引し直した（ページ数）。
+    Derived(i64),
+    /// 完了 pdfium 版が無い / TeX 版 / LCIR に本文が 1 ページも無い ＝ 既存索引に触らない。
+    ///
+    /// `ocr_recorded` は「この添付の索引が OCR 由来として記録されているか」。
+    /// **持たないと集計の意味が変わる** ── 実ライブラリの OCR 済みスキャン本は
+    /// LCIR の本文が 0 ページなのでこの枝に落ちるので、潰すと「OCR を守った」が
+    /// 「本文が無いので触らなかった（＝まだ OCR が要る）」と報告される。
+    /// **ここは 1 行も書かないので、読んでも check-then-act の窓は生まれない。**
+    NoLcirText { ocr_recorded: bool },
+    /// OCR 由来として記録された索引なので触らない。
+    SkippedOcr,
+    /// 出どころの記録が無い既存索引を守った（`protect_unrecorded` の tx 内判定）。
+    SkippedUnrecorded,
+}
+
 /// LCIR の page ノードの `plain_text` から `fulltext`(FTS5) を再生成する。
 ///
 /// Phase 1「FTS5 を削除しても LCIR から再構築できる」の実証として置いた seam を、
 /// **v1.0.0-p1 で既定の索引ソースに昇格**させた（本番の入口は
 /// `index_fulltext_for_attachment` と `derive_page_fts_from_lcir_batch`）。
-/// 反映したページ数を返す。次の 3 つの場合は **既存の索引を触らずに 0 を返す**:
+/// 次の 3 つの場合は **既存の索引を触らない**:
 ///
 /// - LCIR の完了版が無い / pdfium 版でない（TeX 版はページ粒度を持たない）
 /// - LCIR に本文が 1 ページも無い（テキスト層が壊れた PDF では pdfium も空を返す。
@@ -1824,21 +1847,35 @@ async fn run_build_batch<F: Fn(i64, i64), P: Fn() -> bool>(
 /// - この添付の索引が OCR 由来として記録されている（§2.6-1）。
 ///   **判定は書き込みと同じ tx 内**（`index_attachment_from_lcir`）に 1 つだけ置く —
 ///   手前にも同じ判定を置くと、どちらを壊してもテストが落ちない冗長になる
+///
+/// `protect_unrecorded` は自動の再導出だけ真（理由は [`fulltext::index_attachment_from_lcir`]）。
+/// 「LCIR に使える本文が無い」枝の結果を組む。**書かないと決めた後に**出どころを読むので、
+/// check-then-act の窓は生まれない（W1-2 が畳んだ先読みとは性質が違う）。
+/// 読めなければ「記録なし」に倒す ── 分類が 1 段粗くなるだけで、書き込みには一切関与しない。
+async fn no_lcir_text(pool: &SqlitePool, attachment_id: i64) -> LcirDeriveOutcome {
+    let ocr_recorded = matches!(
+        fulltext::get_fulltext_source(pool, attachment_id).await,
+        Ok(Some(fulltext::FulltextSource::Ocr))
+    );
+    LcirDeriveOutcome::NoLcirText { ocr_recorded }
+}
+
 pub async fn regenerate_page_fts_from_lcir(
     pool: &SqlitePool,
     attachment_id: i64,
-) -> Result<i64, String> {
+    protect_unrecorded: bool,
+) -> Result<LcirDeriveOutcome, String> {
     let version = match document_versions::latest_completed_for_attachment(pool, attachment_id)
         .await
         .map_err(|e| e.to_string())?
     {
         Some(v) => v,
-        None => return Ok(0),
+        None => return Ok(no_lcir_text(pool, attachment_id).await),
     };
     // ページ FTS は pdfium 版のみ（TeX 版は page ノードを持たず、`fulltext` はページ粒度の
     // PDF 検索インデックスなので触らない）。
     if version.extractor_name != document_ir::schema::EXTRACTOR_NAME {
-        return Ok(0);
+        return Ok(no_lcir_text(pool, attachment_id).await);
     }
     let pages = document_nodes::page_nodes_for_version(pool, version.id)
         .await
@@ -1857,22 +1894,24 @@ pub async fn regenerate_page_fts_from_lcir(
         .collect();
     if rows.is_empty() {
         // LCIR に本文が 1 ページも無い（スキャン本など）。既存の索引には触らない。
-        return Ok(0);
+        return Ok(no_lcir_text(pool, attachment_id).await);
     }
     let n = rows.len() as i64;
-    if !fulltext::index_attachment_from_lcir(
+    match fulltext::index_attachment_from_lcir(
         pool,
         attachment_id,
         &rows,
         structure::clean_page_text,
+        protect_unrecorded,
     )
     .await
     .map_err(|e| e.to_string())?
     {
+        fulltext::LcirWrite::Replaced => Ok(LcirDeriveOutcome::Derived(n)),
         // OCR 由来として記録された添付（上の早期 return とこの tx の間に立った場合）。
-        return Ok(0);
+        fulltext::LcirWrite::SkippedOcr => Ok(LcirDeriveOutcome::SkippedOcr),
+        fulltext::LcirWrite::SkippedUnrecorded => Ok(LcirDeriveOutcome::SkippedUnrecorded),
     }
-    Ok(n)
 }
 
 /// 1 添付ぶんの全文索引を張った結果（p1・`index_fulltext_for_attachment` の戻り）。
@@ -1886,6 +1925,8 @@ pub enum FulltextIndexOutcome {
     SkippedOcr,
     /// LCIR 由来の索引が既にあるので pdf_extract で上書きしなかった。
     SkippedLcirIndexed,
+    /// **抽出が 1 ページも本文を返さなかったので、既存の索引を残した**（②b の W1-1）。
+    SkippedEmptyExtract,
     /// テキスト抽出 / 書き込みに失敗した（best-effort・既存索引は触らない）。
     Failed(String),
 }
@@ -1893,8 +1934,15 @@ pub enum FulltextIndexOutcome {
 /// 全文索引を「その添付にとって正しいソース」から張る**単一の決定点**（p1）。
 ///
 /// これを増やさないことが debt-17 の対策そのもの ── 添付経路が各自 `extract_and_index` を
-/// spawn し、後から LCIR 派生を**足す**と last-writer-wins になり、pdf_extract が 0 字を返す
-/// 個体（att93/att94）は LCIR が正常でも検索から消える。
+/// spawn し、後から LCIR 派生を**足す**と last-writer-wins になり、pdf_extract が本文を
+/// 返さない個体は LCIR が正常でも検索から消える。
+///
+/// ⚠ **かつてここは att93/att94 を例に挙げていたが、あの 2 件は例として誤りだった**
+/// （2026-08-12 に実 DB の現物を pdf-extract 0.12 へ直接当てて確認）。あの 2 件は
+/// `Ok(空)` ではなく **panic する**（`missing unicode map and encoding`）ので
+/// `spawn_blocking` が Err を返し、`Failed` で早期 return する ＝ **既存索引には触らない**。
+/// 「pdf_extract が `Ok(全ページ空)` を返す」個体はスキャン本（実 DB では att37 / att42 /
+/// att109 / att121）の方で、W1-1 のガードが守るのはそちら。
 ///
 /// `replace_existing` は「ユーザーがこの添付を名指しで再索引した」経路だけ `true`
 /// （詳細パネルの索引ボタン = `index_attachment` コマンド）。**自動経路は必ず `false`**。
@@ -1915,10 +1963,17 @@ pub async fn index_fulltext_for_attachment(
     }
 
     // 2. LCIR が読めるなら LCIR を正とする。
+    //    ここは「その添付にとって正しいソースを選ぶ」決定点なので、記録の無い既存索引は
+    //    守らない（`protect_unrecorded = false`）── 守るのは自動の一括再導出だけ。
     if lcir_enabled(pool).await {
-        match regenerate_page_fts_from_lcir(pool, attachment_id).await {
-            Ok(n) if n > 0 => return FulltextIndexOutcome::Lcir(n),
-            Ok(_) => {}
+        match regenerate_page_fts_from_lcir(pool, attachment_id, false).await {
+            Ok(LcirDeriveOutcome::Derived(n)) => return FulltextIndexOutcome::Lcir(n),
+            // **段 1 との間に立った OCR 記録をここで拾う。** `Ok(_)` に潰すと、
+            // 527 ページの pdf_extract を走らせたうえで「LCIR の索引を残しました」と報告する
+            // （実際に守ったのは OCR）。
+            Ok(LcirDeriveOutcome::SkippedOcr) => return FulltextIndexOutcome::SkippedOcr,
+            // 本文が無い / 記録なしを守った（この経路では後者は起きない）→ 段 3 へ落とす。
+            Ok(LcirDeriveOutcome::NoLcirText { .. } | LcirDeriveOutcome::SkippedUnrecorded) => {}
             Err(e) => eprintln!("p1: LCIR derivation failed for attachment {attachment_id}: {e}"),
         }
     }
@@ -1946,8 +2001,18 @@ pub async fn index_fulltext_for_attachment(
     )
     .await
     {
-        Ok(true) => FulltextIndexOutcome::PdfExtract(non_empty),
-        Ok(false) => FulltextIndexOutcome::SkippedLcirIndexed,
+        Ok(fulltext::PdfExtractWrite::Replaced) => FulltextIndexOutcome::PdfExtract(non_empty),
+        // **守った理由を保つ。** 潰すと、OCR を守った回に UI が
+        // 「LCIR から作った索引を残しました」と出す（段 1 の後に OCR 記録が立った場合に起きる）。
+        Ok(fulltext::PdfExtractWrite::SkippedProtected(fulltext::FulltextSource::Ocr)) => {
+            FulltextIndexOutcome::SkippedOcr
+        }
+        Ok(fulltext::PdfExtractWrite::SkippedProtected(fulltext::FulltextSource::Lcir)) => {
+            FulltextIndexOutcome::SkippedLcirIndexed
+        }
+        Ok(fulltext::PdfExtractWrite::SkippedEmptyExtract) => {
+            FulltextIndexOutcome::SkippedEmptyExtract
+        }
         Err(e) => {
             eprintln!("p1: fulltext indexing failed for attachment {attachment_id}: {e}");
             FulltextIndexOutcome::Failed(e.to_string())
@@ -2092,8 +2157,13 @@ pub struct FulltextDeriveResult {
 }
 
 /// 再導出バッチの強さ（p1）。
+///
+/// **`ingestion` の外へ出さない**（②b の M6）。入口ごとに正しいモードは 1 つに決まっており、
+/// 選択肢を公開すると `#[tauri::command]` 側で取り違えられる ── そして
+/// コマンド本体はテストできないので、その取り違えは変異でも捕まらない。
+/// 外から呼ぶのは [`rederive_fulltext`]（明示操作）と [`derive_page_fts_from_lcir_once`]（自動）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeriveMode {
+pub(crate) enum DeriveMode {
     /// **索引がまだ無い添付だけ**を埋める（起動時の自動実行）。
     ///
     /// `fulltext.source.<id>` はこの版で初めて書かれるキーなので、**この版より前に回した
@@ -2111,7 +2181,7 @@ pub enum DeriveMode {
 /// build 経路に派生を配線しても既存 138 添付には届かない（完了版がある添付は
 /// `attachments_without_completed_lcir` から外れ、`attachments_with_outdated_lcir` は
 /// 版 bump 無しでは 0 件）ので、この経路が無いと過去のライブラリだけ pdf_extract のまま残る。
-pub async fn derive_page_fts_from_lcir_batch(
+pub(crate) async fn derive_page_fts_from_lcir_batch(
     pool: &SqlitePool,
     mode: DeriveMode,
 ) -> Result<FulltextDeriveResult, String> {
@@ -2126,23 +2196,27 @@ pub async fn derive_page_fts_from_lcir_batch(
     res.total = targets.len() as i64;
 
     for att in targets {
-        let source = fulltext::get_fulltext_source(pool, att).await.ok().flatten();
-        if source == Some(fulltext::FulltextSource::Ocr) {
-            res.skipped_ocr += 1;
-            continue;
-        }
-        if mode == DeriveMode::AddMissingOnly && source.is_none() {
-            // 出どころの記録が無い既存索引 = この版より前に入ったもの（OCR かもしれない）。
-            let indexed = fulltext::indexed_page_count(pool, att).await.unwrap_or(0);
-            if indexed > 0 {
-                res.skipped_existing += 1;
-                continue;
-            }
-        }
-        match regenerate_page_fts_from_lcir(pool, att).await {
-            Ok(n) if n > 0 => res.derived += 1,
-            // LCIR に本文が無い添付。既存の索引（OCR / pdf_extract 由来）を残す。
-            Ok(_) => res.skipped_empty += 1,
+        // **守る判定は書き込みと同じ tx の中だけに置く**（②b の W1-2）。
+        //
+        // 以前はここで `get_fulltext_source` と `indexed_page_count` を先読みしていたが、
+        // (1) 読みが Err のとき `unwrap_or(0)` で「索引なし」に倒れて置き換えに進み、
+        // (2) 読んでから書くまでの窓に部分 OCR が着地すると、記録の無い課金済み転写を
+        //     LCIR で置き換え、
+        // (3) そのうえ tx 内に同じ判定を足すと**手前で必ず弾かれて誰も到達しない**ので、
+        //     tx 内のガードを消す変異が 1 本もテストを落とさなくなる（実測した）。
+        // 先読みを畳んで、判定を 1 か所に戻す。読めなければ tx ごと失敗する（＝何も書かない）。
+        let protect = mode == DeriveMode::AddMissingOnly;
+        match regenerate_page_fts_from_lcir(pool, att, protect).await {
+            Ok(LcirDeriveOutcome::Derived(_)) => res.derived += 1,
+            // **OCR 済みのスキャン本は「OCR を守った」に数える。** LCIR の本文が 0 ページなのは
+            // 事実だが、それを `skipped_empty`（＝まだ OCR が要る候補）と報告すると、
+            // 実ライブラリでは `skipped_ocr` が構造的に 0 件になり、
+            // 「OCR 由来 N 件はそのまま」という UI の文言が誰にも当たらなくなる。
+            Ok(LcirDeriveOutcome::NoLcirText { ocr_recorded: true }) => res.skipped_ocr += 1,
+            // LCIR に本文が無い添付。既存の索引（pdf_extract 由来）を残す。
+            Ok(LcirDeriveOutcome::NoLcirText { ocr_recorded: false }) => res.skipped_empty += 1,
+            Ok(LcirDeriveOutcome::SkippedOcr) => res.skipped_ocr += 1,
+            Ok(LcirDeriveOutcome::SkippedUnrecorded) => res.skipped_existing += 1,
             Err(e) => {
                 eprintln!("p1: derivation failed for attachment {att}: {e}");
                 res.failed += 1;
@@ -2153,11 +2227,23 @@ pub async fn derive_page_fts_from_lcir_batch(
     Ok(res)
 }
 
+/// 設定→データの「LCIR から全文索引を張り直す」の本体（②b の M6）。
+///
+/// **`#[tauri::command]` に `DeriveMode` を選ばせない。** コマンド本体は
+/// `State<AppState>` を作れず単体テストできないので、あそこに `ReplaceUnprotected` を
+/// 書いておくと `AddMissingOnly` へ書き換える変異が 1 本もテストを落とさない
+/// （明示ボタンが「足すだけ」に化け、既存 138 添付が全部 `skipped_existing` に落ちても
+/// UI は正常終了に見える ＝ p1 の唯一の移行経路が無言で死ぬ）。
+pub async fn rederive_fulltext(pool: &SqlitePool) -> Result<FulltextDeriveResult, String> {
+    // 明示操作なので置き換えまでやる（自動実行は「足すだけ」＝ `AddMissingOnly`）。
+    derive_page_fts_from_lcir_batch(pool, DeriveMode::ReplaceUnprotected).await
+}
+
 /// 起動時に 1 回だけ再導出する（`rebuild_fulltext_fts_once` と同型）。
 /// 実行したら結果を、フラグ既設 / LCIR OFF で skip したら `None` を返す。
 ///
 /// **自動実行は `AddMissingOnly`**（索引がまだ無い添付だけ）。既存索引の置き換えは
-/// 設定→データのボタンに任せる（理由は [`DeriveMode`]）。
+/// 設定→データのボタン（[`rederive_fulltext`]）に任せる（理由は [`DeriveMode`]）。
 ///
 /// **LCIR が OFF の間はフラグを立てない。** 立てると、後から ON にしたユーザーへ
 /// 再導出が永久に届かなくなる（debt-30 で同型の「一度きりフラグが再発火しない」を踏んでいる）。
@@ -2708,6 +2794,137 @@ mod tests {
         );
         assert_eq!(built, AutoBuildOutcome::Disabled, "フラグ OFF なので build しない");
     }
+
+    /// テキスト層のある最小 PDF（586 バイト・`testdata/text_layer.pdf`）。
+    ///
+    /// **実在する PDF が要る理由**: 既存のテストは全部 `/nonexistent.pdf` を渡していて、
+    /// 決定点が段 3 の抽出失敗（`Failed`）で手前に返る ── `PdfExtract` / `SkippedLcirIndexed`
+    /// の腕にテストが 1 本も到達しないので、`replace_existing` の取り違えが検出できない。
+    /// `pdf_extract::extract_text_by_pages` はこの PDF を `Ok(["\n\nHello Lumen"])` で読む。
+    const TEXT_LAYER_PDF: &[u8] = include_bytes!("testdata/text_layer.pdf");
+
+    /// テスト専用の一時ディレクトリに上の PDF を置いて絶対パスを返す。
+    fn write_text_layer_pdf(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lc-ingest-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("paper.pdf");
+        std::fs::write(&pdf, TEXT_LAYER_PDF).unwrap();
+        (dir, pdf)
+    }
+
+    /// **添付経路の自動索引は既存の LCIR 由来索引を上書きしない**（②b の M3）。
+    ///
+    /// 決定点の doc は「自動経路は必ず `replace_existing = false`」と明記しているのに、
+    /// `true` へ書き換えても 1 本も落ちなかった。`true` になると、添付直後に走る
+    /// pdf_extract（数十秒）の裏でバックフィルが LCIR を作った場合に、**後から終わった
+    /// pdf_extract が LCIR 由来の索引を丸ごと置き換える** ── debt-17 の last-writer-wins
+    /// そのもので、pdf_extract が 0 字を返す個体では LCIR が正常でも検索から消える。
+    ///
+    /// `lcir.enabled` は OFF にする（段 2 を飛ばして段 3 まで通すため。ON だと自動 build が
+    /// 本物の pdfium を掴みにいき、bind 失敗の印がプロセス共有で他テストへ波及する）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_automatic_ingest_path_does_not_overwrite_a_lcir_index(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        // 既に LCIR 由来の索引がある添付（バックフィルが先に終わった状態）。
+        fulltext::index_attachment(&pool, att, &[(1, "derived from lcir".to_string())])
+            .await
+            .unwrap();
+        fulltext::set_fulltext_source(&pool, att, fulltext::FulltextSource::Lcir)
+            .await
+            .unwrap();
+        let (dir, pdf) = write_text_layer_pdf("m3");
+
+        let (indexed, _) = ingest_new_pdf_attachment(&pool, &dir, pdf, att, |_| {}).await;
+
+        assert_eq!(
+            indexed,
+            FulltextIndexOutcome::SkippedLcirIndexed,
+            "自動経路は LCIR 由来の索引に譲る"
+        );
+        assert_eq!(
+            fulltext::search_fulltext(&pool, "derived", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "LCIR 由来の本文が残っている"
+        );
+        assert_eq!(
+            fulltext::search_fulltext(&pool, "Lumen", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "pdf_extract の本文で置き換わっていない"
+        );
+        assert_eq!(
+            fulltext::get_fulltext_source(&pool, att).await.unwrap(),
+            Some(fulltext::FulltextSource::Lcir),
+            "出どころの記録も消えていない"
+        );
+
+        // **生存確認**: 守る記録が無ければ、同じ経路がちゃんと索引する（空テストでない証拠）。
+        let plain = add_attachment(
+            &pool,
+            create_entry(
+                &pool,
+                &EntryInput {
+                    title: "Plain".to_string(),
+                    entry_type: "article".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .id,
+            "attachments/2/plain.pdf",
+            "plain.pdf",
+            "application/pdf",
+        )
+        .await
+        .unwrap()
+        .id;
+        let (dir2, pdf2) = write_text_layer_pdf("m3-live");
+        let (indexed, _) = ingest_new_pdf_attachment(&pool, &dir2, pdf2, plain, |_| {}).await;
+        assert_eq!(indexed, FulltextIndexOutcome::PdfExtract(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// **抽出が空でも既存の索引を消さない**（②b の W1-1・決定点まで通した形）。
+    ///
+    /// DB 層のガードは `db::fulltext` 側のテストが守っているが、決定点が新しい結果を
+    /// そのまま写しているか（`SkippedLcirIndexed` に潰していないか）は別の主張。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_empty_extract_is_reported_as_its_own_outcome(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        fulltext::index_attachment(&pool, att, &[(1, "ocr transcript".to_string())])
+            .await
+            .unwrap();
+        // 本文の無い PDF（テキスト層なし = スキャン本と同じ戻り）。
+        let dir = std::env::temp_dir().join(format!("lc-ingest-{}-blank", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("blank.pdf");
+        std::fs::write(&pdf, BLANK_PDF).unwrap();
+
+        let outcome = index_fulltext_for_attachment(&pool, pdf, att, true).await;
+
+        assert_eq!(outcome, FulltextIndexOutcome::SkippedEmptyExtract);
+        assert_eq!(fulltext::indexed_page_count(&pool, att).await.unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// テキスト層の無い最小 PDF（`testdata/blank.pdf`）。
+    /// `extract_text_by_pages` は `Ok([""])` を返す ── これは正常系で、`lib.rs` が
+    /// 「OCR で拾う候補」として数えている戻りそのもの。
+    const BLANK_PDF: &[u8] = include_bytes!("testdata/blank.pdf");
 
     /// pdfium が使えないプロセスでは自動 build に着手しない。
     /// **印は引数で渡す**（グローバルを立てると同一プロセスの他テストへ波及する）。
@@ -3329,8 +3546,8 @@ mod tests {
         .await
         .unwrap();
 
-        let n = regenerate_page_fts_from_lcir(&pool, att).await.unwrap();
-        assert_eq!(n, 1);
+        let n = regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap();
+        assert_eq!(n, LcirDeriveOutcome::Derived(1));
         let hits = fulltext::search_fulltext(&pool, "transformer", None, None, None)
             .await
             .unwrap();
@@ -3400,7 +3617,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(regenerate_page_fts_from_lcir(&pool, att).await.unwrap(), 1);
+        assert_eq!(
+            regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap(),
+            LcirDeriveOutcome::Derived(1)
+        );
         let content: String =
             sqlx::query_scalar("SELECT content FROM fulltext WHERE attachment_id = ?")
                 .bind(att)
@@ -3506,6 +3726,118 @@ mod tests {
         );
     }
 
+    /// **フラグを切ったら LCIR を使わない**（②b の M11）。
+    ///
+    /// 「ON なら LCIR を使う」は上の `policy_prefers_lcir_over_pdf_extract` が守っていたが、
+    /// **「OFF なら使わない」は無検証**だった（ゲートを `if true` にしても全緑）。
+    /// p3 で既定 ON になった今、穴が開いているのは「明示的に OFF にした人」の経路だけ。
+    /// ゲートが落ちると、その人の添付も page ノードから索引され `source = lcir` が立ち、
+    /// 以後は自動経路が pdf_extract に譲るので **OFF にしたのに LCIR 由来に固定される**。
+    ///
+    /// **同じテストの中で ON に戻して生存確認する** ── 前段の早期 return（完了版が無い /
+    /// TeX 版 / page が空）でも同じ結果になりうるので、それだけだと空テストになる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_decision_point_does_not_use_lcir_while_the_flag_is_off(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        insert_pdf_lcir_pages(&pool, att, "ck-flag-off", &[Some("lcir body")]).await;
+
+        let outcome =
+            index_fulltext_for_attachment(&pool, PathBuf::from("/nonexistent.pdf"), att, false)
+                .await;
+
+        assert!(
+            !matches!(outcome, FulltextIndexOutcome::Lcir(_)),
+            "OFF なのに LCIR から索引した: {outcome:?}"
+        );
+        assert_eq!(
+            fulltext::get_fulltext_source(&pool, att).await.unwrap(),
+            None,
+            "OFF のまま `source = lcir` を立ててはいけない（以後 pdf_extract が譲り続ける）"
+        );
+        assert_eq!(fulltext::indexed_page_count(&pool, att).await.unwrap(), 0);
+
+        // **生存確認**: 同じ入力で ON にすれば LCIR から索引する（= 上の assert が空ではない）。
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        assert_eq!(
+            index_fulltext_for_attachment(&pool, PathBuf::from("/nonexistent.pdf"), att, false)
+                .await,
+            FulltextIndexOutcome::Lcir(1)
+        );
+    }
+
+    /// **決定点と build 経路は、記録の無い既存索引を LCIR で置き換える**（`protect_unrecorded = false`）。
+    ///
+    /// 守るのは自動の一括再導出だけ。ここまで守ると、添付時の
+    /// 「pdf_extract で索引 → build が LCIR へ置き換え」という p1 の設計そのものが止まり、
+    /// 新規添付が永久に pdf_extract のままになる。**この非対称は意図なので固定する**
+    /// （`false` を `true` に書き換えても 1 本も落ちない状態だった）。
+    /// 残る穴 = 記録の無い課金済み OCR がここで消えうる（debt-37 / debt-43）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_decision_point_replaces_an_unrecorded_index_with_lcir(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        fulltext::index_attachment(&pool, att, &[(1, "legacy pdfextract body".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(fulltext::get_fulltext_source(&pool, att).await.unwrap(), None);
+        insert_pdf_lcir_pages(&pool, att, "ck-unrecorded", &[Some("lcir body")]).await;
+
+        let outcome =
+            index_fulltext_for_attachment(&pool, PathBuf::from("/nonexistent.pdf"), att, false)
+                .await;
+
+        assert_eq!(outcome, FulltextIndexOutcome::Lcir(1), "記録が無い索引は置き換える");
+        assert_eq!(
+            fulltext::search_fulltext(&pool, "legacy", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// **OCR 済みのスキャン本は「OCR を守った」に数える**（LCIR の本文が 0 ページでも）。
+    ///
+    /// 実ライブラリのスキャン本 4 冊は LCIR の page 本文が 0 なので、分類を
+    /// 「LCIR に本文があるか」だけで決めると `skipped_ocr` が構造的に 0 件になり、
+    /// 設定 → データの「OCR 由来 N 件はそのまま」が誰にも当たらなくなる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_ocr_scan_book_is_counted_as_protected_not_as_empty(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        fulltext::index_attachment(&pool, att, &[(1, "ocr transcript".to_string())])
+            .await
+            .unwrap();
+        fulltext::set_fulltext_source(&pool, att, fulltext::FulltextSource::Ocr)
+            .await
+            .unwrap();
+        // pdfium は本文を 1 ページも返さない（スキャン本）。
+        insert_pdf_lcir_pages(&pool, att, "ck-scan", &[None, Some("   ")]).await;
+
+        let res = derive_page_fts_from_lcir_batch(&pool, DeriveMode::ReplaceUnprotected)
+            .await
+            .unwrap();
+
+        assert_eq!(res.skipped_ocr, 1, "OCR を守ったと数える");
+        assert_eq!(res.skipped_empty, 0, "「まだ OCR が要る」側に数えない");
+        assert_eq!(
+            fulltext::search_fulltext(&pool, "transcript", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     /// **LCIR が本文を持たないページの既存行は残す**（debt-34 の修正）。
     /// pdfium が 1 ページだけ空を返す添付で、pdf_extract / OCR の本文が消えないこと。
     /// 残した行にも C0 クリーナーが掛かること（受け入れ条件を崩さない）。
@@ -3525,7 +3857,10 @@ mod tests {
         // LCIR は 1 ページ目だけ本文を持つ。
         insert_pdf_lcir_pages(&pool, att, "ck-partial", &[Some("new first page"), None]).await;
 
-        assert_eq!(regenerate_page_fts_from_lcir(&pool, att).await.unwrap(), 1);
+        assert_eq!(
+            regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap(),
+            LcirDeriveOutcome::Derived(1)
+        );
 
         let rows: Vec<(i64, String)> =
             sqlx::query_as("SELECT page, content FROM fulltext WHERE attachment_id = ? ORDER BY page")
@@ -3557,9 +3892,13 @@ mod tests {
         // 「テキストが無い」は NULL だけでなく空白だけのページとしても出る。
         insert_pdf_lcir_pages(&pool, att, "ck-empty", &[None, Some("   \n\t ")]).await;
 
-        let n = regenerate_page_fts_from_lcir(&pool, att).await.unwrap();
+        let n = regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap();
 
-        assert_eq!(n, 0, "LCIR に本文が無いので 0 ページ");
+        assert_eq!(
+            n,
+            LcirDeriveOutcome::NoLcirText { ocr_recorded: false },
+            "LCIR に本文が無い"
+        );
         let hits = fulltext::search_fulltext(&pool, "transcript", None, None, None)
             .await
             .unwrap();
@@ -3608,7 +3947,10 @@ mod tests {
     async fn pdf_extract_does_not_clobber_lcir_derived_index(pool: SqlitePool) {
         let att = setup_attachment(&pool).await;
         insert_pdf_lcir_pages(&pool, att, "ck-lcir", &[Some("derived from lcir pages")]).await;
-        assert_eq!(regenerate_page_fts_from_lcir(&pool, att).await.unwrap(), 1);
+        assert_eq!(
+            regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap(),
+            LcirDeriveOutcome::Derived(1)
+        );
         // 記録は**派生自身が**立てる（ここで手で立て直すと、その配線が壊れても気づけない）。
         assert_eq!(
             fulltext::get_fulltext_source(&pool, att).await.unwrap(),
@@ -3625,7 +3967,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!replaced, "LCIR 由来の索引には譲る");
+        assert_eq!(
+            replaced,
+            fulltext::PdfExtractWrite::SkippedProtected(fulltext::FulltextSource::Lcir),
+            "LCIR 由来の索引には譲る"
+        );
         let hits = fulltext::search_fulltext(&pool, "derived", None, None, None)
             .await
             .unwrap();
@@ -3646,7 +3992,10 @@ mod tests {
             .unwrap();
         insert_pdf_lcir_pages(&pool, att, "ck-seam-ocr", &[Some("garbled text layer")]).await;
 
-        assert_eq!(regenerate_page_fts_from_lcir(&pool, att).await.unwrap(), 0);
+        assert_eq!(
+            regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap(),
+            LcirDeriveOutcome::SkippedOcr
+        );
 
         let content: String =
             sqlx::query_scalar("SELECT content FROM fulltext WHERE attachment_id = ?")
@@ -4007,6 +4356,80 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    // ---- v1.0.0（②b の W1-2）判定できないときは書かない ------------------------------
+
+    /// **索引を読めない回は何も書かず、一度きりフラグも立てない**（次回起動でやり直す）。
+    ///
+    /// 以前はこの判定が tx の外の `indexed_page_count(..).unwrap_or(0)` で、Err が
+    /// 「索引 0 件」に潰れて**そのまま置き換えに進んでいた**（記録の無い課金済み転写が
+    /// 無言で消え、ログも 1 行も出ない）。判定を tx の中に畳んだので、読めない回は
+    /// tx ごと失敗する ＝ 何も書かない。
+    ///
+    /// `res.failed == 0` はフラグ条件の項なのに、これまで 1 本も見ていなかった。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_run_that_could_not_read_the_index_writes_nothing_and_does_not_flag(
+        pool: SqlitePool,
+    ) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        insert_pdf_lcir_pages(&pool, att, "ck-unreadable", &[Some("lcir body")]).await;
+        // `fulltext` を読めなくする。対象クエリは attachments / entries / document_versions
+        // しか見ないので `total` は 1 のまま立つ。
+        sqlx::query("DROP TABLE fulltext")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let res = derive_page_fts_from_lcir_once(&pool)
+            .await
+            .unwrap()
+            .expect("走る");
+
+        assert_eq!(res.total, 1);
+        assert_eq!(res.failed, 1);
+        assert_eq!(res.derived, 0, "読めない回は 1 件も書かない");
+        assert_eq!(
+            fulltext::get_fulltext_source(&pool, att).await.unwrap(),
+            None,
+            "書いていないのだから `lcir` を名乗らない"
+        );
+        assert_eq!(
+            settings::get_setting(&pool, settings::FTS_FULLTEXT_LCIR_DERIVED_KEY)
+                .await
+                .unwrap(),
+            None,
+            "やり切っていないのでフラグは立てない（次回起動でやり直す）"
+        );
+    }
+
+    /// **設定→データのボタンは「置き換える」側でなければならない**（②b の M6）。
+    ///
+    /// これが `AddMissingOnly` に化けると、既存 138 添付が全部 `skipped_existing` に落ちて
+    /// p1 の唯一の移行経路が無言で死ぬ（UI は正常終了に見える）。強さの選択を
+    /// `#[tauri::command]` の本体に置いていた頃は、書き換えても 1 本も落ちなかった。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_explicit_rederive_button_replaces_an_unrecorded_index(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        fulltext::index_attachment(&pool, att, &[(1, "legacy transcript".to_string())])
+            .await
+            .unwrap();
+        insert_pdf_lcir_pages(&pool, att, "ck-explicit", &[Some("lcir body")]).await;
+
+        let res = rederive_fulltext(&pool).await.unwrap();
+
+        assert_eq!(res.derived, 1, "明示操作は記録の無い既存索引を置き換える");
+        assert_eq!(res.skipped_existing, 0);
+        assert_eq!(
+            fulltext::get_fulltext_source(&pool, att).await.unwrap(),
+            Some(fulltext::FulltextSource::Lcir)
         );
     }
 
@@ -4714,7 +5137,10 @@ mod tests {
             .unwrap()
             .is_empty());
         // ページ FTS 側も TeX 版では何もしない。
-        assert_eq!(regenerate_page_fts_from_lcir(&pool, att).await.unwrap(), 0);
+        assert_eq!(
+            regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap(),
+            LcirDeriveOutcome::NoLcirText { ocr_recorded: false }
+        );
     }
 
     /// 手組みの LCIR を read 面（LcirDocument）に組み立て、fragment がノードに紐づき、

@@ -234,6 +234,8 @@ tokenizer: `trigram`（PDF 添付フェーズで `unicode61` から変更予定�
 
 v0.2.0 の **LLM Vision OCR**（`ocr_pdf` / `attach_ocr_text`）はスキャン PDF の認識結果を**この同じテーブル**にページ単位で書き込み、以後 `fulltext_search` でヒットするようにする（スキーマ変更なし）。
 
+**書き手が複数いるので、置き換えには規則がある**（v1.0.0-p1・出どころは settings の `fulltext.source.<attachment_id>` に置く ── FTS5 仮想表には列を足せないため。詳細は `API_SPEC.md`）。とくに **`replace_pages` は先頭で無条件に `DELETE` し、空ページを `INSERT` しない**ので、「全ページ空」の入力をそのまま渡すと**削除だけが走る**。v1.0.0 でこの落とし穴を `index_attachment_from_pdf_extract` の tx 内で塞いだ（非空 0 件 かつ 既存 1 行以上なら書かない）。**新しい writer を足すときは、空入力がこの表に対して何を意味するかを必ず決めること。**
+
 ---
 
 ### Chat 関連テーブル（v0.2.0 追加 / migration 0007）
