@@ -731,18 +731,27 @@ fn gc_stale_asset_dirs(app_data_dir: &Path, abs_asset_dir: &Path) {
 /// [`gc_stale_asset_dirs`] の本体。
 ///
 /// 猶予（[`STALE_ASSET_DIR_SECS`]）内に書かれたものは別インスタンスが今まさに
-/// 使っている可能性があるので残す。残しても次回の build で回収されるだけで、
-/// 消し違えると別インスタンスの成果物が消える ＝ 非対称なので「疑わしきは残す」。
+/// 使っている可能性があるので残す。消し違えると別インスタンスの成果物が消える ＝
+/// 非対称なので「疑わしきは残す」。
 ///
 /// **バックアップ中も同じ理由で残す（②b W1-5）。** フル zip は `attachments/` を丸ごと
 /// 束ねて実測 7〜9 分かかり、DB スナップショット（`VACUUM INTO`）はその先頭で固まる。
 /// 走査が届く前に旧 content_key ディレクトリを trash へ送ると、アーカイブは
 /// 「`assets` 行はあるがファイルが無い」状態で完成する ── 復元後に
-/// `heal_missing_assets` が全ページ再抽出に化け、crop の sha256 が動いて
-/// **課金済み alt text の carry が無言で外れる**（debt-20 / debt-16）。
+/// `heal_missing_assets` が**全ページ再抽出に化ける**（説明そのものは
+/// `refresh_asset_file` が指紋を付け替えるので失われない。残るのはコストと、
+/// 領域数がずれたときに説明が別の絵に付く危険 = debt-20）。
 ///
 /// ⚠ **述語は bool ではなく呼び出し可能で受ける。** 値で受けると「ループに入る前の
 /// スナップショット」に凍り、走査の途中で始まったバックアップに気づけない。
+///
+/// ⚠ **見送った回収は「次の build」では戻ってこない。** 同じ content_key の再 build は
+/// reuse 経路に落ちて gc を呼ばないので、実際に回収されるのは**次に新しい版を作るとき**
+/// （＝抽出器版を上げての再構築や、PDF 差し替え）。見送りはディスクを預けたままにする。
+///
+/// ⚠ **このゲートはプロセスローカル。** `backup::is_running` が見るのは自分のプロセスの
+/// ロックだけなので、配布版と `pnpm tauri dev` を併用しているときは、片方の build が
+/// もう片方のバックアップ中に crop を刈れる（debt-15 / debt-45）。
 ///
 /// 逆向き（バックアップ側が build ロックを取る）は採らない。7〜9 分ユーザーの build を
 /// 止めることになり、しかも build 中に発火した自動バックアップが丸ごと skip される。
@@ -772,7 +781,7 @@ fn gc_stale_asset_dirs_with(
         }
         // 猶予を過ぎていても、バックアップが走っている間は回収しない。
         // `continue` で次のエントリも都度尋ねる（バックアップが終われば同じループの
-        // 途中からでも回収を再開できる）。
+        // 途中からでも回収を再開できる）。見送った分が戻るのは次に**新しい版**を作るとき。
         if backup_running() {
             eprintln!(
                 "LCIR: keeping stale asset dir while a backup is in flight: {}",
@@ -6779,6 +6788,10 @@ mod tests {
         let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
         let old = make_asset_dir(&root, "bbbbbbbbbbbbbbbb");
         age_files(&old, 2 * 60 * 60);
+        // **手前の猶予で守られていないことを先に確かめる。** これが無いと
+        // `STALE_ASSET_DIR_SECS` を伸ばした瞬間にこのテストは無言で空になる
+        // （姉妹テストは「回収される」を主張しているので loud に落ちて気づける）。
+        assert!(is_stale_asset_dir(&old, std::time::SystemTime::now()));
 
         gc_stale_asset_dirs(&root, &current);
 

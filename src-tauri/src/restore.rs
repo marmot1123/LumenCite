@@ -518,9 +518,10 @@ mod tests {
         assert!(safe_archive_path("/etc/passwd").is_none());
         assert!(safe_archive_path("other.txt").is_none());
         assert!(safe_archive_path("attachments/").is_none());
-        // ②b W2-5: バックアップが「走査中に消えて飛ばしたエントリ」を報告するために
-        // 同梱する `SKIPPED.txt` は、復元では無視される（展開先を汚さない）。
+        // ②b W2-5: バックアップが「走査中に読めなくなったエントリ」を報告するために
+        // 同梱する報告ファイルは、復元では無視される（展開先を汚さない）。
         // ここを緩めると、報告用のテキストが app data dir 直下に落ちる。
-        assert!(safe_archive_path("SKIPPED.txt").is_none());
+        // **定数で結ぶ**（リテラルで書くと、どちらかを改名したときに片方だけ動く）。
+        assert!(safe_archive_path(crate::backup::SKIPPED_MANIFEST).is_none());
     }
 }

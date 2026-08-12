@@ -73,7 +73,12 @@ static BACKUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// フル zip は `attachments/` を丸ごと束ねて実測 9 分かかる。その最中に LCIR build が完了して
 /// `gc_stale_asset_dirs` が旧 content_key ディレクトリを trash へ送ると、**アーカイブは
 /// 「`assets` 行はあるがファイルが無い」状態で固まる** ── 復元すると `heal_missing_assets` が
-/// 全ページ再抽出に化け、crop の sha256 が動いて**課金済み alt text の carry が無言で外れる**。
+/// 全ページ再抽出に化ける。
+///
+/// ⚠ **この節は以前「課金済み alt text の carry が無言で外れる」と書いていたが、それは
+/// debt-16 を解消する前（`b69863d` 以前）の話。** 今は `db::assets::refresh_asset_file` が
+/// 指紋の付け替えを同一 tx で行うので、説明が黙って外れることは無い。残るのは
+/// **再抽出のコスト**と、領域数がずれたときに説明が別の絵に付く危険（debt-20）。
 ///
 /// **状態を二重に持たない。** 実行中フラグを別に立てると「立て忘れ」という壊し方が生まれ、
 /// しかもそれを単体テストで検出できない（実行中の一瞬を外から観測する必要があるため）。
@@ -301,7 +306,19 @@ const SKIPPED_SAMPLE_MAX: usize = 200;
 ///
 /// **復元は「`db.sqlite` か `attachments/` 配下」だけを許可する allowlist**（`restore.rs` の
 /// `safe_archive_path`）なので、このエントリは復元時に無視される ＝ 展開先を汚さない。
-const SKIPPED_MANIFEST: &str = "SKIPPED.txt";
+/// ⚠ **自動で読むものは 1 つも無い。** 復元時に警告を出したいなら別途配線が要る（debt-45）。
+pub(crate) const SKIPPED_MANIFEST: &str = "SKIPPED.txt";
+
+/// 消えても報告しない作業ファイルか。
+///
+/// LCIR の crop は `write_atomic` が `<name>.png.tmp` を書いてから rename する
+/// （`ingestion/pdf/mod.rs`）。つまり**バックアップ中に build が走れば `.tmp` は正常動作として
+/// 消える**。これを数えると `SKIPPED.txt` が build のたびに出て、
+/// **唯一の欠損シグナルが恒常的に狼少年になる**。消える前に見えていれば zip には入るので、
+/// 「入らなかったのに黙っている」ことにはならない。
+fn is_transient_work_file(zip_path: &str) -> bool {
+    zip_path.ends_with(".tmp")
+}
 
 impl SkippedEntries {
     fn note(&mut self, zip_path: &str, err: &io::Error) {
@@ -312,11 +329,17 @@ impl SkippedEntries {
     }
 
     /// アーカイブに同梱する報告本文。
+    ///
+    /// 「消えた（vanished）」と断定しない ── ディレクトリごと消えた場合も 1 件で数えるし、
+    /// 壊れた symlink や特殊ファイルも同じ枝に落ちる。言えるのは
+    /// **「アーカイブに入れられなかった」**ことだけ。
     fn report(&self) -> String {
         let mut s = format!(
-            "LumenCite backup: {} entry/entries vanished while the archive was being written \
-             and are NOT included in this backup.\n\
-             このバックアップには、書き出し中に消えた {} 件のファイルが含まれていません。\n\n",
+            "LumenCite backup: {} entry/entries could not be archived (they were removed or \
+             became unreadable while the archive was being written) and are NOT included \
+             in this backup.\n\
+             このバックアップには、書き出し中に読めなくなった {} 件のエントリが\
+             含まれていません。\n\n",
             self.count, self.count
         );
         for n in &self.names {
@@ -333,8 +356,14 @@ impl SkippedEntries {
 /// 「走査中に消えていたら飛ばす、それ以外は失敗」を適用する**唯一の判定点**。
 ///
 /// `NotFound` だけを飛ばす。ここを広げると、容量不足や権限エラーで**中身の欠けた
-/// アーカイブが「成功」として一覧に並ぶ**。zip 側のエラー（`ZipError`）は
-/// `io::Error` に変換されても `NotFound` にはならないので取り違えない。
+/// アーカイブが「成功」として一覧に並ぶ**。
+///
+/// ⚠ **`NotFound` が FS 由来であることは、この関数では保証していない。**
+/// `ZipError` も `io::Error` へ変換されると `NotFound` になりうる
+/// （`ZipError::FileNotFound` と、内側の kind をそのまま通す `ZipError::Io`）。
+/// 今それが起きないのは変換の性質ではなく、**`FileNotFound` を返すのは `abort_file` と
+/// `shallow_copy_file` / `deep_copy_file` だけで、このモジュールはどれも呼んでいない**から。
+/// そのどれかを使うようになったら、ここの分類を必ず見直すこと。
 fn skip_if_vanished(
     res: io::Result<()>,
     zip_path: &str,
@@ -343,7 +372,9 @@ fn skip_if_vanished(
     match res {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            skipped.note(zip_path, &e);
+            if !is_transient_work_file(zip_path) {
+                skipped.note(zip_path, &e);
+            }
             Ok(())
         }
         Err(e) => Err(e),
@@ -404,9 +435,13 @@ fn add_dir_recursive<W: Write + io::Seek>(
         match e {
             Ok(e) => entries.push(e),
             // 反復自体が失敗した ＝ 名前すら分からないエントリ。旧コードは `filter_map(ok)` で
-            // 黙って落としていた。**「`SKIPPED.txt` が無い＝完全」を本当のことにする**ためだけに数える
-            // （落とす理由が「消えた」とは限らないので、ここは失敗させずに記録へ倒す）。
-            Err(err) => skipped.note(&format!("{prefix}/<unreadable directory entry>"), &err),
+            // 黙って落としていた。**判定点を増やさない**ため、名前をプレースホルダにして
+            // 同じ `skip_if_vanished` へ通す（＝ NotFound 以外はここでも全体を失敗させる）。
+            Err(err) => skip_if_vanished(
+                Err(err),
+                &format!("{prefix}/<unreadable directory entry>"),
+                skipped,
+            )?,
         }
     }
     entries.sort_by_key(|e| e.file_name());
@@ -435,16 +470,46 @@ fn archive_one<W: Write + io::Seek>(
         return add_dir_recursive(zip, path, zip_path, opts, skipped);
     }
     if !path.is_file() {
-        // ディレクトリでもファイルでもない = 走査の途中で消えた（壊れた symlink や
-        // 特殊ファイルもここに落ちる）。呼び出し側に 1 種類の形で渡すため NotFound にする。
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "not a regular file or directory",
-        ));
+        // ディレクトリでもファイルでもない。**なぜそう見えたのかを取り直す。**
+        // `Path::is_dir()` / `is_file()` は **stat の失敗を全部 `false` に潰す**ので、
+        // ここで合成した `NotFound` を返すと、親ディレクトリに `x` が無いだけの
+        // （＝今もディスクに在る）ファイルを「消えました」と報告してしまう。
+        // ⚠ `symlink_metadata` はリンク自身を見るので、**壊れた symlink は `Ok`** に落ちる
+        // ── 走査中に消えたファイルと同じ扱い（どちらも中身を持てない）で正しい。
+        return Err(match fs::symlink_metadata(path) {
+            // stat は通ったのに dir でも file でもない = 壊れた symlink・FIFO・ソケット。
+            // 呼び出し側に 1 種類の形で渡すため NotFound にする。
+            Ok(_) => io::Error::new(
+                io::ErrorKind::NotFound,
+                "not a regular file or directory",
+            ),
+            // ENOENT はそのまま「消えた」。EACCES / EIO などは**本物の kind のまま**返して
+            // バックアップ全体を失敗させる（親を辿れる `chmod 000` のファイルが
+            // 既にそうなっているのと揃える）。
+            Err(e) => e,
+        });
     }
-    // **open が成功してから** `start_file` する。逆順にすると、開けなかったファイルの
-    // 空エントリが zip に残り「0 バイトで存在する」という別種の嘘になる。
-    let mut f = fs::File::open(path)?;
+    // **開いた結果を渡す**（ここでは開くだけ・判定しない）。
+    write_file_entry(zip, fs::File::open(path), zip_path, opts)
+}
+
+/// 開いたファイルを zip の 1 エントリとして書く。
+///
+/// **`opened` が成功してから `start_file` する。** 逆順にすると、開けなかったファイルの
+/// 空エントリが zip に残り「0 バイトで存在する」という別種の嘘になる ── しかも
+/// `SKIPPED.txt` には「含まれていません」と載るので、アーカイブが自分と矛盾する。
+///
+/// この順序が効くのは「`is_file()` が true を返した直後に消える」レースだけで、
+/// FS では決定論的に組めない。**開いた結果を引数で受ける**ことで、その 1 点だけを
+/// テストから撮れるようにしてある（[`is_transient_work_file`] と同じく、判定を
+/// アダプタ層から引き剥がす形）。
+fn write_file_entry<W: Write + io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    opened: io::Result<fs::File>,
+    zip_path: &str,
+    opts: SimpleFileOptions,
+) -> io::Result<()> {
+    let mut f = opened?;
     zip.start_file(zip_path, opts)?;
     io::copy(&mut f, zip)?;
     Ok(())
@@ -567,6 +632,97 @@ mod tests {
         // 入れられなかったエントリの**空の枠**を残さない（「0 バイトで存在する」は別種の嘘）。
         let archive = zip::ZipArchive::new(zip.finish().unwrap()).unwrap();
         assert_eq!(archive.len(), 0);
+    }
+
+    /// **開けなかったファイルの空の枠を zip に残さない。**
+    ///
+    /// この順序が効くのは「`is_file()` が true の直後に消える」レースだけで FS では組めない。
+    /// `write_file_entry` が**開いた結果を引数で受ける**ので、そこだけを撮れる。
+    /// 逆順（`start_file` が先）に戻すと、0 バイトのエントリが**完成したアーカイブに残り**、
+    /// 同じパスが `SKIPPED.txt` に「含まれていません」と載って自己矛盾する。
+    #[test]
+    fn a_file_that_could_not_be_opened_leaves_no_empty_frame() {
+        let mut zip = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        let err = write_file_entry(
+            &mut zip,
+            Err(io::Error::new(io::ErrorKind::NotFound, "gone")),
+            "attachments/1/gone.pdf",
+            opts,
+        )
+        .expect_err("開けなければ Err");
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let archive = zip::ZipArchive::new(zip.finish().unwrap()).unwrap();
+        assert_eq!(archive.len(), 0, "空の枠を残さない");
+    }
+
+    /// **stat できなかったファイルを「消えた」と報告しない。**
+    ///
+    /// 親から `x` を落とすと `read_dir` は名前を返すのに子の `metadata()` が EACCES で落ち、
+    /// `is_dir()` / `is_file()` が**どちらも false** になる（レビューで実測された形）。
+    /// ここで合成 `NotFound` を返すと、今もディスクに在るファイルが `SKIPPED.txt` に
+    /// 「含まれていません」と載る ＝ 唯一の欠損記録が嘘をつく。
+    ///
+    /// ⚠ **root で走らせると権限が効かない**ので、効いていることを確かめてから assert する
+    /// （効いていなければこのテストは何も主張しない ── CI の `ubuntu-22.04` は非 root）。
+    #[cfg(unix)]
+    #[test]
+    fn a_file_we_cannot_stat_is_not_reported_as_vanished() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("lc-backup-perm-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let dir = root.join("locked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("paper.pdf");
+        std::fs::write(&victim, b"%PDF-1.7 fake").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let enforced = fs::symlink_metadata(&victim).is_err();
+        if enforced {
+            let mut zip = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let mut skipped = SkippedEntries::default();
+            let err = archive_one(&mut zip, &victim, "attachments/1/paper.pdf", opts, &mut skipped)
+                .expect_err("読めないファイルは Err");
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::PermissionDenied,
+                "stat の失敗を「消えた」に化けさせない（化けると欠けたまま成功する）"
+            );
+        } else {
+            eprintln!("skipped: この環境では権限が効いていない（root?）");
+        }
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `write_atomic` の作業ファイル（`<name>.png.tmp`）が rename で消えるのは
+    /// **LCIR build の正常動作**。これを数えると `SKIPPED.txt` が build のたびに出て、
+    /// 唯一の欠損シグナルが狼少年になる。飛ばすが**記録はしない**。
+    #[test]
+    fn a_vanished_work_file_is_skipped_without_crying_wolf() {
+        let mut skipped = SkippedEntries::default();
+        let gone = io::Error::new(io::ErrorKind::NotFound, "renamed away");
+        assert!(skip_if_vanished(
+            Err(gone),
+            "attachments/1/.lcir/7/abcd/fig-p001-00.png.tmp",
+            &mut skipped
+        )
+        .is_ok());
+        assert_eq!(skipped.count, 0, "作業ファイルの消滅は欠損ではない");
+
+        // 本物の crop が消えたときは今までどおり記録する（規則を広げすぎない）。
+        let gone = io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert!(skip_if_vanished(
+            Err(gone),
+            "attachments/1/.lcir/7/abcd/fig-p001-00.png",
+            &mut skipped
+        )
+        .is_ok());
+        assert_eq!(skipped.count, 1);
     }
 
     /// 報告本文は総数を落とさない（一覧だけ頭打ちにする）。
