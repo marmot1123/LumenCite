@@ -91,6 +91,56 @@ where
     Ok(id)
 }
 
+/// **行き先がまだ生きていることを、書き込みと同じ 1 文の中で確かめて**挿入する
+/// （ゲート ②b の W2-4）。挿入できたら `Ok(true)`、`document_version_id` が
+/// その添付の最新 completed でなくなっていたら 1 行も書かずに `Ok(false)`。
+///
+/// **なぜ「先に確認してから [`insert_alt_text`]」ではないのか。** 確認と書き込みが
+/// 別の文だと、その間に別経路の build が新版を commit する窓が残る（窓が縮むだけで
+/// 消えない）。Vision の応答待ちは数秒あるので、この窓は実際に踏める。1 文にすると、
+/// 書き込みロックを取れた時点の状態で条件が評価されるため、build tx が先なら
+/// 0 行・後なら 1 行に必ず確定する。
+///
+/// 落ちた行の中身は**捨てる**。superseded 版へ書くと (a) `load_lcir_document` は
+/// 最新 completed しか読まないのでどの read 面にも出ず (b) `GC_TARGET_PREDICATE` の
+/// 「alt text を持つ版は消さない」に引っかかってその版を回収不能にする ──
+/// **読めない行が版 1 本を人質に取る**。同じ図は次回の実行で新版の側から拾える。
+pub async fn insert_alt_text_if_version_is_latest<'e, E>(
+    executor: E,
+    a: &NewAltText<'_>,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let res = sqlx::query(
+        "INSERT INTO node_alt_texts
+            (node_id, document_version_id, source_asset_sha256, text, origin, confidence,
+             model, carried_from_version_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (
+             SELECT 1 FROM document_versions target
+              WHERE target.id = ?
+                AND target.id = (
+                    SELECT dv.id FROM document_versions dv
+                     WHERE dv.attachment_id = target.attachment_id
+                       AND dv.extraction_status IN ('completed', 'completed_with_warnings')
+                     ORDER BY dv.id DESC LIMIT 1)
+         )",
+    )
+    .bind(a.node_id)
+    .bind(a.document_version_id)
+    .bind(a.source_asset_sha256)
+    .bind(a.text)
+    .bind(a.origin)
+    .bind(a.confidence)
+    .bind(a.model)
+    .bind(a.carried_from_version_id)
+    .bind(a.document_version_id)
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// 1 バージョンの全 alt text を返す（read 面の `LcirNode.alt_text` 組み立て用）。
 pub async fn alt_texts_for_version(
     pool: &SqlitePool,
@@ -343,6 +393,162 @@ mod tests {
         assert_eq!(rows[0].model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(rows[0].source_asset_sha256, "cropsha1");
         assert!(rows[0].carried_from_version_id.is_none());
+    }
+
+    /// **行き先が生きていれば普通に入る**（ゲート ②b の W2-4）。
+    ///
+    /// 条件付き挿入にしたことで「1 行も入らない」を既定にしてしまわないための表側。
+    /// 条件を `WHERE 0` に落とす変異と、`WHERE 1` に落とす変異の両方を、このテストと
+    /// 次のテストが 1 本ずつ受け持つ。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_conditional_insert_writes_when_the_version_is_still_latest(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let vid = insert_pdf_version(&pool, att, "ck1").await;
+        let node = insert_figure_with_crop(&pool, vid, 0, "cropsha1").await;
+
+        let wrote = insert_alt_text_if_version_is_latest(
+            &pool,
+            &NewAltText {
+                node_id: node,
+                document_version_id: vid,
+                source_asset_sha256: "cropsha1",
+                text: "A pentagon graph.",
+                origin: Origin::LlmInference.as_str(),
+                confidence: Some(0.5),
+                model: Some("claude-sonnet-5"),
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(wrote, "最新 completed 版への書き込みは通る");
+        let rows = alt_texts_for_version(&pool, vid).await.unwrap();
+        assert_eq!(rows.len(), 1, "課金したぶんが 1 行だけ入る");
+        assert_eq!(rows[0].text, "A pentagon graph.");
+        assert_eq!(rows[0].model.as_deref(), Some("claude-sonnet-5"), "全列が素通しで入る");
+    }
+
+    /// **応答を待っている間に新版が入ったら、1 行も書かない**（ゲート ②b の W2-4）。
+    ///
+    /// superseded 版へ書くと (a) `load_lcir_document` は最新 completed しか読まないので
+    /// どの read 面にも出ず (b) `GC_TARGET_PREDICATE` の「alt text を持つ版は消さない」に
+    /// 引っかかって、**読めない行がその版を人質に取る**。捨てるのが正しい。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_conditional_insert_writes_nothing_once_a_newer_version_exists(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let old = insert_pdf_version(&pool, att, "ck1").await;
+        let node = insert_figure_with_crop(&pool, old, 0, "cropsha1").await;
+        // Vision の応答を待っている間に別経路（p2 の自動 build）が新版を commit した。
+        let new = insert_pdf_version(&pool, att, "ck2").await;
+        crate::db::document_versions::mark_superseded_for_attachment(&pool, att, new)
+            .await
+            .unwrap();
+
+        let wrote = insert_alt_text_if_version_is_latest(
+            &pool,
+            &NewAltText {
+                node_id: node,
+                document_version_id: old,
+                source_asset_sha256: "cropsha1",
+                text: "A pentagon graph.",
+                origin: Origin::LlmInference.as_str(),
+                confidence: Some(0.5),
+                model: None,
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!wrote, "行き先が最新でなくなったことを呼び出し側に返す（数えられるように）");
+        assert!(
+            alt_texts_for_version(&pool, old).await.unwrap().is_empty(),
+            "旧版に読めない行を残さない（その版が GC の対象から永久に外れる）"
+        );
+    }
+
+    /// **`superseded` にし忘れた旧版でも守る**（ゲート ②b の W2-4）。
+    ///
+    /// 判定の材料は「その添付の最新 completed 版か」であって「自分が superseded か」では
+    /// ない。`mark_superseded_for_attachment` が走る前に新版が入った瞬間にも効く必要がある
+    /// ── build tx は insert → …→ supersede → commit の順なので、両方が見える窓は無いが、
+    /// **述語をどちらで書いたかは正しさに効く**（`extraction_status` だけを見る実装に
+    /// 変えるとこのテストが落ちる）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_conditional_insert_compares_against_the_newest_completed_not_the_status(
+        pool: SqlitePool,
+    ) {
+        let att = setup_attachment(&pool).await;
+        let old = insert_pdf_version(&pool, att, "ck1").await;
+        let node = insert_figure_with_crop(&pool, old, 0, "cropsha1").await;
+        // 新版は入ったが、まだ旧版を superseded にしていない（両方 completed）。
+        insert_pdf_version(&pool, att, "ck2").await;
+
+        let wrote = insert_alt_text_if_version_is_latest(
+            &pool,
+            &NewAltText {
+                node_id: node,
+                document_version_id: old,
+                source_asset_sha256: "cropsha1",
+                text: "A pentagon graph.",
+                origin: Origin::LlmInference.as_str(),
+                confidence: Some(0.5),
+                model: None,
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!wrote, "status ではなく「最新の completed 版か」で判定する");
+        assert!(alt_texts_for_version(&pool, old).await.unwrap().is_empty());
+    }
+
+    /// **他の添付の版は判定に混ぜない。** 条件を「DB 全体の最新 completed 版か」と
+    /// 書くと、ライブラリに添付が 2 つ以上ある実環境では**ほぼ全部の書き込みが落ちる**
+    /// （＝ 課金しても 1 行も入らない）。相関副問い合わせが添付でつながっていることを見る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_conditional_insert_ignores_versions_of_other_attachments(pool: SqlitePool) {
+        let att = setup_attachment(&pool).await;
+        let vid = insert_pdf_version(&pool, att, "ck1").await;
+        let node = insert_figure_with_crop(&pool, vid, 0, "cropsha1").await;
+        // 別の添付の、もっと新しい版（`attachments.file_path` は UNIQUE なので別パスで作る）。
+        let other_entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "Q".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let other_att =
+            add_attachment(&pool, other_entry.id, "attachments/2/q.pdf", "q.pdf", "application/pdf")
+                .await
+                .unwrap()
+                .id;
+        insert_pdf_version(&pool, other_att, "ck9").await;
+
+        let wrote = insert_alt_text_if_version_is_latest(
+            &pool,
+            &NewAltText {
+                node_id: node,
+                document_version_id: vid,
+                source_asset_sha256: "cropsha1",
+                text: "A pentagon graph.",
+                origin: Origin::LlmInference.as_str(),
+                confidence: Some(0.5),
+                model: None,
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(wrote, "別の添付に新しい版があっても、自分の添付の最新なら通る");
+        assert_eq!(alt_texts_for_version(&pool, vid).await.unwrap().len(), 1);
     }
 
     /// UNIQUE (node_id, origin): 同一ノードへの生成 alt text は 1 件だけ（再課金の構造的防止）。

@@ -396,6 +396,8 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         total: number;
         generated: number;
         skipped: number;
+        /** 実行中に版が入れ替わって行き先を失った図（②b の W2-4）。次回の実行で拾える。 */
+        stale: number;
         failed: number;
         aborted: boolean;
         abort_reason: string | null;
@@ -411,7 +413,9 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                 generated: r.generated,
                 skipped: r.skipped,
                 failed: r.failed,
-              }),
+              }) +
+              // 0 でないときだけ足す（0 が普通なので、常時出すと本体が埋もれる）。
+              (r.stale > 0 ? ` ${t("detailPanel.altTextStale", { stale: r.stale })}` : ""),
       );
     } catch (e: any) {
       if (stillHere()) {

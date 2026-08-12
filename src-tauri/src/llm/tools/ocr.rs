@@ -250,6 +250,12 @@ pub(crate) async fn transcribe_and_save<T: PageTranscriber + ?Sized>(
     let mut results: Vec<(i64, String)> = Vec::with_capacity(images.len());
     let mut out = OcrOutcome { planned, ..Default::default() };
 
+    // **総数が分かった時点で 1 回報告する**（ゲート ②b の F-2）。1 ページ目の転写は
+    // 数秒〜数十秒かかり、その間だけ分母が出ない。OCR は画面をまたいだ停止手段が
+    // この表示にぶら下がっているので（`batch_status::BatchKind::Ocr`）、盲窓は短いほどよい。
+    crate::batch_status::set_progress(crate::batch_status::BatchKind::Ocr, 0, planned);
+    (hooks.on_progress)(0, planned);
+
     for (page_no, b64) in images {
         if OCR_CANCEL.load(Ordering::SeqCst) || (hooks.should_stop)() {
             out.stopped = true;
@@ -838,6 +844,67 @@ mod tests {
 
     fn images(n: i64) -> Vec<(i64, String)> {
         (1..=n).map(|p| (p, format!("b64-{p}"))).collect()
+    }
+
+    /// **1 ページ目を転写する前に分母を出す**（ゲート ②b の F-2）。
+    ///
+    /// OCR は画面をまたいだ停止手段が `batch_status` の進捗表示にぶら下がっているので、
+    /// 「何件中の何件目か」が出ない盲窓は短いほどよい。1 ページ目の往復は数秒〜数十秒。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_page_count_is_reported_before_the_first_transcription(pool: SqlitePool) {
+        let _g = gate().await;
+        let att = an_attachment(&pool).await;
+        let (t, _calls) = fake(None);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i64, i64)>::new()));
+        let s2 = seen.clone();
+        let prog = move |done: i64, total: i64| s2.lock().unwrap().push((done, total));
+        let stop = || false;
+        let hooks = OcrHooks { should_stop: &stop, on_progress: &prog };
+
+        // 本番と同じく実行中の印を握った状態で呼ぶ（Drop が進捗表を掃除するのもここ）。
+        let mark = crate::batch_status::RunningMark::new(crate::batch_status::BatchKind::Ocr);
+        transcribe_and_save(&pool, att, images(3), false, &t, &hooks)
+            .await
+            .unwrap();
+        drop(mark);
+
+        assert_eq!(
+            seen.lock().unwrap().first().copied(),
+            Some((0, 3)),
+            "最初の 1 通は「0 ページ処理済み・全 3 ページ」"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, 3), (1, 3), (2, 3), (3, 3)],
+            "開始の報告が 1 ページ目の報告を置き換えていない"
+        );
+    }
+
+    /// 同じ開始報告が**バックエンドの正本にも**載る（ゲート ②b の F-2 / debt-32）。
+    ///
+    /// **ループが 1 度も回らない入力で撮る。** 1 ページでも回ると最後の 1 通が
+    /// 同じキーを上書きするので、開始報告を消す変異と区別がつかない
+    /// （[[feedback_gate_tests_go_vacuous]] の逆で、ここは「回らない入力」が必要）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_opening_report_reaches_the_backend_progress_table(pool: SqlitePool) {
+        let _g = gate().await;
+        let att = an_attachment(&pool).await;
+        let (t, _calls) = fake(None);
+        let stop = || false;
+        let hooks = OcrHooks { should_stop: &stop, on_progress: &|_, _| {} };
+
+        let mark = crate::batch_status::RunningMark::new(crate::batch_status::BatchKind::Ocr);
+        transcribe_and_save(&pool, att, images(0), false, &t, &hooks)
+            .await
+            .unwrap();
+        let progress = crate::batch_status::snapshot().progress.get("ocr").copied();
+        drop(mark);
+
+        assert_eq!(
+            progress,
+            Some(crate::batch_status::Progress { done: 0, total: 0 }),
+            "モーダルを開き直したフロントは、1 ページ目を待っている間もここを読む"
+        );
     }
 
     /// **停止したらそこで課金が止まる。** 527 ページ中 2 ページで降りたら

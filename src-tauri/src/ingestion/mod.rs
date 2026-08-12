@@ -1821,6 +1821,11 @@ async fn run_build_batch<F: Fn(i64, i64), P: Fn() -> bool>(
     on_progress: F,
 ) -> LcirBatchResult {
     let total = targets.len() as i64;
+    // **総数が分かった時点で 1 回報告する**（ゲート ②b の F-2）。1 件目を処理し終えるまで
+    // 報告しないと、その間だけ分母が出ず、フロントは「構築中…」に落ちる。実ライブラリの
+    // att37（527 頁）は 1 件目で最大 8 分かかるので、いちばん長くこの状態になるのは
+    // debt-32 の根拠に挙げた当の添付だった。`run_gc` は前からこの形（`progress(0, total)`）。
+    on_progress(0, total);
     let (mut built, mut reused, mut failed, mut skipped) = (0i64, 0i64, 0i64, 0i64);
     for (i, (att_id, mime)) in targets.into_iter().enumerate() {
         // pdfium が使えないと分かっている間は PDF に着手しない（v1.0.0-p2）。
@@ -2748,8 +2753,42 @@ mod tests {
         assert_eq!(res.skipped, 0);
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![(1, 2), (2, 2)],
-            "1 添付ごとに (done, total) が通知される"
+            vec![(0, 2), (1, 2), (2, 2)],
+            "総数が分かった時点で 1 回 + 1 添付ごとに (done, total) が通知される"
+        );
+    }
+
+    /// **1 件目に着手する前に分母を出す**（ゲート ②b の F-2）。
+    ///
+    /// 実ライブラリの att37（527 頁）は 1 件目に最大 8 分かかり、その間フロントは
+    /// `batch_status.progress` にエントリが無いので分母なしの「構築中…」に落ちる
+    /// ── debt-32 の根拠に挙げた当の添付が、いちばん長くこの状態になっていた。
+    ///
+    /// **先頭の 1 通だけを見る**（後続は上のテストが端から端まで固定している）。
+    /// 対象を 1 件にして「(0,1) の後に (1,1)」＝ 開始報告が完了報告に化けていないことも見る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn build_batch_reports_the_total_before_touching_the_first_item(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let seen = std::sync::Mutex::new(Vec::<(i64, i64)>::new());
+        run_build_batch(
+            &pool,
+            Path::new("/nonexistent"),
+            vec![(9001, "application/pdf".to_string())],
+            || true,
+            |done, total| seen.lock().unwrap().push((done, total)),
+        )
+        .await;
+        assert_eq!(
+            seen.lock().unwrap().first().copied(),
+            Some((0, 1)),
+            "最初の 1 通は「0 件処理済み・全 1 件」（分母がすぐ出る）"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0, 1), (1, 1)],
+            "開始の報告が完了の報告を置き換えていない"
         );
     }
 
@@ -2781,7 +2820,7 @@ mod tests {
         assert_eq!(res.failed, 1, "TeX は着手する（添付が無いので失敗する）");
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![(1, 2), (2, 2)],
+            vec![(0, 2), (1, 2), (2, 2)],
             "skip した添付でも進捗は前進させる"
         );
     }
