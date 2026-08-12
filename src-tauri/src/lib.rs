@@ -1685,6 +1685,30 @@ impl Drop for VisionAltTextGuard {
 /// `generate_vision_alt_texts` の多重起動ガード（課金する操作を二重に走らせない）。
 static VISION_ALT_TEXT_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// 課金バッチの開始（始められないなら `already_running`）。返り値のガードが Drop で解除する。
+///
+/// **[`begin_lcir_batch`] と同型にしてある。** 裁定を `#[tauri::command]` の本体に置くと
+/// `State<AppState>` を作れず単体テストできないので、**判定も配線も変異が素通りする**
+/// （ゲート ②b の W1-6 / M7 と同じ形）。ここまで出せば「排他が両方向に効く」ことを
+/// 直接 assert できて、残る無検証はコマンドがこの関数を呼ぶ 1 行だけになる。
+///
+/// ⚠ **`already_running` は「バッチが走らなかった」なので記録側へ通さない**
+/// （`batch_status::FinishedBatch` の契約）。呼び出し側は `?` でそのまま返すこと。
+fn begin_vision_alt_text_batch() -> Result<VisionAltTextGuard, String> {
+    if vision_alt_text_is_blocked_by_a_build_batch() {
+        return Err("already_running".to_string());
+    }
+    if VISION_ALT_TEXT_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("already_running".to_string());
+    }
+    Ok(VisionAltTextGuard {
+        _mark: batch_status::RunningMark::new(batch_status::BatchKind::VisionAltText),
+    })
+}
+
 /// alt text 生成が推定であることを示す confidence。値そのものの序列に意味はなく、
 /// 「原資料由来ではない」ことを read 側が判別できるようにするための表明（roadmap §16）。
 const VISION_ALT_TEXT_CONFIDENCE: f64 = 0.5;
@@ -1756,23 +1780,12 @@ async fn generate_vision_alt_texts(
         aborted: false,
         abort_reason: None,
     };
-    // **同じ添付の版を作り替えるバッチとは同居させない**（ゲート ②b の W1-6）。
-    // `already_running` と同じ扱いで返すのは、ユーザーにとって区別が要らないため
-    // （どちらも「今は始められない・待てば始められる」）── 文言は「他の LCIR 処理が
-    // 実行中です」に揃えてあり、GC が弾かれたときと同じものが出る。
-    // **記録側（`record_batch` / `record_success`）へは通さない** ── 走らなかったので
-    // 「直近の結果」を上書きさせない（`batch_status::FinishedBatch` が定めた契約）。
-    if vision_alt_text_is_blocked_by_a_build_batch() {
-        return Err("already_running".to_string());
-    }
-    if VISION_ALT_TEXT_RUNNING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err("already_running".to_string());
-    }
+    // **多重起動と、同じ添付の版を作り替えるバッチとの同居を、まとめてここで裁く**
+    // （ゲート ②b の W1-6）。build 系に弾かれた場合も `already_running` を返すのは、
+    // ユーザーにとって区別が要らないため（どちらも「今は始められない・待てば始められる」）
+    // ── 文言は「他の LCIR 処理が実行中です」に揃えてあり、GC が弾かれたときと同じものが出る。
+    let _guard = begin_vision_alt_text_batch()?;
     let batch_kind = batch_status::BatchKind::VisionAltText;
-    let _guard = VisionAltTextGuard { _mark: batch_status::RunningMark::new(batch_kind) };
 
     // 課金する操作なので、LCIR フラグと Vision 同意の両方を要求する（決定点は 1 つ）。
     //
@@ -1956,6 +1969,12 @@ async fn generate_vision_alt_texts(
                             Ok(false) => {
                                 stale += 1;
                                 consecutive_failures = 0;
+                                // **行にできなくても指紋メモには載せる。** このメモの不変条件は
+                                // 「この画像には**このランで既に 1 度払った**」であって
+                                // 「保存できた」ではない。載せないと、同じ絵を持つ別の図
+                                // （ページごとに出るロゴ等）でもう一度課金する。
+                                described_by_sha
+                                    .insert(target.asset_sha256.clone(), text.clone());
                                 eprintln!(
                                     "LCIR: discarded a billed alt text for node {} (attachment {}): \
                                      version {} is no longer the latest completed one",
@@ -5031,6 +5050,68 @@ mod batch_wiring_tests {
         );
     }
 
+    /// **課金バッチの入口も、build 系が走っていたら開かない**（②b の W1-6・排他の課金側）。
+    ///
+    /// 上のテストが見ているのは述語だけで、**それを入口が読むかどうかは別の主張**
+    /// （判定をコマンド本体に置いていた頃は、判定を消す変異が 1 本もテストを落とさなかった）。
+    /// ここでは `begin_vision_alt_text_batch` を直接呼んで、弾いた側がフラグも印も
+    /// 残さないこと、空いていれば取れて Drop で両方下りることまで見る。
+    #[test]
+    fn the_paid_batch_entry_point_is_closed_while_a_build_batch_runs() {
+        let _g = gate();
+        let held = begin_lcir_batch(batch_status::BatchKind::Rebuild).expect("1 本目は取れる");
+        let rejected = begin_vision_alt_text_batch();
+        drop(held);
+
+        assert_eq!(
+            rejected.err().as_deref(),
+            Some("already_running"),
+            "再構築の最中に課金バッチを開始できてはならない"
+        );
+        assert!(
+            !VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst),
+            "弾かれた側が排他フラグを立てっぱなしにしない（以後どの生成も始められなくなる）"
+        );
+        assert!(!batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::VisionAltText));
+
+        // 空いていれば取れて、印が立ち、Drop で印もフラグも下りる。
+        let guard = begin_vision_alt_text_batch().expect("誰も走っていなければ取れる");
+        assert!(batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::VisionAltText));
+        drop(guard);
+        assert!(!batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::VisionAltText));
+        assert!(
+            !VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst),
+            "Drop で排他フラグも下りる"
+        );
+    }
+
+    /// 2 本目の課金バッチは弾かれ、**1 本目の印を壊さない**（多重起動ガードの側）。
+    #[test]
+    fn a_second_paid_batch_is_rejected_and_leaves_the_first_alone() {
+        let _g = gate();
+        let first = begin_vision_alt_text_batch().expect("1 本目は取れる");
+        let second = begin_vision_alt_text_batch();
+        assert_eq!(second.err().as_deref(), Some("already_running"));
+        assert!(
+            batch_status::snapshot()
+                .running
+                .contains(&batch_status::BatchKind::VisionAltText),
+            "弾かれた 2 本目が 1 本目の印を壊さない"
+        );
+        assert!(
+            VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst),
+            "弾かれた 2 本目の Drop が 1 本目の排他フラグを下ろさない"
+        );
+        drop(first);
+        assert!(!VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst));
+    }
+
     /// **進捗は「バックエンドの正本」と「フロントのイベント」の両方へ流れる**（②b の M4）。
     ///
     /// この配線は `lcir_progress_emitter` の中に埋まっていて、`batch_status::set_progress`
@@ -5040,9 +5121,12 @@ mod batch_wiring_tests {
     #[test]
     fn progress_reaches_both_the_backend_table_and_the_event() {
         let _g = gate();
-        let emitted = std::sync::Mutex::new(Vec::<(i64, i64)>::new());
+        // イベント側が呼ばれた**その時点**でバックエンドの表がどう見えているかを撮る。
+        // 値だけを見ると「先にイベント → 後で表」に入れ替える変異が生き残る。
+        let emitted = std::sync::Mutex::new(Vec::<((i64, i64), Option<batch_status::Progress>)>::new());
         let sink = progress_sink(batch_status::BatchKind::Rederive, |done, total| {
-            emitted.lock().unwrap().push((done, total))
+            let seen = batch_status::snapshot().progress.get("rederive").copied();
+            emitted.lock().unwrap().push(((done, total), seen));
         });
 
         // 印が立っていないと `Drop` が消すべきものが無いだけで、進捗表自体には載る。
@@ -5056,8 +5140,9 @@ mod batch_wiring_tests {
         );
         assert_eq!(
             *emitted.lock().unwrap(),
-            vec![(3, 10)],
-            "同じ値がイベントにも流れる（開いたままのフロントはこちらを見る）"
+            vec![((3, 10), Some(batch_status::Progress { done: 3, total: 10 }))],
+            "同じ値がイベントにも流れ、**その時点で表は既に新しい**（イベントを見て \
+             すぐ `lcir_batch_status` を引くフロントが古い値を読まない）"
         );
         drop(mark);
     }

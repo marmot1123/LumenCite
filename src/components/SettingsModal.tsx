@@ -1700,7 +1700,11 @@ function DataTab() {
               </SecondaryBtn>
               <SecondaryBtn
                 onClick={() => void proceedAltTextIfCountMatches(altTextPending)}
-                disabled={altTextChecking || activeAltTextRunning}
+                // **同じ操作の 2 つ目の入口なので、同じ条件で閉じる。** 確認ボックスを
+                // 開いたまま隣の「再構築」を押せてしまうので、ここに `anyLcirJobRunning` が
+                // 無いと「確認を経た方だけが排他を素通りする」という逆立ちになる
+                // （件数の取り直しで同じ形を踏んだ ── ②b の PR-1b レビュー）。
+                disabled={altTextChecking || anyLcirJobRunning}
               >
                 {t("settings.data.altTextProceed")}
               </SecondaryBtn>

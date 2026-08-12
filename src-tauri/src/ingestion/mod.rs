@@ -1822,9 +1822,9 @@ async fn run_build_batch<F: Fn(i64, i64), P: Fn() -> bool>(
 ) -> LcirBatchResult {
     let total = targets.len() as i64;
     // **総数が分かった時点で 1 回報告する**（ゲート ②b の F-2）。1 件目を処理し終えるまで
-    // 報告しないと、その間だけ分母が出ず、フロントは「構築中…」に落ちる。実ライブラリの
-    // att37（527 頁）は 1 件目で最大 8 分かかるので、いちばん長くこの状態になるのは
-    // debt-32 の根拠に挙げた当の添付だった。`run_gc` は前からこの形（`progress(0, total)`）。
+    // 報告しないと、その間だけ分母が出ず、フロントは「構築中…」に落ちる。長さは 1 件目が
+    // 何かで決まり、**最悪は att37（527 頁）の約 8 分** ── debt-32 の根拠に挙げた当の添付が
+    // そのまま最悪ケースになる。`run_gc` は前からこの形（`progress(0, total)`）。
     on_progress(0, total);
     let (mut built, mut reused, mut failed, mut skipped) = (0i64, 0i64, 0i64, 0i64);
     for (i, (att_id, mime)) in targets.into_iter().enumerate() {
