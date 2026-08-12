@@ -32,6 +32,17 @@ pub struct ToolContext<'a> {
     pub mcp: Option<&'a crate::mcp::McpManager>,
     /// アプリデータディレクトリ（添付ファイルの相対パス解決用。OCR で使用）。
     pub app_data_dir: &'a Path,
+    /// **長いツールが 1 ステップごとに見る中断要求**（v1.0.0・ゲート ②b の追補）。
+    ///
+    /// 現在の読み手は OCR だけ。OCR は 1 ページ 1 回の課金 API 呼び出しで、
+    /// 実ライブラリには 527 ページの本がある。**始まったら止まらない課金**を作らないために、
+    /// 消費点は毎ページこれを見る。
+    ///
+    /// ⚠ **`bool` ではなく関数で渡す。** bool を渡すと開始時のスナップショットで凍り、
+    /// 「実行中に押した停止」が永久に届かない（`is_some_and(|f| f())` のような
+    /// 「1 回だけ評価して bool を返す」ヘルパも同じ理由で置かない）。
+    /// `None` は「この呼び出し元に停止手段が無い」。
+    pub should_stop: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
 }
 
 impl ToolContext<'_> {

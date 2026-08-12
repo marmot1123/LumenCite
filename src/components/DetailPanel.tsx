@@ -577,9 +577,12 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     try {
       let att: { id: number };
       try {
+        // `automatic: false` = ユーザーがこのボタンを押した。**明示操作そのものが同意**
+        // なので、`lcir.enabled` や自動取得の同意が OFF でも取りに行く（v1.0.0・W2-1）。
         att = await invoke<{ id: number }>("download_arxiv_source", {
           entryId: startedFor,
           arxivId: entry.arxiv_id,
+          automatic: false,
         });
       } catch (e: any) {
         if (stillHere()) {

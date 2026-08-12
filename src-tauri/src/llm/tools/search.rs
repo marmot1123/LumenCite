@@ -259,7 +259,7 @@ mod tests {
     }
 
     fn ctx_all(pool: &SqlitePool) -> ToolContext<'_> {
-        ToolContext {
+        ToolContext { should_stop: None,
             pool,
             session_id: 1,
             scope_mode: "all",
@@ -368,7 +368,7 @@ mod tests {
 
         // Scope to only e1.
         let scope_ids = vec![e1.id];
-        let ctx = ToolContext {
+        let ctx = ToolContext { should_stop: None,
             pool: &pool,
             session_id: 1,
             scope_mode: "entries",

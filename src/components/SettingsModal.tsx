@@ -92,7 +92,7 @@ interface GcOutcome {
  * 長時間バッチの種別。Rust 側 `batch_status::BatchKind` の文字列と 1:1 の契約なので、
  * **片方だけ変えない**（Rust 側にも同じ注意書きがある）。
  */
-type BatchKind = "build" | "rebuild" | "rederive" | "gc" | "vision_alt_text" | "tex_fetch";
+type BatchKind = "build" | "rebuild" | "rederive" | "gc" | "vision_alt_text" | "tex_fetch" | "ocr";
 
 /**
  * `lcir_batch_status` の返り値（debt-32）。**バックエンドが正本**で、フロントはこれを引く。
@@ -158,7 +158,26 @@ interface VisionAltTextResult {
   aborted: boolean;
   abort_reason: string | null;
 }
+/** `run_ocr` の結果（`batch_status.last` 経由で読む）。Rust 側 `OcrOutcome` と 1:1。 */
+interface OcrResult {
+  /** 課金して処理したページ数。 */
+  processed: number;
+  /** 本文が取れて索引に残したページ数（白紙ページは含まない）。 */
+  saved: number;
+  planned: number;
+  stopped: boolean;
+  failure: string | null;
+  failed_page: number | null;
+  partial: boolean;
+}
+
 interface FetchArxivSourcesResult {
+  /**
+   * 同意面（自動取得の同意 AND `lcir.enabled`）が開いていたか。
+   * **`false` と「対象 0 件」を混ぜない** ── どちらも `total: 0` だが、
+   * 前者は「取りに行っていない」、後者は「相手が居なかった」で見せる文言が違う。
+   */
+  enabled: boolean;
   total: number;
   fetched: number;
   built: number;
@@ -944,6 +963,10 @@ function DataTab() {
             return busy
               ? t("settings.data.texFetchRunning")
               : t("settings.data.texFetchError", { error });
+          case "ocr":
+            // busy（already_running）はここに来ない ── 排他に弾かれた呼び出しは
+            // `batch_status.last` に載る前に返る（batch_status.rs の FinishedBatch 参照）。
+            return t("settings.data.ocrError", { error });
         }
       })();
       return { message: null, error: text };
@@ -1003,11 +1026,19 @@ function DataTab() {
           ? null
           : r.abort_reason === "consent_withdrawn"
             ? t("settings.data.altTextStopped")
-            : t("settings.data.altTextAborted");
+            // **どちらの面で止まったかを区別する。** LCIR を切って止めた人に
+            // 「同意チェックが外された」と言うと嘘になる（同意は ON のまま）。
+            : r.abort_reason === "lcir_disabled"
+              ? t("settings.data.altTextStoppedLcir")
+              : t("settings.data.altTextAborted");
         return { message: reason ? `${done} ${reason}` : done, error: null };
       }
       case "tex_fetch": {
         const r = result as FetchArxivSourcesResult;
+        // 代替テキスト側（`!r.enabled` → altTextDisabled）と同型。**この分岐を
+        // `total === 0` より前に置くこと** ── 後ろに置くと同意 OFF が
+        // 「未取得の arXiv エントリはありません」という偽の説明になる。
+        if (!r.enabled) return { message: t("settings.data.texFetchDisabled"), error: null };
         if (r.total === 0) return { message: t("settings.data.texFetchNone"), error: null };
         const done = t("settings.data.texFetchDone", {
           total: r.total,
@@ -1019,6 +1050,25 @@ function DataTab() {
         // 途中で同意を外したときは、それが理由だと明示する（黙って件数が減ると失敗に見える）。
         return {
           message: r.aborted ? `${done} ${t("settings.data.texFetchStopped")}` : done,
+          error: null,
+        };
+      }
+      case "ocr": {
+        const r = result as OcrResult;
+        if (r.failure) {
+          return {
+            message: t("settings.data.ocrDoneFailed", { saved: r.saved, error: r.failure }),
+            error: null,
+          };
+        }
+        return {
+          message: r.stopped
+            ? t("settings.data.ocrDoneStopped", {
+                processed: r.processed,
+                planned: r.planned,
+                saved: r.saved,
+              })
+            : t("settings.data.ocrDone", { processed: r.processed, saved: r.saved }),
           error: null,
         };
       }
@@ -1093,18 +1143,21 @@ function DataTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 走っている間だけ軽く追う。理由は 2 つあり、**どちらも「マウント時に 1 回」では届かない**:
-  //   ① このパネルが起動していないバッチ（詳細パネル発の代替テキスト生成・起動時の再導出）は
-  //      invoke の解決が返って来ないので、実行中の表示がいつまでも消えない。
-  //   ② **完了結果もポーリングが拾う。** 開いたまま見届けた場合も、実行中に開き直した場合も、
+  // 開いている間は常に軽く追う。理由は 3 つあり、**どれも「マウント時に 1 回」では届かない**:
+  //   ① このパネルが起動していないバッチ（詳細パネル発の代替テキスト生成・起動時の再導出・
+  //      リーダー／チャット発の OCR）は invoke の解決が返って来ない。⚠ 以前は「running が
+  //      非空と観測できたら追い始める」だったが、**アイドルで開いた後に始まったバッチは
+  //      その最初の観測が永久に来ない** ── OCR はこの節が画面をまたいだ停止手段の本体なので、
+  //      課金中に停止ボタンが出ないことに直結する。running が空でも回し続ける。
+  //   ② 実行中の表示がいつまでも消えない問題（同上）。
+  //   ③ **完了結果もポーリングが拾う。** 開いたまま見届けた場合も、実行中に開き直した場合も、
   //      マウント時の 1 回はまだ `last` が古いので拾えない。
-  // 読むのは Mutex 1 つなので安い。
+  // 読むのは Mutex 1 つなので安い（2 秒に 1 回・このタブを開いている間だけ）。
   useEffect(() => {
-    if (!batchStatus?.running.length) return;
     const id = setInterval(() => void refreshBatchStatus(), 2000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [batchStatus?.running.join(",")]);
+  }, []);
 
   // 表示に使う実行中フラグは「ローカルの楽観更新 ∪ バックエンドの正本」。
   // ローカルだけだと他所で始まったバッチを取りこぼし、バックエンドだけだと
@@ -1481,6 +1534,27 @@ function DataTab() {
         </SecondaryBtn>
       </Section>
 
+      {/* **OCR は起動口がこの画面の外（リーダー／チャット）にしかない。**
+          それでもここに出すのは、走っていることと止める手段を**画面をまたいで**
+          持たせるため ── リーダーを離れると停止できなくなっていた（PR-1b のレビュー指摘）。 */}
+      {batchStatus?.running.includes("ocr") && (
+        <Section title={t("settings.data.ocrRunningTitle")} description={t("settings.data.ocrRunningDesc")}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 12.5 }}>
+              {batchStatus.progress.ocr
+                ? t("settings.data.ocrRunningProgress", {
+                    done: batchStatus.progress.ocr.done,
+                    total: batchStatus.progress.ocr.total,
+                  })
+                : t("settings.data.ocrRunningNoProgress")}
+            </span>
+            <SecondaryBtn onClick={() => { void invoke("cancel_ocr"); }}>
+              {t("settings.data.ocrStop")}
+            </SecondaryBtn>
+          </div>
+        </Section>
+      )}
+
       <Section title={t("settings.data.lcir")} description={t("settings.data.lcirDesc")}>
         <label style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", cursor: "pointer" }}>
           <input type="checkbox" checked={lcirEnabled} onChange={(e) => void toggleLcir(e.target.checked)} />
@@ -1529,7 +1603,17 @@ function DataTab() {
           </SecondaryBtn>
           <SecondaryBtn
             onClick={handleFetchTex}
-            disabled={!texAutofetchEnabled || activeFetchTexRunning || anyLcirBatchRunning || activeGcRunning}
+            // **`!lcirEnabled` を落とさないこと**（ゲート ②b の F-1）。同意チェックは
+            // `disabled={!lcirEnabled}` で固まるので、LCIR を切ると「同意 ON のまま
+            // 押せるボタン」だけが残る。バックエンドは AND で弾くので通信は起きないが、
+            // 押しても何も起きないボタンになる。代替テキスト側と同型にする。
+            disabled={
+              !lcirEnabled ||
+              !texAutofetchEnabled ||
+              activeFetchTexRunning ||
+              anyLcirBatchRunning ||
+              activeGcRunning
+            }
           >
             {activeFetchTexRunning
               ? activeTexProgress

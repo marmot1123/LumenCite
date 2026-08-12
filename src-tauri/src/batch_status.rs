@@ -44,6 +44,12 @@ pub enum BatchKind {
     VisionAltText,
     /// arXiv e-print の一括取得（`fetch_missing_arxiv_sources`）
     TexFetch,
+    /// スキャン PDF の OCR（`run_ocr`）。**1 ページごとに課金される。**
+    ///
+    /// 他の 6 種と違い、起動口が 2 つある（リーダーのボタン / チャットの `ocr_pdf` ツール）。
+    /// **どちらから始めても必ずここに載せる** ── 載せないと、リーダーを離れた瞬間に
+    /// 「走っていることも、止める手段も」画面から消える（PR-1b のレビューで実際に出た）。
+    Ocr,
 }
 
 impl BatchKind {
@@ -55,6 +61,7 @@ impl BatchKind {
             BatchKind::Gc => "gc",
             BatchKind::VisionAltText => "vision_alt_text",
             BatchKind::TexFetch => "tex_fetch",
+            BatchKind::Ocr => "ocr",
         }
     }
 }
@@ -187,6 +194,18 @@ pub fn record_failure(kind: BatchKind, error: &str) {
     });
 }
 
+/// **プロセス共有の static を触るテストの、モジュール横断の直列化ゲート。**
+///
+/// この表（running / progress / last）と OCR の排他フラグはプロセスに 1 つしか無いのに、
+/// 読み書きするテストは 3 モジュール（ここ / `lib.rs` の `batch_wiring_tests` /
+/// `llm::tools::ocr`）に散っている。**モジュールごとに別の gate を持つと相互の窓が残る**
+/// ── 例えば ocr のテストが `RunningMark(Ocr)` を DB I/O をまたいで握っている間に、
+/// ここの「誰も走っていない」前提 assert が並列スレッドで落ちる（#9 で CI だけ落とした形）。
+/// tokio の Mutex なのは、`#[sqlx::test]` の async 本体が guard を await 越しに持つため。
+/// 同期テストは `blocking_lock()` で取る。
+#[cfg(test)]
+pub(crate) static TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 現在の状態を写して返す（**読み取り専用**）。
 ///
 /// 「直近の結果」をここで消さないのは、読むだけの命令が状態を壊すと、
@@ -204,13 +223,11 @@ pub fn snapshot() -> BatchStatus {
 mod tests {
     use super::*;
 
-    /// **プロセス共有の static を触るテストはここで直列化する。**
+    /// **プロセス共有の static を触るテストは [`TEST_GATE`]（モジュール横断）で直列化する。**
     /// 並列実行だと他のテストが立てた印を自分のものと取り違える（#9 で CI だけ落とした形）。
     /// そのうえで、各テストは**自分が起こした遷移だけ**を assert する。
-    static GATE: Mutex<()> = Mutex::new(());
-
-    fn gate() -> std::sync::MutexGuard<'static, ()> {
-        GATE.lock().unwrap_or_else(|e| e.into_inner())
+    fn gate() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_GATE.blocking_lock()
     }
 
     #[test]
@@ -374,5 +391,6 @@ mod tests {
         assert_eq!(BatchKind::Gc.as_str(), "gc");
         assert_eq!(BatchKind::VisionAltText.as_str(), "vision_alt_text");
         assert_eq!(BatchKind::TexFetch.as_str(), "tex_fetch");
+        assert_eq!(BatchKind::Ocr.as_str(), "ocr");
     }
 }

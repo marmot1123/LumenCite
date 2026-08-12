@@ -23,6 +23,27 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// **表示専用の同意値。** チェックボックスに映すためだけのもので、
+/// 「やってよいか」の判定には使えない。
+///
+/// なぜ `bool` を返さないのか ── この repo は同じ間違いを 4 回している。
+/// 「同意している」と「やってよい」は違う（後者は `lcir.enabled` との AND）のに、
+/// 消費点が前者を読んで通してしまう。ゲート ②b では 3 件が同時に見つかった
+/// （W1-4 の Vision ループ / W2-1 の追加シート / F-1 の一括取得ボタン）。
+///
+/// **テストでは守れない。** 消費点の多くは `#[tauri::command]` の本体にあって
+/// `State<AppState>` を作れず単体テストできず、実際に変異（判定を同意だけに戻す）を
+/// 当てても 1 本も落ちなかった。そこで型で**摩擦**を作る ── `if !consent(..)` は
+/// `bool` でないのでコンパイルが通らない。判定には
+/// [`tex_autofetch_enabled`] / [`vision_alt_text_allowed`] / [`may_fetch_eprint`] を使う。
+///
+/// ⚠ **これは壁ではなく摩擦。** `.0` を付ければ素通りするし、この型を剥がす手本
+/// （表示用ゲッター）が同じ repo にある。防げるのは「うっかり同意だけを読む」形だけで、
+/// **意図して `.0` と書く形は防げない**。呼び出し側の配線そのものを守るには
+/// `#[tauri::command]` の本体をテスト可能にする必要がある（post-1.0 の宿題）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsentForDisplay(pub bool);
+
 /// arXiv TeX ソース添付の mime（`download_arxiv_source` が登録する唯一の値）。
 /// **build ディスパッチとバッチ対象クエリはこの値を同一述語として共有する**（Phase 4）。
 pub const TEX_SOURCE_MIME: &str = "application/gzip";
@@ -78,7 +99,12 @@ async fn raw_lcir_enabled(pool: &SqlitePool) -> Option<String> {
 ///
 /// ⚠ **取りに行ってよいかは [`tex_autofetch_enabled`] で判定すること。** これは
 /// 「同意しているか」だけで、LCIR 自体が切られているかは見ていない（設定 UI の表示用）。
-pub async fn tex_autofetch_consent(pool: &SqlitePool) -> bool {
+pub async fn tex_autofetch_consent(pool: &SqlitePool) -> ConsentForDisplay {
+    ConsentForDisplay(tex_autofetch_consent_raw(pool).await)
+}
+
+/// 同意の生値（この module の内部だけが読む）。
+async fn tex_autofetch_consent_raw(pool: &SqlitePool) -> bool {
     match settings::get_setting(pool, settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY)
         .await
         .ok()
@@ -107,7 +133,25 @@ pub async fn tex_autofetch_consent(pool: &SqlitePool) -> bool {
 ///    取らないと「操作できない灰色のチェックが生きたまま外部通信が続く」状態が作れる
 ///    （レビューで 2 レンズが独立に当てた）。
 pub async fn tex_autofetch_enabled(pool: &SqlitePool) -> bool {
-    lcir_enabled(pool).await && tex_autofetch_consent(pool).await
+    lcir_enabled(pool).await && tex_autofetch_consent_raw(pool).await
+}
+
+/// **1 回の取得呼び出しを通してよいか。** `download_arxiv_source` の唯一のゲート。
+///
+/// | `automatic` | 意味 | 判定 |
+/// |---|---|---|
+/// | `false` | ユーザーがそのボタンを押した（詳細パネル） | **常に通す**（明示操作が同意そのもの） |
+/// | `true` | アプリが自動で決めた（追加シートの arXiv 取得） | [`tex_autofetch_enabled`] を要求 |
+///
+/// ⚠ **クリッパーはこの関数を通らない。** あちらは `download_and_attach_arxiv_source` を
+/// 直接呼び、ジョブを発行する時点（`clipper.rs`）で同じ AND を見ている。
+///
+/// ⚠ **`!automatic ||` の向きを間違えないこと。** 逆にすると
+/// 「自動のときだけ通して、ユーザーが押したときに弾く」になる。
+/// この関数が独立しているのは、その変異を捕まえるテストを書けるようにするため
+/// （`#[tauri::command]` の本体は `State<AppState>` を作れず単体テストできない）。
+pub async fn may_fetch_eprint(pool: &SqlitePool, automatic: bool) -> bool {
+    !automatic || tex_autofetch_enabled(pool).await
 }
 
 /// 未設定のときの既定値。**この版より前に `lcir.enabled` を明示 ON にしていた人は、
@@ -144,6 +188,82 @@ pub async fn backfill_tex_autofetch_consent(pool: &SqlitePool) -> Result<bool, S
         .await
         .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+/// 図の代替テキストを LLM Vision で生成することへの**同意そのもの**（既定 OFF）。
+///
+/// ⚠ **課金してよいかは [`vision_alt_text_allowed`] で判定すること。** これは
+/// 「同意しているか」だけで、LCIR 自体が切られているかは見ていない（設定 UI の表示用）。
+/// [`tex_autofetch_consent`] と同じ役割。
+pub async fn vision_alt_text_consent(pool: &SqlitePool) -> ConsentForDisplay {
+    ConsentForDisplay(vision_alt_text_consent_raw(pool).await)
+}
+
+/// 同意の生値（この module の内部だけが読む）。
+async fn vision_alt_text_consent_raw(pool: &SqlitePool) -> bool {
+    settings::get_setting(pool, settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1")
+}
+
+/// **実際に Vision を呼んで課金してよいか。課金する経路が呼ぶ唯一の決定点。**
+///
+/// 同意（[`vision_alt_text_consent`]）に加えて **LCIR 自体が有効であること**も要る。
+/// [`tex_autofetch_enabled`] とまったく同型。
+///
+/// **入口だけでなくループの各回もこれを読むこと。** 設定 UI のチェックボックスは
+/// `disabled={!lcirEnabled}` なので、LCIR を切ると同意を下ろせなくなる。入口でしか
+/// AND を取らないと「ユーザーに見える唯一の停止操作（LCIR を切る）が効かず、
+/// 同意も下ろせないまま課金が最後まで続く」状態が実際に作れる（ゲート ②b の W1-4）。
+///
+/// ⚠ 同意だけを見る [`vision_alt_text_consent`] を消費点から呼んではいけない。
+/// 呼べないように、消費点はこの関数だけを使う。
+pub async fn vision_alt_text_allowed(pool: &SqlitePool) -> bool {
+    matches!(vision_alt_text_gate(pool).await, VisionGate::Allowed)
+}
+
+/// 課金してよいか、**駄目ならどちらの面が閉じているか**。
+///
+/// 打ち切りの理由をユーザーに見せる経路（`abort_reason`）が使う。
+/// 両方を `consent_withdrawn` に丸めると、**LCIR を切って止めた人に
+/// 「同意チェックが外されました」という嘘の説明**が出る（この PR のレビューで指摘された）。
+///
+/// bool ではなく enum を返すのは、[`ConsentForDisplay`] と同じ理由 ──
+/// 消費点が `if !...` と書けないようにして、AND を取り忘れる形を減らす。
+pub async fn vision_alt_text_gate(pool: &SqlitePool) -> VisionGate {
+    if !lcir_enabled(pool).await {
+        return VisionGate::LcirDisabled;
+    }
+    if !vision_alt_text_consent_raw(pool).await {
+        return VisionGate::ConsentWithdrawn;
+    }
+    VisionGate::Allowed
+}
+
+/// [`vision_alt_text_gate`] の結果。**どちらの面で止まったかを保つ。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionGate {
+    /// 課金してよい。
+    Allowed,
+    /// `lcir.enabled` が OFF。**同意チェックは UI で `disabled` になるので、
+    /// ユーザーはこちらを切って止めるしかない。**
+    LcirDisabled,
+    /// LCIR は有効だが `lcir.vision_alt_text.enabled` が OFF。
+    ConsentWithdrawn,
+}
+
+impl VisionGate {
+    /// `abort_reason` に載せる機械可読な印（フロントが i18n に変換する）。
+    pub fn abort_reason(self) -> Option<&'static str> {
+        match self {
+            VisionGate::Allowed => None,
+            VisionGate::LcirDisabled => Some("lcir_disabled"),
+            VisionGate::ConsentWithdrawn => Some("consent_withdrawn"),
+        }
+    }
 }
 
 /// **読める LCIR が実在するか**（フラグ ON かつ完了済みの版が 1 本以上ある）。
@@ -2890,8 +3010,12 @@ mod tests {
 
     /// **LCIR を切ったら取得も止まる。** 同意は保存値として残る（UI のチェックは映したまま）が、
     /// 取りに行く判定は false になる。ここを AND にしないと、設定 UI が
-    /// `disabled={!lcirEnabled}` で同意を下ろせないまま外部通信だけが続く
-    /// （`lcir.vision_alt_text.enabled` は最初からこの形。TeX 側だけ非対称だった）。
+    /// `disabled={!lcirEnabled}` で同意を下ろせないまま外部通信だけが続く。
+    ///
+    /// ⚠ 初版はここに「`lcir.vision_alt_text.enabled` は最初からこの形」と書いていたが、
+    /// **偽だった** ── Vision は入口でしか AND を取っておらず、ループの各回は同意だけを
+    /// 読んでいた（ゲート ②b の W1-4）。両者は今 [`vision_alt_text_allowed`] と
+    /// [`tex_autofetch_enabled`] で同型になっている。
     #[sqlx::test(migrations = "./migrations")]
     async fn turning_lcir_off_stops_fetching_but_keeps_the_consent(pool: SqlitePool) {
         settings::set_setting(&pool, settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "1")
@@ -2907,7 +3031,7 @@ mod tests {
             "LCIR を切ったら取りに行かない（取ってきても build が no-op で無駄になる）"
         );
         assert!(
-            tex_autofetch_consent(&pool).await,
+            tex_autofetch_consent(&pool).await.0,
             "同意そのものは残す ── 勝手に外すと UI のチェックが独りでに消えたように見える"
         );
 
@@ -2928,6 +3052,143 @@ mod tests {
             .unwrap();
         assert!(lcir_enabled(&pool).await);
         assert!(!tex_autofetch_enabled(&pool).await);
+    }
+
+    /// **明示操作は同意面を問わない。自動だけがゲートを通る**（ゲート ②b の W2-1）。
+    ///
+    /// p3 まで `download_arxiv_source` は無ゲートで、呼び出し側の `AddSheet.tsx` が
+    /// 同意だけを見ていたため、**LCIR を明示 OFF にしたユーザーの arXiv 追加で毎回
+    /// 数 MB のダウンロードが走っていた**（直後の build は no-op なので純粋な無駄）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_explicit_press_fetches_even_when_the_consent_is_closed(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        settings::set_setting(&pool, settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        assert!(!tex_autofetch_enabled(&pool).await, "前提: 同意面は閉じている");
+
+        assert!(
+            may_fetch_eprint(&pool, false).await,
+            "ユーザーが押したなら取りに行く ── 明示操作そのものが同意"
+        );
+        assert!(
+            !may_fetch_eprint(&pool, true).await,
+            "自動経路は弾く（ここが p3 で抜けていた）"
+        );
+    }
+
+    /// 自動経路は **LCIR と同意の両方**が開いているときだけ通る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_automatic_path_needs_both_the_consent_and_lcir(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_TEX_AUTOFETCH_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        assert!(
+            may_fetch_eprint(&pool, true).await,
+            "同意あり + LCIR 既定 ON なら自動でも取りに行く"
+        );
+
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        assert!(
+            !may_fetch_eprint(&pool, true).await,
+            "LCIR を切ったら自動取得は止まる（取ってきても build が no-op）"
+        );
+        assert!(
+            may_fetch_eprint(&pool, false).await,
+            "それでも明示ボタンは通る"
+        );
+    }
+
+    /// **課金面も TeX 側と同じ AND であること。** ゲート ②b（W1-4）まで、Vision の
+    /// 消費点は入口でしか `lcir_enabled` を見ておらず、**ループの各回は同意だけ**を
+    /// 読んでいた。設定 UI は LCIR を切ると同意チェックを `disabled` にするので、
+    /// 「ユーザーに見える唯一の停止操作が効かず、同意も下ろせないまま課金が続く」
+    /// 状態が実際に作れた。ここでは述語そのものの形を固定する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn turning_lcir_off_stops_billing_but_keeps_the_vision_consent(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        assert!(
+            vision_alt_text_allowed(&pool).await,
+            "LCIR が既定 ON・同意ありなら課金してよい"
+        );
+
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        assert!(
+            !vision_alt_text_allowed(&pool).await,
+            "LCIR を切ったら課金しない（走行中のループもこれを読んで止まる）"
+        );
+        assert!(
+            vision_alt_text_consent(&pool).await.0,
+            "同意そのものは残す ── 勝手に外すと UI のチェックが独りでに消えたように見える"
+        );
+
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        assert!(vision_alt_text_allowed(&pool).await, "戻せば元どおり");
+    }
+
+    /// **どちらの面で止まったかを保つ**（この PR のレビュー指摘）。
+    /// 両方を `consent_withdrawn` に丸めると、LCIR を切って止めた人に
+    /// 「同意チェックが外されました」という嘘の説明が出る。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_gate_says_which_surface_closed(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        assert_eq!(vision_alt_text_gate(&pool).await, VisionGate::Allowed);
+        assert_eq!(vision_alt_text_gate(&pool).await.abort_reason(), None);
+
+        // 同意を外した ── これは本当に「同意が撤回された」。
+        settings::set_setting(&pool, settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        assert_eq!(vision_alt_text_gate(&pool).await, VisionGate::ConsentWithdrawn);
+        assert_eq!(
+            vision_alt_text_gate(&pool).await.abort_reason(),
+            Some("consent_withdrawn")
+        );
+
+        // LCIR を切った ── 同意は ON のままでもこちらが優先される。
+        // **UI は LCIR を切ると同意チェックを disabled にするので、
+        // ユーザーが止める手段は実質こちらしかない。**
+        settings::set_setting(&pool, settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        assert_eq!(vision_alt_text_gate(&pool).await, VisionGate::LcirDisabled);
+        assert_eq!(
+            vision_alt_text_gate(&pool).await.abort_reason(),
+            Some("lcir_disabled"),
+            "LCIR を切って止めたのに『同意が外された』と説明してはいけない"
+        );
+    }
+
+    /// 逆向き: LCIR が ON でも同意が無ければ課金しない。
+    /// **既定 OFF** なので、未設定のまま LCIR だけ ON になっても課金は起きない。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn vision_is_off_by_default_even_though_lcir_is_on_by_default(pool: SqlitePool) {
+        assert!(lcir_enabled(&pool).await, "LCIR は未設定＝既定 ON");
+        assert!(
+            !vision_alt_text_consent(&pool).await.0,
+            "課金面は未設定＝既定 OFF（TeX と違い引き継ぐ過去が無い）"
+        );
+        assert!(!vision_alt_text_allowed(&pool).await);
+
+        settings::set_setting(&pool, settings::LCIR_VISION_ALT_TEXT_ENABLED_KEY, "0")
+            .await
+            .unwrap();
+        assert!(!vision_alt_text_allowed(&pool).await, "明示 OFF も当然 false");
     }
 
     /// バックフィルは**未設定を明示値に確定させる**。`false` でも書くのが要点 ──

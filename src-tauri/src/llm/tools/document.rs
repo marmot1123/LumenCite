@@ -1573,7 +1573,7 @@ mod tests {
     }
 
     fn ctx_all(pool: &SqlitePool) -> ToolContext<'_> {
-        ToolContext {
+        ToolContext { should_stop: None,
             pool,
             session_id: 1,
             scope_mode: "all",
@@ -1584,7 +1584,7 @@ mod tests {
     }
 
     fn ctx_scoped<'a>(pool: &'a SqlitePool, ids: &'a [i64]) -> ToolContext<'a> {
-        ToolContext {
+        ToolContext { should_stop: None,
             pool,
             session_id: 1,
             scope_mode: "entries",

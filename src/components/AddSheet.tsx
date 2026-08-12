@@ -127,9 +127,16 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
         // e-print（TeX ソース）の取得は **`lcir.enabled` ではなく専用の同意面**で決める
         // （v1.0.0-p3）。LCIR は既定 ON になったので、それで判定すると論文を足すたびに
         // 数 MB の外部ダウンロードが黙って始まる。
-        const texConsent = await invoke<boolean>("get_lcir_tex_autofetch_enabled").catch(() => false);
+        //
+        // ⚠ **同意だけを見てはいけない**（`get_lcir_tex_autofetch_enabled` は同意の生値）。
+        // 取りに行ってよいかは「同意 AND LCIR が有効」で、その実効値を返すのが
+        // `get_lcir_tex_autofetch_effective`。p3 はここを同意だけに差し替えたため、
+        // **LCIR を明示 OFF にしたユーザーの arXiv 追加で毎回数 MB を落としていた**
+        // （ゲート ②b の W2-1）。バックエンドの `download_arxiv_source` にも
+        // `automatic: true` のときだけ効く同じゲートを置いてある（二重の防波堤）。
+        const texAllowed = await invoke<boolean>("get_lcir_tex_autofetch_effective").catch(() => false);
         const wantPdf = downloadPdf && !hasPdf;
-        const wantTex = texConsent && !hasTex;
+        const wantTex = texAllowed && !hasTex;
 
         // 既存エントリで欠落がある場合は clipper.complete_missing に従う（未設定=確認 / "1"=自動）。
         // 新規エントリはチェックボックスが同意なので確認しない。
@@ -164,7 +171,13 @@ function IdentifierTab({ tabId, onCreated, onClose, onSelectExisting }: {
           const entryId = entry.id;
           void (async () => {
             try {
-              const att = await invoke<{ id: number }>("download_arxiv_source", { entryId, arxivId });
+              // `automatic: true` = ユーザーは「取ってこい」と言っていない。
+              // バックエンドが同意面を再確認し、閉じていれば通信せずに弾く。
+              const att = await invoke<{ id: number }>("download_arxiv_source", {
+                entryId,
+                arxivId,
+                automatic: true,
+              });
               await invoke("build_lcir_for_attachment", { attachmentId: att.id });
             } catch (e) {
               console.warn("arXiv TeX source fetch failed:", e);
