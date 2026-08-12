@@ -2,7 +2,8 @@
 //! - SQLite の `VACUUM INTO` を使って読み取り中でもロックを取らずに DB のクリーンコピーを作り、
 //!   添付本体（`<app_data_dir>/attachments/`）とあわせて単一の `.zip` に束ねる。
 //! - 保管先は `<app_data_dir>/backups/lumencite-YYYYMMDD-HHmmss.zip`。
-//!   アーカイブ内レイアウトは `db.sqlite` ＋ `attachments/<entry_id>/<file_name>`。
+//!   アーカイブ内レイアウトは `db.sqlite` ＋ `attachments/<entry_id>/<file_name>`
+//!   ＋（走査中に消えたエントリがあったときだけ）`SKIPPED.txt`。
 //! - 直近 `keep` 世代のみ残し、それより古いものは削除する（旧 `.db` バックアップも対象）。
 //!
 //! 作業ファイルは全て「完成前は拾われない名前」で書く:
@@ -63,7 +64,11 @@ pub struct BackupInfo {
 /// DB は 1 つなのでモジュール static で足りる。
 static BACKUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// バックアップが今走っているか（v1.0.0-p2 の LCIR バックフィルが読む）。
+/// バックアップが今走っているか。
+///
+/// 読み手は 2 つ:
+/// 1. v1.0.0-p2 の LCIR 起動時バックフィル（`lib.rs`・`should_stop`）
+/// 2. `ingestion::gc_stale_asset_dirs`（②b の W1-5 で配線・**crop を消す側**）
 ///
 /// フル zip は `attachments/` を丸ごと束ねて実測 9 分かかる。その最中に LCIR build が完了して
 /// `gc_stale_asset_dirs` が旧 content_key ディレクトリを trash へ送ると、**アーカイブは
@@ -76,6 +81,16 @@ static BACKUP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// `try_lock` は待ち行列に並ばないので、待っている実行から permit を奪うことはない。
 pub fn is_running() -> bool {
     BACKUP_LOCK.try_lock().is_err()
+}
+
+/// テスト専用: 「バックアップ実行中」を本物の [`BACKUP_LOCK`] で再現する。
+///
+/// 別モジュールのテスト（`ingestion` の GC 配線）が `is_running()` の **true 側**を
+/// 観測するために使う。⚠ **false 側はどのテストの支配下にも無い**（同じ static を
+/// 他のバックアップテストが並列に取りうる）ので、握っている間だけを assert すること。
+#[cfg(test)]
+pub(crate) async fn hold_lock_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    BACKUP_LOCK.lock().await
 }
 
 /// バックアップを実行する（手動実行 = 常に走る）。
@@ -169,7 +184,7 @@ async fn run_backup_inner(
             tmp_db.clone(),
             app_dir.join("attachments"),
         );
-        tokio::task::spawn_blocking(move || write_archive(&dst, &src, &att))
+        let skipped = tokio::task::spawn_blocking(move || write_archive(&dst, &src, &att))
             .await
             .map_err(|e| format!("archive task failed: {}", e))?
             .map_err(|e| format!("archive write failed: {}", e))?;
@@ -177,16 +192,38 @@ async fn run_backup_inner(
         // 完成してから正式名に付け替える。途中で殺されても `.zip.partial` が残るだけで、
         // 中身の欠けたアーカイブが「バックアップ」として一覧・世代管理に混ざらない。
         fs::rename(&partial, &target).map_err(|e| format!("archive rename failed: {}", e))?;
-        Ok::<(), String>(())
+        Ok::<SkippedEntries, String>(skipped)
     };
 
     let result = build.await;
     // 一時ファイルは成功・失敗どちらでも掃除する。
     let _ = fs::remove_file(&tmp_db);
-    if let Err(e) = result {
-        // 途中失敗した壊れかけのアーカイブを残さない。
-        let _ = fs::remove_file(&partial);
-        return Err(e);
+    let skipped = match result {
+        Ok(s) => s,
+        Err(e) => {
+            // 途中失敗した壊れかけのアーカイブを残さない。
+            let _ = fs::remove_file(&partial);
+            return Err(e);
+        }
+    };
+    if skipped.count > 0 {
+        // 「静かに欠けた成功」を成功と同じ見た目にしない。自動バックアップは UI に
+        // 何も出さないので、ここのログとアーカイブ内の `SKIPPED.txt` が唯一の手掛かりになる。
+        // 一覧そのものは `SKIPPED.txt` にあるので、ログには先頭数件だけ出す。
+        eprintln!(
+            "backup: {} entry/entries vanished during the archive walk and were skipped \
+             (full list in {} inside {}): {}",
+            skipped.count,
+            SKIPPED_MANIFEST,
+            target.display(),
+            skipped
+                .names
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     // 次回の自動バックアップの間引き判定に使う。成功時のみ記録するので、
@@ -242,8 +279,84 @@ pub fn sweep_backup_workdir(app_dir: &Path, keep: usize) -> usize {
     removed
 }
 
+/// 走査中に消えていて archive に入れられなかったエントリの記録（②b W2-5）。
+///
+/// zip 書き出しは実ライブラリで **7〜9 分**かかり、その間に添付の削除・LCIR の
+/// `gc_stale_asset_dirs`・GC の trash 送りが普通に走る。「あるはず」の先が消えているのは
+/// **異常ではなく通常のレース**なので、バックアップ全体を失敗させない。
+/// ただし黙って飛ばすと **「1 枚も落ちなかった成功」と「静かに欠けた成功」が同じ見た目**になる。
+#[derive(Debug, Default)]
+struct SkippedEntries {
+    /// 飛ばした総数。
+    count: usize,
+    /// 記録に残すアーカイブ内パス（先頭 [`SKIPPED_SAMPLE_MAX`] 件）。
+    names: Vec<String>,
+}
+
+/// 記録に残すパスの上限。走査中に添付ツリーごと消えると件数は数千に達しうるので、
+/// 総数は数え続けたまま一覧だけ頭打ちにする。
+const SKIPPED_SAMPLE_MAX: usize = 200;
+
+/// 飛ばした一覧をアーカイブ内に残すエントリ名。
+///
+/// **復元は「`db.sqlite` か `attachments/` 配下」だけを許可する allowlist**（`restore.rs` の
+/// `safe_archive_path`）なので、このエントリは復元時に無視される ＝ 展開先を汚さない。
+const SKIPPED_MANIFEST: &str = "SKIPPED.txt";
+
+impl SkippedEntries {
+    fn note(&mut self, zip_path: &str, err: &io::Error) {
+        self.count += 1;
+        if self.names.len() < SKIPPED_SAMPLE_MAX {
+            self.names.push(format!("{zip_path}\t({err})"));
+        }
+    }
+
+    /// アーカイブに同梱する報告本文。
+    fn report(&self) -> String {
+        let mut s = format!(
+            "LumenCite backup: {} entry/entries vanished while the archive was being written \
+             and are NOT included in this backup.\n\
+             このバックアップには、書き出し中に消えた {} 件のファイルが含まれていません。\n\n",
+            self.count, self.count
+        );
+        for n in &self.names {
+            s.push_str(n);
+            s.push('\n');
+        }
+        if self.count > self.names.len() {
+            s.push_str(&format!("... and {} more\n", self.count - self.names.len()));
+        }
+        s
+    }
+}
+
+/// 「走査中に消えていたら飛ばす、それ以外は失敗」を適用する**唯一の判定点**。
+///
+/// `NotFound` だけを飛ばす。ここを広げると、容量不足や権限エラーで**中身の欠けた
+/// アーカイブが「成功」として一覧に並ぶ**。zip 側のエラー（`ZipError`）は
+/// `io::Error` に変換されても `NotFound` にはならないので取り違えない。
+fn skip_if_vanished(
+    res: io::Result<()>,
+    zip_path: &str,
+    skipped: &mut SkippedEntries,
+) -> io::Result<()> {
+    match res {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            skipped.note(zip_path, &e);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// `db.sqlite` ＋ `attachments/…` を単一 zip に書き出す。
-fn write_archive(target: &Path, db_file: &Path, attachments_dir: &Path) -> io::Result<()> {
+/// 戻り値は走査中に消えて飛ばしたエントリの記録（[`SkippedEntries`]）。
+fn write_archive(
+    target: &Path,
+    db_file: &Path,
+    attachments_dir: &Path,
+) -> io::Result<SkippedEntries> {
     // ZipWriter は圧縮のたびに小さく write するので、素の File だと syscall が支配的になる。
     let file = io::BufWriter::with_capacity(1 << 20, fs::File::create(target)?);
     let mut zip = zip::ZipWriter::new(file);
@@ -256,12 +369,25 @@ fn write_archive(target: &Path, db_file: &Path, attachments_dir: &Path) -> io::R
     let mut db = fs::File::open(db_file)?;
     io::copy(&mut db, &mut zip)?;
 
+    let mut skipped = SkippedEntries::default();
+    // `attachments/` が最初から無いのは通常（添付ゼロのライブラリ）なので記録しない。
+    // 「あると確かめてから読めなくなった」だけを飛ばした扱いにする。
     if attachments_dir.is_dir() {
-        add_dir_recursive(&mut zip, attachments_dir, "attachments", opts)?;
+        skip_if_vanished(
+            add_dir_recursive(&mut zip, attachments_dir, "attachments", opts, &mut skipped),
+            "attachments",
+            &mut skipped,
+        )?;
+    }
+
+    if skipped.count > 0 {
+        // 報告はアーカイブの中に置く。stderr のログは復元する時点では残っていない。
+        zip.start_file(SKIPPED_MANIFEST, opts)?;
+        zip.write_all(skipped.report().as_bytes())?;
     }
 
     zip.finish()?.flush()?;
-    Ok(())
+    Ok(skipped)
 }
 
 /// `dir` 以下を再帰的に zip へ追加する。アーカイブ内パスは `prefix` からの `/` 区切り。
@@ -270,22 +396,57 @@ fn add_dir_recursive<W: Write + io::Seek>(
     dir: &Path,
     prefix: &str,
     opts: SimpleFileOptions,
+    skipped: &mut SkippedEntries,
 ) -> io::Result<()> {
     // 決定的な順序で走査する（テスト容易性と差分の安定のため）。
-    let mut entries: Vec<_> = fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+    let mut entries = Vec::new();
+    for e in fs::read_dir(dir)? {
+        match e {
+            Ok(e) => entries.push(e),
+            // 反復自体が失敗した ＝ 名前すら分からないエントリ。旧コードは `filter_map(ok)` で
+            // 黙って落としていた。**「`SKIPPED.txt` が無い＝完全」を本当のことにする**ためだけに数える
+            // （落とす理由が「消えた」とは限らないので、ここは失敗させずに記録へ倒す）。
+            Err(err) => skipped.note(&format!("{prefix}/<unreadable directory entry>"), &err),
+        }
+    }
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         let zip_path = format!("{}/{}", prefix, name);
-        if path.is_dir() {
-            add_dir_recursive(zip, &path, &zip_path, opts)?;
-        } else if path.is_file() {
-            zip.start_file(&zip_path, opts)?;
-            let mut f = fs::File::open(&path)?;
-            io::copy(&mut f, zip)?;
-        }
+        // 消えたかどうかの分類は [`skip_if_vanished`] 1 か所に集める。
+        // ここで分岐ごとに判定を書くと、どれか 1 つを壊してもテストが落ちない冗長になる。
+        let step = archive_one(zip, &path, &zip_path, opts, skipped);
+        skip_if_vanished(step, &zip_path, skipped)?;
     }
+    Ok(())
+}
+
+/// 1 エントリ（ディレクトリ or ファイル）を zip へ足す。**この関数は判定を持たない** ──
+/// 消えていたかどうかの分類は呼び出し側（[`skip_if_vanished`]）が行う。
+fn archive_one<W: Write + io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    path: &Path,
+    zip_path: &str,
+    opts: SimpleFileOptions,
+    skipped: &mut SkippedEntries,
+) -> io::Result<()> {
+    if path.is_dir() {
+        return add_dir_recursive(zip, path, zip_path, opts, skipped);
+    }
+    if !path.is_file() {
+        // ディレクトリでもファイルでもない = 走査の途中で消えた（壊れた symlink や
+        // 特殊ファイルもここに落ちる）。呼び出し側に 1 種類の形で渡すため NotFound にする。
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "not a regular file or directory",
+        ));
+    }
+    // **open が成功してから** `start_file` する。逆順にすると、開けなかったファイルの
+    // 空エントリが zip に残り「0 バイトで存在する」という別種の嘘になる。
+    let mut f = fs::File::open(path)?;
+    zip.start_file(zip_path, opts)?;
+    io::copy(&mut f, zip)?;
     Ok(())
 }
 
@@ -363,6 +524,69 @@ mod tests {
         drop(guard);
     }
 
+    /// **「飛ばす」か「バックアップごと失敗する」かの判定はここ 1 か所**（②b W2-5）。
+    /// `NotFound` だけを飛ばす ── 広げると容量不足や権限エラーで中身の欠けた
+    /// アーカイブが「成功」として一覧に並ぶ。
+    #[test]
+    fn only_a_vanished_entry_is_skipped() {
+        let mut skipped = SkippedEntries::default();
+        assert!(skip_if_vanished(Ok(()), "attachments/1/a.pdf", &mut skipped).is_ok());
+        assert_eq!(skipped.count, 0, "成功は何も記録しない");
+
+        let gone = io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert!(
+            skip_if_vanished(Err(gone), "attachments/1/b.pdf", &mut skipped).is_ok(),
+            "走査中に消えたエントリでバックアップ全体を落とさない"
+        );
+        assert_eq!(skipped.count, 1);
+        assert!(skipped.names[0].starts_with("attachments/1/b.pdf"));
+
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(
+            skip_if_vanished(Err(denied), "attachments/1/c.pdf", &mut skipped).is_err(),
+            "消えた以外の失敗は握り潰さない（欠けたまま成功させない）"
+        );
+        assert_eq!(skipped.count, 1, "失敗させた分は skip に数えない");
+    }
+
+    /// 走査の途中で消えたエントリは、`is_dir()` にも `is_file()` にも当たらない。
+    /// その形を呼び出し側へ **`NotFound` として**返すのが `archive_one` の役目
+    /// （分類は持たない）。
+    #[test]
+    fn archive_one_reports_a_missing_path_as_not_found() {
+        let mut zip = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let mut skipped = SkippedEntries::default();
+        let missing = std::env::temp_dir().join("lc-backup-no-such-entry-xyzzy");
+
+        let err = archive_one(&mut zip, &missing, "attachments/1/gone.pdf", opts, &mut skipped)
+            .expect_err("消えたパスは Err で返る");
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(skipped.count, 0, "記録は呼び出し側の仕事");
+        // 入れられなかったエントリの**空の枠**を残さない（「0 バイトで存在する」は別種の嘘）。
+        let archive = zip::ZipArchive::new(zip.finish().unwrap()).unwrap();
+        assert_eq!(archive.len(), 0);
+    }
+
+    /// 報告本文は総数を落とさない（一覧だけ頭打ちにする）。
+    #[test]
+    fn the_report_keeps_the_total_when_the_list_is_capped() {
+        let mut skipped = SkippedEntries::default();
+        let n = SKIPPED_SAMPLE_MAX + 3;
+        for i in 0..n {
+            skipped.note(
+                &format!("attachments/1/f{i}.pdf"),
+                &io::Error::new(io::ErrorKind::NotFound, "gone"),
+            );
+        }
+        assert_eq!(skipped.count, n);
+        assert_eq!(skipped.names.len(), SKIPPED_SAMPLE_MAX);
+        let report = skipped.report();
+        assert!(report.contains(&n.to_string()), "総数が出る: {report}");
+        assert!(report.contains("... and 3 more"), "省略が分かる: {report}");
+    }
+
     /// zip アーカイブ内のエントリ名一覧を返すテストヘルパ。
     fn archive_names(path: &Path) -> Vec<String> {
         let file = fs::File::open(path).unwrap();
@@ -437,6 +661,73 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp vacuum files left: {leftovers:?}");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ②b W2-5: 走査中に読めなくなったエントリは**飛ばして続行**し、飛ばしたことを
+    /// アーカイブ内の `SKIPPED.txt` に残す。
+    ///
+    /// 実際の失敗は「9 分の zip 書き出し中に添付や crop が消える」レースだが、
+    /// レースは決定的に組めないので**同じ分岐**（`is_dir()` にも `is_file()` にも
+    /// 当たらないパス）を壊れた symlink で作る。
+    #[cfg(unix)]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_vanished_entry_is_skipped_and_reported(pool: SqlitePool) {
+        let dir = std::env::temp_dir().join(format!("lc-backup-skip-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let att = dir.join("attachments").join("42");
+        std::fs::create_dir_all(&att).unwrap();
+        std::fs::write(att.join("paper.pdf"), b"%PDF-1.7 fake").unwrap();
+        // 走査が届いたときには実体が無いエントリ。
+        std::os::unix::fs::symlink(att.join("gone.pdf"), att.join("dangling.pdf")).unwrap();
+
+        let archive = run_backup(&pool, &dir, 14).await.unwrap();
+        let names = archive_names(&archive);
+
+        assert!(
+            names.iter().any(|n| n == "attachments/42/paper.pdf"),
+            "残っている添付は入る: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "attachments/42/dangling.pdf"),
+            "読めなかったエントリの空の枠を作らない: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == SKIPPED_MANIFEST),
+            "飛ばしたことが記録される: {names:?}"
+        );
+
+        let file = fs::File::open(&archive).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut report = String::new();
+        zip.by_name(SKIPPED_MANIFEST)
+            .unwrap()
+            .read_to_string(&mut report)
+            .unwrap();
+        assert!(
+            report.contains("attachments/42/dangling.pdf"),
+            "どれが欠けたか分かる: {report}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 1 件も飛ばさなかったバックアップに報告は入らない。
+    /// **「静かに欠けた成功」と「本当に完全な成功」を見分けられる**ことが目的なので、
+    /// 常時 `SKIPPED.txt` を入れると意味が消える。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_complete_backup_carries_no_skip_manifest(pool: SqlitePool) {
+        let dir = std::env::temp_dir().join(format!("lc-backup-noskip-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let att = dir.join("attachments").join("42");
+        std::fs::create_dir_all(&att).unwrap();
+        std::fs::write(att.join("paper.pdf"), b"%PDF-1.7 fake").unwrap();
+
+        let archive = run_backup(&pool, &dir, 14).await.unwrap();
+        let names = archive_names(&archive);
+
+        assert!(!names.iter().any(|n| n == SKIPPED_MANIFEST), "{names:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -719,11 +719,38 @@ async fn heal_missing_assets(
 /// 値と理由は `backup::WORK_FILE_STALE_SECS` に揃えてある。
 const STALE_ASSET_DIR_SECS: u64 = 60 * 60;
 
-/// `.lcir/<attachment_id>/` 直下の「現 content_key 以外」のサブディレクトリを trash へ。
-/// ただし猶予（[`STALE_ASSET_DIR_SECS`]）内に書かれたものは別インスタンスが今まさに
+/// `.lcir/<attachment_id>/` 直下の「現 content_key 以外」のサブディレクトリを trash へ
+/// （**本番の入口**）。
+///
+/// バックアップ実行中かどうかは [`crate::backup::is_running`] にそのまま尋ねる。
+/// ここが**唯一の配線点**で、`build_pdf_version` 側には選択肢を残さない。
+fn gc_stale_asset_dirs(app_data_dir: &Path, abs_asset_dir: &Path) {
+    gc_stale_asset_dirs_with(app_data_dir, abs_asset_dir, crate::backup::is_running)
+}
+
+/// [`gc_stale_asset_dirs`] の本体。
+///
+/// 猶予（[`STALE_ASSET_DIR_SECS`]）内に書かれたものは別インスタンスが今まさに
 /// 使っている可能性があるので残す。残しても次回の build で回収されるだけで、
 /// 消し違えると別インスタンスの成果物が消える ＝ 非対称なので「疑わしきは残す」。
-fn gc_stale_asset_dirs(app_data_dir: &Path, abs_asset_dir: &Path) {
+///
+/// **バックアップ中も同じ理由で残す（②b W1-5）。** フル zip は `attachments/` を丸ごと
+/// 束ねて実測 7〜9 分かかり、DB スナップショット（`VACUUM INTO`）はその先頭で固まる。
+/// 走査が届く前に旧 content_key ディレクトリを trash へ送ると、アーカイブは
+/// 「`assets` 行はあるがファイルが無い」状態で完成する ── 復元後に
+/// `heal_missing_assets` が全ページ再抽出に化け、crop の sha256 が動いて
+/// **課金済み alt text の carry が無言で外れる**（debt-20 / debt-16）。
+///
+/// ⚠ **述語は bool ではなく呼び出し可能で受ける。** 値で受けると「ループに入る前の
+/// スナップショット」に凍り、走査の途中で始まったバックアップに気づけない。
+///
+/// 逆向き（バックアップ側が build ロックを取る）は採らない。7〜9 分ユーザーの build を
+/// 止めることになり、しかも build 中に発火した自動バックアップが丸ごと skip される。
+fn gc_stale_asset_dirs_with(
+    app_data_dir: &Path,
+    abs_asset_dir: &Path,
+    backup_running: impl Fn() -> bool,
+) {
     let (Some(parent), Some(current)) = (abs_asset_dir.parent(), abs_asset_dir.file_name()) else {
         return;
     };
@@ -739,6 +766,16 @@ fn gc_stale_asset_dirs(app_data_dir: &Path, abs_asset_dir: &Path) {
         if !is_stale_asset_dir(&p, now) {
             eprintln!(
                 "LCIR: keeping recently written asset dir (another instance may own it): {}",
+                p.display()
+            );
+            continue;
+        }
+        // 猶予を過ぎていても、バックアップが走っている間は回収しない。
+        // `continue` で次のエントリも都度尋ねる（バックアップが終われば同じループの
+        // 途中からでも回収を再開できる）。
+        if backup_running() {
+            eprintln!(
+                "LCIR: keeping stale asset dir while a backup is in flight: {}",
                 p.display()
             );
             continue;
@@ -6596,7 +6633,7 @@ mod tests {
         std::fs::write(old.join("fig-p002-00.png"), b"png").unwrap();
         age_files(&old, 2 * 60 * 60);
 
-        gc_stale_asset_dirs(&root, &current);
+        gc_stale_asset_dirs_with(&root, &current, || false);
 
         assert!(!old.exists(), "猶予を過ぎた旧ディレクトリは回収される");
         assert!(current.is_dir(), "現 content_key は残る");
@@ -6622,7 +6659,7 @@ mod tests {
         age_file(&other.join("fig-p001-00.png"), 2 * 60 * 60);
         std::fs::write(other.join("fig-p002-00.png"), b"png").unwrap();
 
-        gc_stale_asset_dirs(&root, &current);
+        gc_stale_asset_dirs_with(&root, &current, || false);
 
         assert!(
             other.is_dir(),
@@ -6644,7 +6681,7 @@ mod tests {
         // current の中身は猶予を超えている = 猶予では守られない状態。
         assert!(is_stale_asset_dir(&current, std::time::SystemTime::now()));
 
-        gc_stale_asset_dirs(&root, &current);
+        gc_stale_asset_dirs_with(&root, &current, || false);
 
         assert!(current.is_dir(), "名前の一致ガードだけが current を守っている");
         assert!(!old.exists(), "旧は回収される");
@@ -6665,7 +6702,7 @@ mod tests {
             .join("ffffffffffffffff");
         std::fs::create_dir_all(&empty).unwrap();
 
-        gc_stale_asset_dirs(&root, &current);
+        gc_stale_asset_dirs_with(&root, &current, || false);
 
         assert!(empty.is_dir(), "作られたばかりの空ディレクトリは残す");
         std::fs::remove_dir_all(&root).ok();
@@ -6679,7 +6716,7 @@ mod tests {
         let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
         let other = make_asset_dir(&root, "cccccccccccccccc");
 
-        gc_stale_asset_dirs(&root, &current);
+        gc_stale_asset_dirs_with(&root, &current, || false);
 
         assert!(other.is_dir(), "別インスタンスが書いたばかりのディレクトリは残す");
         assert!(
@@ -6701,9 +6738,54 @@ mod tests {
         // heal が 1 枚だけ書き直した状態。
         std::fs::write(other.join("fig-p001-00.png"), b"png2").unwrap();
 
-        gc_stale_asset_dirs(&root, &current);
+        gc_stale_asset_dirs_with(&root, &current, || false);
 
         assert!(other.is_dir(), "書き直された直後のディレクトリは残す");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// ②b W1-5: バックアップが走っている間は、猶予を過ぎた旧ディレクトリでも回収しない。
+    /// フル zip は 7〜9 分かけて `attachments/` を走査するので、その最中に crop を消すと
+    /// 「`assets` 行はあるがファイルが無い」アーカイブが完成してしまう。
+    #[test]
+    fn gc_defers_collection_while_a_backup_is_running() {
+        let root = gc_tmp_root("backup");
+        let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
+        let old = make_asset_dir(&root, "bbbbbbbbbbbbbbbb");
+        age_files(&old, 2 * 60 * 60);
+        // 猶予では守られない状態（＝ バックアップの述語だけが残す理由）。
+        assert!(is_stale_asset_dir(&old, std::time::SystemTime::now()));
+
+        gc_stale_asset_dirs_with(&root, &current, || true);
+
+        assert!(old.is_dir(), "バックアップ中は回収を見送る");
+        assert!(
+            old.join("fig-p001-00.png").is_file(),
+            "中の crop PNG も残る（アーカイブが参照できる）"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 上のゲートが**本番の入口にも配線されている**ことを、本物の `BACKUP_LOCK` で確かめる。
+    /// `build_pdf_version` が呼ぶのはこの 2 引数版なので、ここが `|| false` に化けると
+    /// ゲートは実質存在しない。
+    ///
+    /// ⚠ **握っている間の true 側だけを assert する。** `BACKUP_LOCK` はプロセス全体で
+    /// 共有の static で、false 側はこのテストの支配下に無い。
+    #[tokio::test]
+    async fn the_production_entry_point_asks_whether_a_backup_is_running() {
+        let _held = crate::backup::hold_lock_for_test().await;
+        let root = gc_tmp_root("backup-wired");
+        let current = make_asset_dir(&root, "aaaaaaaaaaaaaaaa");
+        let old = make_asset_dir(&root, "bbbbbbbbbbbbbbbb");
+        age_files(&old, 2 * 60 * 60);
+
+        gc_stale_asset_dirs(&root, &current);
+
+        assert!(
+            old.is_dir(),
+            "本番の入口が backup::is_running() を見ていない"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
