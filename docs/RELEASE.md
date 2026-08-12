@@ -128,7 +128,36 @@ v0.1.0 では Windows コード署名は **未署名で配布**（SmartScreen �
 - [ ] VM に SimplySign Desktop（[files.certum.eu](https://files.certum.eu/software/SimplySignDesktop/Windows/) の 64-bit `.msi`）、Rust + Node + pnpm + Tauri ビルド前提一式、Git をインストール
 - [ ] SimplySign モバイルアプリは手元のスマホで OK（VM 側には不要。ログイン時に OTP を入力）
 
+**Phase 4-2 — VM の起動と停止（2026-08-12 のコスト削減以降・毎回必要）**
+
+実運用では Azure の Windows 11 VM（`lumencite-win` / リソースグループ `lumencite-siging` / japaneast）を使っている。**`az vm deallocate` してもディスクと公開 IP の課金は止まらない**（マネージドディスクは電源状態と無関係に「確保した容量」へ、Standard SKU の公開 IPv4 はどこにも紐付いていなくても課金される）。実測では停止中の定常費 ¥4,268/月 のうち 96% がこの 2 つだった。そこで 2026-08-12 に **公開 IP を削除**し、OS ディスクを `Premium_LRS`(P10) → `StandardSSD_LRS`(E10) に落として ¥1,553/月 にした。
+
+このため **署名のたびに公開 IP を作り直して NIC に付ける必要がある**。サブネットは `defaultOutboundAccess` 未設定で NAT Gateway も無いので、公開 IP が無いと RDP が繋がらないだけでなく**送信方向のインターネット接続も無い**（SimplySign はクラウド署名なので致命的）。
+
+```sh
+RG=lumencite-siging; NIC=lumencite-win563_z1
+
+# 起動前 — 公開 IP を作って NIC に付ける（元と同じ Standard / Static / zone 1）
+az network public-ip create -g $RG -n lumencite-win-ip \
+  --sku Standard --allocation-method Static --version IPv4 --zone 1
+az network nic ip-config update -g $RG --nic-name $NIC -n ipconfig1 \
+  --public-ip-address lumencite-win-ip
+az vm start -g $RG -n lumencite-win
+az vm list -d -o table    # 新しい IP を確認（毎回変わる）→ FreeRDP の接続先に使う
+
+# 署名が終わったら — 必ず 3 つとも戻す
+az vm deallocate -g $RG -n lumencite-win
+az network nic ip-config update -g $RG --nic-name $NIC -n ipconfig1 --remove publicIPAddress
+az network public-ip delete -g $RG -n lumencite-win-ip
+```
+
+- **RDP がつながらないときの第一容疑者は NSG**。`lumencite-win-nsg` の受信規則 `RDP`（priority 300 / TCP 3389）は送信元を **VM 作成時の自宅グローバル IP に固定**してある。ISP 側で変わっていると弾かれるので、`curl -s ifconfig.me` で現在の IP を確認し `az network nsg rule update -g $RG --nsg-name lumencite-win-nsg -n RDP --source-address-prefixes <現在の IP>` で更新する（**現在値はリポジトリに書かない**。`az network nsg rule show` で引く）。
+- OS ディスクの SKU 変更は **deallocated 中しかできない**。Premium に戻したくなったら停止中に `az disk update --sku` する。
+- 自動シャットダウン（DevTestLab スケジュール・21:00 JST）は有効のまま。ただしこれは**戻し忘れの保険**であって、停止してもディスクと IP の課金は止まらない。
+- 月 ¥2,000 の予算アラート `lumencite-monthly-2000jpy` を設定済み（実績 80%/100% と予測 100% でメール通知）。**通知するだけで課金は止まらない。**
+
 **Phase 5 — リリースごとの Windows 署名手順（VM 上）**
+0. [ ] **VM を起動する。公開 IP を作り直してから起動すること**（Phase 4-2。忘れると RDP も外向き通信も繋がらない）
 1. [ ] CI（タグ push）が **macOS + Linux のドラフトリリース**を生成するのを待つ（§5 参照）
 2. [ ] VM で対象タグを `git checkout`（ローカルに前回ビルドの差分が残っていれば `git stash` か `git checkout -- <file>` で退避してから）。**updater 秘密鍵 (`TAURI_SIGNING_PRIVATE_KEY`) は不要** — Windows オーバーレイ `tauri.release-windows.conf.json` が `createUpdaterArtifacts: false` を設定しており updater 成果物（`.sig`）を生成しないため。署名はコード署名証明書（Certum）だけで完結する
 3. [ ] **SimplySign Desktop を起動しログイン**（ユーザーID + スマホ OTP）。証明書がストアに載る（PIN キャッシュ 3h・セッション 2h）
@@ -374,10 +403,12 @@ v0.4.0 は文献種別を 6→19（Zotero 準拠）に拡張し、LumenCite 自�
 
 §2-2 Phase 5 の手順に加えて、今回ハマった点と回避策:
 
+> **⚠️ 2026-08-12 以降、接続先 IP は毎回変わる。** コスト削減で公開 IP を削除したため、署名のたびに作り直す（§2-2 Phase 4-2）。下記の FreeRDP 手順に入る前に IP の作成と NIC への付け替えを済ませ、`az vm list -d -o table` で出た新しい IP を接続先にすること。
+
 - **VM への接続は FreeRDP を使う（JIS キーボードのため）**。macOS の「Windows App」(旧 Microsoft Remote Desktop) は JIS の**キーボード種別(101/106)を送れず**、VM 上で Shift+2 が `"` でなく `@` になる（i8042prt レジストリも `IgnoreRemoteKeyboardLayout` も RDP では効かない）。`brew install freerdp` の **`sdl-freerdp`**（`xfreerdp` は X11 依存で macOS では `$DISPLAY` エラー）で `/kbd:layout:0x00000411 /kbd:type:7 /kbd:subtype:2` を明示送出すると JIS が通る（**Shift+2=`"` で成功判定**）。JIS の `\`/`|`/`_`（¥キー・右Shift左の「ろ」キー）は FreeRDP が転送しないことがあるが、**コマンドはクリップボード貼り付け**（FreeRDP 既定で有効）と PowerShell の `/`(スラッシュ)パスで回避できる。
 - **アップロードで古いバージョンの成果物を拾わない**。VM の `src-tauri/target/release/bundle/{msi,nsis}/` に**前回リリースの古い `.msi`/`.exe` が残る**ことがあり、`Get-ChildItem *.msi | Select -First 1` はアルファベット順で**古い方**を拾う（v0.4.0 で 0.2.1 を誤アップロード→`gh release delete-asset` で削除して再アップロードした）。**アップロード前に bundle を clean するか、`*<version>*` でバージョンを明示**して拾うこと。
 - **signtool を PATH に通す**。Windows SDK の `C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64`（v0.4.0 では `10.0.26100.0`）を `[Environment]::SetEnvironmentVariable('Path', "$old;$dir", 'User')` で永続追加（`setx` は 1024 文字で PATH を破壊しうるので使わない）。
-- 接続ワンライナー（VM パスワード平文を含むため**リポジトリには置かない**）はローカルの `~/bin/lumencite-vm-rdp.sh`（chmod 700）に保管。
+- 接続ワンライナー（VM パスワード平文を含むため**リポジトリには置かない**）はローカルの `~/bin/lumencite-vm-rdp.sh`（chmod 700）に保管。**このスクリプトは接続先 IP を固定で持っているので、2026-08-12 以降は毎回そこを書き換える**（旧 IP `20.210.105.233` は解放済みで、もう存在しない）。
 
 ## 10. v0.5.0 リリースの固有事項（Web クリッパー）— 準備中
 
