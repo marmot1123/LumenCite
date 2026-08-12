@@ -288,6 +288,9 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   // 添付ごとの全文索引状態。
   const [indexStatus, setIndexStatus] = useState<Record<number, "indexed" | "none" | "indexing">>({});
   const [indexNote, setIndexNote] = useState<string | null>(null);
+  // 索引削除のインライン確認（対象の添付 id）。`window.confirm` は WKWebView で
+  // 素通りすることがあるので、破壊操作の確認は画面内で取る。
+  const [confirmUnindex, setConfirmUnindex] = useState<number | null>(null);
   // LCIR エクスポートで運べなかった固有情報（debt-8）。エラーではないので attachError とは別枠。
   const [lcirExportWarnings, setLcirExportWarnings] = useState<LcirExportWarning[]>([]);
   // arXiv TeX ソース取得（LCIR Phase 4）。
@@ -465,7 +468,8 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                 : t("detailPanel.indexNoText"),
       );
     } catch (e: any) {
-      setIndexStatus(s => ({ ...s, [attId]: "none" }));
+      // **失敗してもバッジは触らない。** 索引は DB に残っているのに "none" へ落とすと、
+      // 「索引を削除」ボタンが消えて、いちばん必要な場面で逃げ道が無くなる。
       setIndexNote(e?.message ?? String(e));
     }
   };
@@ -475,15 +479,27 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
   // **再索引ボタンが索引を消す唯一の非破壊経路だった。** 空抽出で既存を守るようにした以上、
   // 「PDF を差し替えたので古い本文を検索から消したい」人に逃げ道が要る ── 無いと
   // 添付ごと削除（PDF 実体と LCIR アセットまでゴミ箱送り）しか手が無くなる。
+  //
+  // 確認は**インライン**で取る（設定 → データの GC / 復元と同じ方式）。
+  // `window.confirm` は WKWebView で素通りすることがあり、素通りすると
+  // **確認なしで索引が消える**（このコンポーネントの他の破壊操作も同じ理由で入れ替え済み）。
   const handleUnindexAttachment = async (attId: number) => {
-    if (!window.confirm(t("detailPanel.unindexConfirm"))) return;
+    setConfirmUnindex(null);
     setIndexNote(null);
+    // 完了までにユーザーが別エントリへ移っていたら表示は捨てる（build / TeX 取得と同じ
+    // stale closure ガード。バックエンドの処理そのものは最後まで走る）。
+    const startedFor = entry?.id ?? null;
+    const stillHere = () => entryIdRef.current === startedFor;
     setIndexStatus(s => ({ ...s, [attId]: "indexing" }));
     try {
       await invoke("unindex_attachment", { id: attId });
+      if (!stillHere()) return;
       setIndexStatus(s => ({ ...s, [attId]: "none" }));
       setIndexNote(t("detailPanel.unindexDone"));
     } catch (e: any) {
+      if (!stillHere()) return;
+      // 失敗＝索引は残っている。**バッジは触らない**（"none" に落とすと、
+      // 索引が残っているのに「索引を削除」ボタンが消えて逃げ道が無くなる）。
       setIndexStatus(s => ({ ...s, [attId]: "indexed" }));
       setIndexNote(e?.message ?? String(e));
     }
@@ -517,6 +533,15 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
       if (r.built) {
         onAttachmentsChanged?.();
         refreshAltTextPending();
+        // build は中で page-FTS も張り直す（p1）ので、索引バッジを取り直す。
+        // 取り直さないと「未索引」表示のまま索引が復活し、**索引済みのときだけ出る
+        // 「索引を削除」ボタンが現れない**（この PR が用意した逃げ道が見えなくなる）。
+        try {
+          const indexed = await invoke<boolean>("is_attachment_indexed", { id: attId });
+          if (stillHere()) setIndexStatus(s => ({ ...s, [attId]: indexed ? "indexed" : "none" }));
+        } catch {
+          /* バッジの表示だけなので握りつぶす */
+        }
       }
     } catch (e: any) {
       if (stillHere()) {
@@ -946,7 +971,7 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                         </button>
                         {indexStatus[att.id] === "indexed" && (
                           <button
-                            onClick={() => handleUnindexAttachment(att.id)}
+                            onClick={() => setConfirmUnindex(att.id)}
                             style={{
                               width: 16, height: 16, padding: 0, border: "none",
                               background: "transparent", cursor: "pointer",
@@ -1086,6 +1111,22 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                 {indexNote && (
                   <div style={{ fontSize: 11, color: "var(--text-mute)", marginTop: 2 }}>
                     {indexNote}
+                  </div>
+                )}
+                {confirmUnindex !== null && (
+                  <div
+                    style={{
+                      marginTop: 4, padding: 8, borderRadius: 6,
+                      border: "1px solid var(--danger, #c0392b)", fontSize: 11,
+                    }}
+                  >
+                    <div style={{ marginBottom: 6 }}>{t("detailPanel.unindexConfirm")}</div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button onClick={() => handleUnindexAttachment(confirmUnindex)}>
+                        {t("detailPanel.unindexConfirmYes")}
+                      </button>
+                      <button onClick={() => setConfirmUnindex(null)}>{t("common.cancel")}</button>
+                    </div>
                   </div>
                 )}
                 {lcirExportWarnings.length > 0 && (

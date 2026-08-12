@@ -520,10 +520,10 @@
     "indexDonePages": "Indexed {{count}} page(s)",
     "indexNoText": "No text layer found (for scanned PDFs, try OCR in the detail view)",
     "indexKeptOcr": "Kept the OCR'd text ({{count}} page(s)) as-is. Re-run OCR to replace it",
-    "indexKeptLcir": "Kept the LCIR-derived index ({{count}} page(s)) as-is",
+    "indexKeptLcir": "Kept the existing index ({{count}} page(s)) as-is",
     "indexKeptNoText": "No text could be extracted, so the existing index ({{count}} page(s)) was kept. Use \"Remove index\" to clear it",
     "unindexTitle": "Remove index",
-    "unindexConfirm": "This removes the full-text index for this attachment. The PDF file itself is not deleted. Continue?",
+    "unindexConfirm": "This removes the full-text search index (page text) for this attachment. The PDF file and its LCIR analysis are not deleted. Continue?",
     "unindexDone": "Removed the index",
     "texSource": "Fetch TeX source",
     "texSourceBusy": "Fetching TeX source…",
@@ -534,7 +534,7 @@
     "texSourceBuildFailed": "TeX source attached, but LCIR build failed: {{error}}",
     "altText": "Generate figure alt text ({{pending}})",
     "altTextBusy": "Generating…",
-      "altTextCountChanged": "The number of pending figures changed to {{pending}}. Check the count on the button and press again.",
+    "altTextCountChanged": "The number of pending figures changed to {{pending}}. Check the count on the button and press again.",
     "altTextTitle": "Describe this paper's figures with an LLM vision model (each image is sent to an external API and billed)",
     "altTextDone": "Generated {{generated}} of {{total}} ({{skipped}} skipped, {{failed}} failed).",
     "altTextNone": "No figures are missing alt text.",
@@ -608,7 +608,8 @@
     "attachmentsLabel": "Attachments",
     "removeAttachment": "Remove attachment",
     "removeAttachmentConfirm": "Remove this PDF?",
-    "lcirBuildBusy": "Another LCIR build is running. Try again once it finishes."
+    "lcirBuildBusy": "Another LCIR build is running. Try again once it finishes.",
+    "unindexConfirmYes": "Remove index"
   },
   "pdfViewer": {
     "loading": "Loading…",

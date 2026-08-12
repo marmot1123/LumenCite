@@ -1821,7 +1821,13 @@ pub enum LcirDeriveOutcome {
     /// LCIR から索引し直した（ページ数）。
     Derived(i64),
     /// 完了 pdfium 版が無い / TeX 版 / LCIR に本文が 1 ページも無い ＝ 既存索引に触らない。
-    NoLcirText,
+    ///
+    /// `ocr_recorded` は「この添付の索引が OCR 由来として記録されているか」。
+    /// **持たないと集計の意味が変わる** ── 実ライブラリの OCR 済みスキャン本は
+    /// LCIR の本文が 0 ページなのでこの枝に落ちるので、潰すと「OCR を守った」が
+    /// 「本文が無いので触らなかった（＝まだ OCR が要る）」と報告される。
+    /// **ここは 1 行も書かないので、読んでも check-then-act の窓は生まれない。**
+    NoLcirText { ocr_recorded: bool },
     /// OCR 由来として記録された索引なので触らない。
     SkippedOcr,
     /// 出どころの記録が無い既存索引を守った（`protect_unrecorded` の tx 内判定）。
@@ -1843,6 +1849,17 @@ pub enum LcirDeriveOutcome {
 ///   手前にも同じ判定を置くと、どちらを壊してもテストが落ちない冗長になる
 ///
 /// `protect_unrecorded` は自動の再導出だけ真（理由は [`fulltext::index_attachment_from_lcir`]）。
+/// 「LCIR に使える本文が無い」枝の結果を組む。**書かないと決めた後に**出どころを読むので、
+/// check-then-act の窓は生まれない（W1-2 が畳んだ先読みとは性質が違う）。
+/// 読めなければ「記録なし」に倒す ── 分類が 1 段粗くなるだけで、書き込みには一切関与しない。
+async fn no_lcir_text(pool: &SqlitePool, attachment_id: i64) -> LcirDeriveOutcome {
+    let ocr_recorded = matches!(
+        fulltext::get_fulltext_source(pool, attachment_id).await,
+        Ok(Some(fulltext::FulltextSource::Ocr))
+    );
+    LcirDeriveOutcome::NoLcirText { ocr_recorded }
+}
+
 pub async fn regenerate_page_fts_from_lcir(
     pool: &SqlitePool,
     attachment_id: i64,
@@ -1853,12 +1870,12 @@ pub async fn regenerate_page_fts_from_lcir(
         .map_err(|e| e.to_string())?
     {
         Some(v) => v,
-        None => return Ok(LcirDeriveOutcome::NoLcirText),
+        None => return Ok(no_lcir_text(pool, attachment_id).await),
     };
     // ページ FTS は pdfium 版のみ（TeX 版は page ノードを持たず、`fulltext` はページ粒度の
     // PDF 検索インデックスなので触らない）。
     if version.extractor_name != document_ir::schema::EXTRACTOR_NAME {
-        return Ok(LcirDeriveOutcome::NoLcirText);
+        return Ok(no_lcir_text(pool, attachment_id).await);
     }
     let pages = document_nodes::page_nodes_for_version(pool, version.id)
         .await
@@ -1877,7 +1894,7 @@ pub async fn regenerate_page_fts_from_lcir(
         .collect();
     if rows.is_empty() {
         // LCIR に本文が 1 ページも無い（スキャン本など）。既存の索引には触らない。
-        return Ok(LcirDeriveOutcome::NoLcirText);
+        return Ok(no_lcir_text(pool, attachment_id).await);
     }
     let n = rows.len() as i64;
     match fulltext::index_attachment_from_lcir(
@@ -1917,8 +1934,15 @@ pub enum FulltextIndexOutcome {
 /// 全文索引を「その添付にとって正しいソース」から張る**単一の決定点**（p1）。
 ///
 /// これを増やさないことが debt-17 の対策そのもの ── 添付経路が各自 `extract_and_index` を
-/// spawn し、後から LCIR 派生を**足す**と last-writer-wins になり、pdf_extract が 0 字を返す
-/// 個体（att93/att94）は LCIR が正常でも検索から消える。
+/// spawn し、後から LCIR 派生を**足す**と last-writer-wins になり、pdf_extract が本文を
+/// 返さない個体は LCIR が正常でも検索から消える。
+///
+/// ⚠ **かつてここは att93/att94 を例に挙げていたが、あの 2 件は例として誤りだった**
+/// （2026-08-12 に実 DB の現物を pdf-extract 0.12 へ直接当てて確認）。あの 2 件は
+/// `Ok(空)` ではなく **panic する**（`missing unicode map and encoding`）ので
+/// `spawn_blocking` が Err を返し、`Failed` で早期 return する ＝ **既存索引には触らない**。
+/// 「pdf_extract が `Ok(全ページ空)` を返す」個体はスキャン本（実 DB では att37 / att42 /
+/// att109 / att121）の方で、W1-1 のガードが守るのはそちら。
 ///
 /// `replace_existing` は「ユーザーがこの添付を名指しで再索引した」経路だけ `true`
 /// （詳細パネルの索引ボタン = `index_attachment` コマンド）。**自動経路は必ず `false`**。
@@ -1944,7 +1968,12 @@ pub async fn index_fulltext_for_attachment(
     if lcir_enabled(pool).await {
         match regenerate_page_fts_from_lcir(pool, attachment_id, false).await {
             Ok(LcirDeriveOutcome::Derived(n)) => return FulltextIndexOutcome::Lcir(n),
-            Ok(_) => {}
+            // **段 1 との間に立った OCR 記録をここで拾う。** `Ok(_)` に潰すと、
+            // 527 ページの pdf_extract を走らせたうえで「LCIR の索引を残しました」と報告する
+            // （実際に守ったのは OCR）。
+            Ok(LcirDeriveOutcome::SkippedOcr) => return FulltextIndexOutcome::SkippedOcr,
+            // 本文が無い / 記録なしを守った（この経路では後者は起きない）→ 段 3 へ落とす。
+            Ok(LcirDeriveOutcome::NoLcirText { .. } | LcirDeriveOutcome::SkippedUnrecorded) => {}
             Err(e) => eprintln!("p1: LCIR derivation failed for attachment {attachment_id}: {e}"),
         }
     }
@@ -1973,7 +2002,14 @@ pub async fn index_fulltext_for_attachment(
     .await
     {
         Ok(fulltext::PdfExtractWrite::Replaced) => FulltextIndexOutcome::PdfExtract(non_empty),
-        Ok(fulltext::PdfExtractWrite::SkippedProtected) => FulltextIndexOutcome::SkippedLcirIndexed,
+        // **守った理由を保つ。** 潰すと、OCR を守った回に UI が
+        // 「LCIR から作った索引を残しました」と出す（段 1 の後に OCR 記録が立った場合に起きる）。
+        Ok(fulltext::PdfExtractWrite::SkippedProtected(fulltext::FulltextSource::Ocr)) => {
+            FulltextIndexOutcome::SkippedOcr
+        }
+        Ok(fulltext::PdfExtractWrite::SkippedProtected(fulltext::FulltextSource::Lcir)) => {
+            FulltextIndexOutcome::SkippedLcirIndexed
+        }
         Ok(fulltext::PdfExtractWrite::SkippedEmptyExtract) => {
             FulltextIndexOutcome::SkippedEmptyExtract
         }
@@ -2172,8 +2208,13 @@ pub(crate) async fn derive_page_fts_from_lcir_batch(
         let protect = mode == DeriveMode::AddMissingOnly;
         match regenerate_page_fts_from_lcir(pool, att, protect).await {
             Ok(LcirDeriveOutcome::Derived(_)) => res.derived += 1,
-            // LCIR に本文が無い添付。既存の索引（OCR / pdf_extract 由来）を残す。
-            Ok(LcirDeriveOutcome::NoLcirText) => res.skipped_empty += 1,
+            // **OCR 済みのスキャン本は「OCR を守った」に数える。** LCIR の本文が 0 ページなのは
+            // 事実だが、それを `skipped_empty`（＝まだ OCR が要る候補）と報告すると、
+            // 実ライブラリでは `skipped_ocr` が構造的に 0 件になり、
+            // 「OCR 由来 N 件はそのまま」という UI の文言が誰にも当たらなくなる。
+            Ok(LcirDeriveOutcome::NoLcirText { ocr_recorded: true }) => res.skipped_ocr += 1,
+            // LCIR に本文が無い添付。既存の索引（pdf_extract 由来）を残す。
+            Ok(LcirDeriveOutcome::NoLcirText { ocr_recorded: false }) => res.skipped_empty += 1,
             Ok(LcirDeriveOutcome::SkippedOcr) => res.skipped_ocr += 1,
             Ok(LcirDeriveOutcome::SkippedUnrecorded) => res.skipped_existing += 1,
             Err(e) => {
@@ -3729,6 +3770,74 @@ mod tests {
         );
     }
 
+    /// **決定点と build 経路は、記録の無い既存索引を LCIR で置き換える**（`protect_unrecorded = false`）。
+    ///
+    /// 守るのは自動の一括再導出だけ。ここまで守ると、添付時の
+    /// 「pdf_extract で索引 → build が LCIR へ置き換え」という p1 の設計そのものが止まり、
+    /// 新規添付が永久に pdf_extract のままになる。**この非対称は意図なので固定する**
+    /// （`false` を `true` に書き換えても 1 本も落ちない状態だった）。
+    /// 残る穴 = 記録の無い課金済み OCR がここで消えうる（debt-37 / debt-43）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_decision_point_replaces_an_unrecorded_index_with_lcir(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        fulltext::index_attachment(&pool, att, &[(1, "legacy pdfextract body".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(fulltext::get_fulltext_source(&pool, att).await.unwrap(), None);
+        insert_pdf_lcir_pages(&pool, att, "ck-unrecorded", &[Some("lcir body")]).await;
+
+        let outcome =
+            index_fulltext_for_attachment(&pool, PathBuf::from("/nonexistent.pdf"), att, false)
+                .await;
+
+        assert_eq!(outcome, FulltextIndexOutcome::Lcir(1), "記録が無い索引は置き換える");
+        assert_eq!(
+            fulltext::search_fulltext(&pool, "legacy", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// **OCR 済みのスキャン本は「OCR を守った」に数える**（LCIR の本文が 0 ページでも）。
+    ///
+    /// 実ライブラリのスキャン本 4 冊は LCIR の page 本文が 0 なので、分類を
+    /// 「LCIR に本文があるか」だけで決めると `skipped_ocr` が構造的に 0 件になり、
+    /// 設定 → データの「OCR 由来 N 件はそのまま」が誰にも当たらなくなる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_ocr_scan_book_is_counted_as_protected_not_as_empty(pool: SqlitePool) {
+        settings::set_setting(&pool, settings::LCIR_ENABLED_KEY, "1")
+            .await
+            .unwrap();
+        let att = setup_attachment(&pool).await;
+        fulltext::index_attachment(&pool, att, &[(1, "ocr transcript".to_string())])
+            .await
+            .unwrap();
+        fulltext::set_fulltext_source(&pool, att, fulltext::FulltextSource::Ocr)
+            .await
+            .unwrap();
+        // pdfium は本文を 1 ページも返さない（スキャン本）。
+        insert_pdf_lcir_pages(&pool, att, "ck-scan", &[None, Some("   ")]).await;
+
+        let res = derive_page_fts_from_lcir_batch(&pool, DeriveMode::ReplaceUnprotected)
+            .await
+            .unwrap();
+
+        assert_eq!(res.skipped_ocr, 1, "OCR を守ったと数える");
+        assert_eq!(res.skipped_empty, 0, "「まだ OCR が要る」側に数えない");
+        assert_eq!(
+            fulltext::search_fulltext(&pool, "transcript", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     /// **LCIR が本文を持たないページの既存行は残す**（debt-34 の修正）。
     /// pdfium が 1 ページだけ空を返す添付で、pdf_extract / OCR の本文が消えないこと。
     /// 残した行にも C0 クリーナーが掛かること（受け入れ条件を崩さない）。
@@ -3785,7 +3894,11 @@ mod tests {
 
         let n = regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap();
 
-        assert_eq!(n, LcirDeriveOutcome::NoLcirText, "LCIR に本文が無い");
+        assert_eq!(
+            n,
+            LcirDeriveOutcome::NoLcirText { ocr_recorded: false },
+            "LCIR に本文が無い"
+        );
         let hits = fulltext::search_fulltext(&pool, "transcript", None, None, None)
             .await
             .unwrap();
@@ -3856,7 +3969,7 @@ mod tests {
 
         assert_eq!(
             replaced,
-            fulltext::PdfExtractWrite::SkippedProtected,
+            fulltext::PdfExtractWrite::SkippedProtected(fulltext::FulltextSource::Lcir),
             "LCIR 由来の索引には譲る"
         );
         let hits = fulltext::search_fulltext(&pool, "derived", None, None, None)
@@ -5026,7 +5139,7 @@ mod tests {
         // ページ FTS 側も TeX 版では何もしない。
         assert_eq!(
             regenerate_page_fts_from_lcir(&pool, att, false).await.unwrap(),
-            LcirDeriveOutcome::NoLcirText
+            LcirDeriveOutcome::NoLcirText { ocr_recorded: false }
         );
     }
 

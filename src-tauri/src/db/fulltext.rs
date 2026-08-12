@@ -181,8 +181,10 @@ pub(crate) async fn clear_fulltext_sources_for_entry_tx(
 pub enum PdfExtractWrite {
     /// 索引を置き換えた（出どころの記録は既定 = pdf_extract 由来に戻した）。
     Replaced,
-    /// 出どころの記録（OCR / LCIR）に守られたので触らなかった。
-    SkippedProtected,
+    /// 出どころの記録に守られたので触らなかった。**どちらの記録で守ったかを持つ** ──
+    /// 潰すと呼び出し側が理由を復元できず、OCR を守った回に
+    /// 「LCIR から作った索引を残しました」と表示することになる。
+    SkippedProtected(FulltextSource),
     /// **抽出が 1 ページも本文を返さなかったので、既存の索引を残した**（v1.0.0・②b の W1-1）。
     SkippedEmptyExtract,
 }
@@ -205,7 +207,16 @@ pub enum PdfExtractWrite {
 /// 再索引ボタン 1 回で、課金して起こした OCR 転写が消えていた。
 ///
 /// **守るのは「非空 0 件」のときだけで、縮小（既存 500 行 → 新規 1 行）は守らない。**
-/// 縮小まで守ると、本当に内容が減った PDF を張り直せなくなる。
+///
+/// 縮小まで守ると、**テキスト層が部分的に壊れた PDF を張り直す**（再索引ボタンの本来の用途）が
+/// できなくなる ── どこからを「壊れている」と見るかの閾値をアプリが持つことになり、それは
+/// 決められない。⚠ **かつてここは「本当に内容が減った PDF を張り直せなくなる」と書いていたが、
+/// その操作はアプリに存在しない**（`UPDATE attachments` は 0 件・`file_path` は不変・添付は
+/// ライブラリ内へコピーされるので、短くした PDF を足すと必ず別の添付になる）。
+///
+/// **残る穴**: テキスト層が部分的に生きている PDF で、封印されていない課金済み OCR ページ
+/// （中断した OCR・debt-43）は、再索引ボタン 1 回で今も消える。実 DB では該当 0 件
+/// （`0 < 非空ページ < 既存行数` になる添付は 136 中 0 件）。
 pub async fn index_attachment_from_pdf_extract(
     pool: &SqlitePool,
     attachment_id: i64,
@@ -223,13 +234,13 @@ pub async fn index_attachment_from_pdf_extract(
         .fetch_optional(&mut *tx)
         .await?;
     let blocked = match current.as_deref().and_then(FulltextSource::parse) {
-        Some(FulltextSource::Ocr) => true,
-        Some(FulltextSource::Lcir) => !replace_existing,
-        None => false,
+        Some(FulltextSource::Ocr) => Some(FulltextSource::Ocr),
+        Some(FulltextSource::Lcir) if !replace_existing => Some(FulltextSource::Lcir),
+        _ => None,
     };
-    if blocked {
+    if let Some(source) = blocked {
         // 譲る（tx は drop でロールバック）。
-        return Ok(PdfExtractWrite::SkippedProtected);
+        return Ok(PdfExtractWrite::SkippedProtected(source));
     }
 
     // **空抽出のガードは `blocked` 判定の後**。前に置くと、OCR 由来の添付に空抽出が来たとき
@@ -1044,7 +1055,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            PdfExtractWrite::SkippedProtected
+            PdfExtractWrite::SkippedProtected(FulltextSource::Lcir)
         );
         // 名指し（`true`）は張り直し、出どころの記録も既定に戻す。
         assert_eq!(
@@ -1085,7 +1096,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            PdfExtractWrite::SkippedProtected
+            PdfExtractWrite::SkippedProtected(FulltextSource::Ocr)
         );
         assert_eq!(
             get_fulltext_source(&pool, ocr_att).await.unwrap(),
@@ -1226,7 +1237,8 @@ mod tests {
             index_attachment_from_pdf_extract(&pool, att, &[(1, String::new())], true)
                 .await
                 .unwrap(),
-            PdfExtractWrite::SkippedProtected
+            PdfExtractWrite::SkippedProtected(FulltextSource::Ocr),
+            "守った理由を保つ（潰すと UI が「LCIR から作った索引」と嘘をつく）"
         );
     }
 
@@ -1311,6 +1323,41 @@ mod tests {
         assert_eq!(
             get_fulltext_source(&pool, att).await.unwrap(),
             Some(FulltextSource::Lcir)
+        );
+    }
+
+    /// **守るのは「記録が無い」ときだけ。** 出どころが分かっている（= Lcir）索引は
+    /// 既存行があっても置き換える ── `recorded.is_none()` の項を落とすと、
+    /// LCIR 由来の索引が二度と更新できなくなる（再構築の成果が反映されない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_derive_path_still_replaces_a_recorded_lcir_index(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Rebuilt").await;
+        index_attachment(&pool, att, &[(1, "old lcir body".to_string())])
+            .await
+            .unwrap();
+        set_fulltext_source(&pool, att, FulltextSource::Lcir)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index_attachment_from_lcir(
+                &pool,
+                att,
+                &[(1, "new lcir body".to_string())],
+                |s| s.to_string(),
+                true
+            )
+            .await
+            .unwrap(),
+            LcirWrite::Replaced,
+            "記録があるなら守らない（守ると再構築の成果が届かない）"
+        );
+        assert_eq!(
+            search_fulltext(&pool, "new", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
