@@ -194,6 +194,18 @@ pub fn record_failure(kind: BatchKind, error: &str) {
     });
 }
 
+/// **プロセス共有の static を触るテストの、モジュール横断の直列化ゲート。**
+///
+/// この表（running / progress / last）と OCR の排他フラグはプロセスに 1 つしか無いのに、
+/// 読み書きするテストは 3 モジュール（ここ / `lib.rs` の `batch_wiring_tests` /
+/// `llm::tools::ocr`）に散っている。**モジュールごとに別の gate を持つと相互の窓が残る**
+/// ── 例えば ocr のテストが `RunningMark(Ocr)` を DB I/O をまたいで握っている間に、
+/// ここの「誰も走っていない」前提 assert が並列スレッドで落ちる（#9 で CI だけ落とした形）。
+/// tokio の Mutex なのは、`#[sqlx::test]` の async 本体が guard を await 越しに持つため。
+/// 同期テストは `blocking_lock()` で取る。
+#[cfg(test)]
+pub(crate) static TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 現在の状態を写して返す（**読み取り専用**）。
 ///
 /// 「直近の結果」をここで消さないのは、読むだけの命令が状態を壊すと、
@@ -211,13 +223,11 @@ pub fn snapshot() -> BatchStatus {
 mod tests {
     use super::*;
 
-    /// **プロセス共有の static を触るテストはここで直列化する。**
+    /// **プロセス共有の static を触るテストは [`TEST_GATE`]（モジュール横断）で直列化する。**
     /// 並列実行だと他のテストが立てた印を自分のものと取り違える（#9 で CI だけ落とした形）。
     /// そのうえで、各テストは**自分が起こした遷移だけ**を assert する。
-    static GATE: Mutex<()> = Mutex::new(());
-
-    fn gate() -> std::sync::MutexGuard<'static, ()> {
-        GATE.lock().unwrap_or_else(|e| e.into_inner())
+    fn gate() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_GATE.blocking_lock()
     }
 
     #[test]

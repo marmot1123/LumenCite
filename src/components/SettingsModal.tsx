@@ -160,10 +160,14 @@ interface VisionAltTextResult {
 }
 /** `run_ocr` の結果（`batch_status.last` 経由で読む）。Rust 側 `OcrOutcome` と 1:1。 */
 interface OcrResult {
+  /** 課金して処理したページ数。 */
+  processed: number;
+  /** 本文が取れて索引に残したページ数（白紙ページは含まない）。 */
   saved: number;
   planned: number;
   stopped: boolean;
   failure: string | null;
+  failed_page: number | null;
   partial: boolean;
 }
 
@@ -960,7 +964,9 @@ function DataTab() {
               ? t("settings.data.texFetchRunning")
               : t("settings.data.texFetchError", { error });
           case "ocr":
-            return busy ? t("settings.data.ocrBusy") : t("settings.data.ocrError", { error });
+            // busy（already_running）はここに来ない ── 排他に弾かれた呼び出しは
+            // `batch_status.last` に載る前に返る（batch_status.rs の FinishedBatch 参照）。
+            return t("settings.data.ocrError", { error });
         }
       })();
       return { message: null, error: text };
@@ -1057,8 +1063,12 @@ function DataTab() {
         }
         return {
           message: r.stopped
-            ? t("settings.data.ocrDoneStopped", { saved: r.saved, planned: r.planned })
-            : t("settings.data.ocrDone", { saved: r.saved }),
+            ? t("settings.data.ocrDoneStopped", {
+                processed: r.processed,
+                planned: r.planned,
+                saved: r.saved,
+              })
+            : t("settings.data.ocrDone", { processed: r.processed, saved: r.saved }),
           error: null,
         };
       }
@@ -1133,18 +1143,21 @@ function DataTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 走っている間だけ軽く追う。理由は 2 つあり、**どちらも「マウント時に 1 回」では届かない**:
-  //   ① このパネルが起動していないバッチ（詳細パネル発の代替テキスト生成・起動時の再導出）は
-  //      invoke の解決が返って来ないので、実行中の表示がいつまでも消えない。
-  //   ② **完了結果もポーリングが拾う。** 開いたまま見届けた場合も、実行中に開き直した場合も、
+  // 開いている間は常に軽く追う。理由は 3 つあり、**どれも「マウント時に 1 回」では届かない**:
+  //   ① このパネルが起動していないバッチ（詳細パネル発の代替テキスト生成・起動時の再導出・
+  //      リーダー／チャット発の OCR）は invoke の解決が返って来ない。⚠ 以前は「running が
+  //      非空と観測できたら追い始める」だったが、**アイドルで開いた後に始まったバッチは
+  //      その最初の観測が永久に来ない** ── OCR はこの節が画面をまたいだ停止手段の本体なので、
+  //      課金中に停止ボタンが出ないことに直結する。running が空でも回し続ける。
+  //   ② 実行中の表示がいつまでも消えない問題（同上）。
+  //   ③ **完了結果もポーリングが拾う。** 開いたまま見届けた場合も、実行中に開き直した場合も、
   //      マウント時の 1 回はまだ `last` が古いので拾えない。
-  // 読むのは Mutex 1 つなので安い。
+  // 読むのは Mutex 1 つなので安い（2 秒に 1 回・このタブを開いている間だけ）。
   useEffect(() => {
-    if (!batchStatus?.running.length) return;
     const id = setInterval(() => void refreshBatchStatus(), 2000);
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [batchStatus?.running.join(",")]);
+  }, []);
 
   // 表示に使う実行中フラグは「ローカルの楽観更新 ∪ バックエンドの正本」。
   // ローカルだけだと他所で始まったバッチを取りこぼし、バックエンドだけだと

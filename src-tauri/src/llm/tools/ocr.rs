@@ -12,8 +12,10 @@ use super::{ToolContext, ToolError};
 use crate::keychain;
 use crate::llm::{ocr, ToolCallSpec, ToolSpec};
 
-/// 2 本目の OCR を弾いたことを表す印。フロントは既存の変換規約に載せて文言にする
-/// （生のまま出すと「OCR 失敗: already_running」になる）。
+/// 2 本目の OCR を弾いたことを表す印。フロントは専用の文言に変換する。
+/// ⚠ 実際にフロントへ届く文字列は `ToolError::Execution` の Display が前置した
+/// `"execution error: already_running"` なので、**読み手は必ず部分一致で拾う**こと
+/// （等価比較で書くと一生マッチしない）。
 pub const OCR_ALREADY_RUNNING: &str = "already_running";
 
 pub fn specs() -> Vec<ToolSpec> {
@@ -82,11 +84,17 @@ pub async fn try_execute(
             .await
             .unwrap_or(0);
         if indexed > 0 {
+            // ⚠ 中断・失敗した OCR が数ページだけ保存した添付もここに来る（保存が
+            // 索引に数えられるため）。その場合「読める」は過大なので、部分転写の
+            // 可能性と逃げ道（リーダーのボタンはこのガードを受けない）を必ず添える。
             return Some(Ok(format!(
                 "entry {entry_id} already has {indexed} indexed page(s) of full text — call \
                  get_fulltext to read it. OCR is only for scanned PDFs with no text layer, and \
                  re-running it would replace the existing text. To re-transcribe specific pages \
-                 anyway, pass `pages`."
+                 anyway, pass `pages`. Note: if an earlier OCR of this entry was stopped or \
+                 failed partway, those {indexed} page(s) may be only a partial transcription — \
+                 a full re-run is possible from the reader's OCR button, which is not subject \
+                 to this guard."
             )));
         }
     }
@@ -143,9 +151,15 @@ impl Drop for OcrRunGuard {
 ///
 /// `run_ocr` の入り口はこれだけ。ばらすと「排他は取ったが印を立て忘れた」のような
 /// 片肺の変異が観測されずに残る（②b の配線 survivor は全部この形だった）。
+///
+/// ⚠ **フィールドの順序が正しさの一部。** drop は宣言順なので、`_mark` を先に置いて
+/// **印を消してから排他フラグを離す**（取得の逆順）。逆にすると、フラグが離れてから
+/// 印が消えるまでの数命令の窓で次のランが排他を取れてしまい、`RunningMark::new` の
+/// 重複排除と旧ランの `retain` が相殺して**新しいランの印が誰にも立たない**
+/// （＝設定 → データの停止ボタンが出ないまま 527 ページ課金し切る）。
 struct OcrRun {
-    _guard: OcrRunGuard,
     _mark: crate::batch_status::RunningMark,
+    _guard: OcrRunGuard,
 }
 
 /// 排他を取り、前回の中断要求を倒し、「OCR 実行中」の印を立てる。
@@ -162,8 +176,8 @@ fn begin_ocr() -> Result<OcrRun, ToolError> {
     // 前回の押し忘れを引き継がない（引き継ぐと 1 ページも処理せず終わる）。
     OCR_CANCEL.store(false, Ordering::SeqCst);
     Ok(OcrRun {
-        _guard: guard,
         _mark: crate::batch_status::RunningMark::new(crate::batch_status::BatchKind::Ocr),
+        _guard: guard,
     })
 }
 
@@ -193,10 +207,14 @@ impl PageTranscriber for VisionTranscriber {
     }
 }
 
-/// [`transcribe_and_save`] の結果。
+/// [`transcribe_and_save`] の結果。**課金した枚数（processed）と索引に残した枚数（saved）を
+/// 分けて持つ** ── Vision は白紙ページに空文字を返す（システムプロンプトがそう指示している）ので、
+/// 2 つは正規の運用で食い違う。混ぜると「全ページ空白の課金ランが成功に見える」。
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct OcrOutcome {
-    /// 今回 API を呼んで課金したページ数（= 保存したページ数）。
+    /// 今回 API を呼んで課金したページ数。
+    pub processed: i64,
+    /// 本文が取れて索引に残したページ数（空白だけのページは含まない）。
     pub saved: i64,
     /// 今回処理する予定だった枚数。
     pub planned: i64,
@@ -204,6 +222,9 @@ pub(crate) struct OcrOutcome {
     pub stopped: bool,
     /// 失敗して降りたときのエラー。
     pub failure: Option<String>,
+    /// 失敗した実ページ番号（1 始まり）。`pages` 指定の部分 OCR では
+    /// 通し番号と実ページ番号がずれるので、通し番号から推定してはいけない。
+    pub failed_page: Option<i64>,
     /// 保存を部分差し替えにしたか（`false` = 添付ごと置き換え）。
     pub partial: bool,
 }
@@ -235,24 +256,34 @@ pub(crate) async fn transcribe_and_save<T: PageTranscriber + ?Sized>(
             break;
         }
         match transcriber.transcribe(&b64).await {
-            Ok(text) => results.push((page_no, text)),
+            Ok(text) => {
+                out.processed += 1;
+                // **空白だけの転写は保存に回さない。** 部分差し替えで空ページを渡すと
+                // 「そのページの既存行を削除して何も入れない」になり、中断ランが
+                // pdf_extract や前回の課金済み本文を黙って消す（さらに全行が消えると
+                // 封印まで剥がれる）。課金は発生しているので processed には数える。
+                if !text.trim().is_empty() {
+                    results.push((page_no, text));
+                }
+            }
             Err(e) => {
                 out.failure = Some(e);
+                out.failed_page = Some(page_no);
                 break;
             }
         }
-        let done = results.len() as i64;
-        crate::batch_status::set_progress(crate::batch_status::BatchKind::Ocr, done, planned);
-        (hooks.on_progress)(done, planned);
+        crate::batch_status::set_progress(crate::batch_status::BatchKind::Ocr, out.processed, planned);
+        (hooks.on_progress)(out.processed, planned);
     }
 
     out.saved = results.len() as i64;
     if results.is_empty() {
+        // 保存するものが無い ── 既存の索引にも封印にも一切触らない。
         crate::batch_status::record_success(crate::batch_status::BatchKind::Ocr, &out);
         return Ok(out);
     }
 
-    out.partial = ocr_save_is_partial(explicit_pages, out.saved, planned);
+    out.partial = ocr_save_is_partial(explicit_pages, out.processed, planned);
     // 封印してよいのは、頼まれたぶんを最後まで処理し切ったときだけ（中断・失敗では立てない）。
     let completed = !out.stopped && out.failure.is_none();
     if let Err(e) = save_ocr_pages(pool, attachment_id, &results, out.partial, completed).await {
@@ -281,6 +312,40 @@ pub async fn run_ocr(
     // 排他・中断フラグ・実行中の印。**どの起動口から来てもここを通る。**
     let _run = begin_ocr()?;
 
+    // **ループ手前の失敗（添付なし・キー未設定・ラスタライズ失敗…）も「直近の結果」に残す。**
+    // 残さないと、リーダーを離れた後に失敗したラン（527 頁本のラスタライズは数分かかる）が
+    // どの画面からも読めない ── 「OCR 実行中」が黙って消えるだけになる。
+    // `already_running` はここに来ない（`begin_ocr` が印を作る前に返す）ので、
+    // 「弾かれた呼び出しは本物の結果を上書きしない」契約（`FinishedBatch`）はそのまま。
+    let (attachment_id, images, transcriber) =
+        match prepare_ocr(pool, app_data_dir, entry_id, attachment_id, &pages).await {
+            Ok(p) => p,
+            Err(e) => {
+                crate::batch_status::record_failure(
+                    crate::batch_status::BatchKind::Ocr,
+                    &e.to_string(),
+                );
+                return Err(e);
+            }
+        };
+
+    // ループ本体（テスト可能な側）。進捗・成否の記録はループ自身が書く。
+    let out =
+        transcribe_and_save(pool, attachment_id, images, pages.is_some(), &transcriber, &hooks)
+            .await?;
+
+    Ok(describe_outcome(entry_id, &out))
+}
+
+/// ループ手前の段取り: 対象添付の特定 → プロバイダ/キー解決 → ラスタライズ。
+/// ここの失敗は [`run_ocr`] が `record_failure` に通す（この関数は記録しない）。
+async fn prepare_ocr(
+    pool: &sqlx::SqlitePool,
+    app_data_dir: &Path,
+    entry_id: i64,
+    attachment_id: Option<i64>,
+    pages: &Option<Vec<i64>>,
+) -> Result<(i64, Vec<(i64, String)>, VisionTranscriber), ToolError> {
     // 1. 対象 PDF 添付。attachment_id 指定があればその添付を、無ければ最初の PDF を使う（CR-027）。
     //    複数 PDF のとき「常に先頭」を OCR してしまわないよう、UI からは選択中の添付 id を渡す。
     let row: Option<(i64, String)> = match attachment_id {
@@ -340,13 +405,7 @@ pub async fn run_ocr(
         return Err(ToolError::Execution("no pages to OCR".into()));
     }
 
-    // 4. ループ本体（テスト可能な側）。進捗・排他後の記録はループ自身が書く。
-    let transcriber = VisionTranscriber { provider, model, api_key };
-    let out =
-        transcribe_and_save(pool, attachment_id, images, pages.is_some(), &transcriber, &hooks)
-            .await?;
-
-    Ok(describe_outcome(entry_id, &out))
+    Ok((attachment_id, images, VisionTranscriber { provider, model, api_key }))
 }
 
 /// 結果を人（と LLM）に説明する文字列。**再開は実装していないので、「続きから」とは言わない**
@@ -355,35 +414,59 @@ pub async fn run_ocr(
 pub(crate) fn describe_outcome(entry_id: i64, out: &OcrOutcome) -> String {
     const RERUN_STARTS_OVER: &str = " Running OCR again does NOT resume: it starts over from the \
          first page and every page is billed again.";
+    // 失敗位置は**実ページ番号**で言う。`pages` 指定の部分 OCR では通し番号と
+    // 実ページ番号がずれ、通し番号で案内すると取り直しで別のページを再課金させる。
     if out.saved == 0 {
         return match &out.failure {
-            Some(e) => format!(
-                "OCR failed before any page was saved for entry {entry_id}: {e}. The existing \
-                 index was not touched."
-            ),
-            None if out.stopped => format!(
+            Some(e) => {
+                let at = out
+                    .failed_page
+                    .map(|p| format!(" on page {p}"))
+                    .unwrap_or_default();
+                format!(
+                    "OCR failed{at} before any page could be saved for entry {entry_id}: {e}. \
+                     The existing index was not touched."
+                )
+            }
+            None if out.stopped && out.processed == 0 => format!(
                 "OCR was stopped before any page was processed for entry {entry_id}; nothing \
                  changed and nothing was billed."
+            ),
+            None if out.stopped => format!(
+                "OCR was stopped after {} page(s) for entry {entry_id}; none of them contained \
+                 text, so the existing index was not touched.",
+                out.processed
+            ),
+            // 全ページ課金したのに 1 行も残らなかった ── 成功に見せない（唯一の異常シグナル）。
+            None if out.processed > 0 => format!(
+                "OCR processed {} page(s) for entry {entry_id} but found no text on any of \
+                 them; nothing was indexed and the existing index was not touched.",
+                out.processed
             ),
             None => format!("OCR had nothing to do for entry {entry_id}."),
         };
     }
     if out.stopped {
         format!(
-            "OCR stopped at {}/{} page(s) for entry {entry_id}; the {} page(s) already \
-             transcribed were saved.{RERUN_STARTS_OVER}",
-            out.saved, out.planned, out.saved
+            "OCR stopped at {}/{} page(s) for entry {entry_id}; the {} page(s) with text were \
+             saved.{RERUN_STARTS_OVER}",
+            out.processed, out.planned, out.saved
         )
     } else if let Some(e) = &out.failure {
+        let at = out
+            .failed_page
+            .map(|p| format!(" on page {p}"))
+            .unwrap_or_default();
         format!(
-            "OCR failed at page {} of {} for entry {entry_id}: {e}. The {} page(s) transcribed \
-             before the failure were saved.{RERUN_STARTS_OVER}",
-            out.saved + 1,
-            out.planned,
-            out.saved
+            "OCR failed{at} after {}/{} page(s) for entry {entry_id}: {e}. The {} page(s) with \
+             text transcribed before the failure were saved.{RERUN_STARTS_OVER}",
+            out.processed, out.planned, out.saved
         )
     } else {
-        format!("OCR'd {} page(s) for entry {entry_id}.", out.saved)
+        format!(
+            "OCR'd {} page(s) for entry {entry_id}; {} page(s) contained text and were indexed.",
+            out.processed, out.saved
+        )
     }
 }
 
@@ -396,8 +479,11 @@ pub(crate) fn describe_outcome(entry_id: i64, out: &OcrOutcome) -> String {
 ///
 /// 判定を関数に出しているのは、`run_ocr` の中に埋めると `#[tauri::command]` 経由でしか
 /// 到達できずテストが届かないため（ゲート ②b の debt-38 と同じ理由）。
-pub(crate) fn ocr_save_is_partial(explicit_pages: bool, done: i64, planned: i64) -> bool {
-    explicit_pages || done < planned
+///
+/// 判定は **processed（課金して処理した枚数）**で取る。saved（本文が残った枚数）で取ると、
+/// 白紙ページを含む本が完走しても「部分」扱いになり、完走時の全置換の意味論が壊れる。
+pub(crate) fn ocr_save_is_partial(explicit_pages: bool, processed: i64, planned: i64) -> bool {
+    explicit_pages || processed < planned
 }
 
 /// OCR 結果を保存する。全ページ OCR なら添付ごと置き換え、部分 OCR なら該当ページのみ差し替え。
@@ -507,23 +593,22 @@ mod tests {
     use crate::models::EntryInput;
     use sqlx::SqlitePool;
 
-    /// **プロセス共有の static（`OCR_RUNNING` / `OCR_CANCEL` / batch_status）を触るテストは
-    /// ここで直列化する**（`lib.rs` の `batch_wiring_tests` と同じ作法）。そのうえで各テストは
-    /// **自分が起こした遷移だけ**を assert する。ロック取得時に中断要求を必ず倒すのは、
-    /// 前のテストが assert 失敗で途中脱落しても残骸を引き継がないため。
-    /// std ではなく tokio の Mutex なのは、`#[sqlx::test]` の async 本体で
-    /// guard を await 越しに持つため。
-    static GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
+    /// **プロセス共有の static（`OCR_RUNNING` / `OCR_CANCEL` / batch_status の表）を触る
+    /// テストは、モジュール横断の `batch_status::TEST_GATE` で直列化する** ── batch_status /
+    /// `batch_wiring_tests` のテストと同じ表を読み書きするので、モジュールごとの別 gate では
+    /// 「こちらが `RunningMark(Ocr)` を握っている間に、あちらの『誰も走っていない』前提
+    /// assert が落ちる」窓が残る。そのうえで各テストは**自分が起こした遷移だけ**を assert する。
+    /// ロック取得時に中断要求を必ず倒すのは、前のテストが assert 失敗で途中脱落しても
+    /// 残骸を引き継がないため。
     async fn gate() -> tokio::sync::MutexGuard<'static, ()> {
-        let g = GATE.lock().await;
+        let g = crate::batch_status::TEST_GATE.lock().await;
         OCR_CANCEL.store(false, Ordering::SeqCst);
         g
     }
 
     /// 同期テスト用（async でない `#[test]` はランタイムを持たないので blocking で取る）。
     fn gate_blocking() -> tokio::sync::MutexGuard<'static, ()> {
-        let g = GATE.blocking_lock();
+        let g = crate::batch_status::TEST_GATE.blocking_lock();
         OCR_CANCEL.store(false, Ordering::SeqCst);
         g
     }
@@ -571,28 +656,48 @@ mod tests {
     /// 嘘をつくと LLM が「続きを取ろう」と再実行して、最初から全ページ課金し直す。
     #[test]
     fn an_interrupted_outcome_says_rerun_starts_over_not_resumes() {
-        let stopped = OcrOutcome { saved: 3, planned: 527, stopped: true, ..Default::default() };
+        let stopped = OcrOutcome {
+            processed: 3,
+            saved: 3,
+            planned: 527,
+            stopped: true,
+            ..Default::default()
+        };
         let msg = describe_outcome(1, &stopped);
         assert!(!msg.contains("continues"), "「続きから」と読める文言を出してはいけない: {msg}");
         assert!(msg.contains("starts over"), "やり直しになることを明言する: {msg}");
         assert!(msg.contains("billed again"), "全ページ課金し直しになることを明言する: {msg}");
 
         let failed = OcrOutcome {
+            processed: 2,
             saved: 2,
             planned: 10,
             failure: Some("provider exploded".into()),
+            failed_page: Some(7),
             ..Default::default()
         };
         let msg = describe_outcome(1, &failed);
         assert!(msg.contains("starts over"), "失敗も同じ: {msg}");
+        assert!(msg.contains("page 7"), "失敗位置は実ページ番号で言う: {msg}");
     }
 
     /// 完走した結果に「もう一度走らせろ」と読める文言を書かない（二重課金の誘発）。
     #[test]
     fn a_complete_outcome_does_not_invite_a_rerun() {
-        let complete = OcrOutcome { saved: 527, planned: 527, ..Default::default() };
+        let complete =
+            OcrOutcome { processed: 527, saved: 527, planned: 527, ..Default::default() };
         let msg = describe_outcome(1, &complete);
         assert!(!msg.contains("again"), "完走したのに再実行を勧めない: {msg}");
+    }
+
+    /// **全ページ課金したのに 1 行も残らなかったランを成功に見せない。**
+    /// 索引行数との乖離が読める唯一のシグナル（v2 レビュー confirmed[4] の解消）。
+    #[test]
+    fn an_all_blank_run_is_not_reported_as_plain_success() {
+        let out = OcrOutcome { processed: 40, saved: 0, planned: 40, ..Default::default() };
+        let msg = describe_outcome(1, &out);
+        assert!(msg.contains("no text"), "空振りだったことを明言する: {msg}");
+        assert!(msg.contains("existing index was not touched"), "{msg}");
     }
 
     // ── 保存と封印（save_ocr_pages）──────────────────────────────────────
@@ -698,6 +803,8 @@ mod tests {
     struct FakeTranscriber {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         fail_on_call: Option<usize>,
+        /// true なら全ページ空白を返す（Vision は白紙ページにそうするよう指示されている）。
+        blank: bool,
     }
 
     #[async_trait::async_trait]
@@ -707,6 +814,9 @@ mod tests {
             if self.fail_on_call == Some(n) {
                 return Err("provider exploded".into());
             }
+            if self.blank {
+                return Ok("   \n".to_string());
+            }
             Ok(format!("page text {n}"))
         }
     }
@@ -715,7 +825,15 @@ mod tests {
         fail_on_call: Option<usize>,
     ) -> (FakeTranscriber, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        (FakeTranscriber { calls: calls.clone(), fail_on_call }, calls)
+        (FakeTranscriber { calls: calls.clone(), fail_on_call, blank: false }, calls)
+    }
+
+    fn fake_blank() -> FakeTranscriber {
+        FakeTranscriber {
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_on_call: None,
+            blank: true,
+        }
     }
 
     fn images(n: i64) -> Vec<(i64, String)> {
@@ -765,6 +883,7 @@ mod tests {
 
         assert_eq!(out.failure.as_deref(), Some("provider exploded"));
         assert_eq!(out.saved, 2, "失敗した 3 ページ目より前の 2 ページ");
+        assert_eq!(out.failed_page, Some(3), "失敗した実ページ番号が残る");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert_eq!(
             crate::db::fulltext::indexed_page_count(&pool, att).await.unwrap(),
@@ -944,8 +1063,107 @@ mod tests {
         assert_eq!(last.kind, crate::batch_status::BatchKind::Ocr);
         let result = last.result.expect("成功の戻り値がそのまま入る");
         assert_eq!(result["saved"], 2);
+        assert_eq!(result["processed"], 2);
         assert_eq!(result["planned"], 2);
         assert_eq!(result["stopped"], false);
+    }
+
+    /// **ループ手前の失敗（添付なし・キー未設定・ラスタライズ失敗）も「直近の結果」に残る。**
+    /// 残さないと、リーダーを離れた後に失敗したランがどの画面からも読めない
+    /// （v2 レビュー confirmed[7] の解消）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_pre_loop_failure_is_recorded_for_the_settings_screen(pool: SqlitePool) {
+        let _g = gate().await;
+        let entry = create_entry(
+            &pool,
+            &EntryInput {
+                title: "No attachment".to_string(),
+                entry_type: "book".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = run_ocr(&pool, Path::new(""), entry.id, None, None, OcrHooks::none()).await;
+
+        assert!(err.is_err(), "添付が無いので失敗する");
+        let last = crate::batch_status::snapshot().last.expect("ループ手前の失敗も記録される");
+        assert_eq!(last.kind, crate::batch_status::BatchKind::Ocr);
+        assert!(
+            last.error.as_deref().unwrap_or("").contains("no matching PDF attachment"),
+            "エラー内容がそのまま残る: {:?}",
+            last.error
+        );
+    }
+
+    /// **白紙ページの転写（空白だけ）は既存の索引にも封印にも触らない。**
+    /// 以前は部分差し替えが「そのページの既存行を削除して何も入れない」になり、
+    /// 中断ラン + 全ページ空白で、既存本文の削除と封印剥がしまで連鎖した（レビューの medium）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn blank_transcriptions_never_touch_the_existing_index(pool: SqlitePool) {
+        let _g = gate().await;
+        let att = an_attachment(&pool).await;
+        // 以前の完走ランが 3 ページを転写して封印済み、という状態。
+        index_attachment(
+            &pool,
+            att,
+            &[(1, "old 1".into()), (2, "old 2".into()), (3, "old 3".into())],
+        )
+        .await
+        .unwrap();
+        crate::db::fulltext::set_fulltext_source(
+            &pool,
+            att,
+            crate::db::fulltext::FulltextSource::Ocr,
+        )
+        .await
+        .unwrap();
+
+        // 再実行が全ページ空白を返し、2 ページで停止した。
+        let t = fake_blank();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d2 = done.clone();
+        let stop = move || d2.load(std::sync::atomic::Ordering::SeqCst) >= 2;
+        let d3 = done.clone();
+        let prog = move |n: i64, _t: i64| d3.store(n as usize, std::sync::atomic::Ordering::SeqCst);
+        let hooks = OcrHooks { should_stop: &stop, on_progress: &prog };
+
+        let out = transcribe_and_save(&pool, att, images(3), false, &t, &hooks)
+            .await
+            .unwrap();
+
+        assert_eq!(out.processed, 2, "課金は 2 回発生している");
+        assert_eq!(out.saved, 0, "本文が取れたページは 0");
+        assert_eq!(
+            crate::db::fulltext::indexed_page_count(&pool, att).await.unwrap(),
+            3,
+            "空白転写が既存行を消してはいけない"
+        );
+        assert_eq!(
+            crate::db::fulltext::get_fulltext_source(&pool, att).await.unwrap(),
+            Some(crate::db::fulltext::FulltextSource::Ocr),
+            "以前の完走ランの封印が剥がれてはいけない"
+        );
+    }
+
+    /// **失敗位置は実ページ番号で報告する。** `pages` 指定では通し番号と実ページ番号がずれ、
+    /// 通し番号で案内すると取り直しが別のページを再課金する（v2 レビュー confirmed[3] の解消）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_failure_reports_the_real_page_number_not_the_ordinal(pool: SqlitePool) {
+        let _g = gate().await;
+        let att = an_attachment(&pool).await;
+        let (t, _) = fake(Some(3)); // 3 枚目（実ページ 11）で失敗
+        let hooks = OcrHooks::none();
+        let pages = vec![(3, "b".into()), (7, "b".into()), (11, "b".into())];
+
+        let out = transcribe_and_save(&pool, att, pages, true, &t, &hooks)
+            .await
+            .unwrap();
+
+        assert_eq!(out.failed_page, Some(11), "通し番号の 3 ではなく実ページ番号の 11");
+        let msg = describe_outcome(1, &out);
+        assert!(msg.contains("page 11"), "案内も実ページ番号で: {msg}");
     }
 
     /// 保存に失敗したら**失敗として記録される**（無言で消えない）。
@@ -983,7 +1201,6 @@ mod tests {
 
         assert!(out.stopped, "プロセス内フラグでも止まる");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "1 回も課金しない");
-        OCR_CANCEL.store(false, Ordering::SeqCst);
     }
 
     /// **`cancel_ocr` コマンドの中身が実際に停止述語へ届く**（配線・変異 10 の防波堤）。
@@ -1001,7 +1218,6 @@ mod tests {
 
         assert!(out.stopped, "コマンド経由の停止要求がループへ届く");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        OCR_CANCEL.store(false, Ordering::SeqCst);
     }
 
     // ── 排他と印の配線（begin_ocr / run_ocr）─────────────────────────────

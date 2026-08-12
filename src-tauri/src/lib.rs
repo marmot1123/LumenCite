@@ -4836,11 +4836,12 @@ pub fn run() {
 mod batch_wiring_tests {
     use super::*;
 
-    /// **プロセス共有の static（`LCIR_BATCH_RUNNING` と batch_status）を触るので直列化する。**
+    /// **プロセス共有の static（`LCIR_BATCH_RUNNING` と batch_status）を触るので、
+    /// モジュール横断の `batch_status::TEST_GATE` で直列化する**（batch_status /
+    /// llm::tools::ocr のテストと同じ表を読み書きするため、別 gate では窓が残る）。
     /// そのうえで各テストは自分が起こした遷移だけを assert する。
-    static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn gate() -> std::sync::MutexGuard<'static, ()> {
-        GATE.lock().unwrap_or_else(|e| e.into_inner())
+    fn gate() -> tokio::sync::MutexGuard<'static, ()> {
+        batch_status::TEST_GATE.blocking_lock()
     }
 
     /// **GC の排他は「どれか 1 つでも走っていたら止める」**（ゲート ②b の M7）。
