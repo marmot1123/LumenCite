@@ -320,6 +320,9 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     setTagInput("");
     setAttachError(null);
     setIndexNote(null);
+    // **エントリを移ったら索引削除の確認も畳む。** 残すと、別の文献を開いた画面に
+    // 前の文献の添付を消すボタンが出たままになる（`setConfirmDelete(false)` と同じ理由）。
+    setConfirmUnindex(null);
     // 直前のエントリの警告を残すと、別の文献の欠落として読まれてしまう。
     setLcirExportWarnings([]);
   }, [entry?.id]);
