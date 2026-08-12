@@ -172,20 +172,46 @@ pub(crate) async fn clear_fulltext_sources_for_entry_tx(
     Ok(())
 }
 
+/// [`index_attachment_from_pdf_extract`] が実際に何をしたか。
+///
+/// **bool で返さない。** 「譲った」には理由が 2 つあり（出どころ記録に守られた / 抽出が空だった）、
+/// 呼び出し側の UI 文言が別物になる ── 1 つに潰すと「テキストが見つかりません」と
+/// 「既存の索引を残しました」を区別できない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PdfExtractWrite {
+    /// 索引を置き換えた（出どころの記録は既定 = pdf_extract 由来に戻した）。
+    Replaced,
+    /// 出どころの記録（OCR / LCIR）に守られたので触らなかった。
+    SkippedProtected,
+    /// **抽出が 1 ページも本文を返さなかったので、既存の索引を残した**（v1.0.0・②b の W1-1）。
+    SkippedEmptyExtract,
+}
+
 /// pdf_extract 由来のページで索引を置き換える。ただし **LCIR / OCR 由来の索引は上書きしない**
 /// （debt-17 の last-writer-wins 回避）。
 ///
-/// 置き換えたら `true`、譲ったら `false`。判定と書き込みは同一トランザクションで行う
+/// 判定と書き込みは同一トランザクションで行う
 /// （spawn した pdf_extract は数十秒かかるので、抽出前に 1 度読むだけでは競合を塞げない）。
 ///
 /// `replace_existing` は「ユーザーがこの添付を名指しで再索引した」経路だけ `true`。
 /// **OCR 由来は名指しでも守る**（守る対象はユーザーが課金して起こした転写）。
+///
+/// ## 空の抽出結果は既存の索引を消さない（v1.0.0・②b の W1-1）
+///
+/// [`replace_pages`] は先頭で無条件に `DELETE` し、空ページを `INSERT` しない ＝
+/// **全ページ空の入力は「削除だけ」になる**。テキスト層の無いスキャン PDF で
+/// `extract_text_by_pages` が `Ok(全ページ空)` を返すのは正常系（`lib.rs` が
+/// `PdfExtract(0)` を「OCR で拾う候補」として数えている）なので、確認ダイアログの無い
+/// 再索引ボタン 1 回で、課金して起こした OCR 転写が消えていた。
+///
+/// **守るのは「非空 0 件」のときだけで、縮小（既存 500 行 → 新規 1 行）は守らない。**
+/// 縮小まで守ると、本当に内容が減った PDF を張り直せなくなる。
 pub async fn index_attachment_from_pdf_extract(
     pool: &SqlitePool,
     attachment_id: i64,
     pages: &[(i64, String)],
     replace_existing: bool,
-) -> Result<bool, sqlx::Error> {
+) -> Result<PdfExtractWrite, sqlx::Error> {
     let key = fulltext_source_key(attachment_id);
     // **`BEGIN IMMEDIATE`**（既定の DEFERRED ではない）。読んでから書く tx を deferred で始めると、
     // 読みスナップショットを取った後に他の接続が commit した場合、昇格時に `SQLITE_BUSY_SNAPSHOT`
@@ -203,7 +229,28 @@ pub async fn index_attachment_from_pdf_extract(
     };
     if blocked {
         // 譲る（tx は drop でロールバック）。
-        return Ok(false);
+        return Ok(PdfExtractWrite::SkippedProtected);
+    }
+
+    // **空抽出のガードは `blocked` 判定の後**。前に置くと、OCR 由来の添付に空抽出が来たとき
+    // `SkippedProtected` ではなくこちらが返り、詳細パネルの「OCR で取り込んだ本文を残しました」
+    // （取り直す手順を書いた文言）が、まさにスキャン本で出なくなる。
+    //
+    // 数えるのは非空 0 件のときだけ ── `fulltext` は FTS5 で `attachment_id` が UNINDEXED
+    // なので `COUNT(*)` は全行スキャンになり、しかもこの tx は `BEGIN IMMEDIATE` で
+    // writer ロックを握っている。正常に張り直す大多数の呼び出しでロックを延ばさない。
+    if pages.iter().all(|(_, t)| t.trim().is_empty()) {
+        let existing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM fulltext WHERE attachment_id = ?")
+                .bind(attachment_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if existing > 0 {
+            return Ok(PdfExtractWrite::SkippedEmptyExtract);
+        }
+        // 既存 0 行なら通す。ここで譲ると下の `DELETE FROM settings` が飛び、
+        // 「行は 0 なのに `source = lcir` の記録だけ残る」添付ができて、以後の自動経路が
+        // 永久に譲り続ける（`clear_fulltext_source_tx` の doc が名指しで警告している状態）。
     }
 
     replace_pages(&mut tx, attachment_id, pages).await?;
@@ -213,14 +260,39 @@ pub async fn index_attachment_from_pdf_extract(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(PdfExtractWrite::Replaced)
+}
+
+/// [`index_attachment_from_lcir`] が実際に何をしたか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LcirWrite {
+    /// LCIR のページで差し替えて `source = lcir` を立てた。
+    Replaced,
+    /// OCR 由来として記録済みなので触らなかった。
+    SkippedOcr,
+    /// **出どころの記録が無い既存索引を守った**（`protect_unrecorded` が真のときだけ）。
+    SkippedUnrecorded,
 }
 
 /// LCIR の page ノード由来のページで索引を差し替え、**出どころの記録を同一 tx で**立てる。
 ///
 /// 2 文に分けると「索引は LCIR 由来なのに記録がまだ無い」窓ができ、その隙に走った
 /// pdf_extract が上書きしてしまう（debt-17 と同じ形の競合）。
-/// OCR 由来として記録済みの添付には書かない（`false` を返す）。
+/// OCR 由来として記録済みの添付には書かない（[`LcirWrite::SkippedOcr`]）。
+///
+/// ## `protect_unrecorded`（v1.0.0・②b の W1-2）
+///
+/// 真なら「**出どころの記録が無く、かつ既存の索引行がある**」添付も守る（自動の再導出だけ）。
+/// 呼び出し側にも同じ判定があるが、あちらは tx の外なので check-then-act の窓が開く ──
+/// 評価した直後に部分 OCR（`seal = false` なので記録を立てない）が着地すると、
+/// 記録の無い課金済み転写を LCIR で置き換える。**判定を tx の中にも置いて塞ぐ。**
+///
+/// 記録が無い既存索引には 3 つの母集団がある ── ①この版より前に入った索引
+/// ②OCR が行を書いてから封印するまでの窓 ③中断・部分 OCR（封印しない・debt-43）。
+/// 「この版より前」だけではない（実 DB に 0 件でも安全にならない）。
+///
+/// **明示操作（設定→データのボタン）と build 経路では偽**を渡すこと。あちらは
+/// 「記録が無い既存索引を LCIR へ移行する」ことそのものが目的（p1 の唯一の移行経路）。
 ///
 /// **LCIR が本文を持たないページの既存行は残す**（debt-34）。pdfium がそのページだけ空を返す
 /// ことがあり、添付ごと置き換えると pdf_extract / OCR で入っていた本文が消える（実 DB で 2 ページ）。
@@ -231,7 +303,8 @@ pub async fn index_attachment_from_lcir(
     attachment_id: i64,
     pages: &[(i64, String)],
     clean: fn(&str) -> String,
-) -> Result<bool, sqlx::Error> {
+    protect_unrecorded: bool,
+) -> Result<LcirWrite, sqlx::Error> {
     let key = fulltext_source_key(attachment_id);
     // `BEGIN IMMEDIATE`（理由は `index_attachment_from_pdf_extract` と同じ）。
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -240,8 +313,9 @@ pub async fn index_attachment_from_lcir(
         .bind(&key)
         .fetch_optional(&mut *tx)
         .await?;
-    if current.as_deref().and_then(FulltextSource::parse) == Some(FulltextSource::Ocr) {
-        return Ok(false);
+    let recorded = current.as_deref().and_then(FulltextSource::parse);
+    if recorded == Some(FulltextSource::Ocr) {
+        return Ok(LcirWrite::SkippedOcr);
     }
 
     let covered: std::collections::HashSet<i64> = pages.iter().map(|(p, _)| *p).collect();
@@ -250,6 +324,10 @@ pub async fn index_attachment_from_lcir(
             .bind(attachment_id)
             .fetch_all(&mut *tx)
             .await?;
+    // 既存行はこの下の merge でどのみち読むので、守る判定の追加コストは 0。
+    if protect_unrecorded && recorded.is_none() && !existing.is_empty() {
+        return Ok(LcirWrite::SkippedUnrecorded);
+    }
     let mut merged: Vec<(i64, String)> = pages.to_vec();
     merged.extend(
         existing
@@ -269,7 +347,7 @@ pub async fn index_attachment_from_lcir(
     .await?;
 
     tx.commit().await?;
-    Ok(true)
+    Ok(LcirWrite::Replaced)
 }
 
 pub async fn unindex_attachment(
@@ -932,10 +1010,11 @@ mod tests {
         unindex_attachment(&pool, att).await.unwrap();
 
         assert_eq!(get_fulltext_source(&pool, att).await.unwrap(), None);
-        assert!(
+        assert_eq!(
             index_attachment_from_pdf_extract(&pool, att, &[(1, "fresh text".to_string())], false)
                 .await
                 .unwrap(),
+            PdfExtractWrite::Replaced,
             "記録が消えていれば pdf_extract で張り直せる"
         );
     }
@@ -956,18 +1035,19 @@ mod tests {
             .unwrap();
 
         // 自動経路（`replace_existing = false`）は譲る。
-        assert!(
-            !index_attachment_from_pdf_extract(
+        assert_eq!(
+            index_attachment_from_pdf_extract(
                 &pool,
                 lcir_att,
                 &[(1, "stale output".to_string())],
                 false
             )
             .await
-            .unwrap()
+            .unwrap(),
+            PdfExtractWrite::SkippedProtected
         );
         // 名指し（`true`）は張り直し、出どころの記録も既定に戻す。
-        assert!(
+        assert_eq!(
             index_attachment_from_pdf_extract(
                 &pool,
                 lcir_att,
@@ -975,7 +1055,8 @@ mod tests {
                 true
             )
             .await
-            .unwrap()
+            .unwrap(),
+            PdfExtractWrite::Replaced
         );
         assert_eq!(get_fulltext_source(&pool, lcir_att).await.unwrap(), None);
         assert_eq!(
@@ -995,15 +1076,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            !index_attachment_from_pdf_extract(
+        assert_eq!(
+            index_attachment_from_pdf_extract(
                 &pool,
                 ocr_att,
                 &[(1, "garbage layer".to_string())],
                 true
             )
             .await
-            .unwrap()
+            .unwrap(),
+            PdfExtractWrite::SkippedProtected
         );
         assert_eq!(
             get_fulltext_source(&pool, ocr_att).await.unwrap(),
@@ -1016,6 +1098,241 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // ---- v1.0.0（②b の W1-1）空の抽出結果で既存索引を消さない ---------------------
+
+    /// **本命**: 出どころの記録が無い添付（= p1 より前の OCR かもしれない）に空の抽出結果が
+    /// 来ても、既存の索引を消さない。名指しの再索引でも守る。
+    ///
+    /// これが無いと、確認ダイアログの無い同期アイコンを 1 回押すだけで、課金して起こした
+    /// 転写が全削除される（`replace_pages` は無条件 `DELETE` して空ページを `INSERT` しない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_empty_extract_keeps_an_unrecorded_index(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Scanned").await;
+        index_attachment(
+            &pool,
+            att,
+            &[
+                (1, "ocr transcript one".to_string()),
+                (2, "ocr transcript two".to_string()),
+                (3, "ocr transcript three".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        // p1 より前の OCR には出どころの記録が無い（= この状態が守る対象そのもの）。
+        assert_eq!(get_fulltext_source(&pool, att).await.unwrap(), None);
+
+        let empty = [(1, String::new()), (2, "   \n\t ".to_string()), (3, String::new())];
+
+        // 名指しの再索引（`replace_existing = true`）でも守る。
+        assert_eq!(
+            index_attachment_from_pdf_extract(&pool, att, &empty, true)
+                .await
+                .unwrap(),
+            PdfExtractWrite::SkippedEmptyExtract
+        );
+        assert_eq!(indexed_page_count(&pool, att).await.unwrap(), 3);
+        // 自動経路でも同じ。
+        assert_eq!(
+            index_attachment_from_pdf_extract(&pool, att, &empty, false)
+                .await
+                .unwrap(),
+            PdfExtractWrite::SkippedEmptyExtract
+        );
+        assert_eq!(indexed_page_count(&pool, att).await.unwrap(), 3);
+        assert_eq!(
+            search_fulltext(&pool, "transcript", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "課金して起こした転写が残っている"
+        );
+    }
+
+    /// LCIR 由来の索引にも同じガードが効き、**出どころの記録も残る**。
+    ///
+    /// ここで記録だけ消すと「行は LCIR 由来なのに記録は pdf_extract」という嘘になる。
+    /// 代償は正直に書く: この添付（LCIR を OFF にした × テキスト層が無い）は
+    /// 再索引ボタンでは LCIR 由来から抜けられなくなる ── 抜けたい人は索引を削除する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_empty_extract_keeps_a_lcir_index_and_its_record(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Derived").await;
+        index_attachment(&pool, att, &[(1, "derived body".to_string())])
+            .await
+            .unwrap();
+        set_fulltext_source(&pool, att, FulltextSource::Lcir)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index_attachment_from_pdf_extract(&pool, att, &[(1, String::new())], true)
+                .await
+                .unwrap(),
+            PdfExtractWrite::SkippedEmptyExtract
+        );
+        assert_eq!(indexed_page_count(&pool, att).await.unwrap(), 1);
+        assert_eq!(
+            get_fulltext_source(&pool, att).await.unwrap(),
+            Some(FulltextSource::Lcir),
+            "行が LCIR 由来のままなら記録も LCIR のまま"
+        );
+    }
+
+    /// **AND 条件の番人。** 既存が 0 行なら、空の抽出結果でも通す。
+    ///
+    /// ガードを「非空 0 件」だけに簡約すると、`source = lcir` かつ索引 0 行の添付で
+    /// 記録の後始末（`DELETE FROM settings`）が飛び、**キーだけが残って以後の自動経路が
+    /// 永久に譲り続ける**（守る中身がもう無いのに守り続ける）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_empty_extract_with_no_existing_rows_still_clears_the_record(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Emptied").await;
+        set_fulltext_source(&pool, att, FulltextSource::Lcir)
+            .await
+            .unwrap();
+        assert_eq!(indexed_page_count(&pool, att).await.unwrap(), 0);
+
+        assert_eq!(
+            index_attachment_from_pdf_extract(&pool, att, &[(1, String::new())], true)
+                .await
+                .unwrap(),
+            PdfExtractWrite::Replaced
+        );
+        assert_eq!(
+            get_fulltext_source(&pool, att).await.unwrap(),
+            None,
+            "守る中身が無いなら記録も残さない"
+        );
+    }
+
+    /// **OCR 記録は空抽出ガードより先に効く。**
+    ///
+    /// 順序が逆だと、OCR 由来のスキャン本に空抽出が来たとき `SkippedProtected` ではなく
+    /// `SkippedEmptyExtract` が返り、詳細パネルの「OCR で取り込んだ本文を残しました
+    /// （取り直すには OCR を再実行）」という文言が、**まさにスキャン本で出なくなる**。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_ocr_record_is_reported_ahead_of_the_empty_extract_guard(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Scanned").await;
+        index_attachment(&pool, att, &[(1, "ocr transcript".to_string())])
+            .await
+            .unwrap();
+        set_fulltext_source(&pool, att, FulltextSource::Ocr)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            index_attachment_from_pdf_extract(&pool, att, &[(1, String::new())], true)
+                .await
+                .unwrap(),
+            PdfExtractWrite::SkippedProtected
+        );
+    }
+
+    /// **守るのは「非空 0 件」だけで、縮小は守らない**（境界を固定する）。
+    ///
+    /// 既存 3 ページに対して非空 1 ページの抽出結果が来たら、そのまま 1 ページに置き換える。
+    /// ここまで守ると「本当に内容が減った PDF を張り直せない」になる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_shrinking_extract_is_not_protected(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Shrunk").await;
+        index_attachment(
+            &pool,
+            att,
+            &[
+                (1, "old one".to_string()),
+                (2, "old two".to_string()),
+                (3, "old three".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_attachment_from_pdf_extract(
+                &pool,
+                att,
+                &[(1, "only page".to_string()), (2, String::new()), (3, String::new())],
+                true
+            )
+            .await
+            .unwrap(),
+            PdfExtractWrite::Replaced
+        );
+        assert_eq!(indexed_page_count(&pool, att).await.unwrap(), 1);
+    }
+
+    // ---- v1.0.0（②b の W1-2）tx 内で「記録の無い既存索引」を守る -------------------
+
+    /// 自動の再導出は、**tx の中でも**記録の無い既存索引を守る。
+    ///
+    /// 呼び出し側にも同じ判定があるが、あちらは tx の外なので check-then-act の窓が開く ──
+    /// 評価した直後に部分 OCR（封印しないので記録が立たない）が着地すると、
+    /// 課金済みの転写を LCIR で置き換える。**同じテストの中で `false` 側も確かめる**
+    /// （守るだけのテストは、引数を無視する実装でも通ってしまう）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_derive_path_can_protect_an_unrecorded_index_inside_the_tx(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Partially OCRd").await;
+        index_attachment(&pool, att, &[(1, "interrupted ocr transcript".to_string())])
+            .await
+            .unwrap();
+        assert_eq!(get_fulltext_source(&pool, att).await.unwrap(), None);
+
+        let lcir = [(1, "lcir page text".to_string())];
+
+        assert_eq!(
+            index_attachment_from_lcir(&pool, att, &lcir, |s| s.to_string(), true)
+                .await
+                .unwrap(),
+            LcirWrite::SkippedUnrecorded
+        );
+        assert_eq!(
+            search_fulltext(&pool, "interrupted", None, None, None)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "記録の無い転写が残っている"
+        );
+        assert_eq!(
+            get_fulltext_source(&pool, att).await.unwrap(),
+            None,
+            "守ったのだから lcir を名乗らない"
+        );
+
+        // **生存確認**: 守らないと言われたら置き換える（＝上の assert が空ではない）。
+        assert_eq!(
+            index_attachment_from_lcir(&pool, att, &lcir, |s| s.to_string(), false)
+                .await
+                .unwrap(),
+            LcirWrite::Replaced
+        );
+        assert_eq!(
+            get_fulltext_source(&pool, att).await.unwrap(),
+            Some(FulltextSource::Lcir)
+        );
+    }
+
+    /// 守る対象は「記録が無い **かつ** 既存行がある」。索引がまだ無い添付は普通に埋める
+    /// （`AddMissingOnly` の本来の仕事がここで止まると、p1 が 1 件も進まない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_derive_path_still_fills_an_attachment_with_no_index(pool: SqlitePool) {
+        let (_, att) = setup_attachment(&pool, "Unindexed").await;
+
+        assert_eq!(
+            index_attachment_from_lcir(
+                &pool,
+                att,
+                &[(1, "lcir page text".to_string())],
+                |s| s.to_string(),
+                true
+            )
+            .await
+            .unwrap(),
+            LcirWrite::Replaced
+        );
+        assert_eq!(indexed_page_count(&pool, att).await.unwrap(), 1);
     }
 
     /// ゴミ箱の一括 purge でも記録を残さない（`purge_one` 側の後始末）。

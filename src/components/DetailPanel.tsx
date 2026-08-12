@@ -450,16 +450,41 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
     try {
       const r = await invoke<{ pages: number; outcome: string }>("index_attachment", { id: attId });
       setIndexStatus(s => ({ ...s, [attId]: r.pages > 0 ? "indexed" : "none" }));
+      // 守って何もしなかった回は「N ページを索引しました」と言わない。**3 種類の skip を
+      // 全部 outcome で分ける** ── 以前は skipped_ocr だけを見ており、skipped_lcir は
+      // `r.pages > 0` 側に落ちて「索引しました」と嘘をついていた（1 行も書いていないのに）。
       setIndexNote(
-        // 守って何もしなかった場合は「索引しました」と言わない（OCR の転写は上書きしない）。
         r.outcome === "skipped_ocr"
           ? t("detailPanel.indexKeptOcr", { count: r.pages })
-          : r.pages > 0
-            ? t("detailPanel.indexDonePages", { count: r.pages })
-            : t("detailPanel.indexNoText"),
+          : r.outcome === "skipped_lcir"
+            ? t("detailPanel.indexKeptLcir", { count: r.pages })
+            : r.outcome === "skipped_empty_extract"
+              ? t("detailPanel.indexKeptNoText", { count: r.pages })
+              : r.pages > 0
+                ? t("detailPanel.indexDonePages", { count: r.pages })
+                : t("detailPanel.indexNoText"),
       );
     } catch (e: any) {
       setIndexStatus(s => ({ ...s, [attId]: "none" }));
+      setIndexNote(e?.message ?? String(e));
+    }
+  };
+
+  // 索引を捨てる（`index_attachment` が空の抽出結果で既存索引を消さなくなった代わりの経路）。
+  //
+  // **再索引ボタンが索引を消す唯一の非破壊経路だった。** 空抽出で既存を守るようにした以上、
+  // 「PDF を差し替えたので古い本文を検索から消したい」人に逃げ道が要る ── 無いと
+  // 添付ごと削除（PDF 実体と LCIR アセットまでゴミ箱送り）しか手が無くなる。
+  const handleUnindexAttachment = async (attId: number) => {
+    if (!window.confirm(t("detailPanel.unindexConfirm"))) return;
+    setIndexNote(null);
+    setIndexStatus(s => ({ ...s, [attId]: "indexing" }));
+    try {
+      await invoke("unindex_attachment", { id: attId });
+      setIndexStatus(s => ({ ...s, [attId]: "none" }));
+      setIndexNote(t("detailPanel.unindexDone"));
+    } catch (e: any) {
+      setIndexStatus(s => ({ ...s, [attId]: "indexed" }));
       setIndexNote(e?.message ?? String(e));
     }
   };
@@ -919,6 +944,20 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                         >
                           <Icon name="sync" size={11} color="var(--text-faint)" />
                         </button>
+                        {indexStatus[att.id] === "indexed" && (
+                          <button
+                            onClick={() => handleUnindexAttachment(att.id)}
+                            style={{
+                              width: 16, height: 16, padding: 0, border: "none",
+                              background: "transparent", cursor: "pointer",
+                              display: "inline-flex", alignItems: "center", justifyContent: "center",
+                              borderRadius: 3, color: "var(--text-faint)",
+                            }}
+                            title={t("detailPanel.unindexTitle")}
+                          >
+                            <Icon name="trash" size={11} color="var(--text-faint)" />
+                          </button>
+                        )}
                       </>
                     ) : (
                       <span
