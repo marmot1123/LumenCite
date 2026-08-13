@@ -411,6 +411,21 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         abort_reason: string | null;
       }>("generate_vision_alt_texts", { entryId: startedFor });
       if (!stillHere()) return;
+      // 打ち切られたときは理由を出す（設定 → データの `formatBatchOutcome` と同じ 3 分岐）。
+      // **この文が無いと `generated + skipped + failed` が `total` に届かない理由が
+      // どこにも出ない** ── 「説明できなかった」と「途中で止めた」が同じ見た目になる。
+      // 設定モーダルは `batch_status.last` 経由で同じ結果を拾えるが、それは**あちらの画面を
+      // 開いたとき**の話で、詳細パネルから押した人がそこを開くとは限らない
+      // （②b の PR-3 レビュー ── 反証されたが、2 つの入口で説明の粒度が違うのは事実）。
+      const abortReason = !r.aborted
+        ? ""
+        : r.abort_reason === "consent_withdrawn"
+          ? ` ${t("detailPanel.altTextStopped")}`
+          // **どちらの面で閉じたかを区別する。** LCIR を切って止めた人に
+          // 「同意チェックが外された」と言うと嘘になる（同意は ON のまま）。
+          : r.abort_reason === "lcir_disabled"
+            ? ` ${t("detailPanel.altTextStoppedLcir")}`
+            : ` ${t("detailPanel.altTextAborted")}`;
       setIndexNote(
         !r.enabled
           ? t("detailPanel.altTextDisabled")
@@ -423,7 +438,8 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
                 failed: r.failed,
               }) +
               // 0 でないときだけ足す（0 が普通なので、常時出すと本体が埋もれる）。
-              (r.stale > 0 ? ` ${t("detailPanel.altTextStale", { stale: r.stale })}` : ""),
+              (r.stale > 0 ? ` ${t("detailPanel.altTextStale", { stale: r.stale })}` : "") +
+              abortReason,
       );
     } catch (e: any) {
       if (stillHere()) {

@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **LCIR is now built automatically (experimental; requires LCIR enabled)** — attaching a PDF, downloading one from arXiv, or clipping one from the browser now builds its LCIR in the background, and an existing library fills in gradually on launch. Until now LCIR only ever appeared if you pressed a button, which is why the in-app assistant's document tools stayed hidden for most libraries. The backfill is deliberately unhurried: it works within a time budget per run, checked between papers, and stands aside the moment you start a batch yourself, generate figure descriptions, fetch TeX sources, or a backup begins. It does not run when a second copy of LumenCite is open on the same library, and it never re-builds papers just because the extractor version changed — raising a version still requires the explicit "rebuild outdated" button. If the PDF library (pdfium) cannot be loaded, PDFs are skipped and **counted**, so "nothing to do" and "nothing ran" no longer look alike; TeX sources keep building since they don't need it. No migration.
 
+- **LCIR — figures drawn as vectors, and figures hidden inside form objects, are now found** (experimental; requires LCIR enabled) — a paper's figures are not always images. TikZ/PGF plots, and anything else drawn with vector paths, left no trace for the extractor to find; so did images nested inside PDF form objects, which the page's top-level listing does not report. In a real 138-paper library this added **431 figure regions (1,198 → 1,629)** and brought figure–caption pairing to **662 pairs**. Of the 381 vector figures found, **every one has a caption** — the pairing is what tells a drawing apart from a decorative rule. Region detection stands down on pages with implausibly many path or image objects rather than guessing (39 pages in that library, the worst holding 15,153 paths): a missing figure is recoverable, a wrong one is not.
+
 ### Changed
 
 - **LCIR is now on by default, and fetching arXiv sources became a separate choice** — the structural analysis of PDFs is no longer an experimental switch you have to find: new libraries get it on. It only counts as "off" if you actually turned it off, so anyone who switched it off stays off across updates. Downloading e-prints (the LaTeX sources authors submit to arXiv) is now its own consent setting rather than something LCIR implies — building LCIR happens on your machine, but fetching an e-print is a few megabytes pulled from arXiv on every paper you add or clip, and that should not start silently just because the analysis is on. If you had LCIR switched on before this version you were already fetching them, so that choice is carried over; everyone else starts with fetching off and can turn it on in Settings → Data. Turning LCIR itself off also stops fetching (there would be nothing to build from what it downloads), and turning the fetch off partway through the bulk "fetch missing TeX sources" run stops it at the next paper. No migration.
@@ -60,6 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The assistant no longer re-OCRs a PDF whose text is already indexed** — it now reads the existing text with `get_fulltext` instead. A full re-OCR replaces the attachment's index, so this used to overwrite good extracted text with vision output and bill for it. Explicitly running OCR yourself from the app is unchanged.
 - **Read-only chat tools no longer reload the whole library list after every call**, and they are no longer displayed as write operations awaiting approval.
 - **Opening a PDF page from the app no longer scrolls every other open PDF window** — the jump is now addressed to the intended window instead of broadcast to all of them.
+
+- **Figure regions, running-head detection, and captions no longer depend on where a page's origin happens to sit** (experimental; requires LCIR enabled) — three fixes with one root: a PDF page's coordinate box does not have to start at (0, 0), and three places compared absolute coordinates against a box-relative height. Figure regions were clipped to the wrong rectangle; the band that recognises running heads and page numbers sat in the wrong place, mislabelling body text (**107 blocks moved from "unknown" to paragraph, 12 the other way**); and captions labelled in Roman numerals or in all capitals ("FIG. III", "TABLE II") were not recognised as captions at all, which also cost the figures they belong to. Measured on a real library, the clamp fix newly picked up **4 figures**, moved the bounds of **3**, and lost **none**.
+
+### Notes
+
+- **The extractor version moved from 0.7.0 to 0.14.0 in this release**, so every paper whose LCIR was built by an earlier version now counts as out of date. Nothing is rebuilt automatically — raising the version never triggers a rebuild — so Settings → Data will show all of them under "rebuild outdated LCIR" and **the improvements above do not reach existing papers until you press it**. What that costs, measured on a 138-paper library: about **20 minutes** of rebuilding, and, if you have figure descriptions enabled, a further **30 minutes and roughly $0.80** of API calls for the figures that are genuinely new. Existing descriptions are *not* re-billed — they follow their figure across the rebuild by image fingerprint (887 of 888 carried over; the one that did not is a figure whose bounds the clamp fix corrected, so its image genuinely changed). The database file does not grow during a rebuild if you reclaim storage first.
 
 ## [0.10.0] - 2026-07-28
 
@@ -235,6 +243,15 @@ Initial public release.
 - **Windows installer is unsigned**: SmartScreen will warn on first launch. Click "More info" → "Run anyway". Code signing is planned for a future release once download volume warrants it.
 - **macOS** builds are signed with a Developer ID certificate and notarized by Apple.
 
-[Unreleased]: https://github.com/marmot1123/lumencite/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/marmot1123/lumencite/releases/tag/v0.2.0
+[Unreleased]: https://github.com/marmot1123/lumencite/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/marmot1123/lumencite/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/marmot1123/lumencite/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/marmot1123/lumencite/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/marmot1123/lumencite/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/marmot1123/lumencite/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/marmot1123/lumencite/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/marmot1123/lumencite/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/marmot1123/lumencite/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/marmot1123/lumencite/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/marmot1123/lumencite/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/marmot1123/lumencite/releases/tag/v0.1.0

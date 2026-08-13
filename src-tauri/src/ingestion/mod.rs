@@ -3476,6 +3476,72 @@ mod tests {
         );
     }
 
+    /// `abort_reason` は**課金バッチを起動できる 2 つの入口の両方**で文言に変換される
+    /// （設定 → データの `formatBatchOutcome` と、詳細パネルの `handleGenerateAltTexts`）。
+    ///
+    /// 片方にしか文言が無いと、そちらの入口では「途中で止まった理由」が出ない ──
+    /// **`generated + skipped + failed` が `total` に届かない理由がどこにも出ない**形になる
+    /// （ゲート ②b の PR-3 レビュー。詳細パネル側が実際にこれだった）。
+    /// i18n は TypeScript の型が守らない（キー名は文字列）ので、**ここで機械的に固定する**。
+    #[test]
+    fn every_abort_reason_has_a_message_at_both_entry_points() {
+        // **網羅を型に守らせる。** 面を足すとこの match が非網羅になってコンパイルが落ちる。
+        let all = [
+            VisionGate::Allowed,
+            VisionGate::LcirDisabled,
+            VisionGate::ConsentWithdrawn,
+        ];
+        for g in all {
+            match g {
+                VisionGate::Allowed | VisionGate::LcirDisabled | VisionGate::ConsentWithdrawn => {}
+            }
+        }
+
+        // 印 → i18n キーの対応。フロント 2 か所が同じ対応を持っている
+        // （`abort_reason` が既知のどれでもなければ `altTextAborted` に落ちる）。
+        let key_of = |reason: &str| match reason {
+            "consent_withdrawn" => "altTextStopped",
+            "lcir_disabled" => "altTextStoppedLcir",
+            _ => "altTextAborted",
+        };
+
+        let locales = [
+            ("ja", include_str!("../../../src/i18n/locales/ja.json")),
+            ("en", include_str!("../../../src/i18n/locales/en.json")),
+        ];
+        for (lang, raw) in locales {
+            let root: serde_json::Value = serde_json::from_str(raw).unwrap();
+            for g in all {
+                let Some(reason) = g.abort_reason() else {
+                    continue;
+                };
+                let key = key_of(reason);
+                for section in [
+                    // 設定 → データ（一括生成）と詳細パネル（この文献だけ）。
+                    root.pointer("/settings/data").unwrap(),
+                    root.pointer("/detailPanel").unwrap(),
+                ] {
+                    let msg = section.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+                    assert!(
+                        !msg.is_empty(),
+                        "{lang}: {reason} ({g:?}) の文言 `{key}` が片方の入口に無い"
+                    );
+                }
+            }
+        }
+
+        // 系統的失敗で打ち切ったとき（`abort_reason` が印のどれでもない）の受け皿も両方に要る。
+        for (lang, raw) in locales {
+            let root: serde_json::Value = serde_json::from_str(raw).unwrap();
+            for ptr in ["/settings/data/altTextAborted", "/detailPanel/altTextAborted"] {
+                assert!(
+                    root.pointer(ptr).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+                    "{lang}: 連続失敗の受け皿 `{ptr}` が無い"
+                );
+            }
+        }
+    }
+
     /// 逆向き: LCIR が ON でも同意が無ければ課金しない。
     /// **既定 OFF** なので、未設定のまま LCIR だけ ON になっても課金は起きない。
     #[sqlx::test(migrations = "./migrations")]
