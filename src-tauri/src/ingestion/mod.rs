@@ -3476,6 +3476,93 @@ mod tests {
         );
     }
 
+    /// `abort_reason` は**課金バッチを起動できる 2 つの入口の両方**で文言に変換される
+    /// （設定 → データの `formatBatchOutcome` と、詳細パネルの `handleGenerateAltTexts`）。
+    ///
+    /// 片方にしか文言が無いと、そちらの入口では「途中で止まった理由」が出ない ──
+    /// **`generated + skipped + failed` が `total` に届かない理由がどこにも出ない**形になる
+    /// （ゲート ②b の PR-3 レビュー。詳細パネル側が実際にこれだった）。
+    ///
+    /// **このテストが埋めているのは `en.json` の穴だけ**である。`src/i18n/index.ts` の
+    /// `CustomTypeOptions` が `resources: { translation: typeof ja }` を宣言しているので、
+    /// `t("…")` のキーは **`ja.json` の実キー集合に型付けされていて `tsc` が落とす**。
+    /// 型の材料は `ja` だけなので `en.json` の欠落は素通りし、`fallbackLng: "ja"` により
+    /// **英語表示のまま日本語の文が出る**（キー名が生で出るのではない）。
+    /// ⚠ **守られていないもの**: このテストは JSON しか読まないので、
+    /// 「入口が `abort_reason` を文言に**変換する**」ことは固定していない
+    /// （`DetailPanel.tsx` の分岐を丸ごと消しても緑）。`key_of` もフロントの手写しである。
+    #[test]
+    fn every_abort_reason_has_a_message_at_both_entry_points() {
+        // **網羅を型に守らせる。** 面を足すと `index_of` が非網羅でコンパイルが落ち、
+        // 番号を足せば今度は `ALL` の長さ assert が落ちるので、**配列への追加まで強制される**
+        // （match だけだと腕に `| New` を足して終われてしまい、検査対象は 3 つのまま）。
+        fn index_of(g: VisionGate) -> usize {
+            match g {
+                VisionGate::Allowed => 0,
+                VisionGate::LcirDisabled => 1,
+                VisionGate::ConsentWithdrawn => 2,
+            }
+        }
+        let all = [
+            VisionGate::Allowed,
+            VisionGate::LcirDisabled,
+            VisionGate::ConsentWithdrawn,
+        ];
+        for (i, g) in all.iter().enumerate() {
+            assert_eq!(index_of(*g), i, "`ALL` と variant の対応が崩れている");
+        }
+        assert_eq!(all.len(), 3, "面を足したら `ALL` にも足すこと（文言の検査対象が増える）");
+
+        // 印 → i18n キーの対応。フロント 2 か所が同じ対応を持っている。
+        // `None` = フロントが「連続失敗」の受け皿（`altTextAborted`）に落とす値。
+        let key_of = |reason: &str| match reason {
+            "consent_withdrawn" => Some("altTextStopped"),
+            "lcir_disabled" => Some("altTextStoppedLcir"),
+            _ => None,
+        };
+
+        let locales = [
+            ("ja", include_str!("../../../src/i18n/locales/ja.json")),
+            ("en", include_str!("../../../src/i18n/locales/en.json")),
+        ];
+        for (lang, raw) in locales {
+            let root: serde_json::Value = serde_json::from_str(raw).unwrap();
+            for g in all {
+                let Some(reason) = g.abort_reason() else {
+                    continue;
+                };
+                // **受け皿に落ちていないこと**を先に見る。ここを素通りさせると、面を足したときに
+                // 「LCIR を切って止めた」が「連続で失敗した（API キーを確認してください）」に
+                // 化けたままテストが緑になる ── PR-3 が直した嘘そのものが戻る。
+                let key = key_of(reason).unwrap_or_else(|| {
+                    panic!("{lang}: 打ち切り理由 `{reason}` ({g:?}) に専用の文言が無く、連続失敗の受け皿に丸められる")
+                });
+                for section in [
+                    // 設定 → データ（一括生成）と詳細パネル（この文献だけ）。
+                    root.pointer("/settings/data").unwrap(),
+                    root.pointer("/detailPanel").unwrap(),
+                ] {
+                    let msg = section.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+                    assert!(
+                        !msg.is_empty(),
+                        "{lang}: {reason} ({g:?}) の文言 `{key}` が片方の入口に無い"
+                    );
+                }
+            }
+        }
+
+        // 系統的失敗（`VisionGate` 由来ではない `"failures"`）の受け皿も両方に要る。
+        for (lang, raw) in locales {
+            let root: serde_json::Value = serde_json::from_str(raw).unwrap();
+            for ptr in ["/settings/data/altTextAborted", "/detailPanel/altTextAborted"] {
+                assert!(
+                    root.pointer(ptr).and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+                    "{lang}: 連続失敗の受け皿 `{ptr}` が無い"
+                );
+            }
+        }
+    }
+
     /// 逆向き: LCIR が ON でも同意が無ければ課金しない。
     /// **既定 OFF** なので、未設定のまま LCIR だけ ON になっても課金は起きない。
     #[sqlx::test(migrations = "./migrations")]

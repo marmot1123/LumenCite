@@ -1719,8 +1719,14 @@ struct VisionAltTextResult {
     failed: i64,
     /// 途中で打ち切ったか。理由は `abort_reason`。
     aborted: bool,
-    /// 打ち切りの理由: `"failures"`（連続失敗 = キー不正・レート制限など）/
+    /// 打ち切りの理由。**3 値ある**（[`ingestion::VisionGate::abort_reason`] の 2 つ + ここの 1 つ）:
+    /// `"failures"`（連続失敗 = キー不正・レート制限・画像非対応モデル）/
+    /// `"lcir_disabled"`（実行中に `lcir.enabled` が切られた）/
     /// `"consent_withdrawn"`（実行中に同意フラグが外された = 実質のキャンセル）。
+    ///
+    /// ⚠ **消費側は 3 つとも書き分けること。** 未知の値を「連続失敗」に丸めると、
+    /// LCIR を切って止めた人に「API キーを確認してください」と言う嘘になる
+    /// （フロント 2 か所の対応は `ingestion` の i18n 契約テストが固定している）。
     abort_reason: Option<String>,
 }
 

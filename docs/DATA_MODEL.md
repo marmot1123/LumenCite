@@ -308,7 +308,8 @@ LLM APIキー等の機密情報は **OS キーチェーン**（macOS Keychain / 
 | `ui.theme` | `light` \| `dark` \| `auto` | テーマ（localStorage の `lc-theme` と同期） |
 | `ui.accent` | `amber` \| `indigo` \| `teal` \| `rose` | アクセントカラー |
 | `ui.density` | `compact` \| `default` \| `comfortable` | 行密度 |
-| `bibtex.sync_path` | 絶対パス | `.bib` 同期先（既存） |
+| `bibtex_sync_path` | 絶対パス | `.bib` 同期先（既存）。⚠ **このキーだけドットではなくアンダースコア**（他の規約に合わないが、既存データがあるので改名しない） |
+| `llm.summary_prompt` | 文字列（未設定可） | 要約生成のプロンプト上書き。未設定なら組み込みの既定文 |
 | `llm.provider` | `openai` \| `anthropic` | 既定の LLM プロバイダ |
 | `llm.model` | モデル識別子（例 `gpt-4o-mini`） | 既定モデル |
 | `llm.summary_source` | `abstract` \| `fulltext` | 要約生成時の入力 |
@@ -334,6 +335,28 @@ LLM APIキー等の機密情報は **OS キーチェーン**（macOS Keychain / 
 | `mcp_server.enabled` | `"1"` \| `"0"`（または未設定） | LumenCite 自身を MCP サーバーとして公開するかのフラグ。`"1"` で起動時に自動起動 |
 | `mcp_server.port` | 文字列の数値（未設定なら既定 `3917`） | MCP サーバーのバインドポート。`port=0` で起動した場合は OS 割り当ての実ポートをここに保存する |
 | `mcp_server.write_enabled` | `"1"` \| `"0"`（または未設定） | **Phase 2**: MCP サーバー公開で write 系ツールを許可するフラグ（既定 false）。承認 UI が無いためサーバー側でこのゲートを enforce する。サーバーはリクエスト毎に評価するので変更は再起動不要 |
+
+#### キー追加（v0.5.0 / v0.8.0 / v0.10.0）
+
+初出の版は `git log -S` で実測した（表を書いた時点の推測ではない）。
+
+| キー | 初出 | 値 | 用途 |
+|------|------|------|------|
+| `clipper.enabled` | v0.5.0 | `"1"` \| `"0"`（または未設定） | Web クリッパーのローカル HTTP API を待ち受けるかのフラグ（既定 false）|
+| `bibtex.exclude_abstract_note` | v0.5.0 | `"1"` \| `"0"`（または未設定） | BibTeX 出力から `abstract` / `note` を落とす |
+| `clipper.complete_missing` | v0.8.0 | `"1"` \| `"0"`（または未設定） | 重複クリップ時に欠落した PDF / TeX ソースを補完する |
+| `fts.fulltext_rebuilt` | v0.8.0 | `"1"`（または未設定） | `fulltext` の FTS5 索引を起動時に 1 回 self-heal したら立つ |
+| `lcir.enabled` | v0.8.0 | `"1"` \| `"0"`（または未設定） | LCIR（機械可読中間形式）の実験フラグ。**v1.0.0-p3 で既定 ON に反転**した ── 判定は「`"0"` でなければ ON」で、**明示的に切った人だけが OFF のまま残る**。⚠ **未設定 =「一度も触っていない」であって「新規ライブラリ」ではない** —— v0.8.0〜v0.10.0 はこれが既定 off の実験フラグで読み手が `== Some("1")` だったため、**その間トグルを触らなかった既存ライブラリは全部未設定**。反転はその全員を ON にする（`lcir.tex_autofetch.enabled` のバックフィルが要る理由そのもの）|
+| `lcir.vision_alt_text.enabled` | v0.10.0 | `"1"` \| `"0"`（または未設定） | 図の代替テキストを LLM Vision で生成する同意（既定 off）。`lcir.enabled` とは独立で、**両方 ON のときだけ**バッチが動く（画像 1 枚ごとに課金されるため）|
+
+#### キー追加（v1.0.0）
+
+| キー | 値 | 用途 |
+|------|------|------|
+| `lcir.tex_autofetch.enabled` | `"1"` \| `"0"`（または未設定） | arXiv から e-print を**自動で**取得してよいかの同意（v1.0.0-p3 で `lcir.enabled` から分離）。**未設定のときの既定は「この版より前に `lcir.enabled` を明示 ON にしていたか」** ── 既定 ON に反転した `lcir.enabled` で判定すると新規ユーザー全員に自動ダウンロードが付いてくるため。起動時に `backfill_tex_autofetch_consent` が 1 回だけ明示値へ確定させる（**`"0"` でも書く**）|
+| `fulltext.source.<attachment_id>` | `lcir` \| `ocr` | **v1.0.0-p1 の出どころ記録**（添付単位）。FTS5 仮想表に provenance 列を足せないのでここに持つ（migration は v1.0.0 全体で 0 件）。⚠ **「記録が無い」には 3 つの母集団が入る**（この 2 択だと思うと守り方を間違える）: ①この版より前に入った索引（pdf-extract 由来 か **旧 OCR** — 実 DB からも区別できない）②OCR が行を書いてから封印するまでの窓（debt-44）③中断・部分 OCR（**完走時しか封印しない**ので恒常的に生まれる・debt-43）。②③のために `index_attachment_from_lcir` は `protect_unrecorded` 引数を持つ。「記録なし + 索引あり」が旧 OCR か新規 pdf_extract かを区別できないのが debt-37 の窓。⚠ **未知の残骸として掃除しないこと** —— 消すと「記録なし + 索引あり」に戻り、次の自動処理が OCR 由来の索引を LCIR で置き換えうる。逆に添付を消したのに残すと、その `attachment_id` を再利用した添付が永久に索引されない。**後始末は索引・添付・エントリの削除と同一トランザクションで行う**（`db::fulltext::clear_fulltext_source_tx` / `clear_fulltext_sources_for_entry_tx`）|
+| `fts.fulltext_lcir_derived` | `"1"`（または未設定） | 起動時 1 回の再導出（`AddMissingOnly`・索引が無い添付を埋めるだけ）を済ませたら立つ。**立てて良いのは「やり切った」ときだけ**で、①LCIR が OFF ②対象 0 件 ③失敗が 1 件でもある、のいずれかなら立てずに次回起動でやり直す（バッチは冪等なので再試行の代償は 1 回ぶん。①を立ててしまうと、後から LCIR を ON にした人へ再導出が永久に届かない）|
+| `lcir.backfill.last_run` | ISO8601 | LCIR バックフィル（v1.0.0-p2）が**最後に 1 件以上着手した**時刻。間引き（`AUTO_INTERVAL_SECS` = 1 時間）の基準。⚠ **「直近実行時刻」ではない** —— 対象 0 件の回・全 skip の回・他バッチに譲って降りた回・LCIR OFF の回は**書かない**（書くと間引きが効いて次の 1 時間ぶんのバックフィルが止まる）。⚠ **「起動時」だけでもない** —— 起動 60 秒後から 10 分周期で「走ってよいか」を叩き続け、実際に走るのは 1 時間ごと（10 分の tick と 1 時間の間引きを混同しないこと。`backfill.rs` のコメントが名指しで戒めている） |
 
 OS キーチェーン側のサービス名: `com.lumencite.app`、アカウント名は `llm.api_key.openai` / `llm.api_key.anthropic` のように `<scope>.<key>` 形式。MCP **サーバー公開**の Bearer 認可トークンも同サービスのアカウント名 `mcp_server.token` に保管する（`settings` には置かない）。外部 MCP **クライアント**に渡す `env` 秘匿情報（API キー等）は、`secretbox.master_key`（キーチェーンの 32byte マスター鍵）で AES-256-GCM 暗号化して `settings` に保存する（平文は置かない・CR-012）。マスター鍵はプロセス内でキャッシュするため keychain へ触るのは起動〜MCP 起動時の実質 1 回。**資格情報のローテーション**は、外部 MCP を一旦削除して新しい `env` で再登録すれば、古い暗号値は上書きされる。
 
