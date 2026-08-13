@@ -120,7 +120,11 @@ pub const LCIR_VISION_ALT_TEXT_ENABLED_KEY: &str = "lcir.vision_alt_text.enabled
 /// `fulltext` は FTS5 仮想表なので provenance 列を持てず（`virtual tables may not be altered`）、
 /// 側表を足すと dev 起動の瞬間に共有実 DB へ migration が適用されて配布版が起動不能になる
 /// （`NewerSchema`）。そこで **DDL を伴わない settings KV** に置く。
-/// 記録が無い = pdf_extract 由来 or 未索引（既定なので書かない）。
+/// 記録が無いのは既定（書かない）だが、**その中身は 1 種類ではない**: ①この版より前に入った
+/// 索引（pdf_extract 由来 **か 旧 OCR** ── 実 DB からも区別できない = debt-37）②OCR が行を
+/// 書いてから封印するまでの窓（debt-44）③中断・部分 OCR（完走時しか封印しないので恒常的に
+/// 生まれる = debt-43）④未索引。**「pdf_extract 由来 or 未索引」と読むと ②③ を守り損ねる**
+/// （そのための `protect_unrecorded` が `db::fulltext` にある）。
 pub const FULLTEXT_SOURCE_KEY_PREFIX: &str = "fulltext.source.";
 
 /// v1.0.0-p1: 既存ライブラリの `fulltext` を LCIR の page ノードから 1 回だけ再導出したか
