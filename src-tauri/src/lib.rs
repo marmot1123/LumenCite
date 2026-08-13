@@ -1185,12 +1185,43 @@ fn emit_attachment_ingest(app: &tauri::AppHandle, attachment_id: i64, busy: bool
 ///
 /// **ユーザーが名指しで押す経路**なので上限付きでロックを待つ（`try_build_lcir_for_attachment`）。
 /// 背景の build が走っていて順番が来なければ `build_busy` を返し、フロントが案内文言に変える。
+///
+/// **課金バッチの実行中は、既存の版を作り替える場合だけ弾く**（PR-3 のレビュー指摘）。
+/// 判定は [`interactive_build_is_blocked_by_a_writing_batch`] にある。
 #[tauri::command]
 async fn build_lcir_for_attachment(
     state: State<'_, AppState>,
     attachment_id: i64,
 ) -> Result<ingestion::LcirBuildResult, String> {
+    let would_supersede =
+        db::document_versions::latest_completed_for_attachment(&state.db, attachment_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .is_some();
+    if interactive_build_is_blocked_by_a_writing_batch(would_supersede) {
+        return Err("already_running".to_string());
+    }
     ingestion::try_build_lcir_for_attachment(&state.db, &state.app_data_dir, attachment_id).await
+}
+
+/// ユーザーが押した **1 件 build** を弾くべきか（ゲート ②b の W1-6・PR-3 のレビュー指摘）。
+///
+/// `build_missing_lcir` などのバッチと違って `LCIR_BATCH_RUNNING` を取らないので、
+/// **課金バッチの実行中でも押せて新版を commit できた** ── その瞬間からそのランの残り全図が
+/// `stale` に落ち、応答待ちに重なった 1 図は課金済みのまま捨てられる。入口は
+/// `DetailPanel` の「LCIR を構築 / 再構築」・TeX 取得後の追い build・`AddSheet` の添付後 build。
+///
+/// ⚠ **`would_supersede` で絞るのが要点。** 無条件に弾くと、課金バッチ中に追加した論文が
+/// バックフィルの周期（最大 1 時間）まで LCIR を持たなくなる。危険なのは
+/// **既に completed 版がある添付を作り替えるとき**だけ ── 新規添付の初回 build は
+/// supersede する版が無いので、走っている Vision の行き先を動かさない。
+///
+/// ⚠ **逆向き（1 件 build の最中に Vision を始める）は弾いていない。** 見るべき状態が
+/// `LCIR_BUILD_LOCK`（tokio Mutex）しか無く、`try_lock` での観測は FIFO の待ち行列を
+/// 乱すため使えない（[`ingestion::lock_build_within`] の doc）。こちら向きの実害は
+/// 「ランが空振りする」だけで**課金は発生しない**（各図の手前確認が Vision を呼ぶ前に落とす）。
+fn interactive_build_is_blocked_by_a_writing_batch(would_supersede: bool) -> bool {
+    would_supersede && a_writing_batch_outside_the_lcir_lock_is_running()
 }
 
 /// LCIR（実験）: 添付の最新 LCIR を木 + PDF 座標付きの JSON 派生ビューで返す（read 面）。
@@ -1208,32 +1239,86 @@ async fn get_lcir_document(
 /// プロセス全体で 1 本に絞る（`fetch_missing_arxiv_sources` と同型）。
 static LCIR_BATCH_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// [`LCIR_BATCH_RUNNING`] を離すだけの内側ガード。**フラグの解放を `impl Drop` の本体では
+/// なくフィールドに持つ**ことで、[`LcirBatchGuard`] の宣言順がそのまま解放順になる
+/// （`Drop::drop` の本体はフィールドより**先**に走るので、そこに置くと必ず逆順になる）。
+struct LcirBatchFlagGuard;
+impl Drop for LcirBatchFlagGuard {
+    fn drop(&mut self) {
+        LCIR_BATCH_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
 /// [`LCIR_BATCH_RUNNING`] を Drop で必ず解除する RAII ガード。
 ///
 /// フィールドの [`batch_status::RunningMark`] は**裁定には関与しない** ── 多重起動を弾くのは
 /// 上の `compare_exchange` だけで、印はその結果を表示用に写しているだけ（debt-32）。
+///
+/// ⚠ **フィールドの順序が正しさの一部**（`OcrRun` と同じ規約・PR-1b で明文化）。drop は
+/// 宣言順なので、**印を消してから排他フラグを離す**（取得の逆順）。逆にすると、フラグが
+/// 離れてから印が消えるまでの窓で次のランが排他を取れてしまい、`RunningMark::new` の
+/// 重複排除と旧ランの `retain` が相殺して**新しいランの印が誰にも立たない**
+/// （＝実行中のバッチが設定 → データのどこにも出ない）。
 struct LcirBatchGuard {
     /// 実行中の印。**Drop で消えることだけが役目**なので直接は読まない。
     _mark: batch_status::RunningMark,
-}
-impl Drop for LcirBatchGuard {
-    fn drop(&mut self) {
-        LCIR_BATCH_RUNNING.store(false, Ordering::SeqCst);
-    }
+    /// 排他フラグの解放。**`_mark` より後ろに置くこと**（上の ⚠ を参照）。
+    _flag: LcirBatchFlagGuard,
 }
 
 /// 一括構築バッチの開始（多重起動なら `already_running`）。返り値のガードが Drop で解除する。
 ///
 /// `kind` は**表示のためだけ**に受ける。`LCIR_BATCH_RUNNING` は 1 本しかないので、
 /// どの種別で来ても排他の効き方は同じ（GC もこれを流用している）。
+///
+/// **`LCIR_BATCH_RUNNING` の外で走る書き込みバッチも見る**（ゲート ②b の W1-6）。
+/// GC だけが以前からこれを見ていたが、`LCIR_BATCH_RUNNING` を取る 4 本
+/// （build / rebuild / rederive / gc）はどれも同じ添付・同じ表を触るので、
+/// **判定を [`begin_lcir_batch`] に 1 つ置いて 4 本に効かせる**。ここで弾かないと
+/// 課金バッチ（Vision）の実行中にユーザーが再構築を始められ、Vision が
+/// 「行き先を失った版」へ書き込む窓を自分で開けることになる（W2-4）。
 fn begin_lcir_batch(kind: batch_status::BatchKind) -> Result<LcirBatchGuard, String> {
+    if a_writing_batch_outside_the_lcir_lock_is_running() {
+        return Err("already_running".to_string());
+    }
     if LCIR_BATCH_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return Err("already_running".to_string());
     }
-    Ok(LcirBatchGuard { _mark: batch_status::RunningMark::new(kind) })
+    Ok(LcirBatchGuard {
+        _mark: batch_status::RunningMark::new(kind),
+        _flag: LcirBatchFlagGuard,
+    })
+}
+
+/// 進捗を**バックエンドの正本とフロントのイベントの両方**へ流す唯一の場所（debt-32）。
+///
+/// `emit` を注入で受けるのは `tauri::AppHandle` を単体テストで作れないため ──
+/// 配線をここまで剥がして初めて「イベントは飛ぶが `batch_status` には載らない」変異を
+/// テストで殺せる（ゲート ②b の M4 は、まさにこの配線が無検証だという指摘だった）。
+/// **順序も契約の一部**: 先にバックエンドへ書いてからイベントを出す。逆にすると、
+/// イベントを受けたフロントが即座に `lcir_batch_status` を引いたとき、古い進捗を読みうる。
+fn progress_sink<E: Fn(i64, i64)>(
+    kind: batch_status::BatchKind,
+    emit: E,
+) -> impl Fn(i64, i64) {
+    move |done, total| {
+        batch_status::set_progress(kind, done, total);
+        emit(done, total);
+    }
+}
+
+/// [`progress_sink`] の本番配線: バックエンドの状態 + `event` 名の Tauri イベント。
+fn tauri_progress_sink<'a>(
+    app: &'a tauri::AppHandle,
+    kind: batch_status::BatchKind,
+    event: &'static str,
+) -> impl Fn(i64, i64) + 'a {
+    progress_sink(kind, move |done, total| {
+        let _ = app.emit(event, serde_json::json!({ "done": done, "total": total }));
+    })
 }
 
 /// 一括構築の進捗を `lcir-build-progress` イベントでフロントへ流すコールバック。
@@ -1246,13 +1331,7 @@ fn lcir_progress_emitter(
     app: &tauri::AppHandle,
     kind: batch_status::BatchKind,
 ) -> impl Fn(i64, i64) + '_ {
-    move |done, total| {
-        batch_status::set_progress(kind, done, total);
-        let _ = app.emit(
-            "lcir-build-progress",
-            serde_json::json!({ "done": done, "total": total }),
-        );
-    }
+    tauri_progress_sink(app, kind, "lcir-build-progress")
 }
 
 /// バッチ 1 本の結果を「直近の結果」へ写してからそのまま返す（debt-32）。
@@ -1366,10 +1445,9 @@ struct StorageStats {
 
 /// LCIR（v1.0.0-p4）: superseded 版を GC して容量を回収する。**非可逆**。
 ///
-/// 排他は 3 つとも見る。`LCIR_BATCH_RUNNING` は既存の [`begin_lcir_batch`] を流用して
-/// 4 本目の static を増やさない（`already_running` のフロント側変換にもそのまま乗る）。
-/// alt text と TeX 取得を別に見るのは、**どちらも SettingsModal の外から呼べる**ため
-/// （`DetailPanel` の 3 箇所）で、UI の `disabled` では塞げない。
+/// 排他は 3 つとも見る。`LCIR_BATCH_RUNNING` と、その外で走る 2 本（Vision / TeX 取得）は
+/// [`begin_lcir_batch`] が 1 か所で裁く（**判定を 2 か所に置かない**）。build ロックだけは
+/// 待ち時間を伴うので、印を立てた後に取る ── 待っている間 GC は「実行中」として見える。
 ///
 /// **v1.0.0-p2: build ロックも取る。** p2 で build は「ユーザーがボタンを押したとき」だけの
 /// 操作ではなくなった（添付のたび / 毎起動）ので、`run_gc` の「削除直前の再評価」
@@ -1377,7 +1455,7 @@ struct StorageStats {
 /// superseded になった版を GC が消すと、`node_alt_texts.carried_from_version_id` が SET NULL に
 /// なり、carry 行が「NULL = この版で生成」というスキーマの契約を偽る。
 ///
-/// 排他の判定そのものは [`gc_is_blocked_by_a_writing_batch`] に出してある ──
+/// 排他の判定そのものは [`a_writing_batch_outside_the_lcir_lock_is_running`] に出してある ──
 /// `#[tauri::command]` の本体は `State<AppState>` を作れず単体テストできないので、
 /// **判定を関数の外に出さないと変異が素通りする**（ゲート ②b の M7）。
 #[tauri::command]
@@ -1385,40 +1463,60 @@ async fn run_lcir_gc(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ingestion::gc::GcOutcome, String> {
-    if gc_is_blocked_by_a_writing_batch() {
-        return Err("already_running".to_string());
-    }
+    let kind = batch_status::BatchKind::Gc;
+    let _guard = begin_lcir_batch(kind)?;
     let Some(_build_guard) = ingestion::lock_build_within(ingestion::INTERACTIVE_BUILD_LOCK_WAIT)
         .await
     else {
         return Err("already_running".to_string());
     };
-    let kind = batch_status::BatchKind::Gc;
-    let _guard = begin_lcir_batch(kind)?;
     record_batch(
         kind,
-        ingestion::gc::run_gc(&state.db, &state.app_data_dir, move |done, total| {
-            batch_status::set_progress(kind, done, total);
-            let _ = app.emit(
-                "lcir-gc-progress",
-                serde_json::json!({ "done": done, "total": total }),
-            );
-        })
+        ingestion::gc::run_gc(
+            &state.db,
+            &state.app_data_dir,
+            tauri_progress_sink(&app, kind, "lcir-gc-progress"),
+        )
         .await,
     )
 }
 
-/// GC を始めてはいけない状態か ── **書き込む長時間バッチがどれか 1 つでも走っていたら真**。
+/// `LCIR_BATCH_RUNNING` の**外**で走る書き込みバッチがどれか 1 つでも走っていたら真。
 ///
-/// `LCIR_BATCH_RUNNING` はここでは見ない（[`begin_lcir_batch`] が直後に取るので二重になる）。
-/// 見るのは **SettingsModal の外からも起動できる 2 つ**（`DetailPanel` 発の代替テキスト生成と
-/// TeX 取得）で、UI の `disabled` では塞げない。
+/// 見るのは `LCIR_BATCH_RUNNING` を取らない 2 つ（代替テキスト生成と TeX 一括取得）。
+/// 代替テキスト生成は `DetailPanel` からも起動できるので UI の `disabled` では塞げない。
+/// `LCIR_BATCH_RUNNING` 自体はここでは見ない
+/// （[`begin_lcir_batch`] が直後に `compare_exchange` で取るので二重になる）。
+/// この関数は [`interactive_build_is_blocked_by_a_writing_batch`] からも使う。
 ///
 /// ⚠ **`||` であって `&&` ではない。** `&&` にすると「2 本とも走っているときだけ止める」
 /// になり、片方だけ走っている実際の競合を通してしまう。この関数が独立しているのは、
 /// その変異を捕まえるテストを書けるようにするため（ゲート ②b の M7）。
-fn gc_is_blocked_by_a_writing_batch() -> bool {
+fn a_writing_batch_outside_the_lcir_lock_is_running() -> bool {
     VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst) || TEX_FETCH_RUNNING.load(Ordering::SeqCst)
+}
+
+/// 課金バッチ（`generate_vision_alt_texts`）を始めてはいけない状態か ── **同じ添付の
+/// LCIR 版を作り替えるバッチが走っていたら真**（ゲート ②b の W1-6）。
+///
+/// [`a_writing_batch_outside_the_lcir_lock_is_running`] と対になる逆向きの判定で、
+/// この 2 つが揃って初めて「排他」になる。片側だけだと、先に始めた方が勝つ順序でしか
+/// 効かない ── 実際 v1.0.0 までは GC 側にしか無く、**再構築の最中に課金を始められた**。
+///
+/// `VISION_ALT_TEXT_RUNNING` 自体は見ない（呼び出し元が直後に `compare_exchange` で取る）。
+/// **`TEX_FETCH_RUNNING` も見る**: TeX 一括取得は取得のたびに
+/// `build_lcir_for_attachment` を呼ぶので、実質 build バッチと同じ危険がある。
+///
+/// ⚠ **ここに載らない build が 2 種ある。**
+/// (a) **p2 の自動 build**（添付追加のたび / 起動時バックフィル / クリッパー）── ユーザー操作
+/// ではないので `already_running` を返す先が無い（起動時バックフィルだけは
+/// `run_backfill_if_due` の一時停止述語で添付境界ごとに譲る）。
+/// (b) **ユーザーが押す 1 件 build** ── こちらは[逆向きに弾いてある]
+/// [`interactive_build_is_blocked_by_a_writing_batch`]（この関数からは見えないので、
+/// 「1 件 build の最中に Vision を始める」向きだけが開いている）。
+/// どちらも `insert_alt_text_if_version_is_latest` が書き込みと同じ 1 文で受け止める。
+fn vision_alt_text_is_blocked_by_a_build_batch() -> bool {
+    LCIR_BATCH_RUNNING.load(Ordering::SeqCst) || TEX_FETCH_RUNNING.load(Ordering::SeqCst)
 }
 
 /// LCIR（実験・Phase 2）: ノード単位（段落・見出し・caption 等）の全文検索。ヒットは
@@ -1606,6 +1704,17 @@ struct VisionAltTextResult {
     generated: i64,
     /// crop ファイルが無い / 応答が空で「説明できなかった」図の数（欠損許容）。
     skipped: i64,
+    /// **実行中にその添付が再構築され、書き込む先の版が最新でなくなった図の数**
+    /// （ゲート ②b の W2-4）。`skipped` に混ぜない ── 混ぜると「説明できなかった」と
+    /// 「行き先が消えた」が同じ数字になり、`total 407 / generated 120 / skipped 287` が
+    /// 何を意味するのか読めなくなる（実際にレビューが挙げた見え方）。**次回の実行で
+    /// 新版の同じ図が対象に戻る**ので、取りこぼしではなく先送り。
+    ///
+    /// 内訳は 2 つあり、**課金の有無が違う**:
+    /// - Vision を呼ぶ前の確認で外れたもの（大多数・**課金なし**）
+    /// - 応答を受け取った後、書き込みと同じ 1 文の中で外れたもの（レース・**課金済み**）。
+    ///   こちらは 1 添付につき高々 1 件で、起きたら stderr に 1 行出す。
+    stale: i64,
     /// API エラー等で失敗した図の数（次回の再実行で拾える）。
     failed: i64,
     /// 途中で打ち切ったか。理由は `abort_reason`。
@@ -1615,20 +1724,53 @@ struct VisionAltTextResult {
     abort_reason: Option<String>,
 }
 
-/// [`VISION_ALT_TEXT_RUNNING`] を Drop で必ず解除する RAII ガード。
-/// フィールドの印は表示用（debt-32）で、裁定は上の `compare_exchange` が持つ。
-struct VisionAltTextGuard {
-    /// 実行中の印。**Drop で消えることだけが役目**なので直接は読まない。
-    _mark: batch_status::RunningMark,
-}
-impl Drop for VisionAltTextGuard {
+/// [`VISION_ALT_TEXT_RUNNING`] を離すだけの内側ガード（[`LcirBatchFlagGuard`] と同型）。
+struct VisionAltTextFlagGuard;
+impl Drop for VisionAltTextFlagGuard {
     fn drop(&mut self) {
         VISION_ALT_TEXT_RUNNING.store(false, Ordering::SeqCst);
     }
 }
 
+/// [`VISION_ALT_TEXT_RUNNING`] を Drop で必ず解除する RAII ガード。
+/// フィールドの印は表示用（debt-32）で、裁定は上の `compare_exchange` が持つ。
+///
+/// ⚠ **フィールドの順序が正しさの一部**（[`LcirBatchGuard`] と同じ）。ここで順序を誤ると
+/// **課金バッチが実行中なのに画面上どこにも出ない**ランを作りうる。
+struct VisionAltTextGuard {
+    /// 実行中の印。**Drop で消えることだけが役目**なので直接は読まない。
+    _mark: batch_status::RunningMark,
+    /// 排他フラグの解放。**`_mark` より後ろに置くこと**。
+    _flag: VisionAltTextFlagGuard,
+}
+
 /// `generate_vision_alt_texts` の多重起動ガード（課金する操作を二重に走らせない）。
 static VISION_ALT_TEXT_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 課金バッチの開始（始められないなら `already_running`）。返り値のガードが Drop で解除する。
+///
+/// **[`begin_lcir_batch`] と同型にしてある。** 裁定を `#[tauri::command]` の本体に置くと
+/// `State<AppState>` を作れず単体テストできないので、**判定も配線も変異が素通りする**
+/// （ゲート ②b の W1-6 / M7 と同じ形）。ここまで出せば「排他が両方向に効く」ことを
+/// 直接 assert できて、残る無検証はコマンドがこの関数を呼ぶ 1 行だけになる。
+///
+/// ⚠ **`already_running` は「バッチが走らなかった」なので記録側へ通さない**
+/// （`batch_status::FinishedBatch` の契約）。呼び出し側は `?` でそのまま返すこと。
+fn begin_vision_alt_text_batch() -> Result<VisionAltTextGuard, String> {
+    if vision_alt_text_is_blocked_by_a_build_batch() {
+        return Err("already_running".to_string());
+    }
+    if VISION_ALT_TEXT_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("already_running".to_string());
+    }
+    Ok(VisionAltTextGuard {
+        _mark: batch_status::RunningMark::new(batch_status::BatchKind::VisionAltText),
+        _flag: VisionAltTextFlagGuard,
+    })
+}
 
 /// alt text 生成が推定であることを示す confidence。値そのものの序列に意味はなく、
 /// 「原資料由来ではない」ことを read 側が判別できるようにするための表明（roadmap §16）。
@@ -1696,18 +1838,17 @@ async fn generate_vision_alt_texts(
         total: 0,
         generated: 0,
         skipped: 0,
+        stale: 0,
         failed: 0,
         aborted: false,
         abort_reason: None,
     };
-    if VISION_ALT_TEXT_RUNNING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err("already_running".to_string());
-    }
+    // **多重起動と、同じ添付の版を作り替えるバッチとの同居を、まとめてここで裁く**
+    // （ゲート ②b の W1-6）。build 系に弾かれた場合も `already_running` を返すのは、
+    // ユーザーにとって区別が要らないため（どちらも「今は始められない・待てば始められる」）
+    // ── 文言は「他の LCIR 処理が実行中です」に揃えてあり、GC が弾かれたときと同じものが出る。
+    let _guard = begin_vision_alt_text_batch()?;
     let batch_kind = batch_status::BatchKind::VisionAltText;
-    let _guard = VisionAltTextGuard { _mark: batch_status::RunningMark::new(batch_kind) };
 
     // 課金する操作なので、LCIR フラグと Vision 同意の両方を要求する（決定点は 1 つ）。
     //
@@ -1757,14 +1898,11 @@ async fn generate_vision_alt_texts(
     // 進捗はイベントとバックエンド状態の**両方**へ流す（debt-32）。ループの中に 3 つの
     // 出口があるので必ずこの 1 本を通す ── 片方しか更新しない経路を残すと、
     // モーダルを閉じている間に進んだぶんが開き直しても復帰しない。
-    let emit_progress = |done: i64| {
-        batch_status::set_progress(batch_kind, done, total);
-        let _ = app.emit(
-            "vision-alt-text-progress",
-            serde_json::json!({ "done": done, "total": total }),
-        );
-    };
-    let (mut generated, mut skipped, mut failed) = (0i64, 0i64, 0i64);
+    let emit_progress = tauri_progress_sink(&app, batch_kind, "vision-alt-text-progress");
+    // **総数が分かった時点で 1 回報告する**（ゲート ②b の F-2）。1 件目が終わるまで
+    // 報告しないと、その間だけ分母が出ず「生成中…」に落ちる（`GC` は前から出している）。
+    emit_progress(0, total);
+    let (mut generated, mut skipped, mut stale, mut failed) = (0i64, 0i64, 0i64, 0i64);
     let mut consecutive_failures = 0u32;
     let mut abort_reason: Option<&'static str> = None;
     // 実際に API を呼んだ回数（スロットルの判定に使う。skip/複製では呼ばない）。
@@ -1790,6 +1928,11 @@ async fn generate_vision_alt_texts(
         // その版がまだ当該添付の最新 completed か確認する（**Vision を呼ぶ前**に）。
         // 長いループ中に再構築されると、旧版のノードへ書いた行はどの read 面にも現れず
         // 課金だけが無駄になる。新版の図は次回の実行で対象になる。
+        //
+        // ⚠ **この手前の確認は畳めない。** 書き込み側（`insert_alt_text_if_version_is_latest`）
+        // にも同じ条件があるが、あちらは**行き先の保証**で、こちらは**高価な API 呼び出しの
+        // 回避**。目的が違うので「同じ判定が 2 か所」には当たらない（PR-2 で同じ形を
+        // 畳もうとして誤った）。ここを消すと、再構築された添付の図を全部課金してから捨てる。
         let still_latest = db::document_versions::latest_completed_for_attachment(
             &state.db,
             target.attachment_id,
@@ -1798,13 +1941,13 @@ async fn generate_vision_alt_texts(
         .map(|v| v.map(|v| v.id) == Some(target.document_version_id))
         .unwrap_or(false);
         if !still_latest {
-            skipped += 1;
-            emit_progress(i as i64 + 1);
+            stale += 1;
+            emit_progress(i as i64 + 1, total);
             continue;
         }
         // 同一ランで同じ画像を既に説明済みなら API を呼ばずに複製する（課金しない）。
         if let Some(text) = described_by_sha.get(&target.asset_sha256) {
-            match db::node_alt_texts::insert_alt_text(
+            match db::node_alt_texts::insert_alt_text_if_version_is_latest(
                 &state.db,
                 &db::node_alt_texts::NewAltText {
                     node_id: target.node_id,
@@ -1819,7 +1962,10 @@ async fn generate_vision_alt_texts(
             )
             .await
             {
-                Ok(_) => generated += 1,
+                Ok(true) => generated += 1,
+                // 複製なので課金は発生していない（`described_by_sha` に入っている ＝
+                // このランで既に 1 回だけ払った絵）。次回の実行で新版の同じ図を拾う。
+                Ok(false) => stale += 1,
                 Err(e) => {
                     eprintln!(
                         "LCIR: failed to save reused alt text for node {} (attachment {}): {e}",
@@ -1828,7 +1974,7 @@ async fn generate_vision_alt_texts(
                     failed += 1;
                 }
             }
-            emit_progress(i as i64 + 1);
+            emit_progress(i as i64 + 1, total);
             continue;
         }
         // ここから先は実際に API を呼ぶ。2 回目以降はリクエスト前に 1 秒待つ
@@ -1857,7 +2003,7 @@ async fn generate_vision_alt_texts(
                     Ok(text) => {
                         let text: String =
                             text.trim().chars().take(VISION_ALT_TEXT_MAX_CHARS).collect();
-                        match db::node_alt_texts::insert_alt_text(
+                        match db::node_alt_texts::insert_alt_text_if_version_is_latest(
                             &state.db,
                             &db::node_alt_texts::NewAltText {
                                 node_id: target.node_id,
@@ -1872,11 +2018,36 @@ async fn generate_vision_alt_texts(
                         )
                         .await
                         {
-                            Ok(_) => {
+                            Ok(true) => {
                                 generated += 1;
                                 consecutive_failures = 0;
                                 described_by_sha
                                     .insert(target.asset_sha256.clone(), text.clone());
+                            }
+                            // **ここだけは課金済み。** 落ちる理由は 2 つある:
+                            // (a) API 応答を待っている間に別経路（p2 の自動 build・クリッパー・
+                            // supersede しない 1 件 build）がこの添付の新版を commit した
+                            // (b) 版はそのままだが `heal_missing_assets` が欠けた crop を
+                            // 再レンダリングして**絵が変わった**（PR-3 のレビュー指摘）。
+                            // どちらも**行を作らない**のが正しい ── (a) は作ると
+                            // どの read 面にも出ずその版を GC の対象から外し（W2-4）、
+                            // (b) は `assets.sha256 == source_asset_sha256` の不変量を破る。
+                            // 1 添付につき高々 1 件なので log で足りる。
+                            Ok(false) => {
+                                stale += 1;
+                                consecutive_failures = 0;
+                                // **行にできなくても指紋メモには載せる。** このメモの不変条件は
+                                // 「この画像には**このランで既に 1 度払った**」であって
+                                // 「保存できた」ではない。載せないと、同じ絵を持つ別の図
+                                // （ページごとに出るロゴ等）でもう一度課金する。
+                                described_by_sha
+                                    .insert(target.asset_sha256.clone(), text.clone());
+                                eprintln!(
+                                    "LCIR: discarded a billed alt text for node {} (attachment {}): \
+                                     version {} is no longer the latest completed one, \
+                                     or its crop was re-rendered mid-run",
+                                    target.node_id, target.attachment_id, target.document_version_id
+                                );
                             }
                             Err(e) => {
                                 eprintln!(
@@ -1903,7 +2074,7 @@ async fn generate_vision_alt_texts(
             _ => skipped += 1,
         }
         // 進捗をフロントへ（図の数だけ Vision 呼び出しが走るので長時間になる）。
-        emit_progress(i as i64 + 1);
+        emit_progress(i as i64 + 1, total);
         // 系統的失敗（このランで 1 件も生成できないまま連続失敗）だけで打ち切る。
         if consecutive_failures >= VISION_ALT_TEXT_MAX_CONSECUTIVE_FAILURES && generated == 0 {
             eprintln!(
@@ -1920,6 +2091,7 @@ async fn generate_vision_alt_texts(
         total,
         generated,
         skipped,
+        stale,
         failed,
         aborted: abort_reason.is_some(),
         abort_reason: abort_reason.map(|r| r.to_string()),
@@ -2121,16 +2293,65 @@ struct FetchMissingArxivSourcesResult {
 /// しまう（別添付は積まれないが 3 秒スロットルが無駄に走る）ため、プロセス全体で 1 本に絞る。
 static TEX_FETCH_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// [`TEX_FETCH_RUNNING`] を Drop で必ず解除する RAII ガード（途中エラー・panic でも解放）。
-/// フィールドの印は表示用（debt-32）で、裁定は `compare_exchange` が持つ。
-struct TexFetchGuard {
-    /// 実行中の印。**Drop で消えることだけが役目**なので直接は読まない。
-    _mark: batch_status::RunningMark,
-}
-impl Drop for TexFetchGuard {
+/// [`TEX_FETCH_RUNNING`] を離すだけの内側ガード（[`LcirBatchFlagGuard`] と同型）。
+struct TexFetchFlagGuard;
+impl Drop for TexFetchFlagGuard {
     fn drop(&mut self) {
         TEX_FETCH_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// [`TEX_FETCH_RUNNING`] を Drop で必ず解除する RAII ガード（途中エラー・panic でも解放）。
+/// フィールドの印は表示用（debt-32）で、裁定は `compare_exchange` が持つ。
+///
+/// ⚠ **フィールドの順序が正しさの一部**（[`LcirBatchGuard`] と同じ）。
+struct TexFetchGuard {
+    /// 実行中の印。**Drop で消えることだけが役目**なので直接は読まない。
+    _mark: batch_status::RunningMark,
+    /// 排他フラグの解放。**`_mark` より後ろに置くこと**。
+    _flag: TexFetchFlagGuard,
+}
+
+/// TeX 一括取得を始めてはいけない状態か ── **LCIR の版を作り替えるバッチか課金バッチが
+/// 走っていたら真**（ゲート ②b の W1-6・PR-3 のレビューで見つかった 3 方向目）。
+///
+/// [`a_writing_batch_outside_the_lcir_lock_is_running`] と
+/// [`vision_alt_text_is_blocked_by_a_build_batch`] はどちらも `TEX_FETCH_RUNNING` を見るのに、
+/// **TeX 側だけが相手を 1 つも見ていなかった**（＝「T を後から始める」5 組が素通りする）。
+/// 3 つの入口が互いを見て初めて「両方向」になる。
+///
+/// `TEX_FETCH_RUNNING` 自体は見ない（呼び出し元が直後に `compare_exchange` で取る）。
+fn tex_fetch_is_blocked_by_another_batch() -> bool {
+    LCIR_BATCH_RUNNING.load(Ordering::SeqCst) || VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst)
+}
+
+/// TeX 一括取得の開始（始められないなら `already_running`）。返り値のガードが Drop で解除する。
+///
+/// [`begin_lcir_batch`] / [`begin_vision_alt_text_batch`] と同型。裁定を
+/// `#[tauri::command]` の本体に置いていたので**変異が素通りしていた**（PR-3 の survivor）。
+///
+/// **弾けることには待ち時間以上の意味がある。** 取得ごとの `build_lcir_for_attachment` は
+/// [`ingestion::lock_build`]（上限なし）で待つので、GC が build ロックを握っている間は
+/// 「取得中 3/200」の表示のまま無言で止まる。手前で弾けば案内文言が出る。
+fn begin_tex_fetch_batch() -> Result<TexFetchGuard, String> {
+    if tex_fetch_is_blocked_by_another_batch() {
+        return Err("already_running".to_string());
+    }
+    if TEX_FETCH_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Err("already_running".to_string());
+    }
+    Ok(TexFetchGuard {
+        _mark: batch_status::RunningMark::new(batch_status::BatchKind::TexFetch),
+        _flag: TexFetchFlagGuard,
+    })
 }
 
 /// 既存コーパスのバックフィル: ゴミ箱以外で arxiv_id を持ち TeX ソース添付が無い
@@ -2146,20 +2367,8 @@ async fn fetch_missing_arxiv_sources(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<FetchMissingArxivSourcesResult, String> {
-    // 既に実行中なら弾く（多重起動ガード）。フロントは `already_running` を案内文言に変換する。
-    if TEX_FETCH_RUNNING
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        )
-        .is_err()
-    {
-        return Err("already_running".to_string());
-    }
     let batch_kind = batch_status::BatchKind::TexFetch;
-    let _guard = TexFetchGuard { _mark: batch_status::RunningMark::new(batch_kind) };
+    let _guard = begin_tex_fetch_batch()?;
 
     // **判定はガードを取った後に置く**（`build_missing_lcir` と同型）。前に置くと
     // `record_success` を通らないまま返るので `batch_status.last` に載らず、
@@ -2189,6 +2398,10 @@ async fn fetch_missing_arxiv_sources(
         }
     };
     let total = targets.len() as i64;
+    // 進捗はイベントとバックエンド状態の両方へ（debt-32）。**総数が分かった時点で 1 回
+    // 報告する** ── 1 件目が終わるまで報告しないと、その間だけ分母が出ない（F-2）。
+    let emit_progress = tauri_progress_sink(&app, batch_kind, "tex-fetch-progress");
+    emit_progress(0, total);
     let (mut fetched, mut built, mut pdf_only, mut failed) = (0i64, 0i64, 0i64, 0i64);
     let mut aborted = false;
     for (i, (entry_id, arxiv_id)) in targets.into_iter().enumerate() {
@@ -2241,11 +2454,7 @@ async fn fetch_missing_arxiv_sources(
         }
         // 進捗をフロントへ（多分単位のバッチが「固まって見える」のを避ける）。
         // バックエンド側にも書く理由は [`batch_status`]（閉じている間のぶんが復帰しない）。
-        batch_status::set_progress(batch_kind, i as i64 + 1, total);
-        let _ = app.emit(
-            "tex-fetch-progress",
-            serde_json::json!({ "done": i as i64 + 1, "total": total }),
-        );
+        emit_progress(i as i64 + 1, total);
     }
     // 添付・LCIR が増えたので、開いている一覧・詳細パネルを更新させる。
     if fetched > 0 {
@@ -4848,7 +5057,8 @@ mod batch_wiring_tests {
         batch_status::TEST_GATE.blocking_lock()
     }
 
-    /// **GC の排他は「どれか 1 つでも走っていたら止める」**（ゲート ②b の M7）。
+    /// **LCIR ロックの外で走る書き込みバッチは「どれか 1 つでも走っていたら止める」**
+    /// （ゲート ②b の M7）。
     ///
     /// `||` を `&&` に変えると「2 本とも走っているときだけ止める」になり、片方だけ
     /// 走っている実際の競合を通す。判定が `#[tauri::command]` の本体に埋まっていた頃は
@@ -4856,31 +5066,274 @@ mod batch_wiring_tests {
     ///
     /// **自分が立てた印だけを倒す**（プロセス共有の static なので、他人の遷移は assert しない）。
     #[test]
-    fn gc_is_blocked_by_either_writing_batch_not_only_by_both() {
+    fn either_writing_batch_alone_blocks_the_lcir_lock_not_only_both() {
         let _g = gate();
         assert!(
-            !gc_is_blocked_by_a_writing_batch(),
+            !a_writing_batch_outside_the_lcir_lock_is_running(),
             "前提: このテストの開始時はどちらも走っていない"
         );
 
         VISION_ALT_TEXT_RUNNING.store(true, Ordering::SeqCst);
         assert!(
-            gc_is_blocked_by_a_writing_batch(),
-            "代替テキスト生成だけでも GC は止まる（課金済みの行を消しうる）"
+            a_writing_batch_outside_the_lcir_lock_is_running(),
+            "代替テキスト生成だけでも止まる（GC は課金済みの行を消しうる）"
         );
         VISION_ALT_TEXT_RUNNING.store(false, Ordering::SeqCst);
 
         TEX_FETCH_RUNNING.store(true, Ordering::SeqCst);
         assert!(
-            gc_is_blocked_by_a_writing_batch(),
-            "TeX 一括取得だけでも GC は止まる（build が新版を作る）"
+            a_writing_batch_outside_the_lcir_lock_is_running(),
+            "TeX 一括取得だけでも止まる（build が新版を作る）"
         );
         TEX_FETCH_RUNNING.store(false, Ordering::SeqCst);
 
         assert!(
-            !gc_is_blocked_by_a_writing_batch(),
+            !a_writing_batch_outside_the_lcir_lock_is_running(),
             "両方下ろしたら通る（印を倒し忘れていない）"
         );
+    }
+
+    /// **排他は両方向でなければ排他ではない**（ゲート ②b の W1-6）。
+    ///
+    /// v1.0.0 までこの判定は GC の入口にしか無く、`LCIR_BATCH_RUNNING` を取る残り 3 本
+    /// （build / rebuild / rederive）は課金バッチの最中でも始められた。判定を
+    /// [`begin_lcir_batch`] へ移したので、**4 本すべてに効く**ことをここで固定する。
+    #[test]
+    fn a_build_batch_cannot_start_while_the_paid_batch_runs() {
+        let _g = gate();
+        VISION_ALT_TEXT_RUNNING.store(true, Ordering::SeqCst);
+        let rejected = begin_lcir_batch(batch_status::BatchKind::Rebuild);
+        VISION_ALT_TEXT_RUNNING.store(false, Ordering::SeqCst);
+
+        assert_eq!(
+            rejected.err().as_deref(),
+            Some("already_running"),
+            "課金バッチの実行中に再構築を始められてはならない（W2-4 の窓を自分で開けることになる）"
+        );
+        assert!(
+            !batch_status::snapshot()
+                .running
+                .contains(&batch_status::BatchKind::Rebuild),
+            "弾かれたバッチの印は立たない"
+        );
+        assert!(
+            !LCIR_BATCH_RUNNING.load(Ordering::SeqCst),
+            "弾かれた側が排他フラグを立てっぱなしにしない（以後どのバッチも始められなくなる）"
+        );
+    }
+
+    /// 逆向き: **課金バッチは build 系が走っている間は始まらない**（ゲート ②b の W1-6）。
+    ///
+    /// `LCIR_BATCH_RUNNING` は build / rebuild / rederive / gc の 4 本で共有なので、
+    /// これ 1 つで 4 本ぶんを塞ぐ。`TEX_FETCH_RUNNING` を別に見るのは、TeX 一括取得が
+    /// 取得のたびに `build_lcir_for_attachment` を呼ぶため（同じ危険がある）。
+    #[test]
+    fn the_paid_batch_cannot_start_while_a_build_batch_runs() {
+        let _g = gate();
+        assert!(
+            !vision_alt_text_is_blocked_by_a_build_batch(),
+            "前提: このテストの開始時はどちらも走っていない"
+        );
+
+        let guard = begin_lcir_batch(batch_status::BatchKind::Build).expect("1 本目は取れる");
+        assert!(
+            vision_alt_text_is_blocked_by_a_build_batch(),
+            "一括構築の最中に課金を始めさせない"
+        );
+        drop(guard);
+
+        TEX_FETCH_RUNNING.store(true, Ordering::SeqCst);
+        assert!(
+            vision_alt_text_is_blocked_by_a_build_batch(),
+            "TeX 一括取得も build を呼ぶので同じ扱いにする"
+        );
+        TEX_FETCH_RUNNING.store(false, Ordering::SeqCst);
+
+        assert!(
+            !vision_alt_text_is_blocked_by_a_build_batch(),
+            "両方下ろしたら通る"
+        );
+    }
+
+    /// **課金バッチの入口も、build 系が走っていたら開かない**（②b の W1-6・排他の課金側）。
+    ///
+    /// 上のテストが見ているのは述語だけで、**それを入口が読むかどうかは別の主張**
+    /// （判定をコマンド本体に置いていた頃は、判定を消す変異が 1 本もテストを落とさなかった）。
+    /// ここでは `begin_vision_alt_text_batch` を直接呼んで、弾いた側がフラグも印も
+    /// 残さないこと、空いていれば取れて Drop で両方下りることまで見る。
+    #[test]
+    fn the_paid_batch_entry_point_is_closed_while_a_build_batch_runs() {
+        let _g = gate();
+        let held = begin_lcir_batch(batch_status::BatchKind::Rebuild).expect("1 本目は取れる");
+        let rejected = begin_vision_alt_text_batch();
+        drop(held);
+
+        assert_eq!(
+            rejected.err().as_deref(),
+            Some("already_running"),
+            "再構築の最中に課金バッチを開始できてはならない"
+        );
+        assert!(
+            !VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst),
+            "弾かれた側が排他フラグを立てっぱなしにしない（以後どの生成も始められなくなる）"
+        );
+        assert!(!batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::VisionAltText));
+
+        // 空いていれば取れて、印が立ち、Drop で印もフラグも下りる。
+        let guard = begin_vision_alt_text_batch().expect("誰も走っていなければ取れる");
+        assert!(batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::VisionAltText));
+        drop(guard);
+        assert!(!batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::VisionAltText));
+        assert!(
+            !VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst),
+            "Drop で排他フラグも下りる"
+        );
+    }
+
+    /// **3 方向目**: TeX 一括取得の入口も、他の 2 グループが走っていたら開かない。
+    ///
+    /// PR-3 の初版は L（`LCIR_BATCH_RUNNING`）と V（課金）の 2 つに互いを見せたが、
+    /// **T の入口だけ相手を 1 つも見ていなかった** ── 「T を後から始める」5 組が素通りし、
+    /// それでいて doc は「両方向で排他」と書いていた（PR-3 のレビュー指摘）。
+    /// 3 つが互いを見て初めて排他が閉じる。
+    #[test]
+    fn the_tex_fetch_entry_point_is_closed_while_either_other_group_runs() {
+        let _g = gate();
+        assert!(
+            !tex_fetch_is_blocked_by_another_batch(),
+            "前提: このテストの開始時はどちらも走っていない"
+        );
+
+        let held = begin_lcir_batch(batch_status::BatchKind::Rebuild).expect("1 本目は取れる");
+        let rejected_by_build = begin_tex_fetch_batch();
+        drop(held);
+        assert_eq!(
+            rejected_by_build.err().as_deref(),
+            Some("already_running"),
+            "再構築の最中に TeX 一括取得を始められてはならない（取得ごとに build を呼ぶ）"
+        );
+
+        let paid = begin_vision_alt_text_batch().expect("課金バッチは取れる");
+        let rejected_by_paid = begin_tex_fetch_batch();
+        drop(paid);
+        assert_eq!(
+            rejected_by_paid.err().as_deref(),
+            Some("already_running"),
+            "課金バッチの最中も始められてはならない"
+        );
+
+        assert!(
+            !TEX_FETCH_RUNNING.load(Ordering::SeqCst),
+            "弾かれた側が排他フラグを立てっぱなしにしない"
+        );
+        assert!(!batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::TexFetch));
+
+        // 空いていれば取れて、印が立ち、Drop で印もフラグも下りる。
+        let guard = begin_tex_fetch_batch().expect("誰も走っていなければ取れる");
+        assert!(batch_status::snapshot()
+            .running
+            .contains(&batch_status::BatchKind::TexFetch));
+        drop(guard);
+        assert!(!TEX_FETCH_RUNNING.load(Ordering::SeqCst), "Drop で排他フラグも下りる");
+    }
+
+    /// **ユーザーが押す 1 件 build は、既存の版を作り替えるときだけ弾く。**
+    ///
+    /// 無条件に弾くと、課金バッチ中に追加した論文が最大 1 時間 LCIR を持たなくなる
+    /// （`AddSheet` の添付後 build がここを通る）。危険なのは **supersede する場合だけ**
+    /// なので、`would_supersede` との `&&` であることをここで固定する ── `||` や
+    /// 定数 `true` への変異は、下の 2 本のどちらかを必ず落とす。
+    #[test]
+    fn a_one_off_build_is_refused_only_when_it_would_supersede_a_live_version() {
+        let _g = gate();
+        assert!(
+            !interactive_build_is_blocked_by_a_writing_batch(true),
+            "誰も走っていなければ、作り替えでも通す"
+        );
+
+        let paid = begin_vision_alt_text_batch().expect("課金バッチは取れる");
+        assert!(
+            interactive_build_is_blocked_by_a_writing_batch(true),
+            "課金バッチの最中に既存版の作り替えを始めさせない（残り全図が stale に落ちる）"
+        );
+        assert!(
+            !interactive_build_is_blocked_by_a_writing_batch(false),
+            "新規添付の初回 build は supersede する版が無いので通す"
+        );
+        drop(paid);
+
+        TEX_FETCH_RUNNING.store(true, Ordering::SeqCst);
+        assert!(
+            interactive_build_is_blocked_by_a_writing_batch(true),
+            "TeX 一括取得の最中も同じ（取得ごとに build ロックを奪い合う）"
+        );
+        TEX_FETCH_RUNNING.store(false, Ordering::SeqCst);
+
+        assert!(!interactive_build_is_blocked_by_a_writing_batch(true), "下ろしたら通る");
+    }
+
+    /// 2 本目の課金バッチは弾かれ、**1 本目の印を壊さない**（多重起動ガードの側）。
+    #[test]
+    fn a_second_paid_batch_is_rejected_and_leaves_the_first_alone() {
+        let _g = gate();
+        let first = begin_vision_alt_text_batch().expect("1 本目は取れる");
+        let second = begin_vision_alt_text_batch();
+        assert_eq!(second.err().as_deref(), Some("already_running"));
+        assert!(
+            batch_status::snapshot()
+                .running
+                .contains(&batch_status::BatchKind::VisionAltText),
+            "弾かれた 2 本目が 1 本目の印を壊さない"
+        );
+        assert!(
+            VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst),
+            "弾かれた 2 本目の Drop が 1 本目の排他フラグを下ろさない"
+        );
+        drop(first);
+        assert!(!VISION_ALT_TEXT_RUNNING.load(Ordering::SeqCst));
+    }
+
+    /// **進捗は「バックエンドの正本」と「フロントのイベント」の両方へ流れる**（②b の M4）。
+    ///
+    /// この配線は `lcir_progress_emitter` の中に埋まっていて、`batch_status::set_progress`
+    /// の呼び出しを丸ごと消しても全テストが通った（＝ debt-32 の中心主張が無検証だった）。
+    /// `tauri::AppHandle` は単体テストで作れないので、**イベント送出だけを注入で受ける**
+    /// 形に剥がして、ここで両方に届くことを見る。
+    #[test]
+    fn progress_reaches_both_the_backend_table_and_the_event() {
+        let _g = gate();
+        // イベント側が呼ばれた**その時点**でバックエンドの表がどう見えているかを撮る。
+        // 値だけを見ると「先にイベント → 後で表」に入れ替える変異が生き残る。
+        let emitted = std::sync::Mutex::new(Vec::<((i64, i64), Option<batch_status::Progress>)>::new());
+        let sink = progress_sink(batch_status::BatchKind::Rederive, |done, total| {
+            let seen = batch_status::snapshot().progress.get("rederive").copied();
+            emitted.lock().unwrap().push(((done, total), seen));
+        });
+
+        // 印が立っていないと `Drop` が消すべきものが無いだけで、進捗表自体には載る。
+        let mark = batch_status::RunningMark::new(batch_status::BatchKind::Rederive);
+        sink(3, 10);
+
+        assert_eq!(
+            batch_status::snapshot().progress.get("rederive").copied(),
+            Some(batch_status::Progress { done: 3, total: 10 }),
+            "バックエンドの正本に載る（閉じている間に進んだぶんの復帰はこれだけが支える）"
+        );
+        assert_eq!(
+            *emitted.lock().unwrap(),
+            vec![((3, 10), Some(batch_status::Progress { done: 3, total: 10 }))],
+            "同じ値がイベントにも流れ、**その時点で表は既に新しい**（イベントを見て \
+             すぐ `lcir_batch_status` を引くフロントが古い値を読まない）"
+        );
+        drop(mark);
     }
 
     #[test]

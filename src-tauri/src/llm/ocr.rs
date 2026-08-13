@@ -118,8 +118,12 @@ mod tests {
     /// 使うが Tauri ランタイム無しで動く（ターミナルから長時間バッチを流したいとき用）。
     /// **1 図ごとに課金される。** 冪等（行がある図は対象外）なので中断しても再実行で続きから進む。
     ///
-    /// 本番との差: ①版の陳腐化チェックは省略（実行中に再構築しない前提）②連続失敗の打ち切りを
-    /// 10 件に固定（長時間の無人実行で系統的失敗を焼き続けないため）。
+    /// 本番との差: ①**Vision を呼ぶ前の**陳腐化チェックは省略（実行中に再構築しない前提。
+    /// 書き込み時の確認は `insert_alt_text_if_version_is_latest` で本番と同じ ── v1.0.0・
+    /// ゲート ②b の W2-4。省いてよいのは「無駄な課金を避ける」側だけで、
+    /// 「課金した説明を読めない版へ書かない」側は実 DB を共有する以上ここでも要る）
+    /// ②連続失敗の打ち切りを 10 件に固定（長時間の無人実行で系統的失敗を焼き続けないため）
+    /// ③排他フラグを取らない（Tauri ランタイムが無く、プロセスが別なのでそもそも効かない）。
     ///
     /// ```text
     /// LCIR_ALT_TEXT_DB=<live.db> LCIR_ALT_TEXT_APPDIR=<app data dir> \
@@ -213,7 +217,11 @@ mod tests {
                 }
             };
             let text = text.expect("text");
-            match crate::db::node_alt_texts::insert_alt_text(
+            // **本番と同じ「行き先の確認つき」で書く**（ゲート ②b の W2-4）。この経路は
+            // 稼働中のアプリと**実 DB を共有**して走る手動バッチなので、別インスタンスの
+            // build が新版を作れば行き先は普通に外れる。旧 `insert_alt_text` のままだと、
+            // 課金した説明を superseded 版へ書いてその版を GC 対象から外す。
+            match crate::db::node_alt_texts::insert_alt_text_if_version_is_latest(
                 &pool,
                 &crate::db::node_alt_texts::NewAltText {
                     node_id: t.node_id,
@@ -228,7 +236,7 @@ mod tests {
             )
             .await
             {
-                Ok(_) => {
+                Ok(true) => {
                     generated += 1;
                     consecutive_failures = 0;
                     eprintln!(
@@ -236,6 +244,17 @@ mod tests {
                         i + 1,
                         t.node_id,
                         text.chars().take(70).collect::<String>()
+                    );
+                }
+                // 行き先が最新でなくなっていた ＝ 書かずに捨てる（次回のランで新版から拾う）。
+                Ok(false) => {
+                    skipped += 1;
+                    consecutive_failures = 0;
+                    eprintln!(
+                        "[{}/{total}] stale (version {} is no longer latest) node={}",
+                        i + 1,
+                        t.document_version_id,
+                        t.node_id
                     );
                 }
                 Err(e) => {

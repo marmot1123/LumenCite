@@ -154,6 +154,12 @@ interface VisionAltTextResult {
   total: number;
   generated: number;
   skipped: number;
+  /**
+   * 実行中にその添付が再構築され、書き込む先の版が最新でなくなった図の数（②b の W2-4）。
+   * **`skipped`（説明できなかった）と混ぜない** — 次回の実行で新版の同じ図が対象に戻るので、
+   * 取りこぼしではなく先送り。
+   */
+  stale: number;
   failed: number;
   aborted: boolean;
   abort_reason: string | null;
@@ -1031,7 +1037,12 @@ function DataTab() {
             : r.abort_reason === "lcir_disabled"
               ? t("settings.data.altTextStoppedLcir")
               : t("settings.data.altTextAborted");
-        return { message: reason ? `${done} ${reason}` : done, error: null };
+        // **0 でないときだけ出す**（0 が普通なので、常時表示すると重要な値が埋もれる。
+        // GC の `gcSkipped` と同じ扱い）。「説明できなかった」と別の文にするのが要点で、
+        // 一緒の括弧に入れると `skipped` に混ぜたのと変わらない。
+        const stale =
+          r.stale > 0 ? ` ${t("settings.data.altTextStale", { stale: r.stale })}` : "";
+        return { message: `${done}${stale}${reason ? ` ${reason}` : ""}`, error: null };
       }
       case "tex_fetch": {
         const r = result as FetchArxivSourcesResult;
@@ -1178,6 +1189,19 @@ function DataTab() {
   const activeGcRunning = gcRunning || backendRunning.includes("gc");
   const activeAltTextRunning = altTextRunning || backendRunning.includes("vision_alt_text");
   const activeFetchTexRunning = fetchTexRunning || backendRunning.includes("tex_fetch");
+  /**
+   * **LCIR 系の長時間バッチはどれか 1 本しか走らない**（ゲート ②b の W1-6）。
+   *
+   * ボタンごとに条件を並べ直すと、1 つだけ抜けたときに誰も気づけない ── 実際
+   * 代替テキストのボタンだけ `anyLcirBatchRunning` と `activeFetchTexRunning` が抜けていて、
+   * **20 分の再構築の最中に課金バッチを始められた**。5 本すべてがこの 1 つを見る。
+   *
+   * ⚠ **これは表示であって裁定ではない。** 本当に止めるのはバックエンドの
+   * `begin_lcir_batch` / `vision_alt_text_is_blocked_by_a_build_batch` で、
+   * 代替テキストと TeX 取得は詳細パネルからも起動できる（この画面の disabled は届かない）。
+   */
+  const anyLcirJobRunning =
+    anyLcirBatchRunning || activeGcRunning || activeAltTextRunning || activeFetchTexRunning;
   // 進捗は「今届いたイベント」を優先し、無ければバックエンドのスナップショット。
   const backendProgress = batchStatus?.progress ?? {};
   const activeLcirProgress =
@@ -1577,7 +1601,7 @@ function DataTab() {
         <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
           <SecondaryBtn
             onClick={() => handleLcirBatch("build")}
-            disabled={!lcirEnabled || anyLcirBatchRunning || activeGcRunning}
+            disabled={!lcirEnabled || anyLcirJobRunning}
           >
             {activeLcirBatch === "build"
               ? activeLcirProgress
@@ -1590,7 +1614,7 @@ function DataTab() {
           </SecondaryBtn>
           <SecondaryBtn
             onClick={() => handleLcirBatch("rebuild")}
-            disabled={!lcirEnabled || anyLcirBatchRunning || activeGcRunning}
+            disabled={!lcirEnabled || anyLcirJobRunning}
           >
             {activeLcirBatch === "rebuild"
               ? activeLcirProgress
@@ -1607,13 +1631,7 @@ function DataTab() {
             // `disabled={!lcirEnabled}` で固まるので、LCIR を切ると「同意 ON のまま
             // 押せるボタン」だけが残る。バックエンドは AND で弾くので通信は起きないが、
             // 押しても何も起きないボタンになる。代替テキスト側と同型にする。
-            disabled={
-              !lcirEnabled ||
-              !texAutofetchEnabled ||
-              activeFetchTexRunning ||
-              anyLcirBatchRunning ||
-              activeGcRunning
-            }
+            disabled={!lcirEnabled || !texAutofetchEnabled || anyLcirJobRunning}
           >
             {activeFetchTexRunning
               ? activeTexProgress
@@ -1645,11 +1663,12 @@ function DataTab() {
         <div style={{ marginTop: 6 }}>
           <SecondaryBtn
             onClick={handleAltTextRequest}
+            // **`anyLcirJobRunning` を分解して並べ直さないこと**（ゲート ②b の W1-6）。
+            // ここだけ構築系と TeX 取得が抜けていて、再構築の最中に課金を始められた。
             disabled={
               !lcirEnabled ||
               !altTextEnabled ||
-              activeAltTextRunning ||
-              activeGcRunning ||
+              anyLcirJobRunning ||
               confirmAltText ||
               altTextChecking
             }
@@ -1681,7 +1700,11 @@ function DataTab() {
               </SecondaryBtn>
               <SecondaryBtn
                 onClick={() => void proceedAltTextIfCountMatches(altTextPending)}
-                disabled={altTextChecking || activeAltTextRunning}
+                // **同じ操作の 2 つ目の入口なので、同じ条件で閉じる。** 確認ボックスを
+                // 開いたまま隣の「再構築」を押せてしまうので、ここに `anyLcirJobRunning` が
+                // 無いと「確認を経た方だけが排他を素通りする」という逆立ちになる
+                // （件数の取り直しで同じ形を踏んだ ── ②b の PR-1b レビュー）。
+                disabled={altTextChecking || anyLcirJobRunning}
               >
                 {t("settings.data.altTextProceed")}
               </SecondaryBtn>
@@ -1696,14 +1719,7 @@ function DataTab() {
         <div style={{ marginTop: 6 }}>
           <SecondaryBtn
             onClick={handleRederiveFulltext}
-            disabled={
-              !lcirEnabled ||
-              busy !== null ||
-              anyLcirBatchRunning ||
-              activeFetchTexRunning ||
-              activeAltTextRunning ||
-              activeGcRunning
-            }
+            disabled={!lcirEnabled || busy !== null || anyLcirJobRunning}
           >
             {busy === "rederive_fulltext"
               ? t("settings.data.fulltextDeriveBusy")
@@ -1757,12 +1773,9 @@ function DataTab() {
             // 「145 件消します」と言って別の件数を消すことになる。
             onClick={handleGcRequest}
             disabled={
-              activeGcRunning ||
+              anyLcirJobRunning ||
               confirmGc ||
               busy !== null ||
-              anyLcirBatchRunning ||
-              activeFetchTexRunning ||
-              activeAltTextRunning ||
               // 未取得（null）のうちも押させない。押しても確認ボックスは
               // `confirmGc && storage` で出ないので、無反応のボタンになるため。
               !storage ||
@@ -1802,7 +1815,15 @@ function DataTab() {
             </div>
             <div style={{ display: "flex", gap: 6 }}>
               <SecondaryBtn onClick={() => setConfirmGc(false)}>{t("common.cancel")}</SecondaryBtn>
-              <SecondaryBtn onClick={handleGcConfirmed}>
+              <SecondaryBtn
+                onClick={handleGcConfirmed}
+                // **同じ操作の 2 つ目の入口なので、同じ条件で閉じる**（代替テキスト側の
+                // 「実行する」と同型）。ここが唯一 `disabled` を持たず、**非可逆な方**だった
+                // ── ボックスを開いたまま隣の「一括再構築」を押せるので、「3 版を消します」
+                // と表示したまま 138 添付ぶんの新版が積まれ、同意した数と桁の違う量を
+                // 消せた（PR-3 のレビュー指摘）。
+                disabled={anyLcirJobRunning}
+              >
                 {t("settings.data.gcProceed")}
               </SecondaryBtn>
             </div>

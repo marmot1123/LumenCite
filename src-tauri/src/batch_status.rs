@@ -19,10 +19,11 @@
 //!
 //! ## 実行中は**集合**であって 1 枠ではない
 //!
-//! 種別どうしは全部が排他ではない ── 例えば図の代替テキスト生成は
-//! `VISION_ALT_TEXT_RUNNING` しか見ないので、LCIR 一括構築と同時に走りうる
-//! （UI の `disabled` が止めているだけで、バックエンドは止めていない）。1 枠にすると
-//! **実際に走っている 2 本目が「走っていない」ことになる**ので集合で持つ。
+//! 種別どうしは全部が排他ではない。**LCIR 系の 6 種は v1.0.0 で互いに排他になった**
+//! （②b の W1-6。3 つの入口 `begin_lcir_batch` / `begin_vision_alt_text_batch` /
+//! `begin_tex_fetch_batch` が互いを見る）が、`ocr` はそれとは独立に走り、
+//! **排他の外にある build も残っている**（p2 の自動 build と、supersede しない 1 件 build）。
+//! 1 枠にすると**実際に走っている 2 本目が「走っていない」ことになる**ので集合で持つ。
 
 use serde::Serialize;
 use std::collections::BTreeMap;
