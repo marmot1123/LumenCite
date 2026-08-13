@@ -272,6 +272,14 @@ function isBuildBusy(e: any): boolean {
   return String(e?.message ?? e).includes("build_busy");
 }
 
+/** 他の LCIR バッチ（代替テキスト生成 / TeX 一括取得）が走っているので弾かれたか
+ *  （`already_running`）。**`build_busy` とは別物** ── あちらは「順番待ちで諦めた」で、
+ *  こちらは「作り替えると走行中の課金バッチの行き先が消えるので始めさせない」。
+ *  既存の版を作り替える build だけが受け取る（PR-3 のレビュー指摘）。 */
+function isBlockedByAnotherBatch(e: any): boolean {
+  return String(e?.message ?? e).includes("already_running");
+}
+
 export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore, onToggleStar, allCollections, onAddToCollection, onRemoveFromCollection, allTags, onAddTag, onRemoveTag, onAttachmentsChanged, onAttachmentAdded, onUpdateField, onSelectEntry, onSummarize, onOpenDetail, onAuthorEdited }: DetailPanelProps) {
   const { t } = useTranslation();
   const [tab, setTab] = useState<TabId>("info");
@@ -556,7 +564,9 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
         setIndexNote(
           isBuildBusy(e)
             ? t("detailPanel.lcirBuildBusy")
-            : t("detailPanel.lcirBuildFailed", { error: msg }),
+            : isBlockedByAnotherBatch(e)
+              ? t("detailPanel.lcirBuildBlocked")
+              : t("detailPanel.lcirBuildFailed", { error: msg }),
         );
       }
     } finally {
@@ -667,6 +677,8 @@ export function DetailPanel({ entry, width, inTrash, onEdit, onDelete, onRestore
           // （起動時バックフィルの対象クエリは gzip も拾うので、いずれ構築される）。
           if (isBuildBusy(e)) {
             setIndexNote(t("detailPanel.lcirBuildBusy"));
+          } else if (isBlockedByAnotherBatch(e)) {
+            setIndexNote(t("detailPanel.lcirBuildBlocked"));
           } else {
             setAttachError(t("detailPanel.texSourceBuildFailed", { error: e?.message ?? String(e) }));
           }

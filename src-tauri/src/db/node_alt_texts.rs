@@ -105,6 +105,15 @@ where
 /// 最新 completed しか読まないのでどの read 面にも出ず (b) `GC_TARGET_PREDICATE` の
 /// 「alt text を持つ版は消さない」に引っかかってその版を回収不能にする ──
 /// **読めない行が版 1 本を人質に取る**。同じ図は次回の実行で新版の側から拾える。
+///
+/// **版だけでなく crop の指紋も確かめる。** 版が変わらないまま画像だけ差し替わる経路が
+/// ある ── reuse 分岐の `heal_missing_assets` は欠けた crop を再レンダリングして
+/// `assets.sha256` を更新し、既存の `node_alt_texts.source_asset_sha256` も付け替える
+/// （`db::assets::refresh_asset_file`）。バッチが開始時に捕まえた指紋のまま書くと、
+/// **`assets.sha256 == node_alt_texts.source_asset_sha256` という不変量を新しい行が破る**。
+/// そうなった行は carry にも `prune_carried_alt_texts` にも当たらないので旧版に残り続け、
+/// W2-4 が消そうとした「読めない行が版を人質に取る」状態を素通りで作る。
+/// 指紋が変わっていたら説明の対象が別の絵なので、書かずに次回へ回すのが正しい。
 pub async fn insert_alt_text_if_version_is_latest<'e, E>(
     executor: E,
     a: &NewAltText<'_>,
@@ -125,6 +134,11 @@ where
                      WHERE dv.attachment_id = target.attachment_id
                        AND dv.extraction_status IN ('completed', 'completed_with_warnings')
                      ORDER BY dv.id DESC LIMIT 1)
+         )
+           AND EXISTS (
+             SELECT 1 FROM assets asset
+              WHERE asset.document_version_id = ?
+                AND asset.sha256 = ?
          )",
     )
     .bind(a.node_id)
@@ -136,6 +150,8 @@ where
     .bind(a.model)
     .bind(a.carried_from_version_id)
     .bind(a.document_version_id)
+    .bind(a.document_version_id)
+    .bind(a.source_asset_sha256)
     .execute(executor)
     .await?;
     Ok(res.rows_affected() > 0)
@@ -549,6 +565,81 @@ mod tests {
 
         assert!(wrote, "別の添付に新しい版があっても、自分の添付の最新なら通る");
         assert_eq!(alt_texts_for_version(&pool, vid).await.unwrap().len(), 1);
+    }
+
+    /// **版が動かなくても、crop の絵だけが差し替わることがある。** reuse 分岐の
+    /// `heal_missing_assets` が欠けた PNG を再レンダリングすると `assets.sha256` が変わる。
+    /// バッチが開始時に捕まえた古い指紋のまま書くと、`assets.sha256 ==
+    /// node_alt_texts.source_asset_sha256` の不変量を**新しい行が**破り、その行は carry にも
+    /// prune にも当たらず旧版に残って版を人質に取る（PR-3 のレビュー指摘）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_conditional_insert_writes_nothing_once_the_crop_has_been_re_rendered(
+        pool: SqlitePool,
+    ) {
+        let att = setup_attachment(&pool).await;
+        let vid = insert_pdf_version(&pool, att, "ck1").await;
+        let node = insert_figure_with_crop(&pool, vid, 0, "cropsha1").await;
+        // 版はそのままに、crop だけ別バイトへ差し替わった状態を作る。
+        sqlx::query("UPDATE assets SET sha256 = 'cropsha2' WHERE document_version_id = ?")
+            .bind(vid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let wrote = insert_alt_text_if_version_is_latest(
+            &pool,
+            &NewAltText {
+                node_id: node,
+                document_version_id: vid,
+                source_asset_sha256: "cropsha1",
+                text: "A pentagon graph.",
+                origin: Origin::LlmInference.as_str(),
+                confidence: Some(0.5),
+                model: None,
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!wrote, "指紋が変わった crop への説明は書かない（別の絵の説明になっている）");
+        assert_eq!(
+            alt_texts_for_version(&pool, vid).await.unwrap().len(),
+            0,
+            "1 行も書かない ── 中途半端に入れると不変量を破る"
+        );
+    }
+
+    /// 上の裏。**指紋が一致していれば、同じ版の別の図があっても素通しで通る**
+    /// （新しい conjunct が「自分の指紋」ではなく「何か 1 つでも asset があるか」に
+    /// なっていたら、この 2 本は両方通ってしまう ── 片方だけでは固定できない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_conditional_insert_matches_the_fingerprint_not_merely_the_presence_of_assets(
+        pool: SqlitePool,
+    ) {
+        let att = setup_attachment(&pool).await;
+        let vid = insert_pdf_version(&pool, att, "ck1").await;
+        let node = insert_figure_with_crop(&pool, vid, 0, "cropsha1").await;
+        // 同じ版にもう 1 枚 crop がある（指紋は別物）。
+        insert_figure_with_crop(&pool, vid, 1, "cropsha2").await;
+
+        let wrote = insert_alt_text_if_version_is_latest(
+            &pool,
+            &NewAltText {
+                node_id: node,
+                document_version_id: vid,
+                source_asset_sha256: "cropshaX",
+                text: "A pentagon graph.",
+                origin: Origin::LlmInference.as_str(),
+                confidence: Some(0.5),
+                model: None,
+                carried_from_version_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!wrote, "版に別の crop があっても、書こうとしている指紋が無ければ書かない");
     }
 
     /// UNIQUE (node_id, origin): 同一ノードへの生成 alt text は 1 件だけ（再課金の構造的防止）。

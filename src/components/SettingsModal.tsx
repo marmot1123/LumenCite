@@ -1815,7 +1815,15 @@ function DataTab() {
             </div>
             <div style={{ display: "flex", gap: 6 }}>
               <SecondaryBtn onClick={() => setConfirmGc(false)}>{t("common.cancel")}</SecondaryBtn>
-              <SecondaryBtn onClick={handleGcConfirmed}>
+              <SecondaryBtn
+                onClick={handleGcConfirmed}
+                // **同じ操作の 2 つ目の入口なので、同じ条件で閉じる**（代替テキスト側の
+                // 「実行する」と同型）。ここが唯一 `disabled` を持たず、**非可逆な方**だった
+                // ── ボックスを開いたまま隣の「一括再構築」を押せるので、「3 版を消します」
+                // と表示したまま 138 添付ぶんの新版が積まれ、同意した数と桁の違う量を
+                // 消せた（PR-3 のレビュー指摘）。
+                disabled={anyLcirJobRunning}
+              >
                 {t("settings.data.gcProceed")}
               </SecondaryBtn>
             </div>

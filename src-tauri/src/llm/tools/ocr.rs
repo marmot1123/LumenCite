@@ -890,11 +890,15 @@ mod tests {
         let _g = gate().await;
         let att = an_attachment(&pool).await;
         let (t, _calls) = fake(None);
-        let stop = || false;
+        // **1 ページ目に入る前に降りる。** こうするとループの `set_progress` が
+        // 開始報告を上書きしないので、**分母まで**そのまま観測できる ── `images(0)` で
+        // 見ていた頃は total が 0 で、`(0, planned)` を `(0, 0)` に変える変異が
+        // 素通りした（PR-3 のレビュー指摘。盲窓を消すのは分母であって 0 ではない）。
+        let stop = || true;
         let hooks = OcrHooks { should_stop: &stop, on_progress: &|_, _| {} };
 
         let mark = crate::batch_status::RunningMark::new(crate::batch_status::BatchKind::Ocr);
-        transcribe_and_save(&pool, att, images(0), false, &t, &hooks)
+        transcribe_and_save(&pool, att, images(3), false, &t, &hooks)
             .await
             .unwrap();
         let progress = crate::batch_status::snapshot().progress.get("ocr").copied();
@@ -902,8 +906,9 @@ mod tests {
 
         assert_eq!(
             progress,
-            Some(crate::batch_status::Progress { done: 0, total: 0 }),
-            "モーダルを開き直したフロントは、1 ページ目を待っている間もここを読む"
+            Some(crate::batch_status::Progress { done: 0, total: 3 }),
+            "モーダルを開き直したフロントは、1 ページ目を待っている間もここを読む \
+             ── そこに載るのは 0 ではなく**ページ数**"
         );
     }
 
