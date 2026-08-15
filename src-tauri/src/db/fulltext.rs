@@ -239,7 +239,11 @@ pub async fn index_attachment_from_pdf_extract(
         _ => None,
     };
     if let Some(source) = blocked {
-        // 譲る（tx は drop でロールバック）。
+        // 譲る。⚠ drop 任せの rollback は**非同期**で、同じ接続が pool から再利用されるまでに
+        // 実行される保証が無い（②c の裁定 PR で実測 ── `set_settings_atomic` のテストが接続の
+        // 引き当て次第で赤くなった）。ここは書き込み前なので漏れても RESERVED ロックが
+        // 一瞬残るだけだが、明示的に巻き戻して前提を仮定しない。
+        tx.rollback().await?;
         return Ok(PdfExtractWrite::SkippedProtected(source));
     }
 
@@ -257,6 +261,8 @@ pub async fn index_attachment_from_pdf_extract(
                 .fetch_one(&mut *tx)
                 .await?;
         if existing > 0 {
+            // 明示 rollback（理由は上の `SkippedProtected` と同じ）。
+            tx.rollback().await?;
             return Ok(PdfExtractWrite::SkippedEmptyExtract);
         }
         // 既存 0 行なら通す。ここで譲ると下の `DELETE FROM settings` が飛び、
@@ -326,6 +332,8 @@ pub async fn index_attachment_from_lcir(
         .await?;
     let recorded = current.as_deref().and_then(FulltextSource::parse);
     if recorded == Some(FulltextSource::Ocr) {
+        // 明示 rollback（理由は `index_attachment_from_pdf_extract` の `SkippedProtected` と同じ）。
+        tx.rollback().await?;
         return Ok(LcirWrite::SkippedOcr);
     }
 
@@ -337,6 +345,8 @@ pub async fn index_attachment_from_lcir(
             .await?;
     // 既存行はこの下の merge でどのみち読むので、守る判定の追加コストは 0。
     if protect_unrecorded && recorded.is_none() && !existing.is_empty() {
+        // 明示 rollback（理由は `index_attachment_from_pdf_extract` の `SkippedProtected` と同じ）。
+        tx.rollback().await?;
         return Ok(LcirWrite::SkippedUnrecorded);
     }
     let mut merged: Vec<(i64, String)> = pages.to_vec();

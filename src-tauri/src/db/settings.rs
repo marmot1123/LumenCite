@@ -30,6 +30,48 @@ pub async fn delete_setting(pool: &SqlitePool, key: &str) -> Result<(), sqlx::Er
     Ok(())
 }
 
+/// 複数キーの snapshot を **1 トランザクション**で upsert する（ゲート②c C-06）。
+///
+/// LLM 設定のように「組で意味を持つ」複数キーをキー単位の [`set_setting`] で順に書くと、
+/// 並行する保存同士が interleave したとき「UI で一度も選んでいない組み合わせ」
+/// （後勝ちの provider × 先勝ちの model など）が最終状態になりうる。1 tx なら
+/// 最終状態は必ずどちらか一方の snapshot 全体になる。
+///
+/// 書きのみでも `BEGIN IMMEDIATE` で始める（deferred の tx は読みから書きへ昇格する
+/// 瞬間に `SQLITE_BUSY_SNAPSHOT` で即死しうる ── `busy_timeout` の対象外。
+/// `db/fulltext.rs` の前例と同じ理由で、形を揃えておく）。
+pub async fn set_settings_atomic(
+    pool: &SqlitePool,
+    pairs: &[(&str, &str)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut failed: Option<sqlx::Error> = None;
+    for (key, value) in pairs {
+        let result = sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&mut *tx)
+        .await;
+        if let Err(e) = result {
+            failed = Some(e);
+            break;
+        }
+    }
+    match failed {
+        None => tx.commit().await,
+        Some(e) => {
+            // ⚠ drop 任せの rollback は**非同期**で、同じ接続が pool から再利用されるまでに
+            // 実行される保証が無い ── 実際に、未コミットの先行キーが後続の読みに見えた
+            // （テストが接続の引き当て次第で緑にも赤にもなった）。明示的に巻き戻す。
+            tx.rollback().await?;
+            Err(e)
+        }
+    }
+}
+
 /// BibTeX 同期先パスの設定キー。
 pub const BIBTEX_SYNC_PATH_KEY: &str = "bibtex_sync_path";
 
@@ -176,5 +218,36 @@ mod tests {
         delete_setting(&pool, "k1").await.unwrap();
         let v = get_setting(&pool, "k1").await.unwrap();
         assert_eq!(v, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_settings_atomic_upserts_all_keys(pool: SqlitePool) {
+        set_setting(&pool, "b", "old").await.unwrap();
+        set_settings_atomic(&pool, &[("a", "1"), ("b", "2"), ("c", "")]).await.unwrap();
+        assert_eq!(get_setting(&pool, "a").await.unwrap().as_deref(), Some("1"));
+        assert_eq!(get_setting(&pool, "b").await.unwrap().as_deref(), Some("2"), "既存キーは upsert");
+        assert_eq!(
+            get_setting(&pool, "c").await.unwrap().as_deref(),
+            Some(""),
+            "空文字も「設定されている空文字」として保存する（set_setting と同じ意味論）"
+        );
+    }
+
+    /// ゲート②c C-06 の核: 途中で失敗したら**先行キーも残らない**（all-or-nothing）。
+    /// tx を外してキー単位の upsert に戻す変異は、この失敗で先行キーが残るのでここで落ちる。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn set_settings_atomic_is_all_or_nothing(pool: SqlitePool) {
+        // 最後のキーだけ確実に失敗させる TRIGGER を仕込む。
+        sqlx::query(
+            "CREATE TRIGGER settings_boom BEFORE INSERT ON settings WHEN NEW.key = 'boom'
+             BEGIN SELECT RAISE(ABORT, 'boom'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let result = set_settings_atomic(&pool, &[("a", "1"), ("b", "2"), ("boom", "3")]).await;
+        assert!(result.is_err(), "仕込んだ失敗はエラーとして返る");
+        assert_eq!(get_setting(&pool, "a").await.unwrap(), None, "先行キーもロールバックされる");
+        assert_eq!(get_setting(&pool, "b").await.unwrap(), None, "先行キーもロールバックされる");
     }
 }

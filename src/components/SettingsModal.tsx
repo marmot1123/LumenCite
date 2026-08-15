@@ -381,6 +381,10 @@ function LlmTab() {
   const [testStatus, setTestStatus] = useState<"idle" | "testing" | "ok" | "error">("idle");
   const [testError, setTestError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  // ゲート②c C-06: auto-save の直列化用。in-flight 中の変更は最新 snapshot だけ保持する。
+  const llmSaveInFlight = useRef(false);
+  const llmSavePending = useRef<LlmSettings | null>(null);
 
   // 起動時: バックエンドから設定を読み込む
   useEffect(() => {
@@ -414,6 +418,31 @@ function LlmTab() {
     invoke<boolean>("has_api_key", { provider }).then(setHasKey).catch(() => setHasKey(false));
   }, [provider, loaded]);
 
+  // ゲート②c C-06: 溜まっている最新 snapshot を 1 本ずつ送る。実行中に届いた変更は
+  // `llmSavePending` に合流し、完了後にその最新だけを送る（古い snapshot が最後に着地して
+  // 選んだばかりの値を巻き戻さない）。backend 側の 1 tx 化は「キー混成の永続化」を防ぐ側で、
+  // 「どの snapshot が最終か」はこの直列化が決める。
+  const flushLlmSave = async () => {
+    if (llmSaveInFlight.current) return;
+    llmSaveInFlight.current = true;
+    try {
+      while (llmSavePending.current) {
+        const payload = llmSavePending.current;
+        llmSavePending.current = null;
+        try {
+          await invoke("save_llm_settings", { settings: payload });
+          setSaveError(false);
+        } catch (e) {
+          // console だけだと「保存されていない設定」に気づけないので画面にも出す。
+          console.error(e);
+          setSaveError(true);
+        }
+      }
+    } finally {
+      llmSaveInFlight.current = false;
+    }
+  };
+
   const persistSettings = (next: Partial<LlmSettings>) => {
     // 現在の state を基準に next で上書き。ocr_* を必ず含めて消えないようにする。
     const payload: LlmSettings = {
@@ -425,7 +454,8 @@ function LlmTab() {
       ocr_model: ocrModel || null,
       ...next,
     };
-    invoke("save_llm_settings", { settings: payload }).catch(console.error);
+    llmSavePending.current = payload;
+    void flushLlmSave();
   };
 
   const handleOcrProviderChange = (next: "" | LlmProvider) => {
@@ -500,6 +530,12 @@ function LlmTab() {
       <div style={{ fontSize: 12, color: "var(--text-mute)", marginBottom: 18, lineHeight: 1.55 }}>
         {t("settings.llm.description")}
       </div>
+
+      {saveError && (
+        <div style={{ fontSize: 11.5, color: "var(--danger-strong)", marginBottom: 12 }}>
+          {t("settings.llm.saveFailed")}
+        </div>
+      )}
 
       <Section title={t("settings.llm.provider")}>
         <Segmented<LlmProvider>

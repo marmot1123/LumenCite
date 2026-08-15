@@ -530,7 +530,8 @@ static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 
 /// tmp を宛先へ置き換える。Unix の rename は既存を原子的に上書きする。
 /// Windows は宛先がロック/存在で rename が失敗し得るため、宛先を消してから rename し直す。
-fn replace_file(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+/// `download.rs` の TeX ソース再取得（ゲート②c C-05）も同じ置き換えを使う。
+pub(crate) fn replace_file(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
     match std::fs::rename(tmp, dest) {
         Ok(()) => Ok(()),
         Err(e) => {

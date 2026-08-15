@@ -46,7 +46,7 @@ use tokio::sync::Notify;
 pub const GUI_LOCK_FILE: &str = "lumencite.gui.lock";
 
 /// [`acquire_gui_lock`] の結果。「取れなかった」を 2 つに割るのが要点で、
-/// **別インスタンスが居ると確認できた場合だけ**掃除系を止める。
+/// **別インスタンスが居ると確認できた場合だけ**第2インスタンスを終了させる（ゲート②c C-01）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuiLockState {
     /// このインスタンスがロックを握った。この app data dir で唯一の GUI。
@@ -55,8 +55,10 @@ enum GuiLockState {
     HeldByOther,
     /// ロック機構自体が使えない（ファイルを開けない・flock 非対応の FS 等）。
     /// 他インスタンスの有無は**判定できていない**ので、これを「別インスタンスあり」と
-    /// 同一視してはいけない。同一視すると、そういう環境では起動時 sweep が永久に
-    /// 走らなくなり、VACUUM 中間 DB が溜まり続ける（220 ファイル・95GB の実例あり）。
+    /// 同一視してはいけない。同一視すると、そういう環境では**起動そのものが永久に
+    /// できなくなる**（ゲート②c C-01 以降、「別インスタンスあり」= 終了のため。
+    /// C-01 より前も、同一視は起動時 sweep を永久に止めて VACUUM 中間 DB が
+    /// 溜まり続けた ── 220 ファイル・95GB の実例あり）。
     Unavailable,
 }
 
@@ -83,12 +85,12 @@ fn classify_lock_error(e: &std::io::Error) -> GuiLockState {
 
 /// GUI が起動中である印の advisory ロックを保持する。プロセスが生きている限り握り続ける
 /// よう、File をプロセス寿命の static に格納する。OS がプロセス終了時に自動解放するので
-/// stale ロックは残らない。2 個目のインスタンスでロックが取れなくても起動は妨げない。
+/// stale ロックは残らない。この関数は**状態を返すだけ**で自分から終了はしない ──
+/// 第2インスタンスを終了させる判断は `run()` の setup 冒頭が行う（ゲート②c C-01）。
 ///
 /// 戻り値でロックを取れたかがわかる（`pnpm tauri dev` の debug ビルドと配布版は
-/// identifier が同じで、同一の app data dir・実 DB・`backups/` を共有する）。起動時の
-/// 掃除のように「別インスタンスが今まさに書いているファイル」に触りうる処理は、
-/// [`GuiLockState::another_instance_is_live`] が `false` のときだけ走らせる。
+/// identifier が同じで、同一の app data dir・実 DB・`backups/` を共有するため、
+/// 片方が起動中ならもう片方は [`GuiLockState::HeldByOther`] になる）。
 fn acquire_gui_lock(data_dir: &std::path::Path) -> GuiLockState {
     use fs2::FileExt;
     static GUI_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
@@ -110,6 +112,51 @@ fn acquire_gui_lock(data_dir: &std::path::Path) -> GuiLockState {
     // ここまで来て set が失敗する経路は実際には無い。
     let _ = GUI_LOCK.set(file);
     GuiLockState::Acquired
+}
+
+/// 起動時のロック取得の再試行回数と間隔（合計 ≈ 3 秒）。relaunch（復元後の再起動・
+/// `pnpm tauri dev` の再ビルド）では旧プロセスがロックを解放する前に新プロセスが
+/// setup へ到達しうるので、その窓を「別インスタンスあり」と誤認して終了しないための猶予。
+const GUI_LOCK_RETRY_ATTEMPTS: u32 = 15;
+const GUI_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// [`acquire_gui_lock`] を `HeldByOther` の間だけ再試行する（ゲート②c C-01）。
+///
+/// `Acquired` / `Unavailable` は再試行しても変わらないので即返す。特に `Unavailable`
+/// （flock 非対応の FS 等）で待つと、そういう環境では毎回の起動が無意味に遅くなる。
+/// 再試行中に旧プロセスが終了すれば `Acquired` に変わる ── 変わらなければ本物の
+/// 別インスタンスが生きている。
+fn acquire_gui_lock_with_retry(
+    data_dir: &std::path::Path,
+    attempts: u32,
+    interval: Duration,
+) -> GuiLockState {
+    let mut state = acquire_gui_lock(data_dir);
+    for _ in 1..attempts {
+        if state != GuiLockState::HeldByOther {
+            return state;
+        }
+        std::thread::sleep(interval);
+        state = acquire_gui_lock(data_dir);
+    }
+    state
+}
+
+/// ゲート②c C-01: 第2インスタンスを終了させるときのダイアログ文言。
+/// 排他フラグ・batch_status・LCIR build ロックは全てプロセスローカルなので、同じ
+/// ライブラリを 2 つの GUI で開くと課金バッチ（OCR / Vision）や build / GC が同じ対象へ
+/// 二重に走りうる ── それを防ぐために後から起動した側を止める、という理由まで書く。
+fn second_instance_dialog_text() -> (&'static str, String) {
+    (
+        "LumenCite は既に起動しています / LumenCite is already running",
+        "同じライブラリを開いている LumenCite が既に起動しているため、こちらは終了します。\
+         既に開いているウィンドウをお使いください。2 つ同時に開くと、有料の処理（OCR や\
+         図の説明生成）が二重に実行されたり、データが壊れたりするおそれがあります。\n\n\
+         Another LumenCite window is already running on this library, so this one will close. \
+         Please use the existing window. Running two copies at once could run paid \
+         operations (OCR, figure descriptions) twice or corrupt your data."
+            .to_string(),
+    )
 }
 
 pub struct AppState {
@@ -1997,6 +2044,16 @@ async fn generate_vision_alt_texts(
                     use base64::Engine;
                     base64::engine::general_purpose::STANDARD.encode(&bytes)
                 };
+                // ゲート②c C-03: ループ冒頭の gate からここまでに throttle の 1 秒 sleep と
+                // crop 読みの await を挟んでいる。その間に同意 / LCIR を外す操作は実際に
+                // 踏めるので、課金する API 呼び出しの直前でもう一度読む（入口と同じ述語 ──
+                // どちらの面で止まったかの区別も保つ）。
+                if let Some(reason) =
+                    ingestion::vision_alt_text_gate(&state.db).await.abort_reason()
+                {
+                    abort_reason = Some(reason);
+                    break;
+                }
                 api_calls += 1;
                 match llm::ocr::describe_image(&provider, &model, &api_key, &target.mime_type, &b64)
                     .await
@@ -2422,6 +2479,14 @@ async fn fetch_missing_arxiv_sources(
         // 先頭以外はリクエスト前に 3 秒待つ（export.arxiv.org の慣行・バーストしない）。
         if i > 0 {
             tokio::time::sleep(Duration::from_secs(3)).await;
+            // ゲート②c C-03: 上の判定とダウンロードの間にこの 3 秒の await 窓があり、
+            // その間に設定で同意を外す操作は実際に踏める。外部送信の直前でもう一度読む
+            // （i == 0 は直前に読んだばかりなので窓が無い）。
+            if !ingestion::tex_autofetch_enabled(&state.db).await {
+                eprintln!("tex fetch: aborted at {i}/{total} (consent withdrawn during throttle)");
+                aborted = true;
+                break;
+            }
         }
         let id = metadata::normalize_arxiv_id(&arxiv_id);
         if id.is_empty() {
@@ -2575,19 +2640,29 @@ async fn get_llm_settings(state: State<'_, AppState>) -> Result<LlmSettings, Str
 
 #[tauri::command]
 async fn save_llm_settings(state: State<'_, AppState>, settings: LlmSettings) -> Result<(), String> {
-    db::settings::set_setting(&state.db, db::settings::LLM_PROVIDER_KEY, &settings.provider)
-        .await.map_err(|e| e.to_string())?;
-    db::settings::set_setting(&state.db, db::settings::LLM_MODEL_KEY, &settings.model)
-        .await.map_err(|e| e.to_string())?;
-    db::settings::set_setting(&state.db, db::settings::LLM_SUMMARY_SOURCE_KEY, &settings.summary_source)
-        .await.map_err(|e| e.to_string())?;
-    db::settings::set_setting(&state.db, db::settings::LLM_SUMMARY_PROMPT_KEY, &settings.summary_prompt)
-        .await.map_err(|e| e.to_string())?;
-    db::settings::set_setting(&state.db, db::settings::LLM_OCR_PROVIDER_KEY, settings.ocr_provider.as_deref().unwrap_or(""))
-        .await.map_err(|e| e.to_string())?;
-    db::settings::set_setting(&state.db, db::settings::LLM_OCR_MODEL_KEY, settings.ocr_model.as_deref().unwrap_or(""))
-        .await.map_err(|e| e.to_string())?;
-    Ok(())
+    // ゲート②c C-06: 6 キーは組で意味を持つので 1 tx で保存する。キー単位の upsert を
+    // 順に await すると、並行 auto-save の interleave で「UI で一度も選んでいない
+    // provider/model の混成」が永続化しうる（Tauri の async コマンドは invocation ごとに
+    // 並行に走る）。
+    db::settings::set_settings_atomic(
+        &state.db,
+        &[
+            (db::settings::LLM_PROVIDER_KEY, settings.provider.as_str()),
+            (db::settings::LLM_MODEL_KEY, settings.model.as_str()),
+            (db::settings::LLM_SUMMARY_SOURCE_KEY, settings.summary_source.as_str()),
+            (db::settings::LLM_SUMMARY_PROMPT_KEY, settings.summary_prompt.as_str()),
+            (
+                db::settings::LLM_OCR_PROVIDER_KEY,
+                settings.ocr_provider.as_deref().unwrap_or(""),
+            ),
+            (
+                db::settings::LLM_OCR_MODEL_KEY,
+                settings.ocr_model.as_deref().unwrap_or(""),
+            ),
+        ],
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// デフォルトのシステムプロンプトをフロントから取れるようにするユーティリティ。
@@ -4456,10 +4531,49 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
 
+            // ゲート②c C-01: 同一 app data dir の GUI は 1 プロセスに制限する。
+            // 排他フラグ（LCIR_BATCH_RUNNING / VISION_ALT_TEXT_RUNNING / TEX_FETCH_RUNNING /
+            // OCR_RUNNING）・LCIR_BUILD_LOCK・batch_status は全てプロセスローカルなので、
+            // 第2 GUI を許すと課金バッチや build / GC を同じ対象へ二重実行できてしまう。
+            // ロックは **pending restore の適用より前**に取る（C-02: 後だと、稼働中の
+            // 第1 GUI が pool を握ったまま、第2 GUI 由来の relaunch が live DB と
+            // attachments/ を pre-restore/ へ差し替える）。この終了に依存しているのは
+            // restore 適用・起動時 sweep・LCIR バックフィル・自動バックアップ・課金バッチ排他。
+            //
+            // このロックは GUI 生存フラグ（CR-011）を兼ねる: 保持している間は「GUI 起動中」で、
+            // CLI の直接書込経路がこれを見て live DB を壊さないよう判断する。
+            //
+            // `Unavailable`（flock 非対応の FS 等）は「別インスタンスあり」ではないので
+            // 従来どおり起動を続ける ── 終了させると、そういう環境では永久に起動できない。
+            let gui_lock = acquire_gui_lock_with_retry(
+                &data_dir,
+                GUI_LOCK_RETRY_ATTEMPTS,
+                GUI_LOCK_RETRY_INTERVAL,
+            );
+            if gui_lock.another_instance_is_live() {
+                eprintln!(
+                    "another LumenCite instance is live on this app data dir; exiting \
+                     (billing/build exclusivity is process-local)"
+                );
+                let (title, body) = second_instance_dialog_text();
+                // setup はメインスレッドで走るため rfd のネイティブモーダルをインラインで
+                // 表示できる（DB 初期化失敗ダイアログと同じ形）。
+                let _ = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title(title)
+                    .set_description(body)
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+                // 異常ではなく「2 個目は開かない」という仕様なので 0 で終了する。
+                std::process::exit(0);
+            }
+
             // CR-018: ステージ済みのバックアップ復元があれば、pool を開く前にここで適用する。
             // ライブ pool がファイルを握っていない起動時に差し替えることで、
-            // オープン中ファイルの置換問題（特に Windows）を避ける。失敗時は自動で
-            // 元の状態へ巻き戻し、旧 DB のまま起動を続ける（ユーザーにはダイアログで通知）。
+            // オープン中ファイルの置換問題（特に Windows）を避ける。上の GUI lock により
+            // このプロセスがこの app data dir で唯一の GUI であることは確定済み（C-02）。
+            // 失敗時は自動で元の状態へ巻き戻し、旧 DB のまま起動を続ける
+            // （ユーザーにはダイアログで通知）。
             match restore::apply_pending_restore(&data_dir) {
                 Ok(Some(info)) => {
                     eprintln!(
@@ -4480,18 +4594,6 @@ pub fn run() {
                         .set_buttons(rfd::MessageButtons::Ok)
                         .show();
                 }
-            }
-
-            // GUI 生存フラグ（CR-011）: このロックを保持している間は「GUI 起動中」。
-            // CLI の直接書込経路がこれを見て、MCP 委譲できないときに live DB を壊さないよう
-            // 判断する。try_lock なので 2 個目のインスタンスでも起動を妨げない。
-            // 取得可否は「掃除系を走らせてよいインスタンスか」の判定にも使う（debt-15）。
-            let gui_lock = acquire_gui_lock(&data_dir);
-            if gui_lock.another_instance_is_live() {
-                eprintln!(
-                    "GUI lock held by another LumenCite instance (same app data dir); \
-                     skipping startup sweeps"
-                );
             }
 
             // `busy_timeout` は v1.0.0-p2 で明示した（それまでは sqlx 既定の 5 秒）。
@@ -4544,7 +4646,6 @@ pub fn run() {
             // 失敗してもアプリ起動は止めず、log だけ残してリトライさせる（次回起動で再試行）。
             let fts_pool = pool.clone();
             let backfill_dir = data_dir.clone();
-            let another_instance_live = gui_lock.another_instance_is_live();
             // dev ビルドは既定オフ（バックアップと同型）。`pnpm tauri dev` は再ビルドのたびに
             // プロセスが再起動し、配布版と**同じ app data dir・同じ実 DB**を共有しているので、
             // その都度 pdfium 抽出と crop 書き出しが実データに走ると互いの crop を消し合う。
@@ -4603,19 +4704,16 @@ pub fn run() {
                 // 負けた側が eprintln 1 行で静かに降りる（「0 件処理」と正常が同じ見た目になる）。
                 // ここなら順序が固定される。
                 //
-                // ゲートは setup で 1 回だけ取った `gui_lock` の値（Copy）。
+                // 「別インスタンスが live なら skip」のゲートはここに**もう無い**。
+                // ゲート②c C-01 で第2インスタンスは setup 冒頭のダイアログ + exit(0) で
+                // 止まるため、ここへ到達するのはこの app data dir で唯一の GUI だけ。
                 // ⚠ ここで `acquire_gui_lock` を呼び直してはいけない ── OnceLock で再入不可なので
-                // 握っている当のインスタンスが自分を `HeldByOther` と誤認し、バックフィルが
-                // どのマシンでも永久に走らなくなる。`Unavailable` は「別インスタンスあり」ではない。
+                // 握っている当のインスタンスが自分を `HeldByOther` と誤認する。
                 if !backfill_enabled {
                     eprintln!(
                         "LCIR backfill: disabled in dev build \
                          (set LUMENCITE_LCIR_BACKFILL=1 to enable)"
                     );
-                    return;
-                }
-                if another_instance_live {
-                    eprintln!("LCIR backfill: skipped (another LumenCite instance is live)");
                     return;
                 }
                 tokio::time::sleep(ingestion::backfill::STARTUP_DELAY).await;
@@ -4721,17 +4819,11 @@ pub fn run() {
             // 回収する。中間 DB は DB と同サイズあり、途中終了のたびに溜まると
             // ディスクを食い潰す（実際に 220 ファイル・95GB 溜まった事例あり）。
             //
-            // 「前回の残骸」を消す処理なので、別インスタンスが生きていると確認できたときは
-            // 走らせない。2 個目のインスタンスは、相手が今まさに書いている作業ファイルを
-            // 残骸と誤認しうる（debt-15）。
-            //
-            // 飛ばしても取りこぼしは残らない。`sweep_trash` は削除操作のたびにも走る
-            // （このゲートの外側）。`sweep_backup_workdir` は起動時だけだが、
-            // (1) それ自体が 1 時間の mtime 猶予を持つので異常終了直後の作業ファイルは
-            // どのみち次の起動まで残る、(2) ロックを握っている相手が自分の起動時に
-            // 走らせている、(3) 2 個目になりやすい dev ビルドはそもそも自動バックアップが
-            // 既定オフ（下の `auto_backup_enabled`）で作業ファイルを作らない。
-            if !gui_lock.another_instance_is_live() {
+            // 「前回の残骸」を消す処理だが、「別インスタンスが live なら skip」のゲートは
+            // ここに**もう無い**（かつては相手が今まさに書いている作業ファイルを残骸と
+            // 誤認しうるため skip していた・debt-15）。ゲート②c C-01 で第2インスタンスは
+            // setup 冒頭で終了するため、ここへ到達するのはこの app data dir で唯一の GUI だけ。
+            {
                 let trash_dir = data_dir.clone();
                 std::thread::spawn(move || {
                     let n = attachment_trash::sweep_trash(&trash_dir);
@@ -5479,7 +5571,7 @@ mod gui_lock_tests {
 
         let state = acquire_gui_lock(&dir);
         assert_eq!(state, GuiLockState::HeldByOther, "先客がいれば HeldByOther");
-        assert!(state.another_instance_is_live(), "掃除系は止める");
+        assert!(state.another_instance_is_live(), "第2インスタンスは終了させる");
 
         fs2::FileExt::unlock(&holder).unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -5509,7 +5601,7 @@ mod gui_lock_tests {
     }
 
     /// ロックファイルを開けない（＝ロック機構が使えない）ときは「別インスタンスあり」と
-    /// 断定しない。断定すると起動時 sweep が永久に走らなくなる。
+    /// 断定しない。断定すると、そういう環境では起動そのものが永久にできなくなる（C-01）。
     #[test]
     fn unavailable_lock_does_not_claim_another_instance() {
         let dir = tmp_dir("unavailable").join("no-such-subdir");
@@ -5517,9 +5609,81 @@ mod gui_lock_tests {
         assert_eq!(state, GuiLockState::Unavailable, "開けなければ Unavailable");
         assert!(
             !state.another_instance_is_live(),
-            "判定不能を「別インスタンスあり」に丸めない（sweep は走らせる）"
+            "判定不能を「別インスタンスあり」に丸めない（起動を止めない）"
         );
         std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// relaunch（復元後の再起動・dev の再ビルド）では旧プロセスがロックを解放する前に
+    /// 新プロセスが起動しうる。その窓は再試行で吸収し、「別インスタンスあり」と誤認して
+    /// 終了しない（C-01 の再試行の存在理由）。
+    #[test]
+    fn retry_acquires_after_the_previous_process_releases() {
+        let dir = tmp_dir("retry-release");
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(GUI_LOCK_FILE))
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            fs2::FileExt::unlock(&holder).unwrap();
+        });
+        // 150ms 後に解放されるので、50ms × 20 回の再試行予算内で必ず取れる。
+        let state = acquire_gui_lock_with_retry(&dir, 20, Duration::from_millis(50));
+        assert_eq!(state, GuiLockState::Acquired, "旧プロセスの解放後に取得へ変わる");
+        releaser.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 本物の別インスタンス（握りっぱなし）は再試行し切っても HeldByOther のまま。
+    #[test]
+    fn retry_gives_up_when_the_holder_stays() {
+        let dir = tmp_dir("retry-hold");
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(GUI_LOCK_FILE))
+            .unwrap();
+        holder.try_lock_exclusive().unwrap();
+
+        let state = acquire_gui_lock_with_retry(&dir, 3, Duration::from_millis(10));
+        assert_eq!(state, GuiLockState::HeldByOther, "握りっぱなしなら諦める");
+
+        fs2::FileExt::unlock(&holder).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Unavailable` は再試行しても変わらないので即返す。flock 非対応 FS で毎回の起動が
+    /// 再試行予算ぶん遅くなってはいけない。
+    #[test]
+    fn retry_returns_unavailable_immediately() {
+        let dir = tmp_dir("retry-unavailable").join("no-such-subdir");
+        let started = std::time::Instant::now();
+        let state = acquire_gui_lock_with_retry(&dir, 100, Duration::from_millis(250));
+        assert_eq!(state, GuiLockState::Unavailable);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "再試行せず即返る（100 回 × 250ms を待っていたらここで落ちる）"
+        );
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// 第2インスタンスに出すダイアログは日英併記で、止める理由（課金の二重実行・
+    /// データ破壊のおそれ）まで説明する。
+    #[test]
+    fn second_instance_dialog_text_is_bilingual() {
+        let (title, body) = second_instance_dialog_text();
+        assert!(title.contains("LumenCite"));
+        assert!(body.contains("既に起動"), "日本語の説明を含む");
+        assert!(body.contains("already running"), "英語の説明を含む");
+        assert!(
+            body.contains("二重") && body.contains("twice"),
+            "二重実行の実害を日英で示す"
+        );
     }
 }
 

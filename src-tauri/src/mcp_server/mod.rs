@@ -998,6 +998,14 @@ fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
         {
             Ok(att) => {
                 eprintln!("clipper: attached {} to entry {}", att.file_name, job.entry_id);
+                // ゲート②c C-04: 添付は**この時点で** DB 行・実ファイルとも完成している。
+                // 一覧の添付バッジ（`has_attachment`）の材料はここで揃うので、下の取り込み
+                // （全文索引 → LCIR build・大きい PDF では数分〜、build lock 待ちで無制限に
+                // 延びうる）を待たずに先に発火する。完了後の再発火も残す（リスナーは一覧を
+                // 読み直すだけで冪等）。
+                if let Some(app) = &app {
+                    let _ = app.emit("entries-changed", ());
+                }
                 // 添付後に取り込む（索引 → LCIR build・クリッパー経路も自動・CR-027 / v1.0.0-p2）。
                 // 既にこの spawn の中で await しているので、新しいタスクは増えない。
                 let abs = app_data_dir
@@ -1036,52 +1044,85 @@ fn spawn_pdf_job(deps: &ServerDeps, job: clipper::PdfJob) {
 ///
 /// ジョブは e-print 自動取得が有効なときだけ発行される（`clipper::derive_tex_source_job` が
 /// `ingestion::tex_autofetch_enabled` = 同意あり かつ LCIR ON を判定・v1.0.0-p3）。
-/// 失敗はログのみでクリップ自体は成功扱い（PDF ジョブと同じ契約）。ビルドは内部でも
-/// フラグを再確認するので、発行後に OFF へ切り替わっても DB には書かない。
+/// 発行と実行の間には window があるので、**外部ダウンロードの直前に同じ述語を読み直す**
+/// （ゲート②c C-03。かつてここのコメントは「ビルドは内部でもフラグを再確認する」と
+/// 書いていたが、build が再確認するのは `lcir.enabled` だけで同意は見ない ── 同意は
+/// 外部取得のゲートであって、取得済みファイルのローカル build には掛けない。手動で
+/// 添付した TeX が同意なしで build されるのと同じ扱い）。
+/// 失敗はログのみでクリップ自体は成功扱い（PDF ジョブと同じ契約）。
 fn spawn_tex_source_job(deps: &ServerDeps, job: clipper::TexSourceJob) {
     let pool = deps.pool.clone();
     let app_data_dir = deps.app_data_dir.clone();
     let app = deps.app.clone();
     tauri::async_runtime::spawn(async move {
-        use tauri::Emitter;
         let url = format!("https://arxiv.org/e-print/{}", job.arxiv_id);
-        match crate::download::download_and_attach_arxiv_source(
+        run_tex_source_job(
             &pool,
             &app_data_dir,
-            job.entry_id,
-            &job.arxiv_id,
+            app.as_ref(),
+            job,
             &url,
             crate::download::DownloadCaps::default(),
         )
-        .await
-        {
-            Ok(att) => {
-                eprintln!(
-                    "clipper: attached TeX source {} to entry {}",
-                    att.file_name, job.entry_id
-                );
-                match crate::ingestion::build_lcir_for_attachment(&pool, &app_data_dir, att.id)
-                    .await
-                {
-                    Ok(r) => {
-                        eprintln!("clipper: LCIR build for attachment {}: {}", att.id, r.message)
-                    }
-                    Err(e) => {
-                        eprintln!("clipper: LCIR build failed for attachment {}: {e}", att.id)
-                    }
+        .await;
+    });
+}
+
+/// [`spawn_tex_source_job`] の本体。URL / caps を注入で受けるのは、テストがローカル
+/// fixture サーバーを指せるようにするため（C-03 の再確認の配線を変異から守る）。
+async fn run_tex_source_job(
+    pool: &SqlitePool,
+    app_data_dir: &Path,
+    app: Option<&tauri::AppHandle>,
+    job: clipper::TexSourceJob,
+    url: &str,
+    caps: crate::download::DownloadCaps,
+) {
+    use tauri::Emitter;
+    // ゲート②c C-03: 発行（`derive_tex_source_job`）とここの間には spawn を挟んだ
+    // window があり、その間に設定で同意を外す操作は実際に踏める。外部送信の直前に
+    // 取得 4 経路と同じ唯一の決定点を読み直す。
+    if !crate::ingestion::tex_autofetch_enabled(pool).await {
+        eprintln!(
+            "clipper: TeX source job for entry {} skipped (consent withdrawn after issue)",
+            job.entry_id
+        );
+        return;
+    }
+    match crate::download::download_and_attach_arxiv_source(
+        pool,
+        app_data_dir,
+        job.entry_id,
+        &job.arxiv_id,
+        url,
+        caps,
+    )
+    .await
+    {
+        Ok(att) => {
+            eprintln!(
+                "clipper: attached TeX source {} to entry {}",
+                att.file_name, job.entry_id
+            );
+            match crate::ingestion::build_lcir_for_attachment(pool, app_data_dir, att.id).await {
+                Ok(r) => {
+                    eprintln!("clipper: LCIR build for attachment {}: {}", att.id, r.message)
                 }
-                if let Some(app) = &app {
-                    let _ = app.emit("entries-changed", ());
+                Err(e) => {
+                    eprintln!("clipper: LCIR build failed for attachment {}: {e}", att.id)
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "clipper: TeX source download failed for entry {}: {e}",
-                    job.entry_id
-                );
+            if let Some(app) = app {
+                let _ = app.emit("entries-changed", ());
             }
         }
-    });
+        Err(e) => {
+            eprintln!(
+                "clipper: TeX source download failed for entry {}: {e}",
+                job.entry_id
+            );
+        }
+    }
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
@@ -1161,6 +1202,111 @@ mod tests {
             h.field.equiv("Access-Control-Allow-Origin")
                 && h.value.as_str() == "chrome-extension://abcdef"
         }));
+    }
+
+    // ── クリッパー TeX job の同意再確認（ゲート②c C-03） ─────────────────────
+
+    /// gzip された最小の TeX ソースを 1 リクエストだけ返すローカル fixture サーバー。
+    fn serve_tex_once() -> String {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"\\documentclass{article}\\begin{document}x\\end{document}")
+            .unwrap();
+        let body = enc.finish().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                let _ = req.respond(tiny_http::Response::from_data(body));
+            }
+        });
+        format!("http://127.0.0.1:{port}/e-print/2301.00001")
+    }
+
+    async fn make_entry_for_tex(pool: &SqlitePool) -> i64 {
+        crate::db::entries::create_entry(
+            pool,
+            &crate::models::EntryInput {
+                title: "Paper".to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn attachment_count(pool: &SqlitePool, entry_id: i64) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attachments WHERE entry_id = ?")
+            .bind(entry_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// 発行時 ON → 実行前に同意だけ OFF へ切り替えた job は、外部 fetch も添付もしない。
+    /// 発行時にしか同意を見ない旧実装ではここで添付が作られる（C-03 の再確認を固定する）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tex_source_job_rechecks_consent_before_download(pool: SqlitePool) {
+        use crate::db::settings::{set_setting, LCIR_ENABLED_KEY, LCIR_TEX_AUTOFETCH_ENABLED_KEY};
+        let entry_id = make_entry_for_tex(&pool).await;
+        set_setting(&pool, LCIR_ENABLED_KEY, "1").await.unwrap();
+        set_setting(&pool, LCIR_TEX_AUTOFETCH_ENABLED_KEY, "0").await.unwrap();
+        let url = serve_tex_once();
+        let dir = std::env::temp_dir().join(format!(
+            "lc-texjob-off-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        run_tex_source_job(
+            &pool,
+            &dir,
+            None,
+            clipper::TexSourceJob { entry_id, arxiv_id: "2301.00001".to_string() },
+            &url,
+            crate::download::DownloadCaps { allow_private_hosts: true, ..Default::default() },
+        )
+        .await;
+        assert_eq!(
+            attachment_count(&pool, entry_id).await,
+            0,
+            "同意 OFF の job はダウンロード前に降りる（添付を作らない）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 同意が ON のままなら job は従来どおり取得して添付する
+    /// （再確認が誤って全 job を止めていないことの対照）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn tex_source_job_downloads_when_consent_stays_on(pool: SqlitePool) {
+        use crate::db::settings::{set_setting, LCIR_ENABLED_KEY, LCIR_TEX_AUTOFETCH_ENABLED_KEY};
+        let entry_id = make_entry_for_tex(&pool).await;
+        set_setting(&pool, LCIR_ENABLED_KEY, "1").await.unwrap();
+        set_setting(&pool, LCIR_TEX_AUTOFETCH_ENABLED_KEY, "1").await.unwrap();
+        let url = serve_tex_once();
+        let dir = std::env::temp_dir().join(format!(
+            "lc-texjob-on-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        run_tex_source_job(
+            &pool,
+            &dir,
+            None,
+            clipper::TexSourceJob { entry_id, arxiv_id: "2301.00001".to_string() },
+            &url,
+            crate::download::DownloadCaps { allow_private_hosts: true, ..Default::default() },
+        )
+        .await;
+        assert_eq!(
+            attachment_count(&pool, entry_id).await,
+            1,
+            "同意 ON なら従来どおり添付される"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[sqlx::test(migrations = "./migrations")]
