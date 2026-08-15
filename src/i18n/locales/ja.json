@@ -846,7 +846,8 @@
       "ocrTitle": "OCR モデル",
       "ocrDesc": "スキャン PDF の OCR に使う Vision モデル。未指定なら上のチャット用プロバイダ/モデルを使います。",
       "ocrFollow": "チャットと同じ",
-      "ocrModelPlaceholder": "モデル ID（例: gpt-4o）"
+      "ocrModelPlaceholder": "モデル ID（例: gpt-4o）",
+      "saveFailed": "設定の保存に失敗しました。直近の変更が反映されていない可能性があります（もう一度選び直すと再保存されます）。"
     },
     "bibtex": {
       "title": "BibTeX 自動同期",

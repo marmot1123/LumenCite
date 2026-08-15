@@ -13,6 +13,10 @@
 //!    現行 `lumencite.db`（＋ `-wal`/`-shm`）と `attachments/` を `<app_dir>/pre-restore/`
 //!    へ退避し、staged の内容を所定位置へ移す。途中失敗時は退避物から巻き戻す。
 //!    pool を開く前に実行するので、オープン中ファイル置換の問題を避けられる。
+//!    「pool を開く前」が**同一 data dir の別 GUI プロセス**にも成り立つのは、setup が
+//!    apply より先に GUI lock を取り、別インスタンスが live なら起動ごと止めるから
+//!    （ゲート②c C-02。順序が逆だと、稼働中の第1 GUI が pool を握ったまま live 一式を
+//!    差し替えてしまう）。
 //!
 //! `RESTORE_LOCK` で staging を直列化する。zip-slip（`..` やアーカイブ外への書き出し）も防ぐ。
 

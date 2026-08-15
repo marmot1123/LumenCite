@@ -96,7 +96,10 @@ pub async fn delete_attachment_with_fulltext(
         .await?
         .rows_affected();
     if rows == 0 {
-        // tx は drop でロールバックされる（fulltext 削除も巻き戻る）。
+        // ⚠ drop 任せの rollback は**非同期**で、同じ接続が pool から再利用されるまでに
+        // 実行される保証が無い（②c 裁定 PR で実測）。ここは fulltext の削除を書いた後
+        // なので、明示的に巻き戻す（fulltext 削除も巻き戻る）。
+        tx.rollback().await?;
         return Err(sqlx::Error::RowNotFound);
     }
     tx.commit().await?;

@@ -366,6 +366,13 @@ function AppearanceTab() {
   );
 }
 
+// ゲート②c C-06: auto-save の直列化状態。**module スコープ**に置く ── コンポーネント内の
+// useRef だと LlmTab の unmount/remount（タブ切替・モーダル開閉）で状態が初期化され、
+// 旧インスタンスの in-flight 保存と新インスタンスの保存が並行して後勝ち不定になる
+// （裁定 PR レビューの指摘。`lastShownBatchFinishedAt` と同じ理由の配置）。
+let llmSaveInFlight = false;
+let llmSavePending: LlmSettings | null = null;
+
 function LlmTab() {
   const { t } = useTranslation();
   const [provider, setProvider] = useState<LlmProvider>("openai");
@@ -381,6 +388,7 @@ function LlmTab() {
   const [testStatus, setTestStatus] = useState<"idle" | "testing" | "ok" | "error">("idle");
   const [testError, setTestError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [saveError, setSaveError] = useState(false);
 
   // 起動時: バックエンドから設定を読み込む
   useEffect(() => {
@@ -414,6 +422,32 @@ function LlmTab() {
     invoke<boolean>("has_api_key", { provider }).then(setHasKey).catch(() => setHasKey(false));
   }, [provider, loaded]);
 
+  // ゲート②c C-06: 溜まっている最新 snapshot を 1 本ずつ送る。実行中に届いた変更は
+  // `llmSavePending` に合流し、完了後にその最新だけを送る（古い snapshot が最後に着地して
+  // 選んだばかりの値を巻き戻さない）。backend 側の 1 tx 化は「キー混成の永続化」を防ぐ側で、
+  // 「どの snapshot が最終か」はこの直列化が決める。
+  const flushLlmSave = async () => {
+    if (llmSaveInFlight) return;
+    llmSaveInFlight = true;
+    try {
+      while (llmSavePending) {
+        const payload = llmSavePending;
+        llmSavePending = null;
+        try {
+          await invoke("save_llm_settings", { settings: payload });
+          setSaveError(false);
+        } catch (e) {
+          // console だけだと「保存されていない設定」に気づけないので画面にも出す
+          // （アンマウント後に失敗した場合は表示できない ── 既知の残る限界・§2.24）。
+          console.error(e);
+          setSaveError(true);
+        }
+      }
+    } finally {
+      llmSaveInFlight = false;
+    }
+  };
+
   const persistSettings = (next: Partial<LlmSettings>) => {
     // 現在の state を基準に next で上書き。ocr_* を必ず含めて消えないようにする。
     const payload: LlmSettings = {
@@ -425,7 +459,8 @@ function LlmTab() {
       ocr_model: ocrModel || null,
       ...next,
     };
-    invoke("save_llm_settings", { settings: payload }).catch(console.error);
+    llmSavePending = payload;
+    void flushLlmSave();
   };
 
   const handleOcrProviderChange = (next: "" | LlmProvider) => {
@@ -500,6 +535,12 @@ function LlmTab() {
       <div style={{ fontSize: 12, color: "var(--text-mute)", marginBottom: 18, lineHeight: 1.55 }}>
         {t("settings.llm.description")}
       </div>
+
+      {saveError && (
+        <div style={{ fontSize: 11.5, color: "var(--danger-strong)", marginBottom: 12 }}>
+          {t("settings.llm.saveFailed")}
+        </div>
+      )}
 
       <Section title={t("settings.llm.provider")}>
         <Segmented<LlmProvider>

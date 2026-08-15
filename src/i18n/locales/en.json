@@ -846,7 +846,8 @@
       "ocrTitle": "OCR model",
       "ocrDesc": "Vision model used to OCR scanned PDFs. Defaults to the chat provider/model above.",
       "ocrFollow": "Same as chat",
-      "ocrModelPlaceholder": "Model id (e.g. gpt-4o)"
+      "ocrModelPlaceholder": "Model id (e.g. gpt-4o)",
+      "saveFailed": "Saving these settings failed; your latest change may not have been stored (pick it again to retry)."
     },
     "bibtex": {
       "title": "BibTeX auto sync",

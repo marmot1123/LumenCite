@@ -260,7 +260,11 @@ pub async fn download_and_attach_arxiv_source(
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&abs, &bytes).map_err(|e| e.to_string())?;
+        // ゲート②c C-05: 既存パスへの `std::fs::write` は open 時に旧内容を truncate する
+        // ため、容量不足・I/O エラー・強制終了が write の途中に当たると、直前まで読めて
+        // いた旧ソースまで失う（DB 行は旧のまま・ファイルだけ空/途中）。tmp へ書き切って
+        // から rename で置き換え、成功するまで旧ファイルを無傷で残す。
+        overwrite_atomically(&abs, &bytes)?;
         return crate::db::attachments::get_attachment(pool, att_id)
             .await
             .map_err(|e| e.to_string());
@@ -304,6 +308,38 @@ pub async fn download_and_attach_arxiv_source(
             Err(e.to_string())
         }
     }
+}
+
+/// 既存ファイルを原子的に置き換える（ゲート②c C-05）。同一ディレクトリに一意な tmp を
+/// 排他 create で作って書き切り、`sync_all` してから rename で置き換える。途中で失敗しても
+/// 宛先の旧内容は無傷で残る。tmp は失敗時に best-effort で消す。プロセス強制終了で残った
+/// 場合も、`.tmp` はバックアップが transient 扱いにするので欠損警報を鳴らさず、tmp 名は
+/// pid + カウンタで一意なので次の置き換えと衝突しない（`bibtex::sync_bibtex` と同じ形）。
+fn overwrite_atomically(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| "destination has no file name".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dest.with_file_name(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        crate::bibtex::replace_file(&tmp, dest)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
 }
 
 /// PDF を `<app_data_dir>/attachments/<entry_id>/` に保存して DB に登録する。
@@ -720,6 +756,62 @@ mod tests {
         let mut body = String::new();
         std::io::Read::read_to_string(&mut dec, &mut body).unwrap();
         assert_eq!(body, "v2 content revised");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 再取得は既存ファイルを **open して書く（truncate する）のではなく** tmp + rename で
+    /// 置き換える（ゲート②c C-05）。宛先を読み取り専用にすると、直接 open する実装は
+    /// ここで失敗する ── rename は宛先のパーミッションに依らず置き換えるので成功する。
+    /// 併せて、成功後に tmp が残っていないことも確認する。
+    #[cfg(unix)]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn arxiv_source_refetch_does_not_open_the_existing_file(pool: SqlitePool) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let entry_id = make_entry(&pool).await;
+        let dir = temp_app_dir("texsrc-atomic");
+        let gz = |body: &[u8]| {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(body).unwrap();
+            enc.finish().unwrap()
+        };
+
+        let url1 = serve_once(gz(b"v1 content"));
+        let first = download_and_attach_arxiv_source(
+            &pool, &dir, entry_id, "2301.00001", &url1, test_caps(),
+        )
+        .await
+        .unwrap();
+
+        // 旧ファイルを読み取り専用にする。直接 open + truncate なら EACCES で失敗し、
+        // （失敗の仕方によっては）旧内容も失われる。
+        let stored = dir.join("attachments").join(entry_id.to_string()).join(&first.file_name);
+        std::fs::set_permissions(&stored, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let url2 = serve_once(gz(b"v2 content revised"));
+        let second = download_and_attach_arxiv_source(
+            &pool, &dir, entry_id, "2301.00001", &url2, test_caps(),
+        )
+        .await
+        .expect("tmp + rename の置き換えは宛先のパーミッションに依らず成功する");
+        assert_eq!(first.id, second.id);
+
+        let mut dec = flate2::read::GzDecoder::new(std::fs::File::open(&stored).unwrap());
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut dec, &mut body).unwrap();
+        assert_eq!(body, "v2 content revised");
+
+        // 成功後に tmp の残骸が無い。
+        let leftovers: Vec<_> = std::fs::read_dir(stored.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "成功後に .tmp が残らない: {leftovers:?}");
 
         std::fs::remove_dir_all(&dir).ok();
     }
