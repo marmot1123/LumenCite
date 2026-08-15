@@ -529,15 +529,40 @@ static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// tmp を宛先へ置き換える。Unix の rename は既存を原子的に上書きする。
-/// Windows は宛先がロック/存在で rename が失敗し得るため、宛先を消してから rename し直す。
+/// Windows は宛先がロック/存在で rename が失敗し得るため、**宛先を一意な退避名へ rename
+/// してから** rename し直し、失敗したら退避を戻す。
+///
+/// ⚠ 以前は「宛先を remove してから rename」だったが、AV 等が tmp を掴んで 2 回目の
+/// rename まで失敗すると**旧・新の両方を失った**（.bib は再生成できるので許容されていたが、
+/// ②c C-05 で TeX ソース添付にも使うようになり許容できない）。退避方式なら失敗時も
+/// 旧内容が必ずどちらかのパスに残る（退避→rename の間の強制終了だけは宛先が一時的に
+/// 欠けるが、旧内容は退避名のファイルとして残り、再取得で宛先は復元される）。
 /// `download.rs` の TeX ソース再取得（ゲート②c C-05）も同じ置き換えを使う。
 pub(crate) fn replace_file(tmp: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
     match std::fs::rename(tmp, dest) {
         Ok(()) => Ok(()),
         Err(e) => {
             if cfg!(windows) && dest.exists() {
-                std::fs::remove_file(dest)?;
-                std::fs::rename(tmp, dest)
+                let name = dest
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let aside =
+                    dest.with_file_name(format!(".{name}.old.{}.{seq}.tmp", std::process::id()));
+                // 退避に失敗したら宛先は無傷のまま Err を返す。
+                std::fs::rename(dest, &aside)?;
+                match std::fs::rename(tmp, dest) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&aside);
+                        Ok(())
+                    }
+                    Err(e2) => {
+                        // 旧内容を戻す（戻しに失敗しても退避名のファイルとして残る）。
+                        let _ = std::fs::rename(&aside, dest);
+                        Err(e2)
+                    }
+                }
             } else {
                 Err(e)
             }

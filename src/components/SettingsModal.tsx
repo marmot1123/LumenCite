@@ -366,6 +366,13 @@ function AppearanceTab() {
   );
 }
 
+// ゲート②c C-06: auto-save の直列化状態。**module スコープ**に置く ── コンポーネント内の
+// useRef だと LlmTab の unmount/remount（タブ切替・モーダル開閉）で状態が初期化され、
+// 旧インスタンスの in-flight 保存と新インスタンスの保存が並行して後勝ち不定になる
+// （裁定 PR レビューの指摘。`lastShownBatchFinishedAt` と同じ理由の配置）。
+let llmSaveInFlight = false;
+let llmSavePending: LlmSettings | null = null;
+
 function LlmTab() {
   const { t } = useTranslation();
   const [provider, setProvider] = useState<LlmProvider>("openai");
@@ -382,9 +389,6 @@ function LlmTab() {
   const [testError, setTestError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [saveError, setSaveError] = useState(false);
-  // ゲート②c C-06: auto-save の直列化用。in-flight 中の変更は最新 snapshot だけ保持する。
-  const llmSaveInFlight = useRef(false);
-  const llmSavePending = useRef<LlmSettings | null>(null);
 
   // 起動時: バックエンドから設定を読み込む
   useEffect(() => {
@@ -423,23 +427,24 @@ function LlmTab() {
   // 選んだばかりの値を巻き戻さない）。backend 側の 1 tx 化は「キー混成の永続化」を防ぐ側で、
   // 「どの snapshot が最終か」はこの直列化が決める。
   const flushLlmSave = async () => {
-    if (llmSaveInFlight.current) return;
-    llmSaveInFlight.current = true;
+    if (llmSaveInFlight) return;
+    llmSaveInFlight = true;
     try {
-      while (llmSavePending.current) {
-        const payload = llmSavePending.current;
-        llmSavePending.current = null;
+      while (llmSavePending) {
+        const payload = llmSavePending;
+        llmSavePending = null;
         try {
           await invoke("save_llm_settings", { settings: payload });
           setSaveError(false);
         } catch (e) {
-          // console だけだと「保存されていない設定」に気づけないので画面にも出す。
+          // console だけだと「保存されていない設定」に気づけないので画面にも出す
+          // （アンマウント後に失敗した場合は表示できない ── 既知の残る限界・§2.24）。
           console.error(e);
           setSaveError(true);
         }
       }
     } finally {
-      llmSaveInFlight.current = false;
+      llmSaveInFlight = false;
     }
   };
 
@@ -454,7 +459,7 @@ function LlmTab() {
       ocr_model: ocrModel || null,
       ...next,
     };
-    llmSavePending.current = payload;
+    llmSavePending = payload;
     void flushLlmSave();
   };
 

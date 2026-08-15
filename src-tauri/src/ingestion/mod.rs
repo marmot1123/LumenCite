@@ -711,10 +711,13 @@ async fn heal_missing_assets(
 /// 旧 content_key ディレクトリを「前回の残骸」とみなすまでの猶予（debt-15）。
 ///
 /// `pnpm tauri dev` の debug ビルドと配布版は identifier が同じで、同一の app data dir と
-/// 実 DB を共有する。GUI ロックは `try_lock` なので 2 個目の起動も止まらない。抽出器版の
-/// 違う 2 つのインスタンスが同じ添付を build すると、猶予が無ければ互いの crop PNG を
-/// trash へ送り合う定常ループになる（8c の alt text は crop の sha256 で carry するので、
+/// 実 DB を共有する。ゲート②c C-01 以降、同一 app data dir の第2インスタンスは起動時に
+/// 終了するので、2 つが並走できるのは **GUI ロックが使えない環境（flock 非対応 FS =
+/// `GuiLockState::Unavailable`）だけ**になった。その残余経路では、抽出器版の違う 2 つの
+/// インスタンスが同じ添付を build すると、猶予が無ければ互いの crop PNG を trash へ
+/// 送り合う定常ループになる（8c の alt text は crop の sha256 で carry するので、
 /// 消し合いは再レンダリング費用だけでなく carry の当たり判定にも効く）。
+/// **「第2インスタンスは起動できないから」とこの猶予を dead code 扱いで消さないこと。**
 ///
 /// 値と理由は `backup::WORK_FILE_STALE_SECS` に揃えてある。
 const STALE_ASSET_DIR_SECS: u64 = 60 * 60;

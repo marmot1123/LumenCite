@@ -74,8 +74,9 @@ impl GuiLockState {
 /// 判別は **raw OS error の一致**で行う。`ErrorKind` の比較では駄目で、Windows の
 /// 競合エラー `ERROR_LOCK_VIOLATION`(33) は std の対応表（`sys/io/error/windows.rs`）に
 /// 無く `Uncategorized` に落ちるため、**無関係な OS エラーまで「先客あり」と一致してしまう**。
-/// 誤って `HeldByOther` にすると起動時 sweep が永久に止まる（片方向に危険なので、
-/// 判別できないものは `Unavailable` に倒す）。
+/// 誤って `HeldByOther` にすると、C-01 以降は**第2インスタンス扱いで毎回終了 ＝ その環境で
+/// 永久に起動できなくなる**（C-01 より前でも起動時 sweep が永久に止まった。片方向に
+/// 危険なので、判別できないものは `Unavailable` に倒す）。
 fn classify_lock_error(e: &std::io::Error) -> GuiLockState {
     match (e.raw_os_error(), fs2::lock_contended_error().raw_os_error()) {
         (Some(actual), Some(contended)) if actual == contended => GuiLockState::HeldByOther,
@@ -132,12 +133,20 @@ fn acquire_gui_lock_with_retry(
     interval: Duration,
 ) -> GuiLockState {
     let mut state = acquire_gui_lock(data_dir);
+    let mut saw_held = state == GuiLockState::HeldByOther;
     for _ in 1..attempts {
         if state != GuiLockState::HeldByOther {
-            return state;
+            break;
         }
         std::thread::sleep(interval);
         state = acquire_gui_lock(data_dir);
+        saw_held = saw_held || state == GuiLockState::HeldByOther;
+    }
+    // 一度でも HeldByOther を観測したら、その後の一時的な `Unavailable` で
+    // 「別インスタンスあり」の証拠を捨てない（裁定 PR レビューの堅牢化。flock 非対応 FS は
+    // 初回に HeldByOther を出せないので、このラッチが真の Unavailable 環境を終了させることはない）。
+    if saw_held && state == GuiLockState::Unavailable {
+        return GuiLockState::HeldByOther;
     }
     state
 }

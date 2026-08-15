@@ -347,6 +347,13 @@ debt-19（テキスト fragment 約 11,970 件がページ矩形をはみ出す�
    `Uncategorized` に落ちるので、**無関係な OS エラーまで「先客あり」に一致してしまう**。
    誤りは片方向にだけ危険（`HeldByOther` に化けると sweep が永久に止まる／`Unavailable` に
    化けても今日と同じ挙動に戻るだけ）なので、判別できないものは `Unavailable` に倒す。
+   **（②c C-01 の追記: 誤って `HeldByOther` に化けたときの帰結は「sweep 停止」から
+   「第2インスタンス扱いで毎回終了 ＝ 永久に起動不能」へ強まった。倒す向きは変わらない・§2.24）**
+
+**（②c C-01 の追記: 以下の「読み手」はこの実装記録当時のもの。2026-08-15 の C-01 で
+第2インスタンスは setup 冒頭のダイアログ + exit(0) で終了するようになり、sweep /
+バックフィルの skip ゲートは削除された。現在の読み手はその終了判定 1 か所だけ。
+gui_lock_tests も 4 本 → 8 本に増えた・§2.24）**
 
 **今の読み手**（`another_instance_is_live()`）は起動時 sweep（`sweep_trash` +
 `sweep_backup_workdir`）で、別インスタンスが生きていると確認できたときだけ skip する。
@@ -3364,19 +3371,46 @@ PR-4 のレビューで訂正した** ── `run_lcir_gc` は印を立ててか
   既存の `db/fulltext.rs` の 4 つの早期 return（`SkippedProtected` / `SkippedEmptyExtract` /
   `SkippedOcr` / `SkippedUnrecorded`）も同じ drop 任せだった ── こちらは書き込み前なので
   実害は「`BEGIN IMMEDIATE` の RESERVED ロックが一瞬 pool に残る」だけだが、同じ PR で
-  明示 rollback に揃え、「tx は drop でロールバック（即時）」という誤った前提のコメントを消した。
+  明示 rollback に揃え、同じ前提のコメント（「譲る（tx は drop でロールバック）。」）を書き直した。
+  下のコミット後レビューがもう 1 箇所（`db/attachments.rs` の `delete_attachment_with_fulltext`
+  ── こちらは **fulltext 削除を書いた後**の早期 return で settings と同じ形）を見つけ、
+  そこも明示 rollback にした。
 
 #### 指摘と裁定（7/7 反映・詳細は `gate2c/CODEX_REVIEW.md`）
 
 | ID | 深刻度 | 一行 | 裁定 |
 |---|---|---|---|
-| C-01 | high | 課金・破壊バッチの排他が全てプロセスローカルで、第2 GUI から全件二重実行できる | **single-instance 化**。既存 flock（`lumencite.gui.lock`）の判定を setup 冒頭へ移し、`HeldByOther` なら日英ダイアログ + exit 0。relaunch / dev 再ビルドの「旧プロセスがまだ握っている」窓は**約 3 秒の再試行**で吸収。`Unavailable`（flock 非対応 FS）は従来どおり起動継続（終了させるとその環境で永久に起動不能）。`tauri-plugin-single-instance` は**採らず**（新規依存 + macOS 実挙動をこの場で検証できない。既存ロックはテスト済み・app data dir 粒度で判定でき `--config` 分離とも整合。代償 = 既存ウィンドウへの focus は無し）。第2インスタンスが起動しなくなったので「別インスタンス live なら skip」の下流ゲート（起動時 sweep / LCIR バックフィル）は**削除**した |
+| C-01 | high | 課金・破壊バッチの排他が全てプロセスローカルで、第2 GUI から全件二重実行できる | **single-instance 化**。既存 flock（`lumencite.gui.lock`）の判定を setup 冒頭へ移し、`HeldByOther` なら日英ダイアログ + exit 0。relaunch / dev 再ビルドの「旧プロセスがまだ握っている」窓は**約 3 秒の再試行**で吸収。`Unavailable`（flock 非対応 FS）は従来どおり起動継続（終了させるとその環境で永久に起動不能）。`tauri-plugin-single-instance` は**採らず**（新規依存 + macOS 実挙動をこの場で検証できない。既存ロックはテスト済み・app data dir 粒度で判定でき `--config` 分離とも整合。代償 = 既存ウィンドウへの focus は無し）。第2インスタンスが起動しなくなったので「別インスタンス live なら skip」の下流ゲート（起動時 sweep / LCIR バックフィル）は**削除**した。レビュー後の堅牢化: 再試行中に一度でも `HeldByOther` を観測したら、後続の一時的な `Unavailable` に「別インスタンスあり」の証拠を上書きさせない（ラッチ。flock 非対応 FS は初回に `HeldByOther` を出せないので誤爆しない） |
 | C-02 | medium | pending restore の適用が GUI lock より先で、稼働中の別 GUI の live 一式を差し替える | lock 判定（+ 第2インスタンス終了）を `apply_pending_restore` より前へ移動。restore が動かす対象（db/-wal/-shm/attachments）にロックファイルは含まれないことを確認済み。`restore.rs` の「pool を開く前なので安全」コメントに前提（単独プロセスは C-01/C-02 が保証）を明記 |
 | C-03 | medium | 同意の検査が sleep / spawn の手前だけで、OFF 後に外部呼出しが 1 回進む | Vision = **課金 API 呼び出しの直前**に gate 再評価（入口と同じ述語・理由の区別を維持）／ TeX 一括 = 3 秒 sleep 後に `tex_autofetch_enabled` を再評価／クリッパー = spawn の中身を `run_tex_source_job` に切り出し **download 直前に再評価**（テスト 2 本・変異 killed）。**「build 前の同意再確認」は採らない** ── 同意は外部取得のゲートで、取得済みファイルのローカル build は `lcir.enabled` が既に見る（手動添付の TeX が同意なしで build されるのと同じ扱い）。嘘だったコメント（「ビルドは内部でもフラグを再確認する」）は実態に合わせて書き直した |
 | C-04 | medium | クリッパーの PDF 添付通知が LCIR build 完了まで遅れ、一覧の添付状態が数分古い | `download_and_attach` 成功直後（= DB 行と実ファイルが揃った時点）に `entries-changed` を発火し、その後に ingestion。完了後の再発火も維持（リスナーは一覧再読込のみで冪等）。`attachment-ingest` は進捗専用のまま |
-| C-05 | medium | TeX 再取得が既存ファイルを直接 truncate し、失敗時に旧ソースまで失う | 上書きを一意 tmp（排他 create + `write_all` + `sync_all`）→ rename に変更（`bibtex::replace_file` を `pub(crate)` 化して再利用・Windows の宛先存在も吸収）。**読み取り専用の宛先でも成功する**回帰テストで「宛先を open しない」を固定（変異 killed）。tmp 残骸は失敗時 best-effort 削除のみ（`.tmp` はバックアップが transient 扱い＝欠損警報を鳴らさない。強制終了で残る 1 個は許容） |
-| C-06 | medium | 並行 auto-save が 6 キーを個別更新し、選んだことのない provider/model 混成を永続化しうる | backend = `set_settings_atomic`（**BEGIN IMMEDIATE** の 1 tx・all-or-nothing テストは RAISE(ABORT) TRIGGER で決定的に固定・tx 外し変異 killed）／ frontend = auto-save を直列化し**最新 snapshot だけ**送る + 失敗を画面に表示（i18n `settings.llm.saveFailed` を ja/en に追加）。**backend での provider/model 組合せ検証は採らない** ── モデル一覧はフロントの `MODEL_PRESETS` にしか無く、二重管理の結合を作る |
+| C-05 | medium | TeX 再取得が既存ファイルを直接 truncate し、失敗時に旧ソースまで失う | 上書きを一意 tmp（排他 create + `write_all` + `sync_all`）→ rename に変更（`bibtex::replace_file` を `pub(crate)` 化して再利用）。コミット後レビューの指摘で `replace_file` の Windows fallback を「宛先 remove → rename」から「**宛先を退避 rename → rename・失敗時は退避を戻す**」に強化した ── remove 方式は 2 回目の rename まで失敗すると旧・新の両方を失い、「旧内容は無傷」の契約を破っていた（Unix には無関係・テスト不能な cfg!(windows) 分岐）。**読み取り専用の宛先でも成功する**回帰テストで「宛先を open しない」を固定（変異 killed）。tmp 残骸は失敗時 best-effort 削除のみ（`.tmp` はバックアップが transient 扱い＝欠損警報を鳴らさない。強制終了で残る 1 個は許容） |
+| C-06 | medium | 並行 auto-save が 6 キーを個別更新し、選んだことのない provider/model 混成を永続化しうる | backend = `set_settings_atomic`（**BEGIN IMMEDIATE** の 1 tx・all-or-nothing テストは RAISE(ABORT) TRIGGER で決定的に固定・tx 外し変異 killed）／ frontend = auto-save を直列化し**最新 snapshot だけ**送る + 失敗を画面に表示（i18n `settings.llm.saveFailed` を ja/en に追加。直列化の状態はコミット後レビューの指摘で useRef から **module スコープ**へ移した ── インスタンススコープだとタブ切替の unmount/remount で状態が初期化され、旧インスタンスの in-flight 保存と並行して後勝ち不定になる）。**backend での provider/model 組合せ検証は採らない** ── モデル一覧はフロントの `MODEL_PRESETS` にしか無く、二重管理の結合を作る |
 | C-07 | low | 重複クリップの TeX 欠落判定が仕様書だけ旧 `lcir.enabled` gate のまま | `API_SPEC.md` の該当 1 文を `lcir.tex_autofetch.enabled` ON（かつ `lcir.enabled` ON）へ修正（SPEC.md:222 と同語彙）。実装・テスト変更なし |
+
+#### 裁定 PR のコミット後レビュー（Workflow `wf_54bc6517-2b2`・2026-08-15〜16）
+
+6 面読解 + 指摘ごとの敵対的検証で **22 体 / 約 1.8M トークン**（session limit を 1 回跨ぎ、
+スクリプト無編集の resume で完了分をキャッシュ回収）。**指摘 16 → confirmed 9 / refuted 7・
+未検証 0**。全件を「直す / 債務化 / 記録」のどれかに裁定した:
+
+- **[medium・唯一の実装欠陥] `replace_file` の Windows fallback（remove → rename）が
+  二重失敗で旧・新両方を失う** → 退避方式へ強化（上の C-05 行）。
+- HeldByOther → 一時 `Unavailable` 降格のラッチ（指摘自体は「操作順を構成できない」で
+  refuted だが、副作用ゼロの堅牢化として採用・上の C-01 行）。
+- auto-save 直列化の module スコープ化（「UI に無い組合せは作れない」ので refuted・
+  格下げ提案どおり low だが、3 行で閉じるので採用・上の C-06 行）。
+- **doc / コメントの腐り 6 箇所を修正**: `classify_lock_error` の帰結（sweep 停止 → 起動不能）/
+  §2.8 と #7 節の旧 skip ゲート記述への追記 / `RELEASE.md` と `LCIR_design_overview.md` の
+  バックフィル 1 行 / mtime 猶予（`STALE_ASSET_DIR_SECS` / `WORK_FILE_STALE_SECS`）の存在理由を
+  「Unavailable の残余だけが守る対象」に更新 / この節の削除コメント引用の不正確（「（即時）」は
+  原文に無い）。**確定 9 件中 6 件が散文・コメントの腐り** ── PR-4 と同じ比率で再現した。
+- `db/attachments.rs` の書き込み後早期 return → 明示 rollback（実測した欠陥の同型・上の実施記録）。
+- **TeX 初回取得の in-flight ガード欠如（pre-existing）→ debt-59 に新設**。
+- **採らなかったもの**（refuted で対応も不要と裁定）: rollback 失敗時のエラー握り潰し
+  （WAL では rollback が失敗する経路を構成できない）/ SPEC の「約 3 秒」（sleep 14 回 =
+  2.8 秒の近似として妥当）/ fulltext の rollback ピン留めテスト（観測可能な差が無く原理的に
+  書けない）/ all-or-nothing テストの BEGIN IMMEDIATE ピン留め（読みを含まない現実装では等価変異）。
 
 #### 残る限界（このゲートで新たに固定したもの）
 
@@ -3384,7 +3418,13 @@ PR-4 のレビューで訂正した** ── `run_lcir_gc` は印を立ててか
   その環境では課金二重実行の窓も従来どおり残る。
 - **Vision / TeX ループの再評価そのものの配線テストは無い**（`#[tauri::command]` 本体・debt-38 の形）。
   gate 述語（`vision_alt_text_gate` / `tex_autofetch_enabled`）自体は既存テストが持つ。
+- **`save_llm_settings` → `set_settings_atomic` の配線もテスト 0 本**（同じ debt-38 の形）。
+  キー単位保存へ戻す退行は新テスト 2 本（ヘルパ単体）では検出されない。
 - **C-04 の emit 順も配線のみ**（`spawn_pdf_job` にテストの seam が無い・debt-38 の形）。実機確認は未実施。
+- **保存失敗の画面表示はマウント中だけ**。変更直後にモーダルを閉じると失敗は console にしか
+  出ず、pending も再送されない（main の全面沈黙より狭いが、窓は残る・レビューで confirmed）。
+- **C-05 の回帰テスト（読み取り専用宛先）は非 root 実行が前提**（root は DAC バイパスで
+  open が成功し、テストが無言で空になる。現 CI・ローカルとも非 root）。
 - **debt-56 は未再現のまま維持**。Codex も決定的な到達手順を構成できず（レビュー §4）、
   「反証でも確認でもなく未再現」の判定を変えなかった。
 
@@ -3803,6 +3843,9 @@ UI 入口 7 つ**が自動的に 1 本に絞られる。「8 つ目」は `cli/m
 
 ~~**プロセス横断の排他が無い。**~~ **#0 で用意済み**（§2.8）。`acquire_gui_lock` は `GuiLockState` を返すので、
 p2 は `!gui_lock.another_instance_is_live()` のときだけバックフィルを走らせればよい（配線するだけ）。
+**（②c C-01 の追記: この skip 配線はその後削除された ── 第2インスタンスは起動時に終了する
+ようになり、バックフィルへ到達するのは唯一の GUI だけ。「Unavailable を丸めない」の理由も
+「バックフィルが走らない」から「起動できなくなる」へ強まった・§2.24）**
 **`Unavailable` を「別インスタンスあり」に丸めないこと**（丸めると flock 非対応 FS でバックフィルが
 永久に走らない）。⚠ **`acquire_gui_lock` を 2 度呼ばないこと** ── `OnceLock` で再入不可なので、
 握っている当のインスタンスが自分を `HeldByOther` と誤認し、バックフィルがどのマシンでも
@@ -3966,6 +4009,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | **debt-57** | **詳細パネルの LCIR ボタン群は `batch_status` を一度も読まないので、他のバッチが走っていても押せる。** 代替テキスト・1 件 build・TeX 取得の 3 つとも `disabled` はローカルの busy だけで、拒否はバックエンドの戻り値（`already_running` / `build_busy`）で説明する設計（**同じパネルには LCIR 書き出しボタンが 2 つあって計 5 ボタンだが、そちらは読み取りのみでバックエンドのロックを取らない**ので購読の対象外 ── 「3 ボタンまとめて」の 3 はこの意味）。**PR-3 で拒否条件が「自分がもう 1 本走らせている」から「LCIR 系のどれか 1 本でも走っている」に広がった**ぶん、空振りの頻度が上がった。②b の PR-3 レビュー（3 レンズとも反証 ── 課金も書き込みも起きず、文言も PR-3 で正しく直っている）。**このパネル全体の既定の設計なので、代替テキストのボタンだけ直すと今度はパネル内に非対称ができる**。直すならパネルに `batch_status` の購読を 1 本入れて 3 ボタンまとめて。post-1.0 | S | post-1.0 |
 
 | **debt-58** | **GC の確認には「押した瞬間の取り直し」が無いので、非可逆な削除を古い数字のまま実行できる。** 課金する代替テキスト側は**押下時に** `count_figures_missing_alt_text` を引き直し、表示と食い違ったら**実行せずに新しい件数で聞き直す**（debt-32）。GC が持っているのは**開くとき**の `refreshStorage()` と、確認ボタンの `disabled={anyLcirJobRunning}`（PR-3）まで。踏める順は 2 つ ── (a) **確認ボックスを開いたまま同じ画面の一括構築 / 一括再構築を押せる**（build ボタンの `disabled` は `confirmGc` を見ない）。走っている間は「削除する」が塞がるが、**終わると再び押せるようになり、その間にボックスの数字を更新する経路も閉じる経路も無い** ── 実装コメントが「直した理由」に挙げている「『3 版を消します』と表示したまま 138 添付ぶんの新版が積まれる」が、窓を狭めただけで残っている。(b) `RunningMark` を立てない p2 の自動 build（添付追加 / 起動時バックフィル）は `anyLcirJobRunning` に映らないので、そもそも塞がらない。削除対象そのものは実行時に取り直すので**保護すべき版（alt text を持つ版）を消すことはなく**（外した数は `versions_skipped` で報告）、実害は「同意した数と違う量を非可逆に消す」ことに限られる。直すなら (a) 押下時に `lcir_storage_stats` を引き直して食い違ったら聞き直す（代替テキストと同型にする）── (b) build ボタン側に `confirmGc` を足すのは対症療法で、(b) だけだと自動 build 経路が残る。⚠ **この行の初版は「GC は件数を取り直さない」「代替テキストとは守り方が違う」と書いていたが、どちらも偽だった**（開くときは取り直すし、代替テキスト側も `anyLcirJobRunning` を持つ）── ②b の PR-4 レビューで訂正 | S | post-1.0 |
+| **debt-59** | **クリッパーの TeX 初回取得に in-flight ガードが無く、同じ論文の並行クリップで `TEX_SOURCE_MIME` の添付行が 2 本できうる。** PDF 側は `PDF_JOBS_IN_FLIGHT` で塞いだ同型の穴。1 本目の job がダウンロード中は attachments 行がまだ無いので、2 本目のクリップ（重複 → 欠落補完）の `plan_completion` も、両 job の `download_and_attach_arxiv_source` の existing クエリも None を見て、双方が新規経路（`create_unique_file` + `add_attachment`）に入る。以後の read / 再取得は `ORDER BY id LIMIT 1` で常に古い行を選ぶため、2 本目は選ばれないゴミとして残る（課金・破壊なし。build は同一 sha256 → 同一 content_key なので版管理も壊れない）。②c 裁定 PR のコミット後レビューで確認（**pre-existing** ── C-03/C-05 は同関数を触ったが競合窓は変えていない）。直すなら PDF と同じ in-flight セットを `spawn_tex_source_job` に足す | S | post-1.0 |
 
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
 `ListItem` / `Footnote` / `Citation` / `InlineMath` / `EquationGroup` / `TextBlock` はどちらも生成しない。
