@@ -1274,8 +1274,13 @@ async fn build_lcir_for_attachment(
 ///
 /// ⚠ **逆向き（1 件 build の最中に Vision を始める）は弾いていない。** 見るべき状態が
 /// `LCIR_BUILD_LOCK`（tokio Mutex）しか無く、`try_lock` での観測は FIFO の待ち行列を
-/// 乱すため使えない（[`ingestion::lock_build_within`] の doc）。こちら向きの実害は
-/// 「ランが空振りする」だけで**課金は発生しない**（各図の手前確認が Vision を呼ぶ前に落とす）。
+/// 乱すため使えない（[`ingestion::lock_build_within`] の doc）。
+/// ⚠ **「課金は発生しない」は誤り**（2026-08-17 に当て直した）。手前確認
+/// [`insert_alt_text_if_version_is_latest`] の呼び出し前チェックが見るのは「その版がまだ
+/// 最新 completed か」だけで、**1 件 build は最後に commit する**ので走行中は確認を素通りする。
+/// commit **後**に到達した図は空振り（無課金）だが、**commit の瞬間に応答待ちだった 1 図は課金済みで捨てる**
+/// ── その窓は `insert_alt_text_if_version_is_latest` の失敗パス（下の「ここだけは課金済み」）そのもの。
+/// 1 添付につき高々 1 件。他の添付の図は通常どおり処理・課金される。
 fn interactive_build_is_blocked_by_a_writing_batch(would_supersede: bool) -> bool {
     would_supersede && a_writing_batch_outside_the_lcir_lock_is_running()
 }
@@ -5819,6 +5824,21 @@ mod update_and_snippet_tests {
         assert!(release_is_newer("0.5.0", "v0.5.1"));
         assert!(!release_is_newer("0.5.0", "v0.5.0")); // 同一は「新しい」でない
         assert!(!release_is_newer("0.5.0", "v0.4.9")); // 古い tag は促さない
+    }
+
+    /// **文字列比較なら落ちる 2 つの遷移**を固定する。どちらも実際に出荷した経路で、
+    /// 上のテストが使う 1 桁どうしの比較では区別が付かない。
+    /// - 2 桁マイナー: `"0.10.0" < "0.9.0"`（辞書順）なので、文字列比較だと v0.9.0 の
+    ///   利用者に v0.10.0 を促さない
+    /// - メジャー繰り上がり: `"1.0.0" < "0.10.0"` ではないが、`0.10.0` 側を 2 桁として
+    ///   扱えないと大小が逆転しうる
+    #[test]
+    fn release_is_newer_handles_two_digit_minor_and_major_bump() {
+        assert!(release_is_newer("0.9.0", "v0.10.0"));
+        assert!(release_is_newer("0.10.0", "v1.0.0"));
+        assert!(!release_is_newer("0.10.0", "v0.9.0"));
+        assert!(!release_is_newer("1.0.0", "v0.10.0"));
+        assert!(!release_is_newer("1.0.0", "v1.0.0"));
     }
 
     #[test]

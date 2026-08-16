@@ -166,7 +166,10 @@ az network public-ip delete -g $RG -n lumencite-win-ip
    （v0.10.0 の `tauri.release-windows.conf.json` には `resources` が無かった）なので、前回 VM 作業の踏襲は効かない。
    ⚠ 展開は必ず `tmp-pdfium\` へ隔離する（ルートで展開すると追跡ファイルの `LICENSE` を壊し、
    それがインストーラのライセンス頁に載る）。配置後に `git status --short` が clean であることを見る。
-   置き忘れたまま次へ進むと、**署名済みなのに LCIR も OCR も動かない**インストーラが出来上がる
+   置き忘れた場合は**ビルドが `ResourcePathNotFound` で落ちてインストーラが 1 つも出来ない**
+   （`bundle.resources` の非 glob エントリは `tauri-build` が実在を要求する）ので、
+   ここは機械が止めてくれる。**黙って壊れるのは次の手順で `--config` を落としたときだけ**
+   ── 署名設定と `resources` が同時に消え、**未署名で pdfium も入っていない**インストーラが出来上がる
 5. [ ] 署名込みでビルド:
    ```pwsh
    pnpm install --frozen-lockfile
@@ -174,7 +177,8 @@ az network public-ip delete -g $RG -n lumencite-win-ip
    ```
    `tauri.release-windows.conf.json` の `certificateThumbprint`（拇印）でバンドル時に `signtool` 署名された `.msi` / `*-setup.exe` が生成される。同オーバーレイは `createUpdaterArtifacts: false` なので **updater 成果物（`.sig`）は生成されない**（Windows auto-updater 見送りのため。Phase 6 参照）
 6. [ ] `signtool verify /pa /v <生成された .exe/.msi>` で署名を確認
-7. [ ] **インストーラを展開して `pdfium.dll` が入っていることを確認**（`--config` の落としと手順 4 の置き忘れの両方が、ここで初めて目に見える）
+7. [ ] **インストーラを展開して `pdfium.dll` が入っていることを確認**（`--config` を落とした場合は
+   ビルドが通ってしまうので、**その取りこぼしが目に見えるのはここが最初で最後**）
 8. [ ] 生成された **署名済み `.msi`/`.exe`** をドラフトリリースへアップロード（`gh release upload <tag> <files> --clobber`）。
    ⚠ **バージョンを明示して拾う**（`bundle\{msi,nsis}\` に前回リリースの成果物が残っていると、
    アルファベット順で古い方を掴む。§9-5 参照）
@@ -258,7 +262,9 @@ Tauri のリソース配置規則そのものは `tauri-utils` の `resource_dir
   $tag = "chromium/7934"      # = PDFIUM_TAG
   $sha = "c2c05e752ef41a1af21ad24f7f09e75e6e24c3d2cf84bbc88f11efa42edd341c"   # = PDFIUM_SHA256_WINDOWS
   Invoke-WebRequest -Uri "https://github.com/bblanchon/pdfium-binaries/releases/download/$tag/pdfium-win-x64.tgz" -OutFile pdfium.tgz
-  certutil -hashfile pdfium.tgz SHA256     # $sha と一致することを目で確かめる
+  # 展開の**前に**照合して止める（CI は `sha256sum -c -` で同じことをしている）
+  $got = ((certutil -hashfile pdfium.tgz SHA256)[1] -replace '\s','')
+  if ($got -ne $sha) { throw "pdfium SHA256 mismatch: $got" }
   New-Item -ItemType Directory -Force tmp-pdfium, src-tauri\pdfium | Out-Null
   tar -xzf pdfium.tgz -C tmp-pdfium        # ← -C を落とすと LICENSE を壊す
   Copy-Item tmp-pdfium\bin\pdfium.dll src-tauri\pdfium\pdfium.dll -Force
@@ -310,12 +316,24 @@ git switch -c release/v1.0.0
 #    末尾の compare リンクも張り直す（§12-3）
 
 # 3. add は対象ファイルを明示する（`git add -A` は使わない。レビュー用エージェントの残骸を
-#    巻き込んだ前例がある）
-git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock CHANGELOG.md
+#    巻き込んだ前例がある）。**doc も同じ PR に載せる**ので、実際の一覧は毎回変わる
+#    ── `git status --short` を目で見て、意図したファイルだけを並べること
+git add package.json src-tauri/Cargo.toml src-tauri/tauri.conf.json src-tauri/Cargo.lock \
+        CHANGELOG.md docs/... README.md
 git commit -m "chore(release): bump version to 1.0.0"
-gh pr create --fill && gh pr merge --squash --delete-branch   # CI が緑になってから
 
-# 4. マージ後の main にタグを打つ
+# 4. PR を出し、**CI が緑になるのを待ってから**マージする
+git push -u origin release/v1.0.0     # ← 先に push する（upstream が無いと gh が対話プロンプトに落ちる）
+gh pr create --fill
+gh pr checks --watch                  # ci.yml と linux-bundle-verify の**両方**が緑になるまで待つ
+gh pr merge --squash --delete-branch
+#  ⚠ `&&` で繋がない。このリポジトリは **auto-merge 無効（`allow_auto_merge:false`）で
+#    必須チェックも未設定**なので、`gh pr merge` は CI の起動前に即座に通ってしまう。
+#    同じ理由で `--auto` も使えない（`enablePullRequestAutoMerge` が拒否される）。
+#    `linux-bundle-verify` は 7〜12 分かかるので、待たずにマージすると §12-3 の
+#    「`linux-bundle-verify` が緑」を原理的に満たせない。
+
+# 5. マージ後の main にタグを打つ
 git switch main && git pull --ff-only
 git tag v1.0.0
 git push origin v1.0.0      # ← タグだけを push する（`--tags` はローカルの全タグを送る）
@@ -328,11 +346,11 @@ git push origin v1.0.0      # ← タグだけを push する（`--tags` はロ�
    - 旧 `macos-13` (Intel) ランナーは GitHub 側の供給不足で恒常的に queue 待ちが長いため使わない
    - **Windows は CI 非対象**（Certum SimplySign の対話ログイン要件・§2-2）。署名済みインストーラは
      リリース担当が VM で作ってドラフトへ手動添付する
-2. **macOS だけ**署名 + notarize（Linux は無署名で配布・§2-2 の表）
+2. **macOS だけ**署名 + notarize（Linux は無署名で配布 ── OS ごとの分担は冒頭の「全体像」表）
 3. `latest.json` を生成して updater 用 ed25519 鍵で署名。**`includeUpdaterJson` は macOS ジョブのみ true**
    なので `latest.json` は darwin エントリだけを持つ（＝ auto-update が届くのは macOS だけ）
 4. **ドラフト**の GitHub Release を作成し、そのジョブのアセットをアップロードする
-   （`releaseDraft: true` / `prerelease: false`。公開は §7 の手動手順）
+   （`releaseDraft: true` / `prerelease: false`。公開は §7 の**（タグ後）**項目）
 5. **Linux ジョブが `Verify pdfium is bundled (Linux)` で成果物を展開し、`libpdfium.so` が
    実行時の探索先に入っていることを確かめる**（v1.0.0-p0）
 
@@ -378,19 +396,22 @@ rc タグでのドライランについては §7 を参照。
 - **Windows**: インストーラ実行で SmartScreen が出ない（EV）または「詳細情報」から実行できる（OV）
 - **Linux**: AppImage を実行 / `sudo dpkg -i lumencite_*.deb` 実行
 - **Updater**: 旧バージョンを入れて起動 → アップデート通知 → 適用 → 新バージョンで再起動
-- **pdfium（Windows / Linux・v1.0.0 以降）**: 実インストールで **PDF を 1 本開いて全文索引が付く**ことを見る。
-  上の 3 つはアプリが起動するかまでしか見ておらず、**pdfium の不在は PDF を開いた瞬間に初めて表面化する**
+- **pdfium（Windows / Linux・v1.0.0 以降）**: 実インストールで **PDF を 1 本「新しく添付して」**
+  全文索引が付くことを見る。⚠ **既にある PDF を開くだけでは検査にならない** ── ビューアは webview で
+  pdfium を通らず、索引と LCIR の入口は「添付」と起動時バックフィルだから、pdfium が無くても
+  既存の索引がそのまま表示されて緑に見える。上の 3 つはアプリが起動するかまでしか見ていない
   （`bind_pdfium()` が LCIR と Vision OCR の単一入口）。ログに `pdfium library not found` が出ないこと。
-  Windows は CI もこの検査を持たない（§2-2 Phase 5 の手順 4 と 7 だけが歯止め）
+  Linux は CI が同梱を検査するが、**Windows は自動検査が無い**（§2-2 Phase 5 の手順 7 が最後の歯止め。
+  ただし DLL の置き忘れ自体はビルドが落ちるので、素通りするのは `--config` を落とした場合だけ）
 - **既定 ON のバックフィル（v1.0.0 以降）**: **旧版を入れて updater で上げた直後の初回起動**で
   `LCIR backfill:` のログが出て、放っておくと LCIR を持つ論文が増えることを見る。
   リリースビルドでは起動 60 秒後に始まる。これが「既定 ON」経路の本番で、**開発機では再現できない**（§12-2）
 
 ---
 
-## 7. 毎回のタグ前チェックリスト（初出は v0.1.0・以後の版でも使う）
+## 7. 毎回のリリースチェックリスト（タグ前 / タグ後・初出は v0.1.0）
 
-**版固有の追加項目は各版の節に置く**（v1.0.0 は §12-3）。ここは版に依らないもの。
+**版固有の追加項目は各版の節に置く**（v1.0.0 は §12-3。**§12-3 は全項目がタグ前**）。ここは版に依らないもの。
 
 - [x] Apple Developer Program 加入完了（初回のみ）
 - [x] Developer ID Application 証明書 発行 & ローカル登録（初回のみ）
@@ -402,14 +423,18 @@ rc タグでのドライランについては §7 を参照。
       4 つとも一致し、**打とうとしているタグ名とも一致**している（機械的な検査は無い。ここが唯一の歯止め）
 - [ ] **`tauri.conf.json` の `plugins.updater.pubkey` が本物の鍵**（`REPLACE_…` プレースホルダでない）— v0.1.0 はこれを取りこぼして updater が壊れた。`release.yml` のガードでも検証されるが、タグ前に目視確認
 - [ ] `CHANGELOG.md` の `[Unreleased]` を `[X.Y.Z] - YYYY-MM-DD` へ切り出し、末尾の compare リンクも張り直した
-- [ ] ~~試しに `vX.Y.Z-rc.N` タグでドライランしてワークフローを通す~~ **v0.4.0 以降は実施していない**
-      （v0.2.0 まで rc.1〜rc.4 で署名まわりを潰した名残）。パイプラインが安定した今は、CI / 署名 /
-      同梱設定に触ったときだけ検討する。**やる場合は `release.yml` が `prerelease: false` 固定なので
-      rc タグでもプレリリース扱いにならない** ── 絶対に publish せず、ドラフトと rc タグを事後に消すこと
-- [ ] **Linux ジョブの `Verify pdfium is bundled (Linux)` が緑**（赤ければドラフトを破棄。タイトルに `DO NOT PUBLISH` の印が付く）
+- [ ] ~~試しに `vX.Y.Z-rc.N` タグでドライランしてワークフローを通す~~ **v0.2.1 を最後に実施していない**
+      （以後 v0.3.0〜v0.10.0 の 8 リリースは本番タグ直行）。用途は毎回「署名まわりを潰す」ことで、
+      v0.1.0〜v0.2.0 は Apple 署名（rc.1〜rc.4）、v0.2.1 は Windows の CI 無人署名が不可だと実証した rc.2。
+      パイプラインが安定した今は、CI / 署名 / 同梱設定に触ったときだけ検討する。
+      **やる場合は `release.yml` が `prerelease: false` 固定なので rc タグでもプレリリース扱いにならない**
+      ── 絶対に publish せず、ドラフトと rc タグを事後に消すこと（使用済み rc タグは 1 本も残っていない）
 - [ ] pdfium の版・探索候補・同梱設定に触ったリリースなら、**タグ前に `linux-bundle-verify` を手動実行**（§4）
-- [ ] 各 OS でインストール検証（macOS: Gatekeeper 通過 / Windows: SmartScreen「詳細情報→実行」/ Linux: AppImage 起動）
-- [ ] ドラフトリリースの公開（GitHub UI から手動で「Publish release」）
+- [ ] **（タグ後）Linux ジョブの `Verify pdfium is bundled (Linux)` が緑**（赤ければドラフトを破棄。タイトルに
+      `DO NOT PUBLISH` の印が付く。⚠ このステップはタグ push でしか発火せず、`release.yml` の
+      `workflow_dispatch` を代用に使ってはいけない ── §5 の ⚠ 参照）
+- [ ] **（タグ後）**各 OS でインストール検証（macOS: Gatekeeper 通過 / Windows: SmartScreen「詳細情報→実行」/ Linux: AppImage 起動）
+- [ ] **（タグ後）**ドラフトリリースの公開（GitHub UI から手動で「Publish release」）
 
 ---
 
@@ -560,8 +585,8 @@ macOS ユーザーは `brew install --cask` でも導入できる。公式 homeb
 | **起動時バックフィル** | リリースビルドでは起動 60 秒後に始まり、以後 **10 分ごとに「走ってよいか」を叩いて実際に走るのは 1 時間に 1 回**（`POLL_INTERVAL` と `AUTO_INTERVAL_SECS` は別物 ── 混同すると負荷を 6 倍に見積もる）。1 ラン 5 分の時間予算・添付境界で譲る・他バッチとバックアップ中は stand down（かつての「別インスタンス起動中は走らない」ゲートは、②c C-01 で第2インスタンスが起動自体を拒否するようになったため削除された）。**「updater で上がった直後の初回起動」がこの経路の本番**なので、配布後検証（§6）でここを必ず通す |
 | **migration** | **0 件**。v1.0.0 は 1 本も足していない（p1 の出どころ記録は settings キーに置いた）。したがって配布版 v0.10.0 との相互起動でスキーマは壊れない |
 | **pdfium が Windows / Linux で初同梱** | 両 OS にとって v1.0.0 は pdfium 初同梱版で、**手動 DL しない限り LCIR も OCR も動かない**（`bind_pdfium()` が両者の単一入口）。Windows の DLL は CI が同梱しないので **§2-2 Phase 5 の手順 4（実コマンドは §4）**で手動配置し、**`--config src-tauri/tauri.release-windows.conf.json` を落とさない**（落とすと署名設定と pdfium 同梱が同時に消える）。配置は `tmp-pdfium\` へ隔離して展開すること（ルート展開は追跡ファイルの `LICENSE` を壊す・§4） |
-| **抽出器版 0.6.0 → 0.14.0** | ⚠ **起点は 0.6.0**（v0.10.0 が出荷したのはこの値。0.7.0 は v0.10.0 タグの**後**の PR #67 で入ったので、0.7.0 で作られた LCIR を持つ利用者は存在しない）。**PDF 由来の**既存 LCIR は**全件が「旧版」になる**（TeX 由来は次行）。自動では作り直さない（版 bump は再構築を誘発しない設計）ので、設定 → データの「旧版の LCIR を現行版へ再構築」を押すまで新しい図は出ない。⚠ **押す前に件数は出ない**（対象数を返すコマンドが無く、`lcir_storage_stats` が返すのは superseded 版の数＝別物）。件数が見えるのは実行中の進捗と完了メッセージだけ。**押した場合のコスト**（実測: 138 本で約 20 分 + 図の説明が有効なら約 30 分・≈$0.80）と**押さない場合に失うもの**（図領域 1,202 → 1,629・caption ペア 662）を**リリースノートに両方書く**。⚠ **図の増分に 2 つの数字がある** ── **427** は「8d-2 / 8d-8 + クリップ修正が足したぶん」（1,202 → 1,629）、**431** は「v0.10.0 が出荷した 0.6.0 の LCIR（1,198）との総数差」。CHANGELOG は前者を使っているので、**混ぜない** |
-| **TeX 由来の LCIR は据え置き** | `TEX_EXTRACTOR_VERSION` は 0.5.0 のまま。「既存の LCIR は全件が旧版」は **PDF 由来のものだけ**の話で、arXiv の TeX ソースから作った表現は現行のままで再構築の対象にならない（この版の改善はすべて PDF 側） |
+| **抽出器版 0.6.0 → 0.14.0** | ⚠ **起点は 0.6.0**（v0.10.0 が出荷したのはこの値。0.7.0 は v0.10.0 タグの**後**の PR #67 で入ったので、0.7.0 で作られた LCIR を持つ利用者は存在しない）。**PDF 由来の**既存 LCIR は**全件が「旧版」になる**（TeX 由来は次行）。自動では作り直さない（版 bump は再構築を誘発しない設計）ので、設定 → データの「旧版の LCIR を現行版へ再構築」を押すまで新しい図は出ない。⚠ **押す前に件数は出ない**（対象数を返すコマンドが無く、`lcir_storage_stats` が返すのは superseded 版の数＝別物）。件数が見えるのは実行中の進捗と完了メッセージだけ。**押した場合のコスト**（実測: 138 本で約 20 分 + 図の説明が有効なら約 30 分・≈$0.80）と**押さない場合に失うもの**（図領域 **1,198 → 1,629 ＝ +431**・caption ペア 662）を**リリースノートに両方書く**。⚠ **図の増分に 2 つの数字があるので、どちらの意味で使うかを決めてから書く** ── **431** は「**v0.10.0 が出荷した 0.6.0 の LCIR（1,198）との総数差**」＝押さない人が失う総量。**427** は「8d-2 / 8d-8 + クリップ修正**だけ**の寄与」（1,202 → 1,629）で、残る +4 は debt-14 のクランプ修正ぶん。CHANGELOG は**クランプ修正を別項目に分けている**ので項目ごとに 427 と +4 を使い分けており、それで無矛盾。**1 つの数字で「押さないと失うもの」を言うときは 431** |
+| **TeX 由来の LCIR は据え置き** | `TEX_EXTRACTOR_VERSION` は 0.5.0 のまま。「既存の LCIR は全件が旧版」は **PDF 由来のものだけ**の話で、arXiv の TeX ソースから作った表現は現行のままで再構築の対象にならない（この版の**抽出器側の**改善は PDF 側だけ ── p1〜p4 や排他まわりは両方に効く） |
 
 ### 12-2. アップグレード検証
 
@@ -598,6 +623,8 @@ macOS ユーザーは `brew install --cask` でも導入できる。公式 homeb
       （**pdfium 初同梱と併せて**「手動 DL しないと LCIR も OCR も動かない」まで書く）
 - [ ] Chrome 拡張 0.2.0 を据え置くか決めた（**据え置きでも前回 zip を手動添付する**。CI は zip を作らない・§10-2）
 - [ ] `[1.0.0]` の冒頭に**版の要約段落**を書いた（直近 3 版が守っている形式。看板 / migration 0 件 / 拡張据え置き）
+- [ ] **タグを打つ直前に CHANGELOG の日付を見直した** ── 過去 11 版は**公開日（JST）**を書いている。
+      Windows 署名で半日ずれるので、bump PR を書いた日のまま日付をまたぎやすい
 
 ---
 

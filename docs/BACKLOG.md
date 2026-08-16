@@ -144,9 +144,14 @@ PDF をアプリに落とすと、中の DOI / arXiv ID を読んでエントリ
 
 ドラフトのタイトルを書き換えるステップの条件は
 `failure() && matrix.platform == 'ubuntu-22.04' && startsWith(github.ref, 'refs/tags/')` で、
-**Linux ジョブの任意の失敗**で発火する。apt の失敗でも「Linux pdfium verify failed」と付く。
-逆に**ドラフトが作られる前**に落ちると `gh release edit` 自体が失敗し、
-`::warning::` が 1 行出るだけで**印は付かない**。
+**Linux ジョブの任意の失敗**で発火する。したがって失敗の位置で結果が 2 通りに割れる:
+
+- **ドラフトが出来た後**（tauri-action の成功後）に落ちた失敗 ── アップロード失敗など ── は、
+  原因が pdfium と無関係でも「Linux pdfium verify failed」と**誤って名指し**される。
+- **ドラフトが出来る前**（apt / ビルドの失敗）は `gh release edit` の対象が無いので**印が付かず**、
+  `::warning::` が 1 行出るだけで終わる。
+
+つまり「印が付いた ⇒ pdfium の同梱が壊れた」も「印が無い ⇒ 健全」も成り立たない。
 
 **実装の要点**: verify ステップに `id:` を付けて `steps.<id>.conclusion == 'failure'` で絞るか、
 文言を `DO NOT PUBLISH — Linux job failed` に一般化する。当面は運用（タグ後に run を必ず目視）で埋める。

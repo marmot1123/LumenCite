@@ -24,7 +24,7 @@ A desktop reference management application for researchers, built with **Tauri 2
 - 🔗 **BibTeX workflow** — インポート / エクスポート + 指定パスへの自動同期 (VSCode LaTeX Workshop 連携前提)
 - ⌘K **Command palette** — エントリ横断検索とグローバルアクションを一発起動
 - 🌗 **i18n + theme** — 日本語 / 英語 UI、ライト / ダーク / システム追従、4 アクセントカラー
-- 💾 **Backup & export** — **DB と添付ファイル本体をまとめた zip** を自動バックアップ（前回から 24 時間経っていれば起動時に 1 回・14 世代保持）。壊れたバックアップは復元時に検出され、次回起動時に自動で適用し直せます。JSON / BibTeX / Markdown への手動エクスポートと、LCIR の JSON / 構造付き Markdown 書き出しにも対応
+- 💾 **Backup & export** — **DB と添付ファイル本体をまとめた zip** を自動バックアップ（前回の成功から 24 時間経っていれば実行。起動時と、起動したまま使い続けている間の定期チェックの両方で判定・14 世代保持。手動の「今すぐバックアップ」は無条件）。復元は選んだアーカイブを検証してから段取りし（**壊れていればその場で弾いて何も置き換えません**）、実際の差し替えはライブラリを開く前＝次回起動時に行います。差し替え前の状態は自動で退避され、途中で失敗すれば元に戻ります。JSON / BibTeX / Markdown への手動エクスポートと、LCIR の JSON / 構造付き Markdown 書き出しにも対応
 - ⬆️ **Updates** — macOS は Tauri Updater による署名検証つき自動更新。**Windows / Linux は新版の通知のみ**で、インストーラは Releases ページから手動で入れ替えます
 
 ## Download & install
