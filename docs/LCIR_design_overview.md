@@ -493,4 +493,7 @@ LumenCite の内部構造を、単なる PDF 全文データベースではな�
 - `docs/LCIR_REMAINING_PHASES.md` — 残 Phase の棚卸し（難易度・依存・積み残し債務・着手順序）
 - `docs/DATA_MODEL.md` — 既存 DB スキーマ（第一段実装時に新3表を追記）
 - `docs/API_SPEC.md` — Tauri コマンド仕様（第一段実装時に新コマンドを追記）
-- `docs/SPEC.md` — 機能要件・フェーズ
+- `docs/SPEC.md` — 機能要件・フェーズ（**v1.0.0 節に「LCIR が *しない* こと」の一覧**）
+- `docs/LCIR_v1_personas.md` — v1.0.0 の効能をユーザー視点で描いた素材（ペルソナ 5 本）。
+  本文は 2026-08-04 執筆で p1〜p4 を「未実装」として書いているので、
+  **現状は `LCIR_REMAINING_PHASES.md` と `SPEC.md` を正とする**

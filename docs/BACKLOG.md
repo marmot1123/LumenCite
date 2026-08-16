@@ -120,3 +120,55 @@ PDF をアプリに落とすと、中の DOI / arXiv ID を読んでエントリ
   それを再利用できる。
 - ドロップ先（一覧全体か専用ゾーンか）と、PDF 以外を落とされたときの扱い。
 - `.bib` を落としたら BibTeX インポートに回す、まで広げるか。
+
+---
+
+## B-4 リリース基盤の穴（v1.0.0 のタグ前検証で見つけた・post-1.0）
+
+タグを止める理由にはならないが、**次のリリースまでに塞いでおくと安い**もの。
+いずれも 2026-08-16 に実ファイル・実ワークフローで確かめた。
+
+### B-4-1 タグ名とアプリ版の一致を機械が見ていない
+
+`release.yml` は updater の pubkey がプレースホルダでないことは検査するが、
+**`v1.0.0` というタグと `tauri.conf.json` の `version` が一致するかは誰も見ていない**。
+版 bump を忘れてタグを打つと、**CI は緑のまま「中身が前の版のドラフト」が出来上がる**。
+`latest.json` も古い版を指すので、macOS の updater には「新しい版が無い」ように見える。
+
+**実装の要点**: pubkey ガード（`release.yml` の `Guard against placeholder updater pubkey` ステップ）の隣に、
+`startsWith(github.ref, 'refs/tags/')` のとき `jq -r .version src-tauri/tauri.conf.json` と
+`${GITHUB_REF_NAME#v}` を比べて不一致なら fail する数行を足すだけ。
+**⚠ ここを触るとリリース経路そのものが壊れうる**ので、タグ直前ではなく版と版の間に入れる。
+
+### B-4-2 `DO NOT PUBLISH` の印が原因を誤って名指しする
+
+ドラフトのタイトルを書き換えるステップの条件は
+`failure() && matrix.platform == 'ubuntu-22.04' && startsWith(github.ref, 'refs/tags/')` で、
+**Linux ジョブの任意の失敗**で発火する。したがって失敗の位置で結果が 2 通りに割れる:
+
+- **ドラフトが出来た後**（tauri-action の成功後）に落ちた失敗 ── アップロード失敗など ── は、
+  原因が pdfium と無関係でも「Linux pdfium verify failed」と**誤って名指し**される。
+- **ドラフトが出来る前**（apt / ビルドの失敗）は `gh release edit` の対象が無いので**印が付かず**、
+  `::warning::` が 1 行出るだけで終わる。
+
+つまり「印が付いた ⇒ pdfium の同梱が壊れた」も「印が無い ⇒ 健全」も成り立たない。
+
+**実装の要点**: verify ステップに `id:` を付けて `steps.<id>.conclusion == 'failure'` で絞るか、
+文言を `DO NOT PUBLISH — Linux job failed` に一般化する。当面は運用（タグ後に run を必ず目視）で埋める。
+
+### B-4-3 `.rpm` はタグを打つまで一度も作られない
+
+`linux-bundle-verify` が作るのは `--bundles deb,appimage` の 2 つだけなので、
+**`.rpm` に対する同梱検査はタグ時の `release.yml` が初回**になる。
+rpm だけで落ちるとドラフトを破棄してタグを打ち直すことになる。
+
+**実装の要点**: `linux-bundle-verify.yml` の `--bundles` に `rpm` を足す（実行時間は伸びる）。
+このファイル自身が同ワークフローの `paths` に載っているので、変更 PR で自動的に回る。
+
+### B-4-4 `linux-bundle-verify` の `paths` に `src-tauri/Cargo.toml` が無い
+
+pdfium の探索候補の 1 つは `env!("CARGO_PKG_NAME")` から来る（`ingestion/pdf/pdfium.rs`）ので、
+**crate 名を変えると探索先が変わるのに検査は走らない**。
+v1.0.0 では crate 名は不変（`lumencite`）なので実害は無い。
+足すときは、同ファイル冒頭の対応表に理由を「答えを変えうる」ではなく
+**「候補の 1 つが crate 名から来る」**と書くこと。
