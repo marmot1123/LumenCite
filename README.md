@@ -11,20 +11,27 @@ A desktop reference management application for researchers, built with **Tauri 2
 
 ## Features
 
-- 📚 **Entry management** — 論文・書籍・会議録・Webページ等の CRUD、タグ・コレクション（ネスト対応）、お気に入り、ゴミ箱
+- 📚 **Entry management** — 19 種の文献種別（Zotero 準拠）の CRUD、タグ・コレクション（ネスト対応）、お気に入り、ゴミ箱
 - 🔍 **Auto metadata** — DOI / arXiv / ISBN から CrossRef / arXiv API / Open Library 経由でメタデータを取得
-- 📄 **PDF viewer** — pdf.js ベースの 3 ペイン詳細ビュー、3 色ハイライト、テキスト選択、ページサムネイル、印刷 (⌘P)
+- 📄 **PDF viewer** — pdf.js ベースの 3 ペイン詳細ビュー、3 色ハイライト、テキスト選択、ページサムネイル、印刷 (⌘P)。1 エントリに**本文 + 補助資料の複数 PDF** を添付でき、いずれも全文検索の対象
+- 🧠 **LCIR — 論文の機械可読な構造化**（v1.0.0 で既定 ON）— PDF / arXiv TeX ソースから、節・段落・定理・証明・定義・数式・図・表を**ページ座標と由来（provenance）つき**のノード木として保存します。全文検索の索引はここから作られ、図は切り出して保存し、本文中の「Theorem 2.3」「Figure 3」は実体へ解決されます。**論文を追加すると自動で解析され**、既存のライブラリは起動後に少しずつ埋まります
+- 💬 **Agentic chat** — 全文検索と LCIR の読み取りツールを使って、ライブラリ横断で質問に答えます。回答は**論文自身の言葉と LumenCite の推定を区別**して示し、根拠のブロックをクリックすると PDF の該当箇所がハイライトされます
+- 🔠 **Vision OCR** — テキストレイヤーのないスキャン PDF を LLM Vision で文字起こしして全文検索に載せます。進捗表示つきで**途中で止められ**、止めてもそこまでのページは残ります
+- 🔎 **検索とフィルタ** — メタデータ検索 / PDF 全文検索（FTS5）に加え、種別・年・スター・添付・タグ（AND / OR）を重ねる**複合フィルタ**
+- 🔌 **MCP サーバー / CLI / Web クリッパー** — Claude Desktop・Claude Code・Codex からライブラリを読み書きでき（localhost + Bearer トークン、書込は既定オフ）、ターミナルからは内蔵 CLI（`lumencite bib` で `refs.bib` 生成）、ブラウザからは Chrome 拡張でワンクリック取り込み
 - ✨ **LLM summarization** — OpenAI / Anthropic 対応、API キーは OS キーチェーン保管、ストリーミング表示、カスタムシステムプロンプト
 - 📐 **KaTeX** — 抄録 / ノートで `$…$` / `$$…$$` 数式レンダリング
 - 🔗 **BibTeX workflow** — インポート / エクスポート + 指定パスへの自動同期 (VSCode LaTeX Workshop 連携前提)
 - ⌘K **Command palette** — エントリ横断検索とグローバルアクションを一発起動
 - 🌗 **i18n + theme** — 日本語 / 英語 UI、ライト / ダーク / システム追従、4 アクセントカラー
-- 💾 **Backup & export** — SQLite を `VACUUM INTO` で日次自動バックアップ (14 世代保持) + JSON / BibTeX / Markdown 手動エクスポート
-- ⬆️ **Auto-updater** — Tauri Updater プラグインで署名検証付きアップデート
+- 💾 **Backup & export** — **DB と添付ファイル本体をまとめた zip** を自動バックアップ（前回から 24 時間経っていれば起動時に 1 回・14 世代保持）。壊れたバックアップは復元時に検出され、次回起動時に自動で適用し直せます。JSON / BibTeX / Markdown への手動エクスポートと、LCIR の JSON / 構造付き Markdown 書き出しにも対応
+- ⬆️ **Updates** — macOS は Tauri Updater による署名検証つき自動更新。**Windows / Linux は新版の通知のみ**で、インストーラは Releases ページから手動で入れ替えます
 
 ## Download & install
 
-最新版は [GitHub Releases](https://github.com/marmot1123/LumenCite/releases/latest) から入手できます（macOS: `.dmg` / Windows: `.msi`・`.exe` / Linux: `.AppImage`・`.deb`・`.rpm`）。macOS は署名＋notarize 済みで、アプリ内 **設定 → アップデート**から自動更新できます。
+最新版は [GitHub Releases](https://github.com/marmot1123/LumenCite/releases/latest) から入手できます（macOS: `.dmg` / Windows: `.msi`・`.exe` / Linux: `.AppImage`・`.deb`・`.rpm`）。macOS は署名＋notarize 済みで、アプリ内 **設定 → アップデート**から自動更新できます。Windows は Authenticode 署名済み（SmartScreen はダウンロード実績で評価が育ちます）、Linux は無署名です。
+
+> ℹ️ **Windows / Linux をお使いの方へ:** アプリ内の自動更新は macOS のみで、Windows / Linux は**新版が出たことを知らせるところまで**です。更新はこのページから新しいインストーラを入れ直してください。**v1.0.0 は Windows / Linux にとって PDF 解析ライブラリ（pdfium）の初同梱版**で、LCIR と Vision OCR がこれらの OS で動くのは v1.0.0 からです。
 
 ### macOS: Homebrew
 
@@ -158,10 +165,12 @@ lumencite collect doe2026a 3
 
 ## Documentation
 
-- [docs/SPEC.md](docs/SPEC.md) — 機能仕様と v0.1.0 / Phase 2+ のロードマップ
+- [docs/SPEC.md](docs/SPEC.md) — 機能仕様と版ごとのロードマップ（v1.0.0 節に **LCIR が *しない* こと**の一覧）
 - [docs/DATA_MODEL.md](docs/DATA_MODEL.md) — SQLite スキーマと設計判断
 - [docs/API_SPEC.md](docs/API_SPEC.md) — Tauri コマンド一覧
 - [docs/RELEASE.md](docs/RELEASE.md) — コード署名 / notarization / リリース手順
+- [docs/LCIR_design_overview.md](docs/LCIR_design_overview.md) — LCIR の設計・データモデル・座標系・ノード型
+- [docs/LCIR_REMAINING_PHASES.md](docs/LCIR_REMAINING_PHASES.md) — LCIR の残 Phase・積み残し債務・実測値
 
 ## Sponsor
 
