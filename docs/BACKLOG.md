@@ -172,3 +172,19 @@ pdfium の探索候補の 1 つは `env!("CARGO_PKG_NAME")` から来る（`inge
 v1.0.0 では crate 名は不変（`lumencite`）なので実害は無い。
 足すときは、同ファイル冒頭の対応表に理由を「答えを変えうる」ではなく
 **「候補の 1 つが crate 名から来る」**と書くこと。
+
+### B-4-5 Windows には pdfium の自動検査が 1 つも無い
+
+Linux は `release.yml` が 3 形態を静的検査し、`linux-bundle-verify` が `.deb` と `.AppImage` の中で
+実際に `bind_pdfium()` を呼ぶ。**Windows はそのどちらも無い** ──
+`linux-bundle-verify.yml` に windows の記述は 0 件で、`release.yml` の matrix にも Windows は居ない。
+v1.0.0 では **MSI の File テーブルと NSIS の列挙を人が目で見た**だけで、機械は 1 度も見ていない。
+
+歯止めは `docs/RELEASE.md` §2-2 Phase 5 の手順 7（インストーラを展開して `pdfium.dll` を確認）と
+§6 の pdfium 項（実インストールで PDF を新規添付）で、**どちらも人の手順**。
+DLL の置き忘れ自体はビルドが `ResourcePathNotFound` で落ちるので捕まるが、
+**`--config` を落とした場合はビルドが通ってしまう**（署名設定と `resources` が同時に消える）。
+
+**実装の要点**: VM でのビルド後に走らせるチェックスクリプトを 1 本置く
+（`.msi` の File テーブルか、展開した `.exe` に `pdfium.dll` があること + `signtool verify` の 2 点）。
+CI に載せられないので、**`RELEASE.md` の手順 7 をコマンド 1 行にする**のが現実的な落とし所。
