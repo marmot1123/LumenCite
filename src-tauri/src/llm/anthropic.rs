@@ -484,7 +484,12 @@ where
         ],
     });
 
-    // OCR/vision（単発応答・CR-033）: connect + 全体タイムアウトを張る。
+    // 単発応答（要約生成・接続テスト・CR-033）: connect + 全体タイムアウトを張る。
+    // ⚠ **この全体 timeout は OCR/vision には掛かっていない。** ここへ来る唯一の経路は
+    // `llm::generate_summary` で、OCR は `ChatProvider::stream_chat`（このファイル冒頭の
+    // クライアント = connect 15s + チャンク間 idle 120s のみ）を通る。
+    // CR-033 のコミットメッセージと旧コメントは OCR も対象に挙げていたが**当時から偽**だった
+    // ── OCR ランの全体 timeout は今も存在しない（debt-61）。
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(120))

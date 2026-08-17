@@ -6,9 +6,20 @@
 
 use crate::llm::{provider_for, ChatMessage, ContentBlock, LlmError, Role};
 
+/// スキャン PDF の全文索引に入るページ転写の system プロンプト。
+///
+/// **数式は LaTeX で書かせる**（issue #42 ④）。スキャン本にはこの転写しか本文の経路が無く
+/// （LCIR の `math.latex` が入るのは TeX ソースを取れた版だけ）、形式を指示しないと
+/// Vision の出力が Unicode 崩れにも脱落にもなる。完走した OCR は添付ごと `fulltext.source = Ocr`
+/// に封印されるので、**そこで固定された形がその添付の全文検索の正本になる**。
+/// 全文検索は trigram なので LaTeX が混じっても本文語のヒットは変わらない。
 pub const OCR_SYSTEM_PROMPT: &str = "You are an OCR engine. Transcribe ALL text visible in the \
-image faithfully, preserving reading order and paragraph structure. Do not summarize, translate, \
-or add any commentary — output only the transcribed text. If the page has no text, output nothing.";
+image faithfully, preserving reading order and paragraph structure. Write mathematics as LaTeX: \
+inline math as $...$ and displayed equations as $$...$$, keeping equation numbers as they appear \
+on the page. Leave everything that is not mathematics as plain text — do not add markup to prose, \
+headings, or tables. Do not guess symbols you cannot read clearly; transcribe only what is legible. \
+Do not summarize, translate, or add any commentary — output only the transcribed text. \
+If the page has no text, output nothing.";
 
 /// 図の代替テキスト生成（Phase 8c）の system プロンプト。**見えるものだけを書かせる**方針
 /// （AI 推定を原資料の言い換えに見せない・論文の主張を推測させない）。応答が空文字列なら
@@ -101,6 +112,29 @@ async fn vision_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **数式を LaTeX で書かせる**（issue #42 ④）。スキャン本の数式はこの転写が唯一の経路で
+    /// （LCIR の `math.latex` は TeX ソースがある版にしか入らない）、形式を指示しないと
+    /// Vision の気分次第で Unicode 崩れにも脱落にもなる。しかも完走した OCR は添付ごと
+    /// 封印されるので、その形が全文検索の正本として固定される。
+    ///
+    /// 実 API に出さずに固定できるのは文言だけなので、**文言を固定する**。
+    #[test]
+    fn the_ocr_prompt_asks_for_latex_math() {
+        assert!(OCR_SYSTEM_PROMPT.contains("LaTeX"), "{OCR_SYSTEM_PROMPT}");
+        // **インラインと独立式の両方**を決める。片方だけ固定すると、もう片方を
+        // `\(...\)` に書き換える編集が素通りし、同じ添付の中で記法が食い違う
+        // （封印された後は再課金なしに直せない）。
+        assert!(
+            OCR_SYSTEM_PROMPT.contains("inline math as $...$"),
+            "インラインの区切りも決める: {OCR_SYSTEM_PROMPT}"
+        );
+        assert!(OCR_SYSTEM_PROMPT.contains("$$"), "独立式の区切りまで決める: {OCR_SYSTEM_PROMPT}");
+        // 読めない記号を埋めさせない（誤った転写は封印されると直せない）。
+        assert!(OCR_SYSTEM_PROMPT.contains("cannot read"), "{OCR_SYSTEM_PROMPT}");
+        // 本文まで整形させない（trigram 索引に入るのは素のテキストのまま）。
+        assert!(OCR_SYSTEM_PROMPT.contains("not mathematics"), "{OCR_SYSTEM_PROMPT}");
+    }
 
     /// API キー未設定は**ネットワークに出る前に**弾く（バッチが空キーで全図分叩かないため）。
     #[tokio::test]

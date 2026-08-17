@@ -3414,7 +3414,10 @@ async fn ocr_pdf(
         entry_id,
         attachment_id,
         pages,
-        llm::tools::ocr::OcrHooks { should_stop: &|| false, on_progress: &on_progress },
+        // 停止はプロセス内の `OCR_CANCEL`（`cancel_ocr` コマンド）で効くので、
+        // この経路に呼び出し元固有の停止述語は無い。フックの組み立ては `run_ocr` の中。
+        None,
+        Some(&on_progress),
     )
     .await
     .map_err(|e| e.to_string())
