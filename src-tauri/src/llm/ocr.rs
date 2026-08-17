@@ -122,6 +122,13 @@ mod tests {
     #[test]
     fn the_ocr_prompt_asks_for_latex_math() {
         assert!(OCR_SYSTEM_PROMPT.contains("LaTeX"), "{OCR_SYSTEM_PROMPT}");
+        // **インラインと独立式の両方**を決める。片方だけ固定すると、もう片方を
+        // `\(...\)` に書き換える編集が素通りし、同じ添付の中で記法が食い違う
+        // （封印された後は再課金なしに直せない）。
+        assert!(
+            OCR_SYSTEM_PROMPT.contains("inline math as $...$"),
+            "インラインの区切りも決める: {OCR_SYSTEM_PROMPT}"
+        );
         assert!(OCR_SYSTEM_PROMPT.contains("$$"), "独立式の区切りまで決める: {OCR_SYSTEM_PROMPT}");
         // 読めない記号を埋めさせない（誤った転写は封印されると直せない）。
         assert!(OCR_SYSTEM_PROMPT.contains("cannot read"), "{OCR_SYSTEM_PROMPT}");
