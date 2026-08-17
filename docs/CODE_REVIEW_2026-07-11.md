@@ -212,7 +212,7 @@ sandbox 外の再実行では全件成功した。実装上の失敗ではない
 |---|---|---|
 | CR-036 | Added sort は comparator が値を設定せず常に同順。 | `src/App.tsx:375-381`; `created_at` を比較する。 |
 | CR-037 | dark theme は accent を amber 固定し、PDF別windowは theme/language を同期しない。localStorage 値も型castだけ。 | `useTheme.ts:50-57`; `pdf-viewer.tsx:1-23`; enum 検証と window 間同期を追加する。 |
-| CR-038 | API docs と実装に `attach_ocr_text`、updater command、`abstract`/`abstract_`、return type の drift があり、CLI help は write 対応後も read-only と表示する。相対時刻等の hard-coded UI text と HTML `lang` 固定も残る。 | `docs/API_SPEC.md:125-150,540-585`; `cli/mod.rs:55-60`; docs/type generation と i18n lint を導入する。 |
+| CR-038 | API docs と実装に `attach_ocr_text`、updater command、`abstract`/`abstract_`、return type の drift があり、CLI help は write 対応後も read-only と表示する。相対時刻等の hard-coded UI text と HTML `lang` 固定も残る。 | `docs/API_SPEC.md:125-150,540-585`; `cli/mod.rs:55-60`; docs/type generation と i18n lint を導入する。 ⚠ **2026-08-18 に `attach_ocr_text` の drift だけ消化した**（`docs/API_SPEC.md` 2 箇所 / `SPEC.md` / `DATA_MODEL.md` / `CHAT_UI_BRIEF.md` ── 実装側に同名のツールは無く、`approval.rs` の `attach_ocr_text_is_an_unknown_tool` が「未知のツール」であることをテストで固定している）。**残りの drift は未対応。** |
 | CR-039 | Clippy は重複 attribute、同一 if branch、不要 `Ok(?)` 等 11 warnings。 | `cargo clippy --all-targets --all-features`; baseline を直して CI では warning deny を段階導入する。 |
 
 ## 7. 推奨する修正順

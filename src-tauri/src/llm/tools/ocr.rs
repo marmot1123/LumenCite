@@ -24,9 +24,10 @@ pub fn specs() -> Vec<ToolSpec> {
         description: "OCR a scanned PDF attachment that has NO text layer: rasterize its pages, \
             transcribe them with the vision model, and index the text for full-text search. \
             This costs money and REPLACES the attachment's existing index, so it is a last resort: \
-            first call get_fulltext, and only OCR when it answers `indexed: false`. An entry whose \
-            text is already indexed will refuse a full OCR. Note that fulltext_search finding \
-            nothing only means those words are absent — it does not mean the PDF is unindexed."
+            first call get_fulltext, and only OCR when it answers `indexed: false`. An attachment \
+            whose text is already indexed refuses OCR — whole or partial, naming `pages` does not \
+            change that. Note that fulltext_search finding nothing only means those words are \
+            absent — it does not mean the PDF is unindexed."
             .to_string(),
         parameters: json!({
             "type": "object",
@@ -74,39 +75,111 @@ pub async fn try_execute(
     }
     let attachment_id = call.arguments.get("attachment_id").and_then(|v| v.as_i64());
 
-    // 索引済みの PDF を丸ごと OCR し直させない（issue #42）。全ページ OCR は
-    // `index_attachment` で添付の索引を**置き換える**ので、pdfium が抜いたテキスト層が
-    // Vision の出力で上書きされる。課金もかかる。既に読めるなら `get_fulltext` へ誘導する。
-    // **ユーザーが UI から明示的に押す経路（`run_ocr` 直呼び）はこの制限を受けない** —
+    // 索引済みの PDF を LLM に OCR し直させない（issue #42）。OCR は課金し、その添付の
+    // テキスト層を Vision の出力で置き換え、完走すれば添付ごと「OCR 由来」に封印する。
+    // 既に読めるなら `get_fulltext` へ誘導する。**ユーザーが UI から明示的に押す経路
+    // （`ocr_pdf` コマンド → `run_ocr` 直呼び）はこの制限を受けない** —
     // テキスト層が壊れている PDF を OCR し直すのは正当な操作なので。
-    if pages.is_none() {
-        let indexed = crate::db::fulltext::entry_fulltext_page_count(ctx.pool, entry_id)
-            .await
-            .unwrap_or(0);
-        if indexed > 0 {
-            // ⚠ 中断・失敗した OCR が数ページだけ保存した添付もここに来る（保存が
-            // 索引に数えられるため）。その場合「読める」は過大なので、部分転写の
-            // 可能性と逃げ道（リーダーのボタンはこのガードを受けない）を必ず添える。
-            return Some(Ok(format!(
-                "entry {entry_id} already has {indexed} indexed page(s) of full text — call \
-                 get_fulltext to read it. OCR is only for scanned PDFs with no text layer, and \
-                 re-running it would replace the existing text. To re-transcribe specific pages \
-                 anyway, pass `pages`. Note: if an earlier OCR of this entry was stopped or \
-                 failed partway, those {indexed} page(s) may be only a partial transcription — \
-                 a full re-run is possible from the reader's OCR button, which is not subject \
-                 to this guard."
-            )));
-        }
+    if let Some(refusal) = guard_llm_ocr(ctx.pool, entry_id, attachment_id).await {
+        return Some(Ok(refusal));
     }
 
     // チャットの停止ボタンを OCR の中まで届かせる（`ToolContext::should_stop`）。
     // 進捗はチャットには出さない（ツール結果 1 本で返す形なので出す先が無い）が、
     // `batch_status` へはループ自身が書くので、設定 → データには載る。
-    let hooks = match ctx.should_stop {
-        Some(should_stop) => OcrHooks { should_stop, on_progress: &|_, _| {} },
-        None => OcrHooks::none(),
-    };
+    let hooks = hooks_for(ctx.should_stop);
     Some(run_ocr(ctx.pool, ctx.app_data_dir, entry_id, attachment_id, pages, hooks).await)
+}
+
+/// LLM 経路のガード（issue #42）。`Some(拒否文)` を返したら OCR に進まない。
+///
+/// **判定は「実際に OCR される添付」で取る。** `entry_id` だけで呼ばれたときは
+/// [`resolve_target_pdf`] が [`prepare_ocr`] と同じ規則で対象を決めるので、
+/// 「ガードが見た添付」と「OCR する添付」がずれない。entry 単位で数えていた頃は、
+/// 本体 PDF が索引済みなだけで**未索引のスキャン補遺**まで拒否していた（過剰拒否）。
+///
+/// ⚠ **`pages` は判定材料にしない。** 「ページ指定なら通す」は迂回路になる ──
+/// 完走した OCR は部分・全体を問わず添付ごと `fulltext.source = Ocr` を立てる（§2.6-1）ので、
+/// 1 ページの部分 OCR でも**添付全体の索引が恒久的に再索引を拒む**ようになる。
+/// §2.6-1 がその倒し込みの根拠に置いた「ユーザーが OCR を回した＝この PDF のテキスト層は
+/// 信用できないという明示宣言」は UI 経路にしか成立しないので、LLM 経路は入口で断る。
+/// **リーダーの OCR ボタン（`ocr_pdf` コマンド直呼び）はこのガードを受けない。**
+/// ⚠ **索引の件数が読めなかったときは断る**（`unwrap_or(0)` にしない）── 誤って通すと
+/// 課金と恒久的な封印が起き、誤って断ってもリーダーのボタンが残る。安全側は断る方。
+/// 対象添付そのものが引けなかったときだけは通す ── `run_ocr` が同じ規則で引き直して
+/// 「添付が無い」で落ちるので、同じ文言をここにも持たないため。
+pub(crate) async fn guard_llm_ocr(
+    pool: &sqlx::SqlitePool,
+    entry_id: i64,
+    attachment_id: Option<i64>,
+) -> Option<String> {
+    let (target_id, _) = resolve_target_pdf(pool, entry_id, attachment_id).await.ok()??;
+    match crate::db::fulltext::indexed_page_count(pool, target_id).await {
+        Ok(indexed) => refuse_ocr_of_indexed_attachment(entry_id, target_id, indexed),
+        Err(e) => Some(format!(
+            "could not read the index state of attachment {target_id} (entry {entry_id}): {e}. \
+             Refusing to OCR: running it blind could replace an existing text layer and bill \
+             every page. Ask the user to retry from the app."
+        )),
+    }
+}
+
+/// 索引済みの添付を LLM 経路が OCR し直そうとしたときの拒否文（issue #42）。
+/// `None` を返したときだけ OCR に進む。
+///
+/// **逃げ道を LLM に案内しない。** 以前の文言は「`pages` を渡せば特定ページだけ焼き直せる」と
+/// 書いていたが、それはガードの迂回路そのものだった。ここで案内する先は人間の操作
+/// （リーダーの OCR ボタン）であって、同じツールの別の引数ではない。
+pub(crate) fn refuse_ocr_of_indexed_attachment(
+    entry_id: i64,
+    attachment_id: i64,
+    indexed_pages: i64,
+) -> Option<String> {
+    if indexed_pages <= 0 {
+        return None;
+    }
+    Some(format!(
+        "attachment {attachment_id} (entry {entry_id}) already has {indexed_pages} indexed \
+         page(s) of full text — call get_fulltext to read it. OCR is only for scanned PDFs with \
+         no text layer: it bills every page, replaces this attachment's text with the vision \
+         model's transcription, and permanently marks the attachment as OCR-sourced, so it is \
+         refused here for every page range. Note: if an earlier OCR was stopped or failed \
+         partway, those {indexed_pages} page(s) may be only a partial transcription. \
+         Re-transcribing an attachment that is already indexed is the user's call: tell them it \
+         is available from the OCR button in the app's reader, which this guard does not cover."
+    ))
+}
+
+/// OCR 対象の PDF 添付を決める規則（`attachment_id` 指定があればその添付・無ければ先頭の PDF）。
+/// **ガードと [`prepare_ocr`] は必ずこの 1 本を通す** ── 別々に書くと
+/// 「ガードが見た添付」と「実際に OCR する添付」がずれ、ガードが素通りになる。
+pub(crate) async fn resolve_target_pdf(
+    pool: &sqlx::SqlitePool,
+    entry_id: i64,
+    attachment_id: Option<i64>,
+) -> Result<Option<(i64, String)>, sqlx::Error> {
+    match attachment_id {
+        // 複数 PDF のとき「常に先頭」を OCR してしまわないよう、UI からは選択中の添付 id を渡す（CR-027）。
+        Some(att_id) => {
+            sqlx::query_as(
+                "SELECT id, file_path FROM attachments
+                 WHERE id = ? AND entry_id = ? AND mime_type = 'application/pdf'",
+            )
+            .bind(att_id)
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT id, file_path FROM attachments
+                 WHERE entry_id = ? AND mime_type = 'application/pdf' ORDER BY id LIMIT 1",
+            )
+            .bind(entry_id)
+            .fetch_optional(pool)
+            .await
+        }
+    }
 }
 
 /// 長い OCR の外部依存（停止要求と進捗）。**両方とも関数で受ける** ──
@@ -118,6 +191,23 @@ pub struct OcrHooks<'a> {
     pub should_stop: &'a (dyn Fn() -> bool + Send + Sync),
     /// 1 ページ終わるごとに `(done, total)`。
     pub on_progress: &'a (dyn Fn(i64, i64) + Send + Sync),
+}
+
+/// 呼び出し元の停止手段（`ToolContext::should_stop`）を OCR ループのフックへ詰め替える。
+///
+/// **`try_execute` の中に埋めない。** 埋めると `OcrHooks::none()` へ潰す変異が 1 本も
+/// テストを落とさない ── `run_ocr` は添付の探索で先に落ちるのでフックまで到達せず、
+/// **チャットの停止ボタンだけが黙って効かなくなる**回帰が素通りする。
+///
+/// 進捗はチャットには出さない（ツール結果 1 本で返す形なので出す先が無い）が、
+/// `batch_status` へはループ自身が書くので設定 → データには載る。
+pub(crate) fn hooks_for(
+    should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
+) -> OcrHooks<'_> {
+    match should_stop {
+        Some(should_stop) => OcrHooks { should_stop, on_progress: &|_, _| {} },
+        None => OcrHooks::none(),
+    }
 }
 
 impl OcrHooks<'_> {
@@ -352,29 +442,10 @@ async fn prepare_ocr(
     attachment_id: Option<i64>,
     pages: &Option<Vec<i64>>,
 ) -> Result<(i64, Vec<(i64, String)>, VisionTranscriber), ToolError> {
-    // 1. 対象 PDF 添付。attachment_id 指定があればその添付を、無ければ最初の PDF を使う（CR-027）。
-    //    複数 PDF のとき「常に先頭」を OCR してしまわないよう、UI からは選択中の添付 id を渡す。
-    let row: Option<(i64, String)> = match attachment_id {
-        Some(att_id) => {
-            sqlx::query_as(
-                "SELECT id, file_path FROM attachments
-                 WHERE id = ? AND entry_id = ? AND mime_type = 'application/pdf'",
-            )
-            .bind(att_id)
-            .bind(entry_id)
-            .fetch_optional(pool)
-            .await?
-        }
-        None => {
-            sqlx::query_as(
-                "SELECT id, file_path FROM attachments
-                 WHERE entry_id = ? AND mime_type = 'application/pdf' ORDER BY id LIMIT 1",
-            )
-            .bind(entry_id)
-            .fetch_optional(pool)
-            .await?
-        }
-    };
+    // 1. 対象 PDF 添付（CR-027）。**規則は [`resolve_target_pdf`] に 1 本化してある** ──
+    //    チャット側のガードが同じ規則で対象を決めるので、ここで別に書くとガードが
+    //    「別の添付を見て通す」形になりうる。
+    let row = resolve_target_pdf(pool, entry_id, attachment_id).await?;
     let (attachment_id, file_path) = row
         .ok_or_else(|| ToolError::Execution(format!("entry {entry_id} has no matching PDF attachment")))?;
     let abs_path = app_data_dir.join(&file_path);
@@ -610,6 +681,20 @@ mod tests {
         let g = crate::batch_status::TEST_GATE.lock().await;
         OCR_CANCEL.store(false, Ordering::SeqCst);
         g
+    }
+
+    /// ガードのテスト用の最小 entry。
+    async fn new_entry(pool: &SqlitePool, title: &str) -> crate::models::EntryDetail {
+        create_entry(
+            pool,
+            &EntryInput {
+                title: title.to_string(),
+                entry_type: "article".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
     }
 
     /// 同期テスト用（async でない `#[test]` はランタイムを持たないので blocking で取る）。
@@ -1368,6 +1453,81 @@ mod tests {
         );
     }
 
+    // ── チャット側のガード（guard_llm_ocr）───────────────────────────────
+    //
+    // ガードを `try_execute` から出しているのは、通す側（`None` を返す枝）を
+    // assert するとその先の `run_ocr` が keychain と HTTP に触ってしまうため。
+    // ここは pool だけで完結するので、拒否と通過の**両方**を書ける。
+
+    /// 索引済みの添付は OCR し直させない（issue #42）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_guard_refuses_an_already_indexed_attachment(pool: SqlitePool) {
+        let entry = new_entry(&pool, "Indexed paper").await;
+        let att = add_attachment(&pool, entry.id, "a/p.pdf", "p.pdf", "application/pdf")
+            .await
+            .unwrap();
+        index_attachment(&pool, att.id, &[(1, "existing text layer".to_string())])
+            .await
+            .unwrap();
+
+        let msg = guard_llm_ocr(&pool, entry.id, Some(att.id))
+            .await
+            .expect("索引済みなら断る");
+        assert!(msg.contains("get_fulltext"), "安い経路を指さないと LLM は OCR に戻る: {msg}");
+    }
+
+    /// **判定は「実際に OCR される添付」で取る。** `attachment_id` を省いた呼び出しは
+    /// `prepare_ocr` と同じ規則（先頭の PDF）で解決されるので、その添付の索引を見る。
+    /// ここがずれると、ガードは別の添付を見て通し、OCR は索引済みの添付を焼く。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_guard_reads_the_attachment_that_would_actually_run(pool: SqlitePool) {
+        let entry = new_entry(&pool, "Paper with two PDFs").await;
+        let first = add_attachment(&pool, entry.id, "a/main.pdf", "main.pdf", "application/pdf")
+            .await
+            .unwrap();
+        let _second = add_attachment(&pool, entry.id, "a/si.pdf", "si.pdf", "application/pdf")
+            .await
+            .unwrap();
+        index_attachment(&pool, first.id, &[(1, "main text layer".to_string())])
+            .await
+            .unwrap();
+
+        assert!(
+            guard_llm_ocr(&pool, entry.id, None).await.is_some(),
+            "省略時は先頭の PDF に解決される ── その添付が索引済みなら断る"
+        );
+    }
+
+    /// **過剰拒否をしない。** 本体 PDF が索引済みでも、未索引のスキャン補遺は OCR してよい。
+    /// entry 単位で数えていた頃は、名指ししても「entry は既に N ページ索引済み」で断っていた。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_guard_allows_an_unindexed_attachment_of_a_partly_indexed_entry(pool: SqlitePool) {
+        let entry = new_entry(&pool, "Paper with a scanned supplement").await;
+        let main = add_attachment(&pool, entry.id, "a/main.pdf", "main.pdf", "application/pdf")
+            .await
+            .unwrap();
+        let si = add_attachment(&pool, entry.id, "a/si.pdf", "si.pdf", "application/pdf")
+            .await
+            .unwrap();
+        index_attachment(&pool, main.id, &[(1, "main text layer".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            guard_llm_ocr(&pool, entry.id, Some(si.id)).await,
+            None,
+            "テキスト層の無い添付を名指ししたのに断ると、OCR が本来の対象に届かない"
+        );
+    }
+
+    /// PDF が 1 つも無い entry はここでは断らない ── 「添付が無い」は `run_ocr` の
+    /// エラーで返す（同じ文言を 2 か所に持たない）。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_guard_defers_when_the_entry_has_no_pdf(pool: SqlitePool) {
+        let entry = new_entry(&pool, "No attachments").await;
+        assert_eq!(guard_llm_ocr(&pool, entry.id, None).await, None);
+    }
+
     // ── チャット側のガード（try_execute）─────────────────────────────────
 
     /// issue #42: 索引済みの PDF を LLM に丸ごと OCR し直させない。
@@ -1414,22 +1574,15 @@ mod tests {
         assert_eq!(pages[0].1, "existing text layer");
     }
 
-    /// ページ指定の部分 OCR はこの制限を受けない（差し替えなので既存を消さない）。
-    /// ここでは API キーが無いので「キー未設定」まで進めば分岐を抜けたことになる。
-    /// `run_ocr` 本体まで進んで共有 static（排他）を触るので gate を取る。
+    /// **`pages` はガードの迂回路にならない。** 以前は部分 OCR を通していたが、完走した
+    /// 部分 OCR も添付ごと `fulltext.source = Ocr` を立てる（§2.6-1）ので、1 ページ指定でも
+    /// 添付全体の索引が恒久的に再索引を拒むようになる。§2.6-1 がその倒し込みの根拠に置いた
+    /// 「ユーザーの明示宣言」は UI 経路にしかないので、LLM 経路は入口で断る。
+    ///
+    /// **`run_ocr` に入らずに返るので keychain に触らない**（旧テストは触っていた）。
     #[sqlx::test(migrations = "./migrations")]
-    async fn partial_ocr_is_not_blocked_by_the_indexed_guard(pool: SqlitePool) {
-        let _g = gate().await;
-        let entry = create_entry(
-            &pool,
-            &EntryInput {
-                title: "Indexed paper".to_string(),
-                entry_type: "article".to_string(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    async fn naming_pages_does_not_bypass_the_indexed_guard(pool: SqlitePool) {
+        let entry = new_entry(&pool, "Indexed paper").await;
         let att = add_attachment(&pool, entry.id, "a/p.pdf", "p.pdf", "application/pdf")
             .await
             .unwrap();
@@ -1450,13 +1603,63 @@ mod tests {
             tool_name: "ocr_pdf".to_string(),
             arguments: json!({ "entry_id": entry.id, "pages": [2] }),
         };
-        let out = try_execute(&ctx, &call).await.unwrap();
-        match out {
-            Ok(s) => assert!(!s.contains("already has"), "partial OCR must not be refused: {s}"),
-            Err(e) => {
-                let m = e.to_string();
-                assert!(!m.contains("already has"), "partial OCR must not be refused: {m}");
-            }
-        }
+        let out = try_execute(&ctx, &call).await.unwrap().unwrap();
+        assert!(out.contains("already has"), "ページ指定でも断る: {out}");
+    }
+
+    /// **拒否文が迂回路を教えない。** 旧文言は「To re-transcribe specific pages anyway,
+    /// pass `pages`」と、ガードを抜ける引数そのものを LLM に案内していた。
+    #[test]
+    fn the_refusal_does_not_advertise_a_bypass() {
+        let msg = refuse_ocr_of_indexed_attachment(7, 42, 23).expect("索引済みなら断る");
+        assert!(
+            !msg.contains("pass `pages`"),
+            "ガードを抜ける引数を案内すると、ガードは助言に格下げされる: {msg}"
+        );
+        assert!(msg.contains("reader"), "人間の操作へ渡す先を書く: {msg}");
+        assert!(msg.contains("42") && msg.contains("23"), "どの添付が何ページ索引済みか: {msg}");
+    }
+
+    /// **呼び出し元の停止述語が生きたままループへ渡る。** `hooks_for` を
+    /// `OcrHooks::none()` に潰す変異はここだけが落とす（`try_execute` 経由では
+    /// 添付探索で先に落ちてフックまで届かないので、配線は素通りになる）。
+    #[test]
+    fn the_callers_stop_predicate_reaches_the_loop_hooks() {
+        let pressed = AtomicBool::new(false);
+        let pred = || pressed.load(Ordering::SeqCst);
+        let hooks = hooks_for(Some(&pred));
+
+        assert!(!(hooks.should_stop)(), "まだ押していない");
+        pressed.store(true, Ordering::SeqCst);
+        assert!(
+            (hooks.should_stop)(),
+            "実行中に押した停止が届かない ── bool で渡すと開始時のスナップショットで凍る"
+        );
+    }
+
+    /// 索引が 0 ページなら通す（スキャン PDF ＝ OCR の本来の対象）。
+    #[test]
+    fn an_unindexed_attachment_is_not_refused() {
+        assert_eq!(refuse_ocr_of_indexed_attachment(7, 42, 0), None);
+    }
+
+    /// ⚠ **索引件数が読めなかったら断る。** ここを `unwrap_or(0)` にすると、DB が読めない
+    /// ときだけ「未索引」に見えて課金と封印が通る ── fail-safe の向きが反転する。
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_guard_refuses_when_the_index_cannot_be_read(pool: SqlitePool) {
+        let entry = new_entry(&pool, "Indexed paper").await;
+        let att = add_attachment(&pool, entry.id, "a/p.pdf", "p.pdf", "application/pdf")
+            .await
+            .unwrap();
+        index_attachment(&pool, att.id, &[(1, "existing".to_string())])
+            .await
+            .unwrap();
+        // 添付は引けるが `fulltext` だけ読めない状態を作る。
+        sqlx::query("DROP TABLE fulltext").execute(&pool).await.unwrap();
+
+        let msg = guard_llm_ocr(&pool, entry.id, Some(att.id))
+            .await
+            .expect("読めないなら断る");
+        assert!(msg.contains("could not read the index state"), "{msg}");
     }
 }

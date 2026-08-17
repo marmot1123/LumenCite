@@ -726,7 +726,7 @@ agentic LLM Chat のセッション管理と会話ループ。`chat_send_message
 `chat_send_message` の `channel` は `tauri::ipc::Channel<ChatStreamEvent>`。`tool_call_executed` は **Phase 10b** で `refs: ToolResultRef[]` を持つ（結果が指す PDF 上の根拠。`page` を持つものだけ・最大 5 件。TeX 由来の LCIR には座標が無いので TeX 版を読んだときは常に空）。`tool_call_proposed` の `needs_approval=true` を受けたら UI は承認ダイアログを出し、`approve_tool_call` で応答する。承認制御はツール別ホワイトリスト（DATA_MODEL の `chat.tool_whitelist` 参照）に従う:
 
 - read 系（`fulltext_search` / `get_entry` / `list_*` ＋ **Phase 10b** の文献本文 9 種 = `get_fulltext` / `get_document_structure` / `get_document_blocks` / `search_document_nodes` / `get_node_relations` / `get_symbol_definitions` / `get_figures` / `get_tables` / `get_node_context`）: 常に自動。集合は `llm::tools::approval::READ_ONLY_TOOLS` が正本で、frontend の `src/chat/tools.ts` と一致させる（あちらはカードの色分けと「一覧を再読込するか」の判定に使うので、片方だけ足すと read ツールが write 扱いで表示され毎回一覧が再読込される）
-- `add_tag` / `update_notes` / `attach_ocr_text` / `add_to_collection`: デフォルト自動（設定で都度承認に変更可）
+- `add_tag` / `update_notes` / `add_to_collection`: デフォルト自動（設定で都度承認に変更可）
 - `create_entry` / `update_entry`: 都度承認
 - `delete_*` / MCP の write 系: 常時確認（ホワイトリストで上書き不可）
 
@@ -889,12 +889,12 @@ type ClipperStatusInfo = {
 
 ### OCR（v0.2.0 追加）
 
-テキストレイヤーのないスキャン PDF を LLM Vision で OCR し、結果を `fulltext` にページ単位で保存する。詳細ビューの手動ボタンと LLM ツール（`ocr_pdf` / `attach_ocr_text`）で内部実装を共有する。
+テキストレイヤーのないスキャン PDF を LLM Vision で OCR し、結果を `fulltext` にページ単位で保存する。詳細ビューの手動ボタンと LLM ツール（`ocr_pdf`）で内部実装を共有する（どちらも `llm::tools::ocr::run_ocr` を通る）。
 
 | コマンド | 引数 | 戻り値 |
 |---------|------|--------|
 | `cancel_ocr` | — | `()` — **v1.0.0**。実行中の OCR を**次のページ境界で**止める。1 ページ = 1 回の課金 API 呼び出しで、ページ数は押す前に分からない（ラスタライズして初めて確定する）ため、**実行中に規模を見て降りられること**が唯一の歯止め。処理済みのページは保存される。**再開は無い** ── もう一度実行すると最初からやり直しで全ページ課金し直しになる（結果文言もそう明言する） |
-| `ocr_pdf` | `entry_id: i64, attachment_id?: i64, pages?: Vec<i64>` | `Result<String>` — `attachment_id` 省略時は先頭 PDF、指定時はその添付を OCR（複数 PDF 対応・CR-027）。`pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック。**v1.0.0 で以下が入った**: (a) **1 ページ = 1 課金**なのでループが毎ページ中断要求（`cancel_ocr` のプロセス内フラグ + チャットの停止 `ToolContext::should_stop`）を見る。2 本目は `already_running`（排他は `run_ocr` の中 ── 起動口が 2 つあるため）。⚠ フロントに届く実文字列は `ToolError` の Display が前置した **`"execution error: already_running"`** なので読み手は部分一致で拾うこと (b) `batch_status` の `BatchKind::Ocr` に実行中・進捗・直近結果が載る（**リーダーを離れても設定 → データに停止手段が残る**）。**ループ手前の失敗（添付なし・キー未設定・ラスタライズ失敗）も `record_failure` に載る**。`ocr-progress {done,total}` イベントは UI 起動のランのみ (c) **中断・失敗でも課金済みページは保存**し、届かなかったページがあるなら**部分差し替え**（添付ごと置き換えは完走時だけ）。**空白だけの転写は保存に回さない**（部分差し替えの空ページは既存行の削除になるため）── 結果は `processed`（課金枚数）と `saved`（本文が残った枚数）を分けて返す (d) **`fulltext.source = Ocr` の封印は完走時だけ**（中断・失敗で封印すると、pdf_extract 由来の壊れた既存索引ごと恒久保護してしまう） |
+| `ocr_pdf` | `entry_id: i64, attachment_id?: i64, pages?: Vec<i64>` | `Result<String>` — `attachment_id` 省略時は先頭 PDF、指定時はその添付を OCR（複数 PDF 対応・CR-027）。`pages` 省略時は全ページ。OCR プロバイダは `LlmSettings.ocr_provider` → `provider` のフォールバック。**v1.0.0 で以下が入った**: (a) **1 ページ = 1 課金**なのでループが毎ページ中断要求（`cancel_ocr` のプロセス内フラグ + チャットの停止 `ToolContext::should_stop`）を見る。2 本目は `already_running`（排他は `run_ocr` の中 ── 起動口が 2 つあるため）。⚠ フロントに届く実文字列は `ToolError` の Display が前置した **`"execution error: already_running"`** なので読み手は部分一致で拾うこと (b) `batch_status` の `BatchKind::Ocr` に実行中・進捗・直近結果が載る（**リーダーを離れても設定 → データに停止手段が残る**）。**ループ手前の失敗（添付なし・キー未設定・ラスタライズ失敗）も `record_failure` に載る**。`ocr-progress {done,total}` イベントは UI 起動のランのみ (c) **中断・失敗でも課金済みページは保存**し、届かなかったページがあるなら**部分差し替え**（添付ごと置き換えは完走時だけ）。**空白だけの転写は保存に回さない**（部分差し替えの空ページは既存行の削除になるため）── 結果は `processed`（課金枚数）と `saved`（本文が残った枚数）を分けて返す (d) **`fulltext.source = Ocr` の封印は完走時だけ**（中断・失敗で封印すると、pdf_extract 由来の壊れた既存索引ごと恒久保護してしまう） (e) **チャット（LLM）経路には索引済みガードが掛かる**（`llm::tools::ocr::guard_llm_ocr`）── **実際に OCR される添付**（`resolve_target_pdf` が `prepare_ocr` と同じ規則で決める）に索引済みページが 1 ページでもあれば、`get_fulltext` を案内して実行しない。**`pages` を渡しても変わらない**（2026-08-18・issue #42 ── 旧実装は `pages` 指定を免除しており、しかも拒否文が迂回法を案内していた）。索引件数が読めなかった場合も断る。**このガードは Tauri コマンド `ocr_pdf`（＝リーダーのボタン）には掛からない** ── テキスト層が壊れた PDF を焼き直すのは正当な操作で、封印を添付単位にしている根拠（「ユーザーがテキスト層を信用しないと宣言した」）もそちらにしか成立しないため |
 
 ---
 

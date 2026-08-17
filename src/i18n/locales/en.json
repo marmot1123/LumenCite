@@ -909,7 +909,7 @@
       "ocrRunningTitle": "OCR running",
       "ocrRunningDesc": "A scanned PDF is being transcribed. Each page is billed. Stopping keeps the pages transcribed so far; running OCR again starts over from the first page and bills every page again.",
       "ocrRunningProgress": "{{done}}/{{total}} pages",
-      "ocrRunningNoProgress": "Preparing… (no page progress yet — the first page may already be transcribing)",
+      "ocrRunningNoProgress": "Preparing… (rasterising the PDF into page images. Page progress appears next, just before the first page is transcribed — nothing is billed until then.)",
       "ocrStop": "Stop OCR",
       "lcir": "LCIR (machine-readable IR)",
       "lcirDesc": "Parse PDFs into a typed node tree with coordinates (on by default). Pages, text blocks and coordinates are stored, and full-text search reads from them. Once something has been built, the chat assistant can also read papers by structure — theorems, equations, figures and their PDF regions. Turning this off stops new builds and hides the structural tools from chat; what is already stored is kept.",

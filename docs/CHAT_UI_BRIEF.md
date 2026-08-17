@@ -113,7 +113,7 @@ LLM のツール呼び出しを**全展開で可視化**する折りたたみカ
 
 ツール種別でアイコン/色を分けると分かりやすい:
 - 🔍 **読み取り系**（`fulltext_search` / `get_entry` / `list_*`）— 常に自動承認、地味でよい
-- ✏️ **書き換え系**（`add_tag` / `update_notes` / `attach_ocr_text` / `add_to_collection`）— デフォルト自動だが「DBを変えた」ことが分かる色
+- ✏️ **書き換え系**（`add_tag` / `update_notes` / `add_to_collection`）— デフォルト自動だが「DBを変えた」ことが分かる色
 - ⚠️ **要承認の書き換え**（`create_entry` / `update_entry`）— 承認待ち強調
 - 🗑️ **削除**（`delete_*`）— 常に承認必須、最も強い警告色
 - 🔌 **MCP**（`mcp_<server>_<tool>`）— 外部サーバー呼び出しと分かるバッジ。write 系は常に承認
