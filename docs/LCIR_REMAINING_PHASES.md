@@ -16,7 +16,7 @@
   §2 の順序表は**実施記録として凍結**する。
 
 **点在する実測値は 2026-07-30 時点のもの。再着手時は再計測すること。**
-実装済み Phase（0/1/2/3/4/5/6a/6b/8a/8b/8c/9a/10a/10b）の内容は設計概観 §3・§5.4 を参照。
+実装済み Phase（0/1/2/3/4/5/6a/6b/8a/8b/8c/**8d-2/8d-7/8d-8**/9a/10a/10b）の内容は設計概観 §3・§5.4 を参照。
 
 ---
 
@@ -3484,7 +3484,7 @@ PR-4 のレビューで訂正した** ── `run_lcir_gc` は印を立ててか
 
 | PR | 抜けていた内容 |
 |---|---|
-| #66 | **pdfium を Windows / Linux に同梱** ── **この版の看板の半分**（両 OS で LCIR と OCR が動く初の版） |
+| #66 | **pdfium を Windows / Linux に同梱** ── **この版の看板の半分**（両 OS で **PDF 由来の** LCIR と Vision OCR が動く初の版。TeX ソース由来の LCIR は pdfium を要らないので v0.8.0 から動いていた ── **同じ数え落としを CHANGELOG で 1 度直したのに、ここでまた書いた**） |
 | #65 | 起動時フルバックアップの 24h 間引き / `.zip.partial` / 作業ファイル回収 |
 | #67 | Markdown エクスポートの図と代替テキスト + 欠落警告チャネル / PDF 本文の図表参照（8d-7） |
 
@@ -3504,7 +3504,8 @@ PR-4 のレビューで訂正した** ── `run_lcir_gc` は印を立ててか
 2. **§2-2 Phase 5 に pdfium.dll の配置ステップが無い**のに、§12-1 がそこを指していた
    （壊れた相互参照）。v1.0.0 は Windows にとって pdfium 初同梱なので**前回作業の踏襲が効かない**。
 
-あわせて §5 の `gh pr create --fill && gh pr merge --squash` が **CI を待たない**ことも判明した
+3 つ目は毛色が違う。§5 の `gh pr create --fill && gh pr merge --squash` が **CI を待たない**ことも判明したが、
+**この行は同じ PR が自分で新設したもの**で、既存 doc の腐りではなく**自分の新規記述にレビューが当たった例**
 （`allow_auto_merge:false` + 必須チェック未設定なので右辺が即通る・`--auto` も不可）。
 同じ PR が §12-3 に足した「`linux-bundle-verify`（7〜12 分）が緑」を原理的に満たせなかった。
 
@@ -3523,7 +3524,7 @@ PR-4 のレビューで訂正した** ── `run_lcir_gc` は印を立ててか
 
 #### UI から消えたラベルが CHANGELOG に残っていた
 
-`(experimental; requires LCIR enabled)` が 7 箇所 + `Phase 10a/10b, experimental` が 2 箇所。
+`(experimental; requires LCIR enabled)` が 7 箇所（**うち 5 箇所は前からあったもの・2 箇所はこの PR で新しく書いたもの**）+ `Phase 10a/10b, experimental` が 2 箇所。
 **アプリの設定文言はもう「既定で有効」**で experimental を名乗っていないのに、CHANGELOG だけが
 実験扱いのままで、同じ節の看板段落と矛盾していた。**実装からの削除は doc に自動で伝播しない。**
 
@@ -3537,16 +3538,18 @@ Linux 3 形態の pdfium 同梱・updater 経路・tap の予測・リポジト�
 **pdfium 初同梱の周知**、**拡張 zip の案内**が 1 文字も無かった。**publish 前に本文を書き直して解消。**
 
 ⚠ **`latest.json` の `notes` も同じテンプレートのまま**（tauri-action が `releaseBody` から生成する
-静的アセットなので、`gh release edit` で本文を直しても変わらない）。**macOS の更新ダイアログに出るのは
-こちら**なので、既定を反転するこの版でも予告が出ない。v0.9.0 / v0.10.0 も同じで退行ではないため
-そのまま公開した（直すには署名・platforms・URL を 1 バイトも変えずに再アップロードが要り、
-失敗すると macOS の自動更新が全滅する）。→ **debt 化の候補**。
+静的アセットなので、`gh release edit` で本文を直しても変わらない）。**macOS の in-app 表示に出るのはこちら**
+（設定 → 更新タブで「更新を確認」を押したカード内の、**既定で折り畳まれた**リリースノート。
+自動チェックは無いので押さなければ何も出ない）なので、既定を反転するこの版でも予告が届かない。
+**Windows / Linux は通知分岐なので GitHub の本文がそのまま出る。**
+v0.9.0 / v0.10.0 も同じで退行ではないためそのまま公開した。→ **debt-60 に新設**
+（直し方は 3 通りあり、`latest.json` の再アップロードは最終手段）。
 
 #### 配布物の検証（実物）
 
 | 対象 | 確かめたこと |
 |---|---|
-| macOS `.dmg` | Developer ID 署名 / `spctl` = accepted, Notarized / `stapler validate` OK / universal / `Frameworks/libpdfium.dylib` |
+| macOS `.dmg` **の中の `LumenCite.app`** | Developer ID 署名 / `spctl` = accepted, Notarized / `stapler validate` OK / universal / `Frameworks/libpdfium.dylib`。⚠ **`spctl` / `stapler` は `.app` に当てる** ── `.dmg` 自体に当てると rejected と出る（v0.10.0 も同じで退行ではない） |
 | Windows `.msi` `.exe` | `osslsigncode verify` = **Succeeded** / 拇印 `B4415786…` が設定値と一致 / timestamp あり。**MSI の File テーブルに `pdfium.dll` v`2.0.7934.0`**（`PDFIUM_TAG=chromium/7934` と一致）・NSIS も 7z で直接列挙。**v0.10.0 の MSI は "pdfium" 0 件**＝初同梱を実証 |
 | 同梱 `pdfium.dll` の素性 | 上流 tarball の sha256 が `pdfium.env` の期待値と一致。出荷 DLL との差は **7 バイトのみ**で、内訳は Certificate Table（`Size=0x2870`＝サイズ差 10,352 B と一致）と PE CheckSum の 3 バイト。**署名を剥がすとサイズ完全一致・残差は CheckSum フィールド内のみ** ＝ tauri が同梱リソースにも個別署名している |
 | Linux 3 形態 | `.deb` / `.rpm` / `.AppImage` すべてに `usr/lib/LumenCite/libpdfium.so`。これは `bind_pdfium()` の **productName 候補**に当たる（exe は crate 名 `usr/bin/lumencite` なので、crate 名候補と実行ファイル名候補では 1 つも当たらない） |
@@ -3554,8 +3557,10 @@ Linux 3 形態の pdfium 同梱・updater 経路・tap の予測・リポジト�
 
 #### 残した限界
 
-- **`.rpm` だけ実行時 bind が未検証**（`linux-bundle-verify` は `--bundles deb,appimage`）。
-  静的検査は 3 形態とも通っている。→ B-4-3。
+- **実行時 bind を通したのは `.deb` と `.AppImage` だけ。** `.rpm` は静的検査のみ（→ B-4-3）で、
+  **Windows は静的検査すらワークフローに無い** ── MSI の File テーブルと NSIS の列挙を人が見ただけで、
+  `linux-bundle-verify.yml` に windows の記述は 0 件。**「rpm だけ未検証」と書きかけたが偽**で、
+  自動検査が丸ごと存在しないのは Windows の方。歯止めは `RELEASE.md` §6 の pdfium 項だけ（→ B-4-5）。
 - **実 UI・実 DB での 1 回通し確認**と**クリーンな app data dir での「未設定 → ON」確認**は**未実施のまま公開**した。
   dev ビルドはバックフィルもバックアップも既定 OFF（`LUMENCITE_LCIR_BACKFILL=1` / `LUMENCITE_STARTUP_BACKUP=1`）。
 - **タグ名とアプリ版の一致を機械が見ていない**（→ `BACKLOG.md` B-4-1）。今回は手で照合した。
@@ -4108,7 +4113,7 @@ superseded を指す FTS 行 0 件 / node_id を含む `chat_messages` 0 件＝*
 | **debt-57** | **詳細パネルの LCIR ボタン群は `batch_status` を一度も読まないので、他のバッチが走っていても押せる。** 代替テキスト・1 件 build・TeX 取得の 3 つとも `disabled` はローカルの busy だけで、拒否はバックエンドの戻り値（`already_running` / `build_busy`）で説明する設計（**同じパネルには LCIR 書き出しボタンが 2 つあって計 5 ボタンだが、そちらは読み取りのみでバックエンドのロックを取らない**ので購読の対象外 ── 「3 ボタンまとめて」の 3 はこの意味）。**PR-3 で拒否条件が「自分がもう 1 本走らせている」から「LCIR 系のどれか 1 本でも走っている」に広がった**ぶん、空振りの頻度が上がった。②b の PR-3 レビュー（3 レンズとも反証 ── 課金も書き込みも起きず、文言も PR-3 で正しく直っている）。**このパネル全体の既定の設計なので、代替テキストのボタンだけ直すと今度はパネル内に非対称ができる**。直すならパネルに `batch_status` の購読を 1 本入れて 3 ボタンまとめて。post-1.0 | S | post-1.0 |
 | **debt-58** | **GC の確認には「押した瞬間の取り直し」が無いので、非可逆な削除を古い数字のまま実行できる。** 課金する代替テキスト側は**押下時に** `count_figures_missing_alt_text` を引き直し、表示と食い違ったら**実行せずに新しい件数で聞き直す**（debt-32）。GC が持っているのは**開くとき**の `refreshStorage()` と、確認ボタンの `disabled={anyLcirJobRunning}`（PR-3）まで。踏める順は 2 つ ── (a) **確認ボックスを開いたまま同じ画面の一括構築 / 一括再構築を押せる**（build ボタンの `disabled` は `confirmGc` を見ない）。走っている間は「削除する」が塞がるが、**終わると再び押せるようになり、その間にボックスの数字を更新する経路も閉じる経路も無い** ── 実装コメントが「直した理由」に挙げている「『3 版を消します』と表示したまま 138 添付ぶんの新版が積まれる」が、窓を狭めただけで残っている。(b) `RunningMark` を立てない p2 の自動 build（添付追加 / 起動時バックフィル）は `anyLcirJobRunning` に映らないので、そもそも塞がらない。削除対象そのものは実行時に取り直すので**保護すべき版（alt text を持つ版）を消すことはなく**（外した数は `versions_skipped` で報告）、実害は「同意した数と違う量を非可逆に消す」ことに限られる。直すなら (a) 押下時に `lcir_storage_stats` を引き直して食い違ったら聞き直す（代替テキストと同型にする）── (b) build ボタン側に `confirmGc` を足すのは対症療法で、(b) だけだと自動 build 経路が残る。⚠ **この行の初版は「GC は件数を取り直さない」「代替テキストとは守り方が違う」と書いていたが、どちらも偽だった**（開くときは取り直すし、代替テキスト側も `anyLcirJobRunning` を持つ）── ②b の PR-4 レビューで訂正 | S | post-1.0 |
 | **debt-59** | **クリッパーの TeX 初回取得に in-flight ガードが無く、同じ論文の並行クリップで `TEX_SOURCE_MIME` の添付行が 2 本できうる。** PDF 側は `PDF_JOBS_IN_FLIGHT` で塞いだ同型の穴。1 本目の job がダウンロード中は attachments 行がまだ無いので、2 本目のクリップ（重複 → 欠落補完）の `plan_completion` も、両 job の `download_and_attach_arxiv_source` の existing クエリも None を見て、双方が新規経路（`create_unique_file` + `add_attachment`）に入る。以後の read / 再取得は `ORDER BY id LIMIT 1` で常に古い行を選ぶため、2 本目は選ばれないゴミとして残る（課金・破壊なし。build は同一 sha256 → 同一 content_key なので版管理も壊れない）。②c 裁定 PR のコミット後レビューで確認（**pre-existing** ── C-03/C-05 は同関数を触ったが競合窓は変えていない）。直すなら PDF と同じ in-flight セットを `spawn_tex_source_job` に足す | S | post-1.0 |
-| **debt-60** | **`latest.json` の `notes` が CI の定型テンプレのまま固定される。** tauri-action が `releaseBody` から生成する**静的アセット**なので、publish 前後に `gh release edit` でリリース本文を直しても `notes` は変わらない。**macOS の更新ダイアログに出るのはこちら**なので、v1.0.0 のように既定値を反転する版でも予告が届かない（気づけるのは Releases 頁を開いた人だけ）。v0.9.0 / v0.10.0 も同じで退行ではない。⚠ **直すには署名・`platforms`・URL を 1 バイトも変えずに再アップロードが要り、壊すと macOS の自動更新が全滅する** ── 触るなら手順を先に固めること | S〜M | 否（post-1.0・#12 の公開直前監査で発見） |
+| **debt-60** | **`latest.json` の `notes` が CI の定型テンプレのまま固定される。** tauri-action が `releaseBody` から生成する**静的アセット**なので、publish 前後に `gh release edit` でリリース本文を直しても `notes` は変わらない。**macOS の in-app 表示に出るのはこちら**（設定 → 更新タブで「更新を確認」を押したカード内・**既定で折り畳まれた**リリースノート。自動チェックは無い）なので、v1.0.0 のように既定値を反転する版でも予告が届かない。**Windows / Linux は通知分岐なので GitHub の本文がそのまま出る**（＝ macOS だけが取り残される）。v0.9.0 / v0.10.0 も同じで退行ではない。**直し方は 3 通り**: ①**フロント**で `available.body` の代わりに、版が一致するときだけ `check_latest_github_release` の `body`（GitHub の実本文）を採る ── `latest.json` を触らないので最も安全だが、**効くのは更新“元”の版の**コードなので v1.0.1 以降からしか救えない。②**タグ時に `release.yml` の `releaseBody` へ実文面を渡す** ── `latest.json` は CI が生成するので再アップロード不要で、本文と `notes` が同時に正しくなる（次回リリースの本命）。③**公開済みの版を遡って直すときだけ**の最終手段として、署名・`platforms`・URL を 1 バイトも変えずに再アップロード（**壊すと macOS の自動更新が全滅する**） | ①S / ②S / ③M | 否（post-1.0・#12 の公開直前監査で発見） |
 
 `NodeKind` は 29 種定義されているが、生成経路を持つのは PDF 18 種 / TeX 22 種。
 `ListItem` / `Footnote` / `Citation` / `InlineMath` / `EquationGroup` / `TextBlock` はどちらも生成しない。
@@ -4176,7 +4181,8 @@ block 級ノード 906 件のうち 892 件＝98.6% は既に figure_caption に
   **MSI の File テーブルに `pdfium.dll` v`2.0.7934.0`**・NSIS にも実在を確認した（v0.10.0 の MSI は 0 件）。
   さらに**出荷 DLL が固定タグの上流バイナリと、署名と PE CheckSum を除いてバイト同一**であることまで検算した。
   Linux は 3 形態すべてに `usr/lib/LumenCite/libpdfium.so`（`bind_pdfium()` の productName 候補）。
-  ⚠ **`.rpm` だけ実行時 bind が未検証**（`linux-bundle-verify` は deb と appimage のみ）→ `BACKLOG.md` B-4-3。
+  ⚠ **実行時 bind を通したのは `.deb` と `.AppImage` だけ**（`linux-bundle-verify` は deb と appimage のみ）。
+  `.rpm` は静的検査のみ（→ `BACKLOG.md` B-4-3）で、**Windows は自動検査そのものが無い**（→ B-4-5）。
   以下は当時の手順メモ: Windows の pdfium は CI が同梱せず、VM 上で `curl` →
   `certutil -hashfile` → `src-tauri\pdfium\pdfium.dll` へ手動配置し `--config src-tauri/tauri.release-windows.conf.json`
   付きでビルドする。**`--config` を落とすと署名設定と pdfium 同梱が同時に消える**
@@ -4188,28 +4194,34 @@ block 級ノード 906 件のうち 892 件＝98.6% は既に figure_caption に
   実作業そのものは短いが、**人が VM に張り付ける時間が取れるかで決まる**のは予告どおりだった。
   ⚠ **NSG の RDP 送信元は当日中に変わりうる**（今回セッション中に自宅 → ホテルで変化し、更新が要った）。
   後始末（deallocate → NIC から IP を外す → IP 削除）は公開当日に完了済み。
-- ~~**`latest.json` は darwin エントリのみ**~~ **周知済**（2026-08-17）。公開後に実測して
-  `platforms` が darwin 4 キーのみ・`version` が `1.0.0` であることを確認し、
-  **リリースノート本文に「Windows and Linux: this one needs a manual download」節を書いた**
-  （pdfium 初同梱と併記）。⚠ **ただし `latest.json` の `notes` はテンプレートのまま**で、
-  macOS の更新ダイアログにはこの予告が出ない（§2.25 の末尾）。以下は決定時のメモ:
+- **`latest.json` は darwin エントリのみ** ── ~~この非対称をリリースノートで周知する~~ **周知済**（2026-08-17）。
+  **publish 前に**リリースノート本文へ「Windows and Linux: this one needs a manual download」節を書き
+  （pdfium 初同梱と併記）、**公開後に**実測して `platforms` が darwin 4 キーのみ・`version` が
+  `1.0.0` であることを確認した。⚠ **ただし `latest.json` の `notes` はテンプレートのまま**で、
+  macOS の in-app 表示にはこの予告が出ない（**debt-60**）。以下は決定時のメモ:
   Windows / Linux には v1.0.0 が auto-update で届かない。
   しかも両 OS にとって v1.0.0 は pdfium 初同梱版で、手動 DL しない限り LCIR も OCR も動かない
   （`bind_pdfium()` が両者の単一入口）。看板の到達率が OS で構造的に違うことと、
   更新通知（`check_latest_github_release` は全 OS で出る）での周知をリリースノートに書く。
-- ~~**Homebrew tap は publish 時の自動ワークフロー**~~ **確認済**（2026-08-17）。publish の 2 秒後に発火し
-  **12 秒で success**、tap に `lumencite 1.0.0`（`7b19c73`）が入り、**cask の sha256 が
-  リリースの dmg digest（`e9a66c10…`）と一致**した。`HOMEBREW_TAP_TOKEN` は生きていた。以下は決定時のメモ:
-  （`release: published` で発火・プレリリースでは動かない）。
+- **Homebrew tap は publish 時の自動ワークフロー** ── ~~publish 後に発火と反映を確認する~~
+  **確認済**（2026-08-17）。publish の **2 秒後**に発火し **12 秒で success**、tap に
+  `lumencite 1.0.0`（`7b19c73`）が入り、**cask の sha256 がリリースの dmg digest（`e9a66c10…`）と一致**した。
+  `HOMEBREW_TAP_TOKEN` は生きていた。tap 更新は `release: published` で発火し、プレリリースでは動かない。
+  以下は決定時のメモ:
   必要なのは書き換えではなく、draft → publish の順序、`HOMEBREW_TAP_TOKEN` が生きていること、
   publish 後に tap のコミットと `brew info --cask lumencite` の確認。
   **トークン失効時は 403 で無言失敗**し、cask は `auto_updates true` なので brew ユーザーには
   「更新が来ない」ことすら見えない。
 - **配布後検証**（RELEASE.md §6）── **一部だけ済み。残りは公開後の宿題**。
-  済: macOS の署名 / notarize / staple / universal / pdfium 同梱、Windows の Authenticode 署名と拇印と
-  pdfium 同梱、Linux 3 形態の pdfium 同梱、配信 3 経路（Latest / `latest.json` / 更新通知 API）と tap。
-  **未**: 別マシン / クリーンインストールでの実起動（Gatekeeper・SmartScreen・AppImage・`dpkg -i`）と、
-  **updater 経路**（旧版を入れて起動 → 通知 → 適用 → 再起動）。
+  **済**（すべて手元での実物検証）: macOS の署名 / notarize / staple / universal / pdfium 同梱、
+  Windows の Authenticode 署名と拇印、配信 3 経路（Latest / `latest.json` / 更新通知 API）と tap。
+  pdfium の**同梱**は 4 プラットフォームとも確認したが、**粒度が違う** ── Linux は
+  `.deb` / `.AppImage` が **CI で実行時 bind まで**（`linux-bundle-verify` run 31955353764）、
+  `.rpm` は静的検査のみ、**Windows は静的（MSI の File テーブル / NSIS の列挙）だけで自動検査が無い**。
+  **未**: ①別マシン / クリーンインストールでの実起動（Gatekeeper・SmartScreen・AppImage・`dpkg -i`）
+  ②**updater 経路**（旧版を入れて起動 → 通知 → 適用 → 再起動）
+  ③**`RELEASE.md` §6 の pdfium 項** ── Windows / Linux の実インストールで **PDF を 1 本「新しく添付」**して
+  全文索引が付き、ログに `pdfium library not found` が出ないこと（**既存 PDF を開くだけでは検査にならない**）。
   v1.0.0 は「updater で上がった直後の初回起動」でバックフィルが走る設計なので、**この経路が最重要**。
   あわせて **クリーンな app data dir での「未設定 → ON」確認**（§12-2）も未実施のまま公開した。
 - ~~**Chrome 拡張 0.2.0 を据え置くか**~~ **据え置きで確定**（#12 のタグ前検証で実測）。

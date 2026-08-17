@@ -53,8 +53,8 @@ LCIR はこれらを失わずに保存する基盤を作る。**最優先は高�
 | **5 定理/定義/証明** | theorem-like 環境・proof・型付きノード（定理間参照グラフは Phase 6 の node_relations へ） | **E** | 2 | M | **実装済**（TeX=環境名+`\newtheorem`／PDF=行頭キーワード・信頼度付き） |
 | 6 記号/参照グラフ | `symbols`/`symbol_occurrences`・`node_relations`・スコープ | E | 2,3 | L | **実装済**（6a 参照グラフ = `node_relations`／6b 記号系 = `symbols`/`symbol_occurrences`・TeX の定義文認識） |
 | 7 数式意味表現 | 数式 AST・Content MathML・OpenMath・α 正規化・部分式検索 | — | 3,6 | XL | 予定 |
-| 8 図表機械可読化 | `assets`/`node_assets`・図切出/SVG/OCR・表セル・plot | F | 1,2 | XL | **8a 実装済**（assets 基盤 + 図 crop + figure ノード + caption_of）。**8b 実装済**（TeX tabular セル構造化・`table` ノード）。**8c 実装済**（図の Vision alt text・`node_alt_texts`・opt-in バッチ）。8d（SVG/plot 構造化）予定 |
-| **9a エクスポート第一段** | LCIR JSON 書き出し・構造付き Markdown 出力（決定的レンダリング） | — | 1-6 | M | **実装済**（v0.10.0 で出荷済。**v1.0.0 で図と代替テキストの描画 + 欠落警告チャネルを追加**） |
+| 8 図表機械可読化 | `assets`/`node_assets`・図切出/SVG/OCR・表セル・plot | F | 1,2 | XL | **8d-2 / 8d-7 / 8d-8 も v1.0.0 で実装済**（ベクター図領域 / 本文→図表参照 / XObjectForm 内画像）。残る 8d-1・8d-3〜8d-6（SVG 取込・plot 軸/凡例ほか）は post-1.0。**8a 実装済**（assets 基盤 + 図 crop + figure ノード + caption_of）。**8b 実装済**（TeX tabular セル構造化・`table` ノード）。**8c 実装済**（図の Vision alt text・`node_alt_texts`・opt-in バッチ）。8d（SVG/plot 構造化）予定 |
+| **9a エクスポート第一段** | LCIR JSON 書き出し・構造付き Markdown 出力（決定的レンダリング） | — | 1-6 | M | **実装済**（v0.10.0 で出荷済。**v1.0.0 で図の存在マーカー**（`**[Figure N]** (p. P)`・**画像リンクは張らない**）**と代替テキスト + 欠落警告チャネルを追加**） |
 | 9b 標準形式エクスポート | JATS/TEI/HTML+MathML 出力 | — | 7, 9a | M | 予定（post-1.0 可） |
 | 10 LLM/エージェント | ノードチャンク・provenance 付き回答・embedding 再生成 | — | 2-8 | L | **10a/10b 実装済**（文脈バンドル `get_node_context`・チャットへの露出と根拠ジャンプ）。10c（embedding）は post-1.0 |
 

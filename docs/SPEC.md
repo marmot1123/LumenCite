@@ -364,17 +364,17 @@ CLI（読取＋書込）が揃ったので、LaTeX 執筆支援の `lumencite-bi
 - **Markdown の品質は由来に依存**: TeX 版は原文 LaTeX（`$..$` インライン温存・display は `$$..$$`）・定理番号・cite key まで出る。PDF 版は surface-only（数式は Unicode 線形のまま・`$$` を付けない）。出力の YAML フロントマターに `lcir_source`（抽出器名・版）を記録し、由来を常に区別する（roadmap §16）。
 - **やらないこと（9b へ）**: JATS/TEI/HTML+MathML。embedding・ノードチャンク API は Phase 10。
 
-### LCIR 図表アセット基盤（Phase 8a・v0.10.0 同梱候補）
+### LCIR 図表アセット基盤（Phase 8a・**v0.10.0 で出荷済**）
 
 Phase 8（図表機械可読化）の最小スライス。**PDF 版のみ**（`lumencite-pdfium` 0.5.0→0.6.0・TeX 抽出器は不変）。
 
-- **図領域検出**: ページ内の埋込画像オブジェクト（トップレベル Image のみ）の bbox を近接マージして図領域とし、`figure` ノード（bbox 付き・`origin='layout_model'`・confidence 0.6）を作る。**tikz/pgf 等のベクター図は Image オブジェクトを持たないためアセット 0 件が正当**（誤検出より欠損。数学系コーパスでは体感が薄い既知の限界）。
+- **図領域検出**: ページ内の埋込画像オブジェクト（トップレベル Image のみ）の bbox を近接マージして図領域とし、`figure` ノード（bbox 付き・`origin='layout_model'`・confidence 0.6）を作る。⚠ **以下は 8a 当時の限界で、v1.0.0 で解消済**（8d-2 = PR #80 `95a9f65` / 8d-8 = PR #78 `6386ef5`）── **tikz/pgf 等のベクター図は Image オブジェクトを持たないためアセット 0 件が正当**（誤検出より欠損。数学系コーパスでは体感が薄い既知の限界）。
 - **ページ crop アセット**: 図領域をページレンダリング（幅 1600px・OCR と同値）から切り出した PNG として `attachments/<entry_id>/.lcir/` 配下に保存し、`assets`/`node_assets`（migration 0019）で参照する。バイナリは FS・DB は相対パス + SHA-256（ADR #3）。
 - **caption 関連付け**: 同一ページの figure caption と幾何ペアリング（相互最近のみ・曖昧なら張らない）して `caption_of` 辺を張り、caption の番号（"Figure 2" → "2"）を figure ノードの `figure_number` に載せる。
 - **読み出し**: MCP `get_figures`（図番号 → 画像パス・caption・本文位置を一問い合わせ）+ `LcirDocument` に `assets` が透過で載る（JSON エクスポート含む）。
-- **やらないこと**: XObjectForm 内画像（誤配置 crop 回避を優先）／plot 軸・凡例・alt text（8c・Vision opt-in）／TeX tarball 内画像の取込。表のセル構造化は 8b で実装済（次節）。
+- **やらないこと**（8a 当時）: ~~XObjectForm 内画像（誤配置 crop 回避を優先）~~ **8d-8 で追うようになった**（form 単位の自己校正・包含率が閾値未満なら棄却）／plot 軸・凡例・alt text（alt text は 8c・Vision opt-in で実装済）／TeX tarball 内画像の取込。表のセル構造化は 8b で実装済（次節）。
 
-### LCIR 表セル構造化（Phase 8b・v0.10.0 同梱候補）
+### LCIR 表セル構造化（Phase 8b・**v0.10.0 で出荷済**）
 
 Phase 8（図表機械可読化）の表スライス。**TeX 版のみ**（`lumencite-tex` 0.4.0→0.5.0・pdfium 抽出器は不変・migration 不要 — セル構造は `document_nodes.payload_json`）。
 
@@ -392,7 +392,7 @@ Phase 8（図表機械可読化）の表スライス。**TeX 版のみ**（`lume
 - **詳細パネルの添付行**: 添付 1 件だけを現行版で構築/再構築するボタン（`lcir.enabled` ON のときだけ表示）。`build_lcir_for_attachment` は content_key が変われば新版を作って旧版を supersede するので、「未構築」と「旧版」で操作は同じ。1 本で結果を確かめたいとき（新フェーズの動作確認）用。
 - 完了後は代替テキストの生成対象件数を取り直す（図が増えるため）。
 
-### LCIR 図の代替テキスト（Phase 8c・v0.10.0 同梱候補）
+### LCIR 図の代替テキスト（Phase 8c・**v0.10.0 で出荷済**）
 
 Phase 8（図表機械可読化）の alt text スライス。8a が作った `figure` ノードのページ crop PNG を LLM Vision に説明させ、`node_alt_texts`（migration 0020）へ保存する。**PDF 版のみ**（TeX 版に `figure` ノードは無い）。
 
