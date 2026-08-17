@@ -572,7 +572,7 @@ macOS ユーザーは `brew install --cask` でも導入できる。公式 homeb
 
 ---
 
-## 12. v1.0.0 リリースの固有事項（LCIR 完成）— 準備中
+## 12. v1.0.0 リリースの固有事項（LCIR 完成） ✅ 2026-08-17 公開完了
 
 看板は **LCIR の完成**（Phase 9a/10 到達 + `lcir.enabled` の既定 ON）。
 スコープと実装順序の正本は `docs/LCIR_REMAINING_PHASES.md`（§2 順序 / §9 リリース作業）。
