@@ -3,178 +3,187 @@
 [![Sponsor](https://img.shields.io/github/sponsors/marmot1123?logo=github&label=Sponsor&color=ea4aaa)](https://github.com/sponsors/marmot1123)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+**English** | [日本語](README_ja.md)
+
 A desktop reference management application for researchers, built with **Tauri 2 + React + TypeScript**.
 
-![Library view](docs/screenshots/library_view.png)
+![Library view](docs/screenshots/library_view_en.png)
 
-![Detail view](docs/screenshots/detail_view.png)
+![Detail view](docs/screenshots/detail_view_en.png)
 
 ## Features
 
-- 📚 **Entry management** — 19 種の文献種別（Zotero 準拠）の CRUD、タグ・コレクション（ネスト対応）、お気に入り、ゴミ箱
-- 🔍 **Auto metadata** — DOI / arXiv / ISBN から CrossRef / arXiv API / Open Library 経由でメタデータを取得
-- 📄 **PDF viewer** — pdf.js ベースの 3 ペイン詳細ビュー、3 色ハイライト、テキスト選択、ページサムネイル、印刷 (⌘P)。1 エントリに**本文 + 補助資料の複数 PDF** を添付でき、いずれも全文検索の対象
-- 🧠 **LCIR — 論文の機械可読な構造化**（v1.0.0 で既定 ON）— PDF / arXiv TeX ソースから、節・段落・定理・証明・定義・数式・図・表を**ページ座標と由来（provenance）つき**のノード木として保存します。全文検索の索引はここから作られ、図は切り出して保存し、本文中の「Theorem 2.3」「Figure 3」は実体へ解決されます。**論文を追加すると自動で解析され**、既存のライブラリは起動後に少しずつ埋まります
-- 💬 **Agentic chat** — 全文検索と LCIR の読み取りツールを使って、ライブラリ横断で質問に答えます。回答は**論文自身の言葉と LumenCite の推定を区別**して示し、根拠のブロックをクリックすると PDF の該当箇所がハイライトされます
-- 🔠 **Vision OCR** — テキストレイヤーのないスキャン PDF を LLM Vision で文字起こしして全文検索に載せます。進捗表示つきで**途中で止められ**、止めてもそこまでのページは残ります
-- 🔎 **検索とフィルタ** — メタデータ検索 / PDF 全文検索（FTS5）に加え、種別・年・スター・添付・タグ（AND / OR）を重ねる**複合フィルタ**
-- 🔌 **MCP サーバー / CLI / Web クリッパー** — Claude Desktop・Claude Code・Codex からライブラリを読み書きでき（localhost + Bearer トークン、書込は既定オフ）、ターミナルからは内蔵 CLI（`lumencite bib` で `refs.bib` 生成）、ブラウザからは Chrome 拡張でワンクリック取り込み
-- ✨ **LLM summarization** — OpenAI / Anthropic 対応、API キーは OS キーチェーン保管、ストリーミング表示、カスタムシステムプロンプト
-- 📐 **KaTeX** — 抄録 / ノートで `$…$` / `$$…$$` 数式レンダリング
-- 🔗 **BibTeX workflow** — インポート / エクスポート + 指定パスへの自動同期 (VSCode LaTeX Workshop 連携前提)
-- ⌘K **Command palette** — エントリ横断検索とグローバルアクションを一発起動
-- 🌗 **i18n + theme** — 日本語 / 英語 UI、ライト / ダーク / システム追従、4 アクセントカラー
-- 💾 **Backup & export** — **DB と添付ファイル本体をまとめた zip** を自動バックアップ（前回の成功から 24 時間経っていれば実行。起動時と、起動したまま使い続けている間の定期チェックの両方で判定・14 世代保持。手動の「今すぐバックアップ」は無条件）。復元は選んだアーカイブを検証してから段取りし（**壊れていればその場で弾いて何も置き換えません**）、実際の差し替えはライブラリを開く前＝次回起動時に行います。差し替え前の状態は自動で退避され、途中で失敗すれば元に戻ります。JSON / BibTeX / Markdown への手動エクスポートと、LCIR の JSON / 構造付き Markdown 書き出しにも対応
-- ⬆️ **Updates** — macOS は Tauri Updater による署名検証つき自動更新。**Windows / Linux は新版の通知のみ**で、インストーラは Releases ページから手動で入れ替えます
+- 📚 **Entry management** — create, edit, and organize 19 entry types (Zotero-compatible), with tags, nested collections, favorites, and a trash
+- 🔍 **Automatic metadata** — fetch metadata from a DOI / arXiv ID / ISBN via the CrossRef, arXiv, and Open Library APIs
+- 📄 **PDF viewer** — pdf.js-based three-pane detail view with 3-color highlights, text selection, page thumbnails, and printing (⌘P). Each entry can hold **multiple PDFs (the paper plus supplementary material)**, all of them full-text searchable
+- 🧠 **LCIR: machine-readable paper structure** — parses PDFs and arXiv TeX sources into a tree of sections, paragraphs, theorems, proofs, definitions, equations, figures, and tables, each node carrying **provenance** (nodes parsed from the PDF also carry page coordinates). The full-text index is built from it, figures are cropped and stored, and in-text references like "Theorem 2.3" or "Figure 3" resolve to the actual nodes. **Papers are analyzed automatically when added**; an existing library fills in gradually after launch. On by default since v1.0.0
+- 💬 **Agentic chat** — answers questions across your library using full-text search and LCIR read tools. Answers **distinguish the paper's own words from LumenCite's inference**, and clicking a cited block highlights the corresponding spot in the PDF
+- 🔠 **Vision OCR** — transcribes scanned PDFs that have no text layer via LLM vision so they become full-text searchable. Shows progress and **can be stopped midway**; pages transcribed so far are kept
+- 🔎 **Search & filters** — metadata search and PDF full-text search (FTS5), plus **compound filters** stacking entry type, year, star, attachment, and tags (AND / OR)
+- 🔌 **MCP server / CLI / Web Clipper** — read and write your library from Claude Desktop, Claude Code, and Codex (localhost + Bearer token; writes are off by default), from the terminal via the built-in CLI (`lumencite bib` generates a `refs.bib`), and from the browser via the Chrome extension for one-click capture
+- ✨ **LLM summarization** — OpenAI / Anthropic support, API keys stored in the OS keychain, streaming output, custom system prompts
+- 📐 **KaTeX** — renders `$…$` / `$$…$$` math in abstracts and notes
+- 🔗 **BibTeX workflow** — import / export plus automatic sync to a path of your choice (designed for VSCode LaTeX Workshop)
+- ⌘K **Command palette** — search across entries and trigger global actions from anywhere
+- 🌗 **i18n + themes** — Japanese / English UI, light / dark / system theme, 4 accent colors
+- 💾 **Backup & export** — automatic backups bundle **the database and all attachment files into a single zip** (runs once 24 hours have passed since the last success, checked both at launch and periodically while the app stays open; 14 generations are kept; a manual "Back up now" always runs). Restore validates the chosen archive up front (**a corrupt archive is rejected on the spot and nothing is replaced**) and applies the swap on the next launch, before the library opens; the pre-restore state is saved automatically and comes back if anything fails midway. Manual export to JSON / BibTeX / Markdown, plus LCIR export to JSON / structured Markdown
+- ⬆️ **Updates** — signed auto-updates on macOS via the Tauri Updater. **Windows / Linux get a notification only** — install new versions manually from the Releases page
 
 ## Download & install
 
-最新版は [GitHub Releases](https://github.com/marmot1123/LumenCite/releases/latest) から入手できます（macOS: `.dmg` / Windows: `.msi`・`.exe` / Linux: `.AppImage`・`.deb`・`.rpm`）。macOS は署名＋notarize 済みで、アプリ内 **設定 → アップデート**から自動更新できます。Windows は Authenticode 署名済み（SmartScreen はダウンロード実績で評価が育ちます）、Linux は無署名です。
+Get the latest release from [GitHub Releases](https://github.com/marmot1123/LumenCite/releases/latest) (macOS: `.dmg` / Windows: `.msi`, `.exe` / Linux: `.AppImage`, `.deb`, `.rpm`). The macOS build is signed and notarized, and updates itself from **Settings → Updates** inside the app. The Windows build is Authenticode-signed (SmartScreen reputation builds up with downloads); the Linux build is unsigned.
 
-> ℹ️ **Windows / Linux をお使いの方へ:** アプリ内の自動更新は macOS のみで、Windows / Linux は**新版が出たことを知らせるところまで**です。更新はこのページから新しいインストーラを入れ直してください。**v1.0.0 は Windows / Linux にとって PDF 解析ライブラリ（pdfium）の初同梱版**で、LCIR と Vision OCR がこれらの OS で動くのは v1.0.0 からです。
+> ℹ️ **For Windows / Linux users:** in-app auto-update is macOS-only. On Windows / Linux the app **only notifies you** that a new version is out — install the new installer from the Releases page yourself. **v1.0.0 is the first release to bundle the PDF parsing library (pdfium) on Windows / Linux**, so LCIR and Vision OCR work on those platforms from v1.0.0 onward.
 
 ### macOS: Homebrew
 
-macOS では [Homebrew](https://brew.sh/) 経由でもインストールできます（自前 tap [marmot1123/homebrew-lumencite](https://github.com/marmot1123/homebrew-lumencite) から universal `.dmg` を配布）。
+On macOS you can also install via [Homebrew](https://brew.sh/), from the self-hosted tap [marmot1123/homebrew-lumencite](https://github.com/marmot1123/homebrew-lumencite) (distributes the universal `.dmg`):
 
 ```bash
 brew tap marmot1123/lumencite
-brew trust marmot1123/lumencite   # Homebrew 6.0+ ではサードパーティ tap に必須
+brew trust marmot1123/lumencite   # required for third-party taps since Homebrew 6.0
 brew install --cask lumencite
 ```
 
-アップデートは `brew upgrade --cask lumencite`、またはアプリ内の自動更新（Tauri Updater）のどちらでも行えます。
+Update with `brew upgrade --cask lumencite`, or through the in-app auto-updater (Tauri Updater) — both work.
 
-> ⚠️ **v0.1.0 をお使いの方へ:** v0.1.0 は updater 鍵の設定漏れにより**自動更新が動作しません**（「アップデートを確認」で `Invalid symbol 95, offset 7.` というエラーになります）。お手数ですが、上記 Releases から**最新版を一度だけ手動でダウンロードして入れ直して**ください。以降は自動更新が有効になります。v0.2.0 以降のバージョンはこの問題の影響を受けません。
+> ⚠️ **If you are on v0.1.0:** a missing updater key in that release means **auto-update does not work** ("Check for updates" fails with `Invalid symbol 95, offset 7.`). Please download the latest installer from the Releases page above once, manually — auto-update works from then on. v0.2.0 and later are unaffected.
 
-## Requirements
+## Development
 
-- [Node.js](https://nodejs.org/) 18+ と [pnpm](https://pnpm.io/) 9+
+Most developer docs under `docs/` are currently written in Japanese.
+
+### Requirements
+
+- [Node.js](https://nodejs.org/) 18+ and [pnpm](https://pnpm.io/) 9+
 - [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
 - Tauri prerequisites: https://tauri.app/start/prerequisites/
 
-## Development
+### Run in dev mode
 
 ```bash
 pnpm install
 pnpm tauri dev
 ```
 
-Vite (port 1420) と Rust backend が連動し、ホットリロードで開発できます。
+Vite (port 1420) and the Rust backend run together with hot reload.
 
-## Build
+### Build distributables
 
 ```bash
 pnpm tauri build
 ```
 
-`src-tauri/target/release/bundle/` 配下に各 OS 用のインストーラ (.dmg / .msi / .deb / .AppImage) が出力されます。リリース署名手順は [docs/RELEASE.md](docs/RELEASE.md) を参照してください。
+Installers for each OS (`.dmg` / `.msi` / `.deb` / `.AppImage`) are written under `src-tauri/target/release/bundle/`. For code signing and the release process, see [docs/RELEASE.md](docs/RELEASE.md).
 
-## Tests
+### Tests
 
 ```bash
 # Rust
 cd src-tauri && cargo test
 
-# Frontend (型 + ビルド)
+# Frontend (type check + build)
 pnpm build
 
-# ブラウザ拡張
+# Browser extension
 pnpm --filter lumencite-clipper test
 ```
 
 ## Browser extension (Web Clipper)
 
-LumenCite には Chrome 拡張（Manifest V3）の **Web クリッパー**が付属します。論文ページを開いてツールバーボタンをクリックすると、起動中の LumenCite にエントリを作成します（DOI / arXiv / ISBN を自動抽出し、arXiv は PDF も自動添付）。拡張と LumenCite は**同じ PC 内の localhost** でのみ通信し、外部サーバーは経由しません。
+LumenCite ships with a **Web Clipper** Chrome extension (Manifest V3). Open a paper page and click the toolbar button to create an entry in the running LumenCite app — it extracts DOI / arXiv / ISBN identifiers automatically, and for arXiv papers it also attaches the PDF. The extension talks to LumenCite **only over localhost on the same machine**; no external server is involved.
 
-> ℹ️ Chrome ウェブストアでの公開は準備中です。現在は下記の手順で**手動インストール**（load unpacked）します。Chromium 系ブラウザ（Chrome / Edge / Brave など）で利用できます。
+> ℹ️ The extension is not yet on the Chrome Web Store. For now, install manually (load unpacked) as described below. Works on Chromium-based browsers (Chrome / Edge / Brave, etc.).
 
-### インストール（ユーザー向け）
+### Install (for users)
 
-1. [GitHub Releases](https://github.com/marmot1123/LumenCite/releases/latest) から `lumencite-clipper-<version>.zip` をダウンロードし、**任意の場所に解凍**します（解凍後のフォルダは削除・移動しないでください。拡張はそのフォルダを直接読み込みます）。
-2. Chrome で `chrome://extensions` を開き、右上の **デベロッパーモード**を ON にします。
-3. **「パッケージ化されていない拡張機能を読み込む」**をクリックし、手順 1 で解凍したフォルダ（`manifest.json` を含むフォルダ）を選択します。
-4. LumenCite を起動し、**設定 → Chat → Web クリッパー**を有効化して、表示される**接続コードをコピー**します。
-5. 拡張のアイコンを右クリック →「オプション」（または `chrome://extensions` の拡張の「詳細」→「拡張機能のオプション」）でオプションページを開き、接続コードを貼り付けて**保存**します。
+1. Download `lumencite-clipper-<version>.zip` from [GitHub Releases](https://github.com/marmot1123/LumenCite/releases/latest) and **unzip it anywhere you like** (don't delete or move the unzipped folder afterwards — the extension loads directly from it).
+2. Open `chrome://extensions` in Chrome and turn on **Developer mode** (top right).
+3. Click **"Load unpacked"** and select the folder from step 1 (the one containing `manifest.json`).
+4. Launch LumenCite, enable **Settings → Chat → Web Clipper**, and **copy the connect code** shown there.
+5. Right-click the extension icon → "Options" (or `chrome://extensions` → the extension's "Details" → "Extension options") to open the options page, paste the connect code, and **save**.
 
-これで論文ページのツールバーボタンからクリップできます。
+You can now clip from the toolbar button on paper pages.
 
-> 🔑 接続コードには秘密トークンが含まれます。LumenCite 側でトークンを再生成した場合や、MCP サーバーのポートを変更した場合はペアリングが切れるため、新しい接続コードで**手順 4〜5 をやり直して**ください。
+> 🔑 The connect code contains a secret token. If you regenerate the token in LumenCite or change the MCP server port, the pairing breaks — redo **steps 4–5** with a fresh connect code.
 
-### ソースからビルド（開発者向け）
+### Build from source (for developers)
 
 ```bash
-pnpm --filter lumencite-clipper build   # extension/dist を生成
+pnpm --filter lumencite-clipper build   # generates extension/dist
 ```
 
-`chrome://extensions` →「パッケージ化されていない拡張機能を読み込む」で `extension/dist` を選択すれば、上記のインストール手順 4〜5 に進めます。拡張のバージョン（`extension/manifest.json`）はアプリと独立採番です。
+Load `extension/dist` via `chrome://extensions` → "Load unpacked", then continue from step 4 above. The extension's version (`extension/manifest.json`) is numbered independently of the app.
 
-## CLI（コマンドライン）
+## CLI
 
-LumenCite は GUI を起動せず、ターミナルからライブラリを照会・編集できる CLI を内蔵します（本体バイナリの `argv` 分岐で動作。新しいバイナリは増やしていません）。主な用途は **AI エージェント × LaTeX 執筆**（`\cite` キー → `refs.bib` 生成）とシェルスクリプト連携です。
+LumenCite includes a CLI for querying and editing the library from the terminal, without launching the GUI (it runs as an `argv` branch of the main binary — no extra binary is shipped). The primary use cases are **AI-agent-assisted LaTeX writing** (`\cite` keys → `refs.bib`) and shell scripting.
 
-出力は既定で **JSON**（`jq` 連携向け）、`--human` で人間可読テキストに切り替わります。DB は Tauri の `app_data_dir`（macOS: `~/Library/Application Support/com.lumencite.app/lumencite.db`）を自動解決し、環境変数 `LUMENCITE_DB_PATH` で上書きできます。
+Output is **JSON** by default (for `jq`); `--human` switches to human-readable text. The DB path resolves automatically to Tauri's `app_data_dir` (macOS: `~/Library/Application Support/com.lumencite.app/lumencite.db`) and can be overridden with the `LUMENCITE_DB_PATH` environment variable.
 
-### 読取
+### Reading
 
-読取は SQLite を `PRAGMA query_only = ON` の読取専用接続で開くため、GUI アプリ起動中でも安全に共存し、停止中でも動作します。
+Reads open SQLite over a read-only connection (`PRAGMA query_only = ON`), so they coexist safely with a running GUI and also work while the app is closed.
 
 ```bash
-# メタデータ検索（フィルタ: --type / --year-min / --year-max / --starred / --has-attachment / --limit）
+# Search metadata (filters: --type / --year-min / --year-max / --starred / --has-attachment / --limit)
 lumencite search "quantum walk" --year-min 2018 --limit 10
 
-# 単一エントリ（数値 id でも citation key でも可）
+# Get a single entry (numeric id or citation key)
 lumencite get smith2020a
 lumencite get smith2020a --human
 
-# \cite キー群から refs.bib を生成（キーは化けずに \cite と一致。未解決キーは stderr に警告）
+# Generate refs.bib from \cite keys (keys pass through verbatim; unresolved keys warn on stderr)
 lumencite bib smith2020a jones2021 > refs.bib
 
-# フィルタ条件で BibTeX 一括エクスポート
+# Bulk-export BibTeX by filter
 lumencite export --type article --year-min 2020 > articles.bib
 
-# タグ / コレクション一覧・PDF 全文検索
+# List tags / collections, search PDF full text
 lumencite tags
 lumencite collections
 lumencite fulltext "topological"
 ```
 
-### 書込
+### Writing
 
 ```bash
-# エントリ作成（--field で type 固有フィールド、--author は繰り返し可）
+# Create an entry (--field for type-specific fields; --author is repeatable)
 lumencite add --title "My Paper" --type article --year 2026 \
   --author "Jane Doe" --citation-key doe2026a --field journal="Nature"
 
-# 既存エントリの部分更新（id でも citation key でも可）
+# Partially update an existing entry (id or citation key)
 lumencite update doe2026a --year 2027 --notes "revised"
 
-# ノート設定 / タグ付与 / コレクション追加
+# Set notes / add a tag / add to a collection
 lumencite notes doe2026a "important background reference"
 lumencite tag doe2026a reading-list
 lumencite collect doe2026a 3
 ```
 
-書込は **UI 陳腐化を避けるハイブリッド C** でルーティングされます:
+Writes are routed so that an open GUI never goes stale:
 
-- **LumenCite アプリが起動中（MCP サーバー有効）** → localhost 経由でアプリに委譲し、変更が**一覧に即反映**され `.bib` も同期されます（MCP の書込は設定 → MCP サーバーで許可が必要）。
-- **アプリ停止中** → DB に直接書き込み、`.bib` を同期します。
-- `--force` を付けると、アプリ起動中でも DB に直接書き込みます（開いているウィンドウの一覧は更新するまで古い表示のままになる可能性があります）。
+- **LumenCite running (MCP server enabled)** — the CLI delegates to the app over localhost; changes show up **immediately in the entry list** and the `.bib` stays in sync (MCP writes must be allowed via "Allow write tools" under Settings → Chat → Publish as MCP server).
+- **App closed** — the CLI writes directly to the DB and syncs the `.bib`.
+- With `--force`, the CLI writes directly to the DB even while the app is running (open windows may show stale lists until refreshed).
 
-> ℹ️ 破壊的操作（削除）、DOI/arXiv からのメタデータ自動取得付き作成、CLI を PATH に載せる配布導線（Homebrew の `binary` シンボリックリンク等）は次版以降で検討します。
+> ℹ️ Destructive operations (delete), entry creation with automatic DOI / arXiv metadata fetch, and a `PATH` install story (e.g. a Homebrew `binary` symlink) are being considered for future releases.
 
 ## Documentation
 
-- [docs/SPEC.md](docs/SPEC.md) — 機能仕様と版ごとのロードマップ（v1.0.0 節に **LCIR が *しない* こと**の一覧）
-- [docs/DATA_MODEL.md](docs/DATA_MODEL.md) — SQLite スキーマと設計判断
-- [docs/API_SPEC.md](docs/API_SPEC.md) — Tauri コマンド一覧
-- [docs/RELEASE.md](docs/RELEASE.md) — コード署名 / notarization / リリース手順
-- [docs/LCIR_design_overview.md](docs/LCIR_design_overview.md) — LCIR の設計・データモデル・座標系・ノード型
-- [docs/LCIR_REMAINING_PHASES.md](docs/LCIR_REMAINING_PHASES.md) — LCIR の残 Phase・積み残し債務・実測値
+Written in Japanese unless noted otherwise.
+
+- [CHANGELOG.md](CHANGELOG.md) — release history (English)
+- [docs/SPEC.md](docs/SPEC.md) — feature spec and per-version roadmap (the v1.0.0 section lists what LCIR deliberately does *not* do)
+- [docs/DATA_MODEL.md](docs/DATA_MODEL.md) — SQLite schema and design decisions
+- [docs/API_SPEC.md](docs/API_SPEC.md) — Tauri command reference
+- [docs/RELEASE.md](docs/RELEASE.md) — code signing / notarization / release process
+- [docs/LCIR_design_overview.md](docs/LCIR_design_overview.md) — LCIR design, data model, coordinate system, node types
+- [docs/LCIR_REMAINING_PHASES.md](docs/LCIR_REMAINING_PHASES.md) — remaining LCIR phases, known debts, and measurements
 
 ## Sponsor
 
-LumenCite はオープンソースの個人プロジェクトです。継続的な開発を応援していただける方はぜひ [**GitHub Sponsors**](https://github.com/sponsors/marmot1123) で支援をお願いいたします。
+LumenCite is an open-source project developed by an individual. If you would like to support its continued development, please consider [**GitHub Sponsors**](https://github.com/sponsors/marmot1123).
 
 ## License
 
