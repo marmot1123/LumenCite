@@ -8,6 +8,8 @@
 研究者のためのデスクトップ文献管理アプリです。
 **Tauri 2 + React + TypeScript** で作られています。
 
+**公式サイト:** [lumencite.com](https://lumencite.com)
+
 ![ライブラリ画面](docs/screenshots/library_view.png)
 
 ![詳細画面](docs/screenshots/detail_view.png)
