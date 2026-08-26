@@ -7,6 +7,8 @@
 
 A desktop reference management application for researchers, built with **Tauri 2 + React + TypeScript**.
 
+**Official website:** [lumencite.com](https://lumencite.com)
+
 ![Library view](docs/screenshots/library_view_en.png)
 
 ![Detail view](docs/screenshots/detail_view_en.png)
