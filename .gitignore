@@ -28,3 +28,6 @@ dist-ssr
 
 # Bundled pdfium dynamic library (downloaded for OCR; not committed)
 src-tauri/pdfium/
+
+# Private performance fixtures and measurements (may identify personal papers)
+/performance-results/
