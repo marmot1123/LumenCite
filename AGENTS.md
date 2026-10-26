@@ -40,6 +40,8 @@ the intended behavior rather than copying them mechanically.
 - `src/i18n/locales/`: Japanese and English application translations
 - `src/pdf-viewer.tsx`: entry point for the separate PDF viewer window
 - `src-tauri/src/lib.rs`: Tauri setup, application state, commands, and command registration
+- `src-tauri/src/main.rs`: binary entry point that calls the library's `run()` function
+- `src-tauri/tauri.conf.json`: application metadata, windows, and build hooks
 - `src-tauri/src/db/`: database operations grouped by domain
 - `src-tauri/src/models.rs`: Rust DTOs shared across backend boundaries
 - `src-tauri/src/llm/`: LLM providers, chat orchestration, and tools
@@ -64,6 +66,7 @@ pnpm install
 pnpm tauri dev
 pnpm build
 (cd src-tauri && cargo test)
+(cd src-tauri && cargo clippy --all-targets --all-features -- -D warnings)
 pnpm --filter lumencite-clipper test
 pnpm --filter lumencite-clipper build
 pnpm tauri build
@@ -77,9 +80,25 @@ pnpm tauri build
 - `pnpm tauri build` creates platform bundles and is not required for every
   routine code change.
 
-There is currently no repository-wide lint command or frontend unit-test suite.
-Do not claim those checks ran. Rust formatting is not currently a clean
-repository-wide gate; avoid unrelated formatting churn.
+There is currently no frontend lint command or frontend unit-test suite. Do not
+claim those checks ran. Rust formatting is not currently a clean repository-wide
+gate; avoid unrelated formatting churn.
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs for every pull request and push to `main`:
+
+- the frontend job runs `pnpm build`, then the extension tests and build;
+- the Rust job runs `cargo test` and
+  `cargo clippy --all-targets --all-features -- -D warnings`;
+- `cargo audit` is informational and non-blocking, with reviewed advisories
+  explicitly ignored in the workflow.
+
+Clippy warnings are a hard CI failure. Before pushing Rust changes, update the
+local stable toolchain with `rustup update stable` and run the same clippy
+command used by CI from `src-tauri/`. Prefer fixing the lint over adding an
+`#[allow(...)]` solely to silence it. CI's stable toolchain can be newer than a
+local installation and may report additional lints.
 
 ## Development Workflow
 
@@ -127,6 +146,8 @@ UI refresh events, and MCP audit behavior.
 ## Database Rules
 
 - SQLite is owned by `AppState`; startup applies `sqlx::migrate!`.
+- The database file lives in the operating system's application data directory,
+  resolved through Tauri's `app.path().app_data_dir()`.
 - WAL mode and foreign keys are configured in Rust connection options, not in
   migrations.
 - Never edit an already-applied migration. Inspect the current highest number
