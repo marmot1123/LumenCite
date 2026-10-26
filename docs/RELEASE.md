@@ -156,6 +156,29 @@ az network public-ip delete -g $RG -n lumencite-win-ip
 - 自動シャットダウン（DevTestLab スケジュール・21:00 JST）は有効のまま。ただしこれは**戻し忘れの保険**であって、停止してもディスクと IP の課金は止まらない。
 - 月 ¥2,000 の予算アラート `lumencite-monthly-2000jpy` を設定済み（実績 80%/100% と予測 100% でメール通知）。**通知するだけで課金は止まらない。**
 
+**v1.1.0 リリースで試す — macOS 版 SimplySign による Windows 署名 PoC（2026-09-03 決定）**
+
+Azure VM の廃止可否を判断するため、v1.1.0 の本番 Windows 署名より先に、macOS 版
+SimplySign Desktop が公開する PKCS#11 モジュール
+（`/usr/local/lib/libSimplySignPKCS.dylib`）を `osslsigncode` または `jsign` から呼び、
+**未署名の LumenCite Windows 成果物のコピー**へ Authenticode 署名する PoC を行う。
+Certum は Open Source Code Signing in the Cloud について、macOS 上のツールから
+`.exe` / `.msi` / `.dll` へ署名できると公式に案内している。
+
+- [ ] macOS に公式 SimplySign Desktop と必要な PKCS#11 周辺ツールを入れ、現在の SimplySign
+      アカウントへスマホ OTP で対話ログインする
+- [ ] PKCS#11 から Code Signing 証明書と秘密鍵オブジェクトが見えることを確認する
+- [ ] 未署名の LumenCite `.exe` の**コピー**へ SHA-256 + Certum タイムスタンプ付きで署名する
+- [ ] macOS の `osslsigncode verify` で署名ハッシュとタイムスタンプを確認し、Windows の
+      `signtool verify /pa /all /v` でも有効になることを確認する
+- [ ] MSI / NSIS の外側だけでなく、インストール後の `LumenCite.exe` も署名済みであることを確認する
+
+この PoC はまず「macOS から Windows Authenticode 署名できること」だけを検証する。
+Tauri はバンドル途中で加工したアプリ本体 EXE とインストーラをそれぞれ署名し、WiX/MSI の生成自体は
+Windows 専用なので、PoC 成功だけで現行 VM を削除しない。v1.1.0 は Azure VM をフォールバックとして
+残し、完全なリリース経路を少なくとも 1 回通してから、macOS の NSIS クロスビルド + `signCommand`
+または Windows CI から Mac の署名処理を呼ぶ構成を選定する。
+
 **Phase 5 — リリースごとの Windows 署名手順（VM 上）**
 0. [ ] **VM を起動する。公開 IP を作り直してから起動すること**（Phase 4-2。忘れると RDP も外向き通信も繋がらない）
 1. [ ] CI（タグ push）が **macOS + Linux のドラフトリリース**を生成するのを待つ（§5 参照）
