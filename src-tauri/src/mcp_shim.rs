@@ -12,7 +12,9 @@
 //! MCP の stdio フレーミングは「1 行 = 1 JSON-RPC メッセージ」（改行区切り）。
 
 use std::io::{BufRead, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+mod trace;
 
 use serde_json::{json, Value};
 
@@ -26,11 +28,32 @@ pub fn proxy_line(
     token: &str,
     line: &str,
 ) -> Option<String> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
+    proxy_exchange(client, url, token, line).response
+}
 
+struct ProxyOutcome {
+    response: Option<String>,
+    status: &'static str,
+    http_status: Option<u16>,
+    response_bytes: Option<usize>,
+}
+
+fn proxy_exchange(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: &str,
+    line: &str,
+) -> ProxyOutcome {
+    let trimmed = line.trim();
+    let mut outcome = ProxyOutcome {
+        response: None,
+        status: "notification",
+        http_status: None,
+        response_bytes: None,
+    };
+    if trimmed.is_empty() {
+        return outcome;
+    }
     match client
         .post(url)
         .bearer_auth(token)
@@ -40,36 +63,88 @@ pub fn proxy_line(
     {
         Ok(resp) => {
             let status = resp.status();
-            let text = resp.text().unwrap_or_default();
+            outcome.http_status = Some(status.as_u16());
+            // Keep the existing empty-body fallback if response decoding fails.
+            let (text, read_failed) = match resp.text() {
+                Ok(text) => {
+                    outcome.response_bytes = Some(text.len());
+                    (text, false)
+                }
+                Err(_) => (String::new(), true),
+            };
             if status.is_success() {
                 if text.trim().is_empty() {
-                    // 通知（id 無し / 202）は正常に無出力。ただし id 付きリクエストへ
-                    // 空ボディが返るのは異常なので、クライアントを無限待機させないよう
-                    // エラー応答へ変換する（error_response は id 無しなら None を返す）。
-                    error_response(
+                    outcome.response = error_response(
                         trimmed,
                         -32000,
                         "empty response body from LumenCite MCP server",
-                    )
+                    );
+                    outcome.status = if read_failed {
+                        "read_error"
+                    } else if outcome.response.is_some() {
+                        "empty_response"
+                    } else {
+                        "notification"
+                    };
                 } else {
-                    Some(text)
+                    outcome.response = Some(text);
+                    outcome.status = "ok";
                 }
             } else {
-                // 401 など。生のボディを垂れ流さず JSON-RPC エラーへ変換する。
-                error_response(
+                outcome.response = error_response(
                     trimmed,
                     -32000,
                     &format!("LumenCite MCP server returned HTTP {}", status.as_u16()),
-                )
+                );
+                outcome.status = "http_error";
             }
         }
-        // 接続不可（アプリ未起動・ポート不一致など）。
-        Err(e) => error_response(
-            trimmed,
-            -32000,
-            &format!("cannot reach LumenCite MCP server: {e}"),
-        ),
+        Err(e) => {
+            outcome.status = if e.is_timeout() {
+                "timeout"
+            } else {
+                "transport_error"
+            };
+            outcome.response = error_response(
+                trimmed,
+                -32000,
+                &format!("cannot reach LumenCite MCP server: {e}"),
+            );
+        }
     }
+    outcome
+}
+
+/// The same forwarding path with optional metadata-only observation.
+fn forward_line(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: &str,
+    line: &str,
+    stdout: &mut impl Write,
+    trace: &mut Option<trace::Trace>,
+) -> bool {
+    let ticket = trace.as_mut().and_then(|t| t.begin(line));
+    let forward_start = Instant::now();
+    let outcome = proxy_exchange(client, url, token, line);
+    let forward_end = Instant::now();
+    let delivery = match &outcome.response {
+        None => "none",
+        Some(resp) => {
+            if writeln!(stdout, "{resp}").is_err() {
+                "write_error"
+            } else if stdout.flush().is_err() {
+                "flush_error"
+            } else {
+                "sent"
+            }
+        }
+    };
+    if let (Some(t), Some(ticket)) = (trace.as_mut(), ticket) {
+        t.finish(ticket, &outcome, forward_start, forward_end, delivery);
+    }
+    // Preserve the existing policy: write failure stops, flush failure does not.
+    delivery != "write_error"
 }
 
 /// リクエスト行から `id` を引き継いだ JSON-RPC エラー応答を作る。
@@ -127,6 +202,7 @@ pub fn run_stdio_proxy() -> i32 {
         }
     };
 
+    let mut trace = trace::Trace::from_env();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -140,11 +216,8 @@ pub fn run_stdio_proxy() -> i32 {
             }
             Err(_) => break,
         };
-        if let Some(resp) = proxy_line(&client, &url, &token, &line) {
-            if writeln!(stdout, "{resp}").is_err() {
-                break;
-            }
-            let _ = stdout.flush();
+        if !forward_line(&client, &url, &token, &line, &mut stdout, &mut trace) {
+            break;
         }
     }
     0
@@ -221,11 +294,96 @@ mod tests {
     fn request_with_id_maps_unreachable_to_error() {
         let client = reqwest::blocking::Client::new();
         let line = r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#;
-        let v: Value =
-            serde_json::from_str(&proxy_line(&client, "http://127.0.0.1:1/mcp", "t", line).unwrap())
-                .unwrap();
+        let v: Value = serde_json::from_str(
+            &proxy_line(&client, "http://127.0.0.1:1/mcp", "t", line).unwrap(),
+        )
+        .unwrap();
         assert_eq!(v["id"], 9);
         assert_eq!(v["error"]["code"], -32000);
+    }
+
+    #[test]
+    fn tracing_preserves_http_requests_and_stdout() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", server.server_addr());
+        let request = r#"{"jsonrpc":"2.0","id":"PRIVATE","method":"tools/call","params":{"name":"search_entries","arguments":{"query":"PRIVATE"}}}"#;
+        let responses = [
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":"PRIVATE","result":{"content":[{"text":"PRIVATE"}]}}"#,
+            ),
+            (200, r#"{"error":{"message":"PRIVATE"}}"#),
+            (403, "PRIVATE"),
+            (200, "PRIVATE"),
+            (204, ""),
+        ];
+        let worker = std::thread::spawn(move || {
+            for (status, body) in responses {
+                for _ in 0..2 {
+                    let mut req = server.recv().unwrap();
+                    let mut received = String::new();
+                    req.as_reader().read_to_string(&mut received).unwrap();
+                    assert_eq!(received, request);
+                    req.respond(tiny_http::Response::from_string(body).with_status_code(status))
+                        .unwrap();
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "shim-trace-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut trace = Some(trace::Trace::open(&dir).unwrap());
+        let client = reqwest::blocking::Client::new();
+        for _ in responses {
+            let mut off = Vec::new();
+            let mut on = Vec::new();
+            assert!(forward_line(
+                &client, &url, "PRIVATE", request, &mut off, &mut None
+            ));
+            assert!(forward_line(
+                &client, &url, "PRIVATE", request, &mut on, &mut trace
+            ));
+            assert_eq!(off, on);
+        }
+        worker.join().unwrap();
+        drop(trace);
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(!log.contains("PRIVATE"));
+        let rows: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let ends: Vec<_> = rows
+            .iter()
+            .filter(|row| row["event"] == "call_end")
+            .collect();
+        assert_eq!(
+            ends.iter()
+                .map(|row| row["status"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "ok",
+                "rpc_error",
+                "http_error",
+                "invalid_response",
+                "empty_response"
+            ]
+        );
+        for row in ends {
+            assert!(
+                row["duration_ms"].as_f64().unwrap()
+                    >= row["forward_duration_ms"].as_f64().unwrap()
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

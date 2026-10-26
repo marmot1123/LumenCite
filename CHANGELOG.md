@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Optional privacy-filtered JSONL timing traces for the MCP stdio proxy, enabled with `LUMENCITE_MCP_TRACE=1` and `LUMENCITE_MCP_TRACE_DIR`. Records request order, timings, sizes and outcomes without query text, document content or credentials; read-only replay fixtures can be reconstructed with separately supplied private inputs.
+
 ### Fixed
 
 - **A page range no longer slips past the guard that stops the assistant re-OCR'ing a paper it can already read** — the in-app assistant is refused a whole-document OCR of a paper that already has searchable text, but the refusal ended by telling it that naming individual pages would go through anyway, and naming pages did go through. That path bills every page it names, and once it finishes it marks the **whole** attachment as OCR-derived — which permanently stops the PDF's own text layer from being indexed again (getting it back means pressing **Remove index** on that attachment first, in the details panel, and then re-indexing). Page ranges are now refused on the same terms as a whole document, and the refusal tells the assistant to hand the decision back to you — re-transcribing a paper that already has text is your call, not its. **The OCR button in the app is unchanged** — it never went through this guard, because re-running OCR on a PDF whose text layer is broken is exactly what it is for.

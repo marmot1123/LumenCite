@@ -187,6 +187,13 @@ lumencite collect doe2026a 3
 
 > ℹ️ 破壊的操作（削除）、DOI / arXiv からのメタデータ自動取得つき作成、CLI を PATH に載せる配布導線（Homebrew の `binary` シンボリックリンクなど）は次版以降で検討します。
 
+## MCP の性能調査
+
+MCP stdio 接続の性能調査では、既定 OFF のメタデータトレースを利用できます。
+有効化・無効化と実際の呼出し列の再計測は
+[トレース手順](benchmarks/performance/TRACE.md)を参照してください。
+検索語・本文・認証情報はトレースに保存しません。
+
 ## ドキュメント
 
 - [CHANGELOG.md](CHANGELOG.md)：リリース履歴（英語）

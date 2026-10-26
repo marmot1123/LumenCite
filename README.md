@@ -171,6 +171,13 @@ Writes are routed so that an open GUI never goes stale:
 
 > ℹ️ Destructive operations (delete), entry creation with automatic DOI / arXiv metadata fetch, and a `PATH` install story (e.g. a Homebrew `binary` symlink) are being considered for future releases.
 
+## MCP performance diagnostics
+
+Optional metadata tracing is available for MCP stdio connections and is disabled
+by default. See the [tracing guide](benchmarks/performance/TRACE.md) for enabling
+or disabling it and replaying recorded calls. Traces exclude search queries,
+document content, and credentials.
+
 ## Documentation
 
 Written in Japanese unless noted otherwise.

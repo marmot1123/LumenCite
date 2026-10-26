@@ -120,3 +120,8 @@ remain null. An error stops the sequence and preserves incomplete records.
 The full-text tool's `N hits\n{...}` response is parsed to collect hit counts and
 candidate identifiers. Metadata search uses `id`; block/full-text search uses
 `entry_id`. These identifiers are normalized only in measurement metadata.
+
+## Real-use opt-in tracing
+
+See [TRACE.md](TRACE.md) for metadata-only stdio tracing, ON/OFF environment
+settings, privacy limits, and conversion of actual read calls into replay cases.

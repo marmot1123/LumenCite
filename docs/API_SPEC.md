@@ -942,3 +942,24 @@ DB を `PRAGMA query_only = ON` の読取専用プールで直接開く（読取
 | `collect <id\|citation_key> <collection_id>` | — | `add_to_collection` |
 
 破壊系（`delete_entry`）、DOI/arXiv メタデータ自動取得付き `add`、CLI の PATH 配置は次版以降。
+
+
+### MCP stdio trace（Unreleased）
+
+環境変数は `LUMENCITE_MCP_TRACE=1` で有効、他の値/未設定は無効。
+`LUMENCITE_MCP_TRACE_DIR` は有効時のみ読む絶対ディレクトリ。
+`mcp-trace-<pid>-<time>-<sequence>.jsonl` を排他的に新規作成する。
+仕様・再生手順は `benchmarks/performance/TRACE.md` を参照。
+各行の `schema_version=1`、`session_id`、`process_id`、`event` と
+`offset_ms`（sessionの単調時計起点から）で対応付ける。
+`request_id` はsession内連番。生のRPC idではなく、同一要求のstart/endを結ぶ。
+startは `method`, `tool_name`, `request_bytes`（trim後HTTP body、改行を除く）、
+`safe_arguments`, `replay_complete` を持つ。
+endは `duration_ms`（startからstdout処理後、startの記録コストを含む）、
+`forward_duration_ms`（HTTP転送開始から応答本文受信・既存エラー変換まで）、
+`forward_start_offset_ms`, `response_bytes`（HTTP本文をデコードした文字列のUTF-8バイト数、未受信/読込失敗はnull）、
+`stdout_bytes`（出力予定の応答＋改行）、`status`, `http_status`, `delivery` を持つ。
+`status` は ok/notification/rpc_error/tool_error/invalid_response/empty_response/
+http_error/transport_error/timeout/read_error。deliveryはsent/none/write_error/flush_error。
+session行にはUTC日時・アプリ版・debug/release・120000ms timeoutを保存する。
+raw引数・raw RPC id・エラー本文は保存しない。再試行回数やUI時刻を推測しない。
